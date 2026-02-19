@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use covy_core::config::GateConfig;
+use covy_core::config::{GateConfig, IssueGateConfig};
+use covy_core::diagnostics::DiagnosticsData;
 use covy_core::model::{CoverageData, CoverageFormat};
 use covy_core::CovyConfig;
 
@@ -15,6 +16,10 @@ pub struct CheckArgs {
     /// Coverage format (auto/lcov/cobertura/jacoco/gocov/llvm-cov)
     #[arg(short, long, default_value = "auto")]
     format: String,
+
+    /// SARIF diagnostics file paths (supports globs)
+    #[arg(long)]
+    issues: Vec<String>,
 
     /// Read coverage data from stdin
     #[arg(long)]
@@ -40,6 +45,14 @@ pub struct CheckArgs {
     #[arg(long)]
     fail_under_new: Option<f64>,
 
+    /// Fail if changed-line errors exceed this value
+    #[arg(long)]
+    max_new_errors: Option<u32>,
+
+    /// Fail if changed-line warnings exceed this value
+    #[arg(long)]
+    max_new_warnings: Option<u32>,
+
     /// Output format (terminal/json/markdown/github)
     #[arg(long, default_value = "terminal")]
     report: String,
@@ -63,9 +76,20 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     // Ingest coverage data
     let mut coverage = resolve_and_ingest(&args, &config)?;
 
-    // Normalize paths
+    // Normalize coverage paths
     let source_root = args.source_root.as_deref().map(Path::new);
     covy_core::pathmap::auto_normalize_paths(&mut coverage, source_root);
+
+    // Ingest diagnostics (optional)
+    let mut diagnostics = if args.issues.is_empty() {
+        None
+    } else {
+        Some(resolve_and_ingest_issues(&args.issues)?)
+    };
+
+    if let Some(diag) = diagnostics.as_mut() {
+        covy_core::pathmap::auto_normalize_issue_paths(diag, source_root);
+    }
 
     // Diff
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
@@ -76,13 +100,23 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     tracing::info!("Found {} changed files", diffs.len());
 
     // Gate
+    let issue_gate = IssueGateConfig {
+        max_new_errors: args.max_new_errors.or(config.gate.issues.max_new_errors),
+        max_new_warnings: args
+            .max_new_warnings
+            .or(config.gate.issues.max_new_warnings),
+        max_new_issues: config.gate.issues.max_new_issues,
+    };
+
     let gate_config = GateConfig {
         fail_under_total: args.fail_under_total.or(config.gate.fail_under_total),
         fail_under_changed: args.fail_under_changed.or(config.gate.fail_under_changed),
         fail_under_new: args.fail_under_new.or(config.gate.fail_under_new),
+        issues: issue_gate,
     };
 
-    let gate_result = covy_core::gate::evaluate_gate(&gate_config, &coverage, &diffs);
+    let gate_result =
+        covy_core::gate::evaluate_full_gate(&gate_config, &coverage, diagnostics.as_ref(), &diffs);
 
     // Render
     match args.report.as_str() {
@@ -91,14 +125,28 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
             println!("{json}");
         }
         "markdown" => {
-            let md = covy_core::report::render_markdown(&coverage, &gate_result, &diffs, args.show_missing);
+            let md = covy_core::report::render_markdown(
+                &coverage,
+                &gate_result,
+                &diffs,
+                args.show_missing,
+                diagnostics.as_ref(),
+            );
             print!("{md}");
         }
         "github" => {
-            covy_core::report::render_github_annotations(&coverage, &diffs, &gate_result);
+            covy_core::report::render_github_annotations(
+                &coverage,
+                &diffs,
+                &gate_result,
+                diagnostics.as_ref(),
+            );
         }
         _ => {
             covy_core::report::render_terminal(&coverage, args.show_missing, "name");
+            if let Some(diag) = diagnostics.as_ref() {
+                covy_core::report::render_issues_terminal(diag, Some(&diffs));
+            }
             covy_core::report::render_gate_result(&gate_result);
         }
     }
@@ -164,6 +212,32 @@ pub fn resolve_and_ingest(args: &CheckArgs, config: &CovyConfig) -> Result<Cover
         combined.merge(&data);
     }
 
+    Ok(combined)
+}
+
+fn resolve_and_ingest_issues(patterns: &[String]) -> Result<DiagnosticsData> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for pattern in patterns {
+        let matches: Vec<_> = glob::glob(pattern)
+            .context(format!("Invalid glob pattern: {pattern}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if matches.is_empty() {
+            tracing::warn!("No diagnostics files matched pattern: {}", pattern);
+        }
+        files.extend(matches);
+    }
+
+    if files.is_empty() {
+        anyhow::bail!("No diagnostics files found");
+    }
+
+    let mut combined = DiagnosticsData::new();
+    for file in &files {
+        tracing::info!("Ingesting diagnostics {}", file.display());
+        let data = covy_ingest::ingest_diagnostics_path(file)?;
+        combined.merge(&data);
+    }
     Ok(combined)
 }
 

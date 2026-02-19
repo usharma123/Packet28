@@ -13,6 +13,7 @@ serde_json.workspace = true
 quick-xml.workspace = true
 regex.workspace = true
 tracing.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

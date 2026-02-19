@@ -67,9 +67,7 @@ fn parse_jacoco(data: &[u8]) -> Result<CoverageData, CovyError> {
                     }
                     b"line" => {
                         if current_sourcefile.is_some() {
-                            if let (Some(nr), Some(ci)) =
-                                (get_attr(e, b"nr"), get_attr(e, b"ci"))
-                            {
+                            if let (Some(nr), Some(ci)) = (get_attr(e, b"nr"), get_attr(e, b"ci")) {
                                 if let (Ok(line_no), Ok(covered_instr)) =
                                     (nr.parse::<u32>(), ci.parse::<u64>())
                                 {
@@ -84,26 +82,23 @@ fn parse_jacoco(data: &[u8]) -> Result<CoverageData, CovyError> {
                     _ => {}
                 }
             }
-            Ok(Event::End(ref e)) => {
-                match e.name().as_ref() {
-                    b"sourcefile" => {
-                        if let (Some(pkg), Some(sf)) = (&current_package, current_sourcefile.take())
-                        {
-                            let path = format!("{}/{}", pkg, sf);
-                            result
-                                .files
-                                .entry(path)
-                                .or_insert_with(FileCoverage::new)
-                                .merge(&current_coverage);
-                            current_coverage = FileCoverage::new();
-                        }
+            Ok(Event::End(ref e)) => match e.name().as_ref() {
+                b"sourcefile" => {
+                    if let (Some(pkg), Some(sf)) = (&current_package, current_sourcefile.take()) {
+                        let path = format!("{}/{}", pkg, sf);
+                        result
+                            .files
+                            .entry(path)
+                            .or_insert_with(FileCoverage::new)
+                            .merge(&current_coverage);
+                        current_coverage = FileCoverage::new();
                     }
-                    b"package" => {
-                        current_package = None;
-                    }
-                    _ => {}
                 }
-            }
+                b"package" => {
+                    current_package = None;
+                }
+                _ => {}
+            },
             Ok(Event::Eof) => break,
             Err(e) => {
                 return Err(CovyError::Xml(format!(

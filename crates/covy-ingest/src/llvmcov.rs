@@ -68,7 +68,10 @@ fn parse_llvmcov(data: &[u8]) -> Result<CoverageData, CovyError> {
 
                 let line = seg[0].as_u64().unwrap_or(0) as u32;
                 let count = seg[2].as_u64().unwrap_or(0);
-                let has_count = seg[3].as_bool().or_else(|| seg[3].as_u64().map(|v| v != 0)).unwrap_or(false);
+                let has_count = seg[3]
+                    .as_bool()
+                    .or_else(|| seg[3].as_u64().map(|v| v != 0))
+                    .unwrap_or(false);
 
                 if !has_count {
                     continue;

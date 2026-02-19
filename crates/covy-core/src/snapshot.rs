@@ -23,7 +23,8 @@ pub fn build_snapshot(root: &Path) -> Result<RepoSnapshot, CovyError> {
         .build();
 
     for entry in walker {
-        let entry = entry.map_err(|e| CovyError::IoRaw(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let entry = entry
+            .map_err(|e| CovyError::IoRaw(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         if !entry.file_type().map_or(false, |ft| ft.is_file()) {
             continue;
         }
@@ -56,8 +57,8 @@ pub fn build_snapshot(root: &Path) -> Result<RepoSnapshot, CovyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_snapshot_basic() {

@@ -43,6 +43,16 @@ pub struct GateConfig {
     pub fail_under_total: Option<f64>,
     pub fail_under_changed: Option<f64>,
     pub fail_under_new: Option<f64>,
+    #[serde(default)]
+    pub issues: IssueGateConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IssueGateConfig {
+    pub max_new_errors: Option<u32>,
+    pub max_new_warnings: Option<u32>,
+    pub max_new_issues: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +125,17 @@ impl Default for GateConfig {
             fail_under_total: None,
             fail_under_changed: None,
             fail_under_new: None,
+            issues: IssueGateConfig::default(),
+        }
+    }
+}
+
+impl Default for IssueGateConfig {
+    fn default() -> Self {
+        Self {
+            max_new_errors: None,
+            max_new_warnings: None,
+            max_new_issues: None,
         }
     }
 }
@@ -170,5 +191,41 @@ impl CovyConfig {
             }
         }
         Ok(Self::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_gate_issues_defaults() {
+        let raw = r#"
+            [gate]
+            fail_under_total = 80.0
+        "#;
+        let config: CovyConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.gate.fail_under_total, Some(80.0));
+        assert_eq!(config.gate.issues.max_new_errors, None);
+        assert_eq!(config.gate.issues.max_new_warnings, None);
+        assert_eq!(config.gate.issues.max_new_issues, None);
+    }
+
+    #[test]
+    fn test_deserialize_gate_issues_configured() {
+        let raw = r#"
+            [gate]
+            fail_under_changed = 90.0
+
+            [gate.issues]
+            max_new_errors = 0
+            max_new_warnings = 5
+            max_new_issues = 8
+        "#;
+        let config: CovyConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.gate.fail_under_changed, Some(90.0));
+        assert_eq!(config.gate.issues.max_new_errors, Some(0));
+        assert_eq!(config.gate.issues.max_new_warnings, Some(5));
+        assert_eq!(config.gate.issues.max_new_issues, Some(8));
     }
 }

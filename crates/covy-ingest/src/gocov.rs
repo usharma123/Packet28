@@ -9,9 +9,8 @@ use crate::Ingestor;
 pub struct GoCovIngestor;
 
 // Go coverprofile line: file:startLine.startCol,endLine.endCol numStatements count
-static LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(.+):(\d+)\.\d+,(\d+)\.\d+\s+\d+\s+(\d+)$").unwrap()
-});
+static LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.+):(\d+)\.\d+,(\d+)\.\d+\s+\d+\s+(\d+)$").unwrap());
 
 impl Ingestor for GoCovIngestor {
     fn format(&self) -> CoverageFormat {
@@ -19,11 +18,10 @@ impl Ingestor for GoCovIngestor {
     }
 
     fn parse(&self, data: &[u8]) -> Result<CoverageData, CovyError> {
-        let text = std::str::from_utf8(data)
-            .map_err(|e| CovyError::Parse {
-                format: "gocov".into(),
-                detail: format!("Invalid UTF-8: {e}"),
-            })?;
+        let text = std::str::from_utf8(data).map_err(|e| CovyError::Parse {
+            format: "gocov".into(),
+            detail: format!("Invalid UTF-8: {e}"),
+        })?;
         parse_gocov(text)
     }
 }
@@ -38,7 +36,8 @@ fn parse_gocov(text: &str) -> Result<CoverageData, CovyError> {
     if trimmed.starts_with('<') {
         return Err(CovyError::Parse {
             format: "gocov".into(),
-            detail: "Input looks like XML — did you mean --format cobertura or --format jacoco?".into(),
+            detail: "Input looks like XML — did you mean --format cobertura or --format jacoco?"
+                .into(),
         });
     }
 

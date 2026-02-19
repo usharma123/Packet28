@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod config;
+pub mod diagnostics;
 pub mod diff;
 pub mod error;
 pub mod gate;

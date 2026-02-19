@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::Args;
 use covy_core::config::GateConfig;
+use covy_core::diagnostics::DiagnosticsData;
 use covy_core::model::CoverageData;
 use covy_core::CovyConfig;
 
@@ -15,6 +16,10 @@ pub struct GithubCommentArgs {
     /// Coverage format (auto/lcov/cobertura/jacoco/gocov/llvm-cov)
     #[arg(short, long, default_value = "auto")]
     format: String,
+
+    /// SARIF diagnostics file paths (supports globs)
+    #[arg(long)]
+    issues: Vec<String>,
 
     /// Read coverage data from stdin
     #[arg(long)]
@@ -67,6 +72,16 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
     let source_root = args.source_root.as_deref().map(Path::new);
     covy_core::pathmap::auto_normalize_paths(&mut coverage, source_root);
 
+    let mut diagnostics = if args.issues.is_empty() {
+        None
+    } else {
+        Some(ingest_issues(&args.issues)?)
+    };
+
+    if let Some(diag) = diagnostics.as_mut() {
+        covy_core::pathmap::auto_normalize_issue_paths(diag, source_root);
+    }
+
     // Diff
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
@@ -79,13 +94,20 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
         fail_under_total: args.fail_under_total.or(config.gate.fail_under_total),
         fail_under_changed: args.fail_under_changed.or(config.gate.fail_under_changed),
         fail_under_new: args.fail_under_new.or(config.gate.fail_under_new),
+        issues: config.gate.issues.clone(),
     };
 
-    let gate_result = covy_core::gate::evaluate_gate(&gate_config, &coverage, &diffs);
+    let gate_result =
+        covy_core::gate::evaluate_full_gate(&gate_config, &coverage, diagnostics.as_ref(), &diffs);
 
     // Render markdown
-    let markdown =
-        covy_core::report::render_markdown(&coverage, &gate_result, &diffs, args.show_missing);
+    let markdown = covy_core::report::render_markdown(
+        &coverage,
+        &gate_result,
+        &diffs,
+        args.show_missing,
+        diagnostics.as_ref(),
+    );
 
     if args.dry_run {
         print!("{markdown}");
@@ -93,15 +115,15 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
     }
 
     // Post to GitHub
-    let token = std::env::var("GITHUB_TOKEN")
-        .context("GITHUB_TOKEN environment variable is required")?;
+    let token =
+        std::env::var("GITHUB_TOKEN").context("GITHUB_TOKEN environment variable is required")?;
     let repo = std::env::var("GITHUB_REPOSITORY")
         .context("GITHUB_REPOSITORY environment variable is required (e.g. owner/repo)")?;
     let pr_number = detect_pr_number()
         .context("Could not detect PR number from GITHUB_REF (expected refs/pull/N/merge)")?;
 
-    let api_base = std::env::var("GITHUB_API_URL")
-        .unwrap_or_else(|_| "https://api.github.com".into());
+    let api_base =
+        std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into());
 
     // Find existing covy comment
     let comments_url = format!("{api_base}/repos/{repo}/issues/{pr_number}/comments");
@@ -180,9 +202,8 @@ fn ingest_coverage(args: &GithubCommentArgs, config: &CovyConfig) -> Result<Cove
     };
 
     if args.stdin {
-        let fmt = format.ok_or_else(|| {
-            anyhow::anyhow!("--format is required when reading from --stdin")
-        })?;
+        let fmt = format
+            .ok_or_else(|| anyhow::anyhow!("--format is required when reading from --stdin"))?;
         return Ok(covy_ingest::ingest_reader(std::io::stdin().lock(), fmt)?);
     }
 
@@ -239,6 +260,29 @@ fn ingest_coverage(args: &GithubCommentArgs, config: &CovyConfig) -> Result<Cove
             result
         };
 
+        combined.merge(&data);
+    }
+
+    Ok(combined)
+}
+
+fn ingest_issues(patterns: &[String]) -> Result<DiagnosticsData> {
+    let mut files = Vec::new();
+    for pattern in patterns {
+        let matches: Vec<_> = glob::glob(pattern)
+            .context(format!("Invalid glob pattern: {pattern}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        files.extend(matches);
+    }
+
+    if files.is_empty() {
+        anyhow::bail!("No diagnostics files found");
+    }
+
+    let mut combined = DiagnosticsData::new();
+    for file in &files {
+        let data = covy_ingest::ingest_diagnostics_path(file)?;
         combined.merge(&data);
     }
 

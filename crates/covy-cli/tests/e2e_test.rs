@@ -211,3 +211,56 @@ fn test_ingest_with_strip_prefix() {
         .stdout(predicate::str::contains("main.rs"))
         .stdout(predicate::str::contains("lib.rs"));
 }
+
+#[test]
+fn test_ingest_issues_creates_state_file() {
+    let dir = TempDir::new().unwrap();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args(["ingest", "--issues", &fixture("sarif/basic.sarif")])
+        .assert()
+        .success();
+
+    assert!(dir.path().join(".covy/state/issues.bin").exists());
+}
+
+#[test]
+fn test_check_with_issues_flag() {
+    covy_cmd()
+        .args([
+            "check",
+            &fixture("lcov/basic.info"),
+            "--issues",
+            &fixture("sarif/basic.sarif"),
+            "--max-new-errors",
+            "0",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--report",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("issue_counts"));
+}
+
+#[test]
+fn test_check_without_issues_still_works() {
+    covy_cmd()
+        .args([
+            "check",
+            &fixture("lcov/basic.info"),
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--report",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("passed"));
+}

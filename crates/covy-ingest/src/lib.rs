@@ -3,9 +3,11 @@ pub mod gocov;
 pub mod jacoco;
 pub mod lcov;
 pub mod llvmcov;
+pub mod sarif;
 
 use std::path::Path;
 
+use covy_core::diagnostics::{DiagnosticsData, DiagnosticsFormat};
 use covy_core::model::{CoverageData, CoverageFormat};
 use covy_core::CovyError;
 
@@ -26,10 +28,7 @@ pub fn detect_format(path: &Path, content: &[u8]) -> Result<CoverageFormat, Covy
     }
 
     // Check filename
-    let filename = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("");
+    let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
 
     if filename == "lcov.info" || filename.ends_with(".lcov") {
         return Ok(CoverageFormat::Lcov);
@@ -59,7 +58,10 @@ pub fn detect_format(path: &Path, content: &[u8]) -> Result<CoverageFormat, Covy
     }
 
     // Also detect by structure: { "data": [{ "files": ...
-    if prefix.trim_start().starts_with('{') && prefix.contains("\"data\"") && prefix.contains("\"files\"") {
+    if prefix.trim_start().starts_with('{')
+        && prefix.contains("\"data\"")
+        && prefix.contains("\"files\"")
+    {
         return Ok(CoverageFormat::LlvmCov);
     }
 
@@ -88,7 +90,10 @@ pub fn ingest_path(path: &Path) -> Result<CoverageData, CovyError> {
 }
 
 /// Ingest a file with a specified format.
-pub fn ingest_path_with_format(path: &Path, format: CoverageFormat) -> Result<CoverageData, CovyError> {
+pub fn ingest_path_with_format(
+    path: &Path,
+    format: CoverageFormat,
+) -> Result<CoverageData, CovyError> {
     let content = std::fs::read(path)?;
     if content.is_empty() {
         return Err(CovyError::EmptyInput {
@@ -100,7 +105,10 @@ pub fn ingest_path_with_format(path: &Path, format: CoverageFormat) -> Result<Co
 }
 
 /// Ingest coverage data from a reader (e.g. stdin) with a specified format.
-pub fn ingest_reader<R: std::io::Read>(mut reader: R, format: CoverageFormat) -> Result<CoverageData, CovyError> {
+pub fn ingest_reader<R: std::io::Read>(
+    mut reader: R,
+    format: CoverageFormat,
+) -> Result<CoverageData, CovyError> {
     let mut content = Vec::new();
     reader.read_to_end(&mut content)?;
     if content.is_empty() {
@@ -110,4 +118,50 @@ pub fn ingest_reader<R: std::io::Read>(mut reader: R, format: CoverageFormat) ->
     }
     let ingestor = get_ingestor(format);
     ingestor.parse(&content)
+}
+
+/// Detect diagnostics format from file extension and content sniffing.
+pub fn detect_diagnostics_format(
+    path: &Path,
+    content: &[u8],
+) -> Result<DiagnosticsFormat, CovyError> {
+    let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+
+    if filename.ends_with(".sarif") || filename.ends_with(".sarif.json") {
+        return Ok(DiagnosticsFormat::Sarif);
+    }
+
+    let prefix = std::str::from_utf8(&content[..content.len().min(1024)]).unwrap_or("");
+    if prefix.contains("\"$schema\"") && prefix.to_lowercase().contains("sarif") {
+        return Ok(DiagnosticsFormat::Sarif);
+    }
+
+    Err(CovyError::UnknownFormat {
+        path: path.display().to_string(),
+    })
+}
+
+/// Convenience: ingest diagnostics file, auto-detecting format.
+pub fn ingest_diagnostics_path(path: &Path) -> Result<DiagnosticsData, CovyError> {
+    let content = std::fs::read(path)?;
+    let format = detect_diagnostics_format(path, &content)?;
+    ingest_diagnostics_reader(std::io::Cursor::new(content), format)
+}
+
+/// Ingest diagnostics data from a reader with a specified format.
+pub fn ingest_diagnostics_reader<R: std::io::Read>(
+    mut reader: R,
+    format: DiagnosticsFormat,
+) -> Result<DiagnosticsData, CovyError> {
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content)?;
+    if content.is_empty() {
+        return Err(CovyError::EmptyInput {
+            path: "(stdin)".into(),
+        });
+    }
+
+    match format {
+        DiagnosticsFormat::Sarif => sarif::parse_sarif(&content),
+    }
 }

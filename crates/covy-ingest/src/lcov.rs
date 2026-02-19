@@ -11,11 +11,10 @@ impl Ingestor for LcovIngestor {
     }
 
     fn parse(&self, data: &[u8]) -> Result<CoverageData, CovyError> {
-        let text = std::str::from_utf8(data)
-            .map_err(|e| CovyError::Parse {
-                format: "lcov".into(),
-                detail: format!("Invalid UTF-8: {e}"),
-            })?;
+        let text = std::str::from_utf8(data).map_err(|e| CovyError::Parse {
+            format: "lcov".into(),
+            detail: format!("Invalid UTF-8: {e}"),
+        })?;
         parse_lcov(text)
     }
 }
@@ -33,7 +32,9 @@ fn parse_lcov(text: &str) -> Result<CoverageData, CovyError> {
         if trimmed.starts_with('<') {
             return Err(CovyError::Parse {
                 format: "lcov".into(),
-                detail: "Input looks like XML — did you mean --format cobertura or --format jacoco?".into(),
+                detail:
+                    "Input looks like XML — did you mean --format cobertura or --format jacoco?"
+                        .into(),
             });
         }
         return Err(CovyError::Parse {
@@ -74,7 +75,8 @@ fn parse_lcov(text: &str) -> Result<CoverageData, CovyError> {
             // BRDA:line,block,branch,taken
             let parts: Vec<&str> = line[5..].splitn(4, ',').collect();
             if parts.len() >= 4 {
-                if let (Ok(line_no), Ok(block)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                if let (Ok(line_no), Ok(block)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+                {
                     let taken: u64 = parts[3].parse().unwrap_or(0);
                     current_coverage.branches.insert((line_no, block), taken);
                 }

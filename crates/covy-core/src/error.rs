@@ -51,9 +51,7 @@ impl CovyError {
             CovyError::UnknownFormat { .. } => {
                 Some("Supported formats: lcov, cobertura, jacoco, gocov, llvm-cov")
             }
-            CovyError::GitNotFound => {
-                Some("Install git or ensure it is available in your PATH")
-            }
+            CovyError::GitNotFound => Some("Install git or ensure it is available in your PATH"),
             CovyError::EmptyInput { .. } => {
                 Some("Check that your test runner generated coverage output")
             }

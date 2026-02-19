@@ -8,7 +8,13 @@ use crate::model::{DiffStatus, FileDiff};
 /// Parse git diff output to extract changed files and line numbers.
 pub fn git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>, CovyError> {
     let output = Command::new("git")
-        .args(["diff", "--unified=0", "--no-color", "--diff-filter=ACMR", &format!("{base}..{head}")])
+        .args([
+            "diff",
+            "--unified=0",
+            "--no-color",
+            "--diff-filter=ACMR",
+            &format!("{base}..{head}"),
+        ])
         .output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -112,7 +118,10 @@ mod tests {
 
     #[test]
     fn test_parse_hunk_range() {
-        assert_eq!(parse_hunk_header("@@ -10,3 +20,5 @@ fn foo"), Some((20, 24)));
+        assert_eq!(
+            parse_hunk_header("@@ -10,3 +20,5 @@ fn foo"),
+            Some((20, 24))
+        );
     }
 
     #[test]

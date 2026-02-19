@@ -25,10 +25,41 @@ pub struct ReportArgs {
     /// Path to coverage state file
     #[arg(long)]
     input: Option<String>,
+
+    /// Render diagnostics issues from .covy/state/issues.bin
+    #[arg(long)]
+    issues: bool,
 }
 
 pub fn run(args: ReportArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
+
+    let format = args.format.as_deref().unwrap_or(&config.report.format);
+
+    if args.issues {
+        let issue_path = Path::new(".covy/state/issues.bin");
+        if !issue_path.exists() {
+            anyhow::bail!(
+                "No diagnostics data found at {}. Run `covy ingest --issues ...` first.",
+                issue_path.display()
+            );
+        }
+
+        let bytes = std::fs::read(issue_path)?;
+        let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
+
+        match format {
+            "json" => {
+                let json = covy_core::report::render_issues_json(&diagnostics);
+                println!("{json}");
+            }
+            _ => {
+                covy_core::report::render_issues_terminal(&diagnostics, None);
+            }
+        }
+
+        return Ok(0);
+    }
 
     let input_path = args.input.as_deref().unwrap_or(".covy/state/latest.bin");
     let input_path = Path::new(input_path);
@@ -43,10 +74,6 @@ pub fn run(args: ReportArgs, config_path: &str) -> Result<i32> {
     let bytes = std::fs::read(input_path)?;
     let coverage = covy_core::cache::deserialize_coverage(&bytes)?;
 
-    let format = args
-        .format
-        .as_deref()
-        .unwrap_or(&config.report.format);
     let show_missing = args.show_missing || config.report.show_missing;
 
     match format {

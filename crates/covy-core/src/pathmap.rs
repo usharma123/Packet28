@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+use crate::diagnostics::DiagnosticsData;
 use crate::model::{CoverageData, RepoSnapshot};
 
 /// Strategies for mapping coverage file paths to repository file paths.
@@ -80,7 +81,9 @@ impl PathMapper {
 
         // 3. Strip prefix
         for prefix in &self.strip_prefixes {
-            let stripped = coverage_path.strip_prefix(prefix.as_str()).unwrap_or(coverage_path);
+            let stripped = coverage_path
+                .strip_prefix(prefix.as_str())
+                .unwrap_or(coverage_path);
             if stripped != coverage_path && known_paths.contains(&stripped) {
                 return Some(stripped.to_string());
             }
@@ -111,9 +114,13 @@ impl PathMapper {
 
     /// Resolve using content hash as fallback.
     pub fn resolve_by_hash(&self, content_hash: &str) -> Option<String> {
-        self.hash_index
-            .get(content_hash)
-            .and_then(|paths| if paths.len() == 1 { Some(paths[0].clone()) } else { None })
+        self.hash_index.get(content_hash).and_then(|paths| {
+            if paths.len() == 1 {
+                Some(paths[0].clone())
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -127,7 +134,7 @@ impl PathMapper {
 pub fn auto_normalize_paths(data: &mut CoverageData, source_root: Option<&Path>) {
     let root = source_root
         .map(|p| p.to_string_lossy().to_string())
-        .or_else(|| detect_common_prefix(&data.files))
+        .or_else(|| detect_common_prefix(data.files.keys().map(|k| k.as_str())))
         .or_else(git_toplevel);
 
     let old_files = std::mem::take(&mut data.files);
@@ -162,15 +169,63 @@ pub fn auto_normalize_paths(data: &mut CoverageData, source_root: Option<&Path>)
     data.files = new_files;
 }
 
+/// Automatically normalize paths in diagnostics data to be relative.
+pub fn auto_normalize_issue_paths(data: &mut DiagnosticsData, source_root: Option<&Path>) {
+    let root = source_root
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| detect_common_prefix(data.issues_by_file.keys().map(|k| k.as_str())))
+        .or_else(git_toplevel);
+
+    let old_issues = std::mem::take(&mut data.issues_by_file);
+    let mut new_issues = BTreeMap::new();
+
+    for (path, mut issues) in old_issues {
+        let mut p: String = path.replace('\\', "/");
+
+        if let Some(ref root) = root {
+            let root_normalized = root.replace('\\', "/");
+            let root_with_slash = if root_normalized.ends_with('/') {
+                root_normalized.clone()
+            } else {
+                format!("{root_normalized}/")
+            };
+            if p.starts_with(&root_with_slash) {
+                p = p[root_with_slash.len()..].to_string();
+            } else if p == root_normalized {
+                p = String::new();
+            }
+        }
+
+        if let Some(stripped) = p.strip_prefix("./") {
+            p = stripped.to_string();
+        }
+
+        if !p.is_empty() {
+            for issue in &mut issues {
+                issue.path = p.clone();
+            }
+            new_issues.insert(p, issues);
+        }
+    }
+
+    data.issues_by_file = new_issues;
+}
+
 /// Detect common absolute prefix across all file paths.
-fn detect_common_prefix(files: &BTreeMap<String, crate::model::FileCoverage>) -> Option<String> {
-    let paths: Vec<&str> = files.keys().map(|s| s.as_str()).collect();
+fn detect_common_prefix<'a, I>(paths: I) -> Option<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let paths: Vec<&str> = paths.collect();
     if paths.is_empty() {
         return None;
     }
 
     // Only detect prefix if paths are absolute
-    if !paths.iter().all(|p| p.starts_with('/') || (p.len() >= 2 && p.as_bytes()[1] == b':')) {
+    if !paths
+        .iter()
+        .all(|p| p.starts_with('/') || (p.len() >= 2 && p.as_bytes()[1] == b':'))
+    {
         return None;
     }
 
@@ -181,7 +236,10 @@ fn detect_common_prefix(files: &BTreeMap<String, crate::model::FileCoverage>) ->
     for (i, ch) in first.char_indices() {
         if ch == '/' {
             let candidate = &first[..=i];
-            if paths.iter().all(|p| p.replace('\\', "/").starts_with(candidate)) {
+            if paths
+                .iter()
+                .all(|p| p.replace('\\', "/").starts_with(candidate))
+            {
                 prefix_end = i + 1;
             } else {
                 break;
@@ -226,19 +284,26 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::{Issue, Severity};
 
     #[test]
     fn test_exact_match() {
         let mut mapper = PathMapper::new(vec![], BTreeMap::new(), None);
         let known = vec!["src/main.rs", "src/lib.rs"];
-        assert_eq!(mapper.resolve("src/main.rs", &known), Some("src/main.rs".to_string()));
+        assert_eq!(
+            mapper.resolve("src/main.rs", &known),
+            Some("src/main.rs".to_string())
+        );
     }
 
     #[test]
     fn test_strip_prefix() {
         let mut mapper = PathMapper::new(vec!["/app/".to_string()], BTreeMap::new(), None);
         let known = vec!["src/main.rs"];
-        assert_eq!(mapper.resolve("/app/src/main.rs", &known), Some("src/main.rs".to_string()));
+        assert_eq!(
+            mapper.resolve("/app/src/main.rs", &known),
+            Some("src/main.rs".to_string())
+        );
     }
 
     #[test]
@@ -256,8 +321,14 @@ mod tests {
     #[test]
     fn test_auto_normalize_absolute_paths() {
         let mut data = CoverageData::new();
-        data.files.insert("/home/user/project/src/main.rs".to_string(), crate::model::FileCoverage::new());
-        data.files.insert("/home/user/project/tests/test.rs".to_string(), crate::model::FileCoverage::new());
+        data.files.insert(
+            "/home/user/project/src/main.rs".to_string(),
+            crate::model::FileCoverage::new(),
+        );
+        data.files.insert(
+            "/home/user/project/tests/test.rs".to_string(),
+            crate::model::FileCoverage::new(),
+        );
 
         auto_normalize_paths(&mut data, None);
         assert!(data.files.contains_key("src/main.rs"));
@@ -267,7 +338,10 @@ mod tests {
     #[test]
     fn test_auto_normalize_with_source_root() {
         let mut data = CoverageData::new();
-        data.files.insert("/app/src/main.rs".to_string(), crate::model::FileCoverage::new());
+        data.files.insert(
+            "/app/src/main.rs".to_string(),
+            crate::model::FileCoverage::new(),
+        );
 
         auto_normalize_paths(&mut data, Some(Path::new("/app")));
         assert!(data.files.contains_key("src/main.rs"));
@@ -276,7 +350,10 @@ mod tests {
     #[test]
     fn test_auto_normalize_strips_dot_slash() {
         let mut data = CoverageData::new();
-        data.files.insert("./src/main.rs".to_string(), crate::model::FileCoverage::new());
+        data.files.insert(
+            "./src/main.rs".to_string(),
+            crate::model::FileCoverage::new(),
+        );
 
         auto_normalize_paths(&mut data, None);
         assert!(data.files.contains_key("src/main.rs"));
@@ -285,10 +362,36 @@ mod tests {
     #[test]
     fn test_auto_normalize_backslashes() {
         let mut data = CoverageData::new();
-        data.files.insert("C:\\Users\\dev\\project\\src\\main.rs".to_string(), crate::model::FileCoverage::new());
+        data.files.insert(
+            "C:\\Users\\dev\\project\\src\\main.rs".to_string(),
+            crate::model::FileCoverage::new(),
+        );
 
         auto_normalize_paths(&mut data, Some(Path::new("C:\\Users\\dev\\project")));
         assert!(data.files.contains_key("src/main.rs"));
+    }
+
+    #[test]
+    fn test_auto_normalize_issue_paths() {
+        let mut data = DiagnosticsData::new();
+        data.issues_by_file.insert(
+            "/repo/src/main.rs".to_string(),
+            vec![Issue {
+                path: "/repo/src/main.rs".to_string(),
+                line: 10,
+                column: None,
+                end_line: None,
+                severity: Severity::Warning,
+                rule_id: "x".to_string(),
+                message: "m".to_string(),
+                source: "tool".to_string(),
+                fingerprint: "fp".to_string(),
+            }],
+        );
+
+        auto_normalize_issue_paths(&mut data, Some(Path::new("/repo")));
+        assert!(data.issues_by_file.contains_key("src/main.rs"));
+        assert_eq!(data.issues_by_file["src/main.rs"][0].path, "src/main.rs");
     }
 
     #[test]
@@ -297,6 +400,9 @@ mod tests {
         let known = vec!["src/main.rs"];
         mapper.resolve("src/main.rs", &known);
         // Second call uses cache
-        assert_eq!(mapper.resolve("src/main.rs", &known), Some("src/main.rs".to_string()));
+        assert_eq!(
+            mapper.resolve("src/main.rs", &known),
+            Some("src/main.rs".to_string())
+        );
     }
 }

@@ -148,6 +148,15 @@ pub struct FileDiff {
     pub changed_lines: RoaringBitmap,
 }
 
+/// Counts of issues on changed lines, used for issue gate reporting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueGateCounts {
+    pub changed_errors: u32,
+    pub changed_warnings: u32,
+    pub changed_notes: u32,
+    pub total_issues: usize,
+}
+
 /// Result of a quality gate evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityGateResult {
@@ -156,6 +165,8 @@ pub struct QualityGateResult {
     pub changed_coverage_pct: Option<f64>,
     pub new_file_coverage_pct: Option<f64>,
     pub violations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_counts: Option<IssueGateCounts>,
 }
 
 /// Repository snapshot for cache invalidation.

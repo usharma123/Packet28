@@ -22,6 +22,15 @@ fail_under_total = 80.0
 fail_under_changed = 90.0
 fail_under_new = 80.0
 
+[gate.issues]
+# Diagnostics gate thresholds for issues on changed lines.
+# Set to 0 for strict "no new issues" behavior.
+max_new_errors = 0
+# Allow limited warning growth on changed lines.
+max_new_warnings = 5
+# Optional combined cap across errors + warnings + notes.
+# max_new_issues = 10
+
 [report]
 # Output format: "terminal" or "json"
 format = "terminal"

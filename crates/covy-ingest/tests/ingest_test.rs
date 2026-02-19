@@ -2,8 +2,10 @@ use std::path::PathBuf;
 
 fn fixture(rel: &str) -> PathBuf {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
-        .parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .to_path_buf();
     workspace.join("tests").join("fixtures").join(rel)
 }
@@ -101,4 +103,29 @@ fn test_merge_coverage_data() {
 
     data1.merge(&data2);
     assert_eq!(data1.files.len(), 2);
+}
+
+#[test]
+fn test_ingest_sarif_diagnostics() {
+    let path = fixture("sarif/basic.sarif");
+    let data = covy_ingest::ingest_diagnostics_path(&path).unwrap();
+
+    assert_eq!(data.total_issues(), 5);
+    assert!(data.issues_by_file.contains_key("src/main.rs"));
+    assert!(data.issues_by_file.contains_key("src/lib.rs"));
+}
+
+#[test]
+fn test_ingest_empty_sarif_diagnostics() {
+    let path = fixture("sarif/empty.sarif");
+    let data = covy_ingest::ingest_diagnostics_path(&path).unwrap();
+    assert_eq!(data.total_issues(), 0);
+}
+
+#[test]
+fn test_detect_diagnostics_format_sarif() {
+    let content = br#"{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\"}"#;
+    let format =
+        covy_ingest::detect_diagnostics_format(std::path::Path::new("x.sarif"), content).unwrap();
+    assert_eq!(format, covy_core::diagnostics::DiagnosticsFormat::Sarif);
 }

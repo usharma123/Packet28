@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::diagnostics::{DiagnosticsData, DiagnosticsFormat, Issue, Severity};
 use crate::error::CovyError;
 use crate::model::CoverageData;
 
@@ -90,6 +91,8 @@ pub struct CachedResult {
     pub changed_coverage_pct: Option<f64>,
     pub new_file_coverage_pct: Option<f64>,
     pub violations: Vec<String>,
+    #[serde(default)]
+    pub issue_counts: Option<crate::model::IssueGateCounts>,
 }
 
 impl From<&crate::model::QualityGateResult> for CachedResult {
@@ -100,6 +103,7 @@ impl From<&crate::model::QualityGateResult> for CachedResult {
             changed_coverage_pct: r.changed_coverage_pct,
             new_file_coverage_pct: r.new_file_coverage_pct,
             violations: r.violations.clone(),
+            issue_counts: r.issue_counts.clone(),
         }
     }
 }
@@ -121,14 +125,16 @@ pub fn serialize_coverage(data: &CoverageData) -> Result<Vec<u8>, CovyError> {
 
         // Write covered bitmap
         let mut covered_buf = Vec::new();
-        fc.lines_covered.serialize_into(&mut covered_buf)
+        fc.lines_covered
+            .serialize_into(&mut covered_buf)
             .map_err(|e| CovyError::Cache(format!("bitmap serialize error: {e}")))?;
         out.extend_from_slice(&(covered_buf.len() as u32).to_le_bytes());
         out.extend_from_slice(&covered_buf);
 
         // Write instrumented bitmap
         let mut instr_buf = Vec::new();
-        fc.lines_instrumented.serialize_into(&mut instr_buf)
+        fc.lines_instrumented
+            .serialize_into(&mut instr_buf)
             .map_err(|e| CovyError::Cache(format!("bitmap serialize error: {e}")))?;
         out.extend_from_slice(&(instr_buf.len() as u32).to_le_bytes());
         out.extend_from_slice(&instr_buf);
@@ -168,16 +174,18 @@ pub fn deserialize_coverage(data: &[u8]) -> Result<CoverageData, CovyError> {
         if pos + covered_len > data.len() {
             return Err(CovyError::Cache("unexpected EOF".to_string()));
         }
-        let lines_covered = RoaringBitmap::deserialize_from(Cursor::new(&data[pos..pos + covered_len]))
-            .map_err(|e| CovyError::Cache(format!("bitmap deserialize error: {e}")))?;
+        let lines_covered =
+            RoaringBitmap::deserialize_from(Cursor::new(&data[pos..pos + covered_len]))
+                .map_err(|e| CovyError::Cache(format!("bitmap deserialize error: {e}")))?;
         pos += covered_len;
 
         let instr_len = read_u32(&mut pos)? as usize;
         if pos + instr_len > data.len() {
             return Err(CovyError::Cache("unexpected EOF".to_string()));
         }
-        let lines_instrumented = RoaringBitmap::deserialize_from(Cursor::new(&data[pos..pos + instr_len]))
-            .map_err(|e| CovyError::Cache(format!("bitmap deserialize error: {e}")))?;
+        let lines_instrumented =
+            RoaringBitmap::deserialize_from(Cursor::new(&data[pos..pos + instr_len]))
+                .map_err(|e| CovyError::Cache(format!("bitmap deserialize error: {e}")))?;
         pos += instr_len;
 
         files.insert(
@@ -204,6 +212,96 @@ pub fn deserialize_coverage(data: &[u8]) -> Result<CoverageData, CovyError> {
     })
 }
 
+/// Serialize DiagnosticsData for storage.
+pub fn serialize_diagnostics(data: &DiagnosticsData) -> Result<Vec<u8>, CovyError> {
+    let stored = StoredDiagnosticsData::from_runtime(data);
+    bincode::serialize(&stored)
+        .map_err(|e| CovyError::Cache(format!("Failed to serialize diagnostics: {e}")))
+}
+
+/// Deserialize DiagnosticsData from bytes.
+pub fn deserialize_diagnostics(data: &[u8]) -> Result<DiagnosticsData, CovyError> {
+    let stored: StoredDiagnosticsData = bincode::deserialize(data)
+        .map_err(|e| CovyError::Cache(format!("Failed to deserialize diagnostics: {e}")))?;
+    Ok(stored.into_runtime())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredIssue {
+    path: String,
+    line: u32,
+    column: Option<u32>,
+    end_line: Option<u32>,
+    severity: Severity,
+    rule_id: String,
+    message: String,
+    source: String,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredDiagnosticsData {
+    issues_by_file: std::collections::BTreeMap<String, Vec<StoredIssue>>,
+    format: Option<DiagnosticsFormat>,
+    timestamp: u64,
+}
+
+impl StoredDiagnosticsData {
+    fn from_runtime(data: &DiagnosticsData) -> Self {
+        let mut issues_by_file = std::collections::BTreeMap::new();
+        for (path, issues) in &data.issues_by_file {
+            let stored: Vec<StoredIssue> = issues
+                .iter()
+                .map(|issue| StoredIssue {
+                    path: issue.path.clone(),
+                    line: issue.line,
+                    column: issue.column,
+                    end_line: issue.end_line,
+                    severity: issue.severity,
+                    rule_id: issue.rule_id.clone(),
+                    message: issue.message.clone(),
+                    source: issue.source.clone(),
+                    fingerprint: issue.fingerprint.clone(),
+                })
+                .collect();
+            issues_by_file.insert(path.clone(), stored);
+        }
+
+        Self {
+            issues_by_file,
+            format: data.format,
+            timestamp: data.timestamp,
+        }
+    }
+
+    fn into_runtime(self) -> DiagnosticsData {
+        let mut issues_by_file = std::collections::BTreeMap::new();
+        for (path, issues) in self.issues_by_file {
+            let runtime: Vec<Issue> = issues
+                .into_iter()
+                .map(|issue| Issue {
+                    path: issue.path,
+                    line: issue.line,
+                    column: issue.column,
+                    end_line: issue.end_line,
+                    severity: issue.severity,
+                    rule_id: issue.rule_id,
+                    message: issue.message,
+                    source: issue.source,
+                    fingerprint: issue.fingerprint,
+                })
+                .collect();
+            issues_by_file.insert(path, runtime);
+        }
+
+        DiagnosticsData {
+            issues_by_file,
+            format: self.format,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +318,7 @@ mod tests {
             changed_coverage_pct: Some(90.0),
             new_file_coverage_pct: None,
             violations: vec![],
+            issue_counts: None,
         };
 
         let key = CoverageCache::cache_key("abc", "def", "ghi");
@@ -246,5 +345,29 @@ mod tests {
         let rfc = &restored.files["test.rs"];
         assert_eq!(rfc.lines_covered.len(), 2);
         assert_eq!(rfc.lines_instrumented.len(), 3);
+    }
+
+    #[test]
+    fn test_diagnostics_serialization_roundtrip() {
+        let mut data = DiagnosticsData::new();
+        data.issues_by_file.insert(
+            "src/main.rs".to_string(),
+            vec![crate::diagnostics::Issue {
+                path: "src/main.rs".to_string(),
+                line: 10,
+                column: Some(2),
+                end_line: Some(10),
+                severity: crate::diagnostics::Severity::Error,
+                rule_id: "R001".to_string(),
+                message: "boom".to_string(),
+                source: "tool".to_string(),
+                fingerprint: "fp-1".to_string(),
+            }],
+        );
+
+        let bytes = serialize_diagnostics(&data).unwrap();
+        let restored = deserialize_diagnostics(&bytes).unwrap();
+        assert_eq!(restored.total_issues(), 1);
+        assert_eq!(restored.issues_by_file["src/main.rs"][0].rule_id, "R001");
     }
 }
