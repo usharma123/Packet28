@@ -147,7 +147,7 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
 
         for file in &issue_files {
             tracing::info!("Ingesting diagnostics {}", file.display());
-            let data = covy_ingest::ingest_diagnostics_path(file)?;
+            let data = load_diagnostics_input(file)?;
             diagnostics.merge(&data);
         }
 
@@ -236,4 +236,18 @@ fn apply_strip_prefixes(data: CoverageData, prefixes: &[&str]) -> CoverageData {
         result.files.insert(stripped.to_string(), fc);
     }
     result
+}
+
+fn load_diagnostics_input(path: &Path) -> Result<DiagnosticsData> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+    {
+        let bytes = std::fs::read(path)?;
+        let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
+        return Ok(diagnostics);
+    }
+
+    covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
 }

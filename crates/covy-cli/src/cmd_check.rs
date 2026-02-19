@@ -243,7 +243,7 @@ fn resolve_and_ingest_issues(patterns: &[String]) -> Result<DiagnosticsData> {
     let mut combined = DiagnosticsData::new();
     for file in &files {
         tracing::info!("Ingesting diagnostics {}", file.display());
-        let data = covy_ingest::ingest_diagnostics_path(file)?;
+        let data = load_diagnostics_input(file)?;
         combined.merge(&data);
     }
     Ok(combined)
@@ -275,6 +275,20 @@ fn resolve_diagnostics(
     let bytes = std::fs::read(state_path)?;
     let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
     Ok(Some(diagnostics))
+}
+
+fn load_diagnostics_input(path: &Path) -> Result<DiagnosticsData> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+    {
+        let bytes = std::fs::read(path)?;
+        let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
+        return Ok(diagnostics);
+    }
+
+    covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
 }
 
 fn parse_format(s: &str) -> Result<Option<CoverageFormat>> {
