@@ -26,6 +26,8 @@ cargo build --release -p covy-cli
 - Don’t use `cargo run` for perf measurements; it adds startup overhead per invocation.
 - In this repo, that overhead is roughly `~0.6s` per command.
 - Use the built binary (`target/debug/covy` or `target/release/covy`) for timing and CI perf checks.
+- For repeated checks, ingest diagnostics once and let `check/diff/github` reuse `.covy/state/issues.bin` by default.
+- Passing `--issues <sarif>` to `check` forces SARIF parse again on each invocation (slower, expected).
 
 Example:
 

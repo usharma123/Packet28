@@ -157,7 +157,12 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
         if let Some(parent) = issue_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let bytes = covy_core::cache::serialize_diagnostics(&diagnostics)?;
+        let bytes = covy_core::cache::serialize_diagnostics_with_metadata(
+            &diagnostics,
+            &covy_core::cache::DiagnosticsStateMetadata::normalized_for_repo_root(
+                covy_core::cache::current_repo_root_id(source_root),
+            ),
+        )?;
         std::fs::write(issue_path, bytes)?;
 
         tracing::info!(

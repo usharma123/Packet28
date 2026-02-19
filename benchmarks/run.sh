@@ -65,9 +65,16 @@ if command -v hyperfine >/dev/null 2>&1; then
     "$BIN ingest --issues benchmarks/generated/sarif-200k.sarif --color never" \
     --command-name "ingest sarif 200k"
 
+  # Prime diagnostics state to benchmark the cached fast path.
+  "$BIN" ingest --issues benchmarks/generated/sarif-50k.sarif --color never >/dev/null
+
+  hyperfine --warmup 2 --runs 8 \
+    "$BIN check benchmarks/generated/lcov-100k.info --base HEAD --head HEAD --report json --color never --max-new-errors 999999" \
+    --command-name "check combined 100k+cached-state"
+
   hyperfine --warmup 2 --runs 8 \
     "$BIN check benchmarks/generated/lcov-100k.info --issues benchmarks/generated/sarif-50k.sarif --base HEAD --head HEAD --report json --color never --max-new-errors 999999" \
-    --command-name "check combined 100k+50k"
+    --command-name "check combined 100k+50k(parse)"
 else
   echo "hyperfine not found. Running fallback timer loop."
 
@@ -101,5 +108,10 @@ else
   run_case "ingest lcov 1m" 5 "$BIN" ingest benchmarks/generated/lcov-1m.info --color never
   run_case "ingest sarif 50k" 5 "$BIN" ingest --issues benchmarks/generated/sarif-50k.sarif --color never
   run_case "ingest sarif 200k" 3 "$BIN" ingest --issues benchmarks/generated/sarif-200k.sarif --color never
-  run_case "check combined 100k+50k" 5 "$BIN" check benchmarks/generated/lcov-100k.info --issues benchmarks/generated/sarif-50k.sarif --base HEAD --head HEAD --report json --color never --max-new-errors 999999
+
+  # Prime diagnostics state to benchmark the cached fast path.
+  "$BIN" ingest --issues benchmarks/generated/sarif-50k.sarif --color never >/dev/null
+
+  run_case "check combined 100k+cached-state" 5 "$BIN" check benchmarks/generated/lcov-100k.info --base HEAD --head HEAD --report json --color never --max-new-errors 999999
+  run_case "check combined 100k+50k(parse)" 5 "$BIN" check benchmarks/generated/lcov-100k.info --issues benchmarks/generated/sarif-50k.sarif --base HEAD --head HEAD --report json --color never --max-new-errors 999999
 fi

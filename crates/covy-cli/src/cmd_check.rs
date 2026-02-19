@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -88,17 +89,6 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     let source_root = args.source_root.as_deref().map(Path::new);
     covy_core::pathmap::auto_normalize_paths(&mut coverage, source_root);
 
-    // Ingest diagnostics (optional)
-    let mut diagnostics = resolve_diagnostics(
-        &args.issues,
-        args.issues_state.as_deref(),
-        args.no_issues_state,
-    )?;
-
-    if let Some(diag) = diagnostics.as_mut() {
-        covy_core::pathmap::auto_normalize_issue_paths(diag, source_root);
-    }
-
     // Diff
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
@@ -106,6 +96,23 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     tracing::info!("Computing diff {base}..{head}");
     let diffs = covy_core::diff::git_diff(base, head)?;
     tracing::info!("Found {} changed files", diffs.len());
+
+    let changed_paths: HashSet<String> = diffs.iter().map(|d| d.path.clone()).collect();
+
+    // Ingest diagnostics (optional)
+    let mut loaded = resolve_diagnostics(
+        &args.issues,
+        args.issues_state.as_deref(),
+        args.no_issues_state,
+        &changed_paths,
+        source_root,
+    )?;
+
+    if let Some(diag) = loaded.data.as_mut() {
+        if loaded.needs_normalization {
+            covy_core::pathmap::auto_normalize_issue_paths(diag, source_root);
+        }
+    }
 
     // Gate
     let issue_gate = IssueGateConfig {
@@ -124,7 +131,7 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     };
 
     let gate_result =
-        covy_core::gate::evaluate_full_gate(&gate_config, &coverage, diagnostics.as_ref(), &diffs);
+        covy_core::gate::evaluate_full_gate(&gate_config, &coverage, loaded.data.as_ref(), &diffs);
 
     // Render
     match args.report.as_str() {
@@ -138,7 +145,7 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
                 &gate_result,
                 &diffs,
                 args.show_missing,
-                diagnostics.as_ref(),
+                loaded.data.as_ref(),
             );
             print!("{md}");
         }
@@ -147,12 +154,12 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
                 &coverage,
                 &diffs,
                 &gate_result,
-                diagnostics.as_ref(),
+                loaded.data.as_ref(),
             );
         }
         _ => {
             covy_core::report::render_terminal(&coverage, args.show_missing, "name");
-            if let Some(diag) = diagnostics.as_ref() {
+            if let Some(diag) = loaded.data.as_ref() {
                 covy_core::report::render_issues_terminal(diag, Some(&diffs));
             }
             covy_core::report::render_gate_result(&gate_result);
@@ -253,28 +260,37 @@ fn resolve_diagnostics(
     issues_patterns: &[String],
     issues_state_path: Option<&str>,
     no_issues_state: bool,
-) -> Result<Option<DiagnosticsData>> {
+    selected_paths: &HashSet<String>,
+    source_root: Option<&Path>,
+) -> Result<LoadedDiagnostics> {
     if !issues_patterns.is_empty() {
-        return Ok(Some(resolve_and_ingest_issues(issues_patterns)?));
+        return Ok(LoadedDiagnostics {
+            data: Some(resolve_and_ingest_issues(issues_patterns)?),
+            needs_normalization: true,
+        });
     }
 
     if no_issues_state {
-        return Ok(None);
+        return Ok(LoadedDiagnostics::none());
     }
 
     let state_path = issues_state_path.unwrap_or(".covy/state/issues.bin");
     let state_path = Path::new(state_path);
     if !state_path.exists() {
-        return Ok(None);
+        return Ok(LoadedDiagnostics::none());
     }
 
     tracing::info!(
         "Loading diagnostics from cached state {}",
         state_path.display()
     );
-    let bytes = std::fs::read(state_path)?;
-    let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
-    Ok(Some(diagnostics))
+    let (diagnostics, meta) =
+        covy_core::cache::deserialize_diagnostics_for_paths_from_file(state_path, selected_paths)?;
+    let needs_normalization = !state_metadata_compatible(meta.as_ref(), source_root);
+    Ok(LoadedDiagnostics {
+        data: Some(diagnostics),
+        needs_normalization,
+    })
 }
 
 fn load_diagnostics_input(path: &Path) -> Result<DiagnosticsData> {
@@ -289,6 +305,43 @@ fn load_diagnostics_input(path: &Path) -> Result<DiagnosticsData> {
     }
 
     covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
+}
+
+#[derive(Default)]
+struct LoadedDiagnostics {
+    data: Option<DiagnosticsData>,
+    needs_normalization: bool,
+}
+
+impl LoadedDiagnostics {
+    fn none() -> Self {
+        Self {
+            data: None,
+            needs_normalization: false,
+        }
+    }
+}
+
+fn state_metadata_compatible(
+    meta: Option<&covy_core::cache::DiagnosticsStateMetadata>,
+    source_root: Option<&Path>,
+) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+
+    if meta.schema_version != covy_core::cache::DIAGNOSTICS_STATE_SCHEMA_VERSION {
+        return false;
+    }
+    if meta.path_norm_version != covy_core::cache::DIAGNOSTICS_PATH_NORM_VERSION {
+        return false;
+    }
+    if !meta.normalized_paths {
+        return false;
+    }
+
+    let current_root_id = covy_core::cache::current_repo_root_id(source_root);
+    meta.repo_root_id == current_root_id
 }
 
 fn parse_format(s: &str) -> Result<Option<CoverageFormat>> {

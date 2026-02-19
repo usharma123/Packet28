@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -80,22 +81,27 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
     let source_root = args.source_root.as_deref().map(Path::new);
     covy_core::pathmap::auto_normalize_paths(&mut coverage, source_root);
 
-    let mut diagnostics = resolve_diagnostics(
-        &args.issues,
-        args.issues_state.as_deref(),
-        args.no_issues_state,
-    )?;
-
-    if let Some(diag) = diagnostics.as_mut() {
-        covy_core::pathmap::auto_normalize_issue_paths(diag, source_root);
-    }
-
-    // Diff
+    // Diff first so cached diagnostics can be loaded selectively.
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
 
     tracing::info!("Computing diff {base}..{head}");
     let diffs = covy_core::diff::git_diff(base, head)?;
+    let changed_paths: HashSet<String> = diffs.iter().map(|d| d.path.clone()).collect();
+
+    let mut loaded = resolve_diagnostics(
+        &args.issues,
+        args.issues_state.as_deref(),
+        args.no_issues_state,
+        &changed_paths,
+        source_root,
+    )?;
+
+    if let Some(diag) = loaded.data.as_mut() {
+        if loaded.needs_normalization {
+            covy_core::pathmap::auto_normalize_issue_paths(diag, source_root);
+        }
+    }
 
     // Gate
     let gate_config = GateConfig {
@@ -106,7 +112,7 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
     };
 
     let gate_result =
-        covy_core::gate::evaluate_full_gate(&gate_config, &coverage, diagnostics.as_ref(), &diffs);
+        covy_core::gate::evaluate_full_gate(&gate_config, &coverage, loaded.data.as_ref(), &diffs);
 
     // Render markdown
     let markdown = covy_core::report::render_markdown(
@@ -114,7 +120,7 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
         &gate_result,
         &diffs,
         args.show_missing,
-        diagnostics.as_ref(),
+        loaded.data.as_ref(),
     );
 
     if args.dry_run {
@@ -301,28 +307,38 @@ fn resolve_diagnostics(
     issues_patterns: &[String],
     issues_state_path: Option<&str>,
     no_issues_state: bool,
-) -> Result<Option<DiagnosticsData>> {
+    selected_paths: &HashSet<String>,
+    source_root: Option<&Path>,
+) -> Result<LoadedDiagnostics> {
     if !issues_patterns.is_empty() {
-        return Ok(Some(ingest_issues(issues_patterns)?));
+        return Ok(LoadedDiagnostics {
+            data: Some(ingest_issues(issues_patterns)?),
+            needs_normalization: true,
+        });
     }
 
     if no_issues_state {
-        return Ok(None);
+        return Ok(LoadedDiagnostics::none());
     }
 
     let state_path = issues_state_path.unwrap_or(".covy/state/issues.bin");
     let state_path = Path::new(state_path);
     if !state_path.exists() {
-        return Ok(None);
+        return Ok(LoadedDiagnostics::none());
     }
 
     tracing::info!(
         "Loading diagnostics from cached state {}",
         state_path.display()
     );
-    let bytes = std::fs::read(state_path)?;
-    let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
-    Ok(Some(diagnostics))
+    let (diagnostics, meta) =
+        covy_core::cache::deserialize_diagnostics_for_paths_from_file(state_path, selected_paths)?;
+
+    let needs_normalization = !state_metadata_compatible(meta.as_ref(), source_root);
+    Ok(LoadedDiagnostics {
+        data: Some(diagnostics),
+        needs_normalization,
+    })
 }
 
 fn load_diagnostics_input(path: &Path) -> Result<DiagnosticsData> {
@@ -337,4 +353,40 @@ fn load_diagnostics_input(path: &Path) -> Result<DiagnosticsData> {
     }
 
     covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
+}
+
+#[derive(Default)]
+struct LoadedDiagnostics {
+    data: Option<DiagnosticsData>,
+    needs_normalization: bool,
+}
+
+impl LoadedDiagnostics {
+    fn none() -> Self {
+        Self {
+            data: None,
+            needs_normalization: false,
+        }
+    }
+}
+
+fn state_metadata_compatible(
+    meta: Option<&covy_core::cache::DiagnosticsStateMetadata>,
+    source_root: Option<&Path>,
+) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+
+    if meta.schema_version != covy_core::cache::DIAGNOSTICS_STATE_SCHEMA_VERSION {
+        return false;
+    }
+    if meta.path_norm_version != covy_core::cache::DIAGNOSTICS_PATH_NORM_VERSION {
+        return false;
+    }
+    if !meta.normalized_paths {
+        return false;
+    }
+
+    meta.repo_root_id == covy_core::cache::current_repo_root_id(source_root)
 }
