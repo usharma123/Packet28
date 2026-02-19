@@ -1,0 +1,106 @@
+mod cmd_check;
+mod cmd_diff;
+mod cmd_github;
+mod cmd_ingest;
+mod cmd_report;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "covy", version, about = "Universal code coverage tool")]
+struct Cli {
+    /// Path to config file
+    #[arg(long, global = true, default_value = "covy.toml")]
+    config: String,
+
+    /// Verbose output
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    /// Suppress non-essential output
+    #[arg(short, long, global = true)]
+    quiet: bool,
+
+    /// Color mode (auto/always/never)
+    #[arg(long, global = true, default_value = "auto")]
+    color: String,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// One-shot: ingest + diff + gate + report
+    Check(cmd_check::CheckArgs),
+    /// Ingest coverage reports
+    Ingest(cmd_ingest::IngestArgs),
+    /// Display coverage report
+    Report(cmd_report::ReportArgs),
+    /// Run PR quality gate against a diff
+    Diff(cmd_diff::DiffArgs),
+    /// Post coverage report as a GitHub PR comment
+    GithubComment(cmd_github::GithubCommentArgs),
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    // Set up tracing
+    let filter = if cli.verbose {
+        "debug"
+    } else if cli.quiet {
+        "error"
+    } else {
+        "info"
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
+        )
+        .with_target(false)
+        .without_time()
+        .init();
+
+    // Handle color
+    match cli.color.as_str() {
+        "never" => colored::control::set_override(false),
+        "always" => colored::control::set_override(true),
+        _ => {} // auto
+    }
+
+    let result = match cli.command {
+        Commands::Check(args) => cmd_check::run(args, &cli.config),
+        Commands::Ingest(args) => cmd_ingest::run(args, &cli.config),
+        Commands::Report(args) => cmd_report::run(args, &cli.config),
+        Commands::Diff(args) => cmd_diff::run(args, &cli.config),
+        Commands::GithubComment(args) => cmd_github::run(args, &cli.config),
+    };
+
+    match result {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(e) => {
+            display_error(&e);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn display_error(err: &anyhow::Error) {
+    use colored::Colorize;
+
+    // Check if it's a CovyError with a hint
+    if let Some(covy_err) = err.downcast_ref::<covy_core::CovyError>() {
+        eprintln!("{} {covy_err}", "error:".red().bold());
+        if let Some(hint) = covy_err.hint() {
+            eprintln!("  {} {hint}", "hint:".cyan().bold());
+        }
+    } else {
+        eprintln!("{} {err}", "error:".red().bold());
+        // Print cause chain
+        for cause in err.chain().skip(1) {
+            eprintln!("  {} {cause}", "caused by:".dimmed());
+        }
+    }
+}

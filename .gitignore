@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Covy local state
+.covy/
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

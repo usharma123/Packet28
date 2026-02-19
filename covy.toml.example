@@ -1,0 +1,42 @@
+# Covy configuration file
+# Copy to covy.toml and customize for your project.
+
+[project]
+name = "my-project"
+source_root = "."
+
+[ingest]
+# Glob patterns for coverage report files
+report_paths = ["coverage/lcov.info", "**/coverage.xml"]
+# Prefixes to strip from paths in coverage reports
+strip_prefixes = ["/app/src/"]
+
+[diff]
+# Git refs for diff comparison
+base = "main"
+head = "HEAD"
+
+[gate]
+# Quality gate thresholds (percentage). Omit to skip that check.
+fail_under_total = 80.0
+fail_under_changed = 90.0
+fail_under_new = 80.0
+
+[report]
+# Output format: "terminal" or "json"
+format = "terminal"
+# Show missing line numbers in terminal report
+show_missing = false
+
+[cache]
+# Enable/disable the file-system cache
+enabled = true
+# Cache directory (relative to project root)
+dir = ".covy/cache"
+# Evict cache entries older than this (days)
+max_age_days = 30
+
+# Path mapping rules for translating coverage report paths to source paths.
+# Useful when build outputs use different paths than source.
+[path_mapping.rules]
+# "/build/classes/" = "src/main/java/"

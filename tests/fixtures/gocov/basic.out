@@ -1,0 +1,5 @@
+mode: set
+github.com/user/project/pkg/handler.go:10.30,15.2 3 1
+github.com/user/project/pkg/handler.go:17.30,20.2 2 0
+github.com/user/project/main.go:5.13,10.2 3 1
+github.com/user/project/main.go:12.13,14.2 1 0

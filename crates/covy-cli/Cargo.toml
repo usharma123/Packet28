@@ -1,0 +1,25 @@
+[package]
+name = "covy-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "covy"
+path = "src/main.rs"
+
+[dependencies]
+covy-core = { path = "../covy-core" }
+covy-ingest = { path = "../covy-ingest" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+colored.workspace = true
+glob.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "covy-ingest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+covy-core = { path = "../covy-core" }
+roaring.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+quick-xml.workspace = true
+regex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "ingest_bench"
+harness = false
