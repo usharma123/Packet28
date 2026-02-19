@@ -20,6 +20,7 @@ What it does:
 - Generates synthetic large fixtures in `benchmarks/generated/`
 - Runs benchmark cases using `hyperfine` when available
 - Falls back to a builtin timer loop when `hyperfine` is not installed
+- Uses `--no-issues-state` for the `check small` case so it stays coverage-only
 
 ## Generated Fixtures
 

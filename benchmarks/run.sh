@@ -46,7 +46,7 @@ if command -v hyperfine >/dev/null 2>&1; then
     --command-name "ingest small"
 
   hyperfine --warmup 3 --runs 20 \
-    "$BIN check tests/fixtures/lcov/basic.info --base HEAD --head HEAD --report json --color never" \
+    "$BIN check tests/fixtures/lcov/basic.info --no-issues-state --base HEAD --head HEAD --report json --color never" \
     --command-name "check small"
 
   hyperfine --warmup 2 --runs 10 \
@@ -96,7 +96,7 @@ else
 
   run_case "report small" 10 "$BIN" report --input .covy/state/latest.bin --color never
   run_case "ingest small" 10 "$BIN" ingest tests/fixtures/lcov/basic.info --color never
-  run_case "check small" 10 "$BIN" check tests/fixtures/lcov/basic.info --base HEAD --head HEAD --report json --color never
+  run_case "check small" 10 "$BIN" check tests/fixtures/lcov/basic.info --no-issues-state --base HEAD --head HEAD --report json --color never
   run_case "ingest lcov 100k" 10 "$BIN" ingest benchmarks/generated/lcov-100k.info --color never
   run_case "ingest lcov 1m" 5 "$BIN" ingest benchmarks/generated/lcov-1m.info --color never
   run_case "ingest sarif 50k" 5 "$BIN" ingest --issues benchmarks/generated/sarif-50k.sarif --color never
