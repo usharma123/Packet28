@@ -21,6 +21,14 @@ pub struct CheckArgs {
     #[arg(long)]
     issues: Vec<String>,
 
+    /// Path to cached diagnostics state file (default: .covy/state/issues.bin)
+    #[arg(long)]
+    issues_state: Option<String>,
+
+    /// Disable automatic diagnostics state loading when --issues is not provided
+    #[arg(long)]
+    no_issues_state: bool,
+
     /// Read coverage data from stdin
     #[arg(long)]
     stdin: bool,
@@ -81,11 +89,11 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     covy_core::pathmap::auto_normalize_paths(&mut coverage, source_root);
 
     // Ingest diagnostics (optional)
-    let mut diagnostics = if args.issues.is_empty() {
-        None
-    } else {
-        Some(resolve_and_ingest_issues(&args.issues)?)
-    };
+    let mut diagnostics = resolve_diagnostics(
+        &args.issues,
+        args.issues_state.as_deref(),
+        args.no_issues_state,
+    )?;
 
     if let Some(diag) = diagnostics.as_mut() {
         covy_core::pathmap::auto_normalize_issue_paths(diag, source_root);
@@ -239,6 +247,34 @@ fn resolve_and_ingest_issues(patterns: &[String]) -> Result<DiagnosticsData> {
         combined.merge(&data);
     }
     Ok(combined)
+}
+
+fn resolve_diagnostics(
+    issues_patterns: &[String],
+    issues_state_path: Option<&str>,
+    no_issues_state: bool,
+) -> Result<Option<DiagnosticsData>> {
+    if !issues_patterns.is_empty() {
+        return Ok(Some(resolve_and_ingest_issues(issues_patterns)?));
+    }
+
+    if no_issues_state {
+        return Ok(None);
+    }
+
+    let state_path = issues_state_path.unwrap_or(".covy/state/issues.bin");
+    let state_path = Path::new(state_path);
+    if !state_path.exists() {
+        return Ok(None);
+    }
+
+    tracing::info!(
+        "Loading diagnostics from cached state {}",
+        state_path.display()
+    );
+    let bytes = std::fs::read(state_path)?;
+    let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
+    Ok(Some(diagnostics))
 }
 
 fn parse_format(s: &str) -> Result<Option<CoverageFormat>> {

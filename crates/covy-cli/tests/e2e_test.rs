@@ -264,3 +264,52 @@ fn test_check_without_issues_still_works() {
         .success()
         .stdout(predicate::str::contains("passed"));
 }
+
+#[test]
+fn test_check_loads_issues_from_state_by_default() {
+    covy_cmd()
+        .args(["ingest", "--issues", &fixture("sarif/basic.sarif")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args([
+            "check",
+            &fixture("lcov/basic.info"),
+            "--max-new-errors",
+            "0",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--report",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("issue_counts"));
+}
+
+#[test]
+fn test_check_can_disable_state_issues_loading() {
+    covy_cmd()
+        .args(["ingest", "--issues", &fixture("sarif/basic.sarif")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args([
+            "check",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--report",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("issue_counts").not());
+}
