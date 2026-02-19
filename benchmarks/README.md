@@ -19,10 +19,12 @@ What it does:
 - Builds `target/release/covy`
 - Generates synthetic large fixtures in `benchmarks/generated/`
 - Runs benchmark cases using `hyperfine` when available
+- Uses `hyperfine --shell=none` for lower-noise microbenchmarks (especially sub-5ms cases)
 - Falls back to a builtin timer loop when `hyperfine` is not installed
 - Uses `--no-issues-state` for the `check small` case so it stays coverage-only
 - Benchmarks both diagnostics paths for combined checks:
   - cached state (`issues.bin`) fast path
+  - large cached state (`200k` issues in `issues.bin`)
   - explicit SARIF parse path (`--issues ...`)
 
 ## Generated Fixtures

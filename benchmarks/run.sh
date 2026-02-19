@@ -36,43 +36,51 @@ fi
 
 if command -v hyperfine >/dev/null 2>&1; then
   echo "Running hyperfine benchmarks with $BIN"
+  HF_COMMON=(--shell=none)
 
-  hyperfine --warmup 3 --runs 20 \
+  hyperfine "${HF_COMMON[@]}" --warmup 3 --runs 20 \
     "$BIN report --input .covy/state/latest.bin --color never" \
     --command-name "report small"
 
-  hyperfine --warmup 3 --runs 20 \
+  hyperfine "${HF_COMMON[@]}" --warmup 3 --runs 20 \
     "$BIN ingest tests/fixtures/lcov/basic.info --color never" \
     --command-name "ingest small"
 
-  hyperfine --warmup 3 --runs 20 \
+  hyperfine "${HF_COMMON[@]}" --warmup 3 --runs 20 \
     "$BIN check tests/fixtures/lcov/basic.info --no-issues-state --base HEAD --head HEAD --report json --color never" \
     --command-name "check small"
 
-  hyperfine --warmup 2 --runs 10 \
+  hyperfine "${HF_COMMON[@]}" --warmup 2 --runs 10 \
     "$BIN ingest benchmarks/generated/lcov-100k.info --color never" \
     --command-name "ingest lcov 100k"
 
-  hyperfine --warmup 2 --runs 10 \
+  hyperfine "${HF_COMMON[@]}" --warmup 2 --runs 10 \
     "$BIN ingest benchmarks/generated/lcov-1m.info --color never" \
     --command-name "ingest lcov 1m"
 
-  hyperfine --warmup 2 --runs 10 \
+  hyperfine "${HF_COMMON[@]}" --warmup 2 --runs 10 \
     "$BIN ingest --issues benchmarks/generated/sarif-50k.sarif --color never" \
     --command-name "ingest sarif 50k"
 
-  hyperfine --warmup 2 --runs 10 \
+  hyperfine "${HF_COMMON[@]}" --warmup 2 --runs 10 \
     "$BIN ingest --issues benchmarks/generated/sarif-200k.sarif --color never" \
     --command-name "ingest sarif 200k"
 
   # Prime diagnostics state to benchmark the cached fast path.
   "$BIN" ingest --issues benchmarks/generated/sarif-50k.sarif --color never >/dev/null
 
-  hyperfine --warmup 2 --runs 8 \
+  hyperfine "${HF_COMMON[@]}" --warmup 2 --runs 8 \
     "$BIN check benchmarks/generated/lcov-100k.info --base HEAD --head HEAD --report json --color never --max-new-errors 999999" \
     --command-name "check combined 100k+cached-state"
 
-  hyperfine --warmup 2 --runs 8 \
+  # Prime large diagnostics state, then benchmark cached large-state checks.
+  "$BIN" ingest --issues benchmarks/generated/sarif-200k.sarif --color never >/dev/null
+
+  hyperfine "${HF_COMMON[@]}" --warmup 2 --runs 8 \
+    "$BIN check benchmarks/generated/lcov-100k.info --base HEAD --head HEAD --report json --color never --max-new-errors 999999" \
+    --command-name "check combined 100k+200k(cached-state)"
+
+  hyperfine "${HF_COMMON[@]}" --warmup 2 --runs 8 \
     "$BIN check benchmarks/generated/lcov-100k.info --issues benchmarks/generated/sarif-50k.sarif --base HEAD --head HEAD --report json --color never --max-new-errors 999999" \
     --command-name "check combined 100k+50k(parse)"
 else
@@ -113,5 +121,7 @@ else
   "$BIN" ingest --issues benchmarks/generated/sarif-50k.sarif --color never >/dev/null
 
   run_case "check combined 100k+cached-state" 5 "$BIN" check benchmarks/generated/lcov-100k.info --base HEAD --head HEAD --report json --color never --max-new-errors 999999
+  "$BIN" ingest --issues benchmarks/generated/sarif-200k.sarif --color never >/dev/null
+  run_case "check combined 100k+200k(cached-state)" 5 "$BIN" check benchmarks/generated/lcov-100k.info --base HEAD --head HEAD --report json --color never --max-new-errors 999999
   run_case "check combined 100k+50k(parse)" 5 "$BIN" check benchmarks/generated/lcov-100k.info --issues benchmarks/generated/sarif-50k.sarif --base HEAD --head HEAD --report json --color never --max-new-errors 999999
 fi
