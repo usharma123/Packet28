@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use covy_core::diagnostics::{DiagnosticsData, DiagnosticsFormat, Issue, Severity};
 use covy_core::CovyError;
@@ -97,6 +97,7 @@ pub fn parse_sarif(content: &[u8]) -> Result<DiagnosticsData, CovyError> {
 
     let mut diagnostics = DiagnosticsData::new();
     diagnostics.format = Some(DiagnosticsFormat::Sarif);
+    let mut seen_fingerprints_by_file: HashMap<String, HashSet<String>> = HashMap::new();
 
     for run in log.runs {
         let tool_name = run
@@ -128,8 +129,21 @@ pub fn parse_sarif(content: &[u8]) -> Result<DiagnosticsData, CovyError> {
             let fingerprint =
                 resolve_fingerprint(&result, &tool_name, &rule_id, &path, line, &message);
 
+            let entry = diagnostics.issues_by_file.entry(path.clone()).or_default();
+            let seen = seen_fingerprints_by_file
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    let mut seen = HashSet::with_capacity(entry.len().max(16));
+                    seen.extend(entry.iter().map(|existing| existing.fingerprint.clone()));
+                    seen
+                });
+
+            if !seen.insert(fingerprint.clone()) {
+                continue;
+            }
+
             let issue = Issue {
-                path: path.clone(),
+                path,
                 line,
                 column,
                 end_line,
@@ -137,16 +151,9 @@ pub fn parse_sarif(content: &[u8]) -> Result<DiagnosticsData, CovyError> {
                 rule_id,
                 message,
                 source: tool_name.clone(),
-                fingerprint: fingerprint.clone(),
+                fingerprint,
             };
-
-            let entry = diagnostics.issues_by_file.entry(path).or_default();
-            if !entry
-                .iter()
-                .any(|existing| existing.fingerprint == fingerprint)
-            {
-                entry.push(issue);
-            }
+            entry.push(issue);
         }
     }
 

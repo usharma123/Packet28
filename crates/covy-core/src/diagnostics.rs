@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::model::FileDiff;
 
@@ -82,8 +82,11 @@ impl DiagnosticsData {
     pub fn merge(&mut self, other: &DiagnosticsData) {
         for (path, issues) in &other.issues_by_file {
             let existing = self.issues_by_file.entry(path.clone()).or_default();
+            let mut seen: HashSet<String> =
+                HashSet::with_capacity(existing.len().saturating_add(issues.len()));
+            seen.extend(existing.iter().map(|issue| issue.fingerprint.clone()));
             for issue in issues {
-                if !existing.iter().any(|e| e.fingerprint == issue.fingerprint) {
+                if seen.insert(issue.fingerprint.clone()) {
                     existing.push(issue.clone());
                 }
             }
