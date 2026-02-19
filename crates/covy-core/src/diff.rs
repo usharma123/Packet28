@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use roaring::RoaringBitmap;
@@ -5,8 +6,23 @@ use roaring::RoaringBitmap;
 use crate::error::CovyError;
 use crate::model::{DiffStatus, FileDiff};
 
+const DIFF_CACHE_DIR: &str = ".covy/state/diff-cache";
+
 /// Parse git diff output to extract changed files and line numbers.
 pub fn git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>, CovyError> {
+    let (base_hash, head_hash) = resolve_refs(base, head)?;
+    let cache_path = diff_cache_path(&base_hash, &head_hash);
+
+    if let Some(cached) = load_cached_diff(&cache_path) {
+        return parse_diff_output(&cached);
+    }
+
+    let stdout = run_git_diff(base, head)?;
+    let _ = save_cached_diff(&cache_path, &stdout);
+    parse_diff_output(&stdout)
+}
+
+fn run_git_diff(base: &str, head: &str) -> Result<String, CovyError> {
     let output = Command::new("git")
         .args([
             "diff",
@@ -30,8 +46,64 @@ pub fn git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>, CovyError> {
         return Err(CovyError::Git(format!("git diff failed: {stderr}")));
     }
 
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn resolve_refs(base: &str, head: &str) -> Result<(String, String), CovyError> {
+    let output = Command::new("git")
+        .args(["rev-parse", base, head])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CovyError::GitNotFound
+            } else {
+                CovyError::Git(format!("Failed to run git rev-parse: {e}"))
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CovyError::Git(format!("git rev-parse failed: {stderr}")));
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_diff_output(&stdout)
+    let mut lines = stdout.lines();
+    let base_hash = lines.next().unwrap_or_default().trim().to_string();
+    let head_hash = lines.next().unwrap_or_default().trim().to_string();
+
+    if base_hash.is_empty() || head_hash.is_empty() {
+        return Err(CovyError::Git(
+            "git rev-parse returned empty ref hash".to_string(),
+        ));
+    }
+
+    Ok((base_hash, head_hash))
+}
+
+fn diff_cache_key(base_hash: &str, head_hash: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(base_hash.as_bytes());
+    hasher.update(head_hash.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn diff_cache_path(base_hash: &str, head_hash: &str) -> PathBuf {
+    Path::new(DIFF_CACHE_DIR).join(format!("{}.diff", diff_cache_key(base_hash, head_hash)))
+}
+
+fn load_cached_diff(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+fn save_cached_diff(path: &Path, content: &str) -> Result<(), CovyError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(())
 }
 
 /// Parse the raw output of `git diff --unified=0`.
@@ -188,5 +260,21 @@ rename to new.rs
         assert_eq!(result[0].status, DiffStatus::Renamed);
         assert_eq!(result[0].old_path.as_deref(), Some("old.rs"));
         assert_eq!(result[0].path, "new.rs");
+    }
+
+    #[test]
+    fn test_diff_cache_key_stable() {
+        let a = diff_cache_key("abc", "def");
+        let b = diff_cache_key("abc", "def");
+        let c = diff_cache_key("def", "abc");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_diff_cache_path_ext() {
+        let p = diff_cache_path("abc", "def");
+        assert!(p.to_string_lossy().contains(".covy/state/diff-cache"));
+        assert_eq!(p.extension().and_then(|e| e.to_str()), Some("diff"));
     }
 }
