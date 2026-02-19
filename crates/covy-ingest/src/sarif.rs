@@ -4,18 +4,19 @@ use covy_core::diagnostics::{DiagnosticsData, DiagnosticsFormat, Issue, Severity
 use covy_core::CovyError;
 use rayon::prelude::*;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
-#[derive(Debug, Deserialize)]
-struct SarifLog {
-    #[serde(default)]
-    runs: Vec<SarifRun>,
+#[derive(Deserialize)]
+struct SarifLogRaw<'a> {
+    #[serde(borrow, default)]
+    runs: Vec<SarifRunRaw<'a>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SarifRun {
+#[derive(Deserialize)]
+struct SarifRunRaw<'a> {
     tool: Option<SarifTool>,
-    #[serde(default)]
-    results: Vec<SarifResult>,
+    #[serde(borrow, default)]
+    results: Vec<&'a RawValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,22 +92,29 @@ pub fn parse_sarif(content: &[u8]) -> Result<DiagnosticsData, CovyError> {
         });
     }
 
-    let log: SarifLog = serde_json::from_slice(content).map_err(|e| CovyError::Parse {
+    let text = std::str::from_utf8(content).map_err(|e| CovyError::Parse {
+        format: "sarif".to_string(),
+        detail: format!("Invalid UTF-8: {e}"),
+    })?;
+
+    let log: SarifLogRaw<'_> = serde_json::from_str(text).map_err(|e| CovyError::Parse {
         format: "sarif".to_string(),
         detail: e.to_string(),
     })?;
 
-    let per_run: Vec<DiagnosticsData> = log.runs.into_par_iter().map(parse_run).collect();
+    let per_run: Vec<Result<DiagnosticsData, CovyError>> =
+        log.runs.into_par_iter().map(parse_run_raw).collect();
 
     let mut diagnostics = DiagnosticsData::new();
     diagnostics.format = Some(DiagnosticsFormat::Sarif);
     for run_data in per_run {
+        let run_data = run_data?;
         diagnostics.merge(&run_data);
     }
     Ok(diagnostics)
 }
 
-fn parse_run(run: SarifRun) -> DiagnosticsData {
+fn parse_run_raw(run: SarifRunRaw<'_>) -> Result<DiagnosticsData, CovyError> {
     let mut diagnostics = DiagnosticsData::new();
     diagnostics.format = Some(DiagnosticsFormat::Sarif);
 
@@ -127,7 +135,13 @@ fn parse_run(run: SarifRun) -> DiagnosticsData {
 
     let mut seen_fingerprints_by_file: HashMap<String, HashSet<String>> = HashMap::new();
 
-    for result in run.results {
+    for raw_result in run.results {
+        let result: SarifResult =
+            serde_json::from_str(raw_result.get()).map_err(|e| CovyError::Parse {
+                format: "sarif".to_string(),
+                detail: e.to_string(),
+            })?;
+
         let Some((path, line, column, end_line)) = extract_location(&result) else {
             continue;
         };
@@ -167,7 +181,7 @@ fn parse_run(run: SarifRun) -> DiagnosticsData {
         entry.push(issue);
     }
 
-    diagnostics
+    Ok(diagnostics)
 }
 
 fn extract_location(result: &SarifResult) -> Option<(String, u32, Option<u32>, Option<u32>)> {
