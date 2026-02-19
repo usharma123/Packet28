@@ -12,6 +12,7 @@ pub fn git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>, CovyError> {
             "diff",
             "--unified=0",
             "--no-color",
+            "--no-ext-diff",
             "--diff-filter=ACMR",
             &format!("{base}..{head}"),
         ])
