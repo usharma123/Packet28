@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use covy_core::diagnostics::{DiagnosticsData, DiagnosticsFormat, Issue, Severity};
 use covy_core::CovyError;
+use rayon::prelude::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -95,69 +96,78 @@ pub fn parse_sarif(content: &[u8]) -> Result<DiagnosticsData, CovyError> {
         detail: e.to_string(),
     })?;
 
+    let per_run: Vec<DiagnosticsData> = log.runs.into_par_iter().map(parse_run).collect();
+
     let mut diagnostics = DiagnosticsData::new();
     diagnostics.format = Some(DiagnosticsFormat::Sarif);
+    for run_data in per_run {
+        diagnostics.merge(&run_data);
+    }
+    Ok(diagnostics)
+}
+
+fn parse_run(run: SarifRun) -> DiagnosticsData {
+    let mut diagnostics = DiagnosticsData::new();
+    diagnostics.format = Some(DiagnosticsFormat::Sarif);
+
+    let tool_name = run
+        .tool
+        .as_ref()
+        .and_then(|t| t.driver.as_ref())
+        .and_then(|d| d.name.as_ref())
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let rules = run
+        .tool
+        .as_ref()
+        .and_then(|t| t.driver.as_ref())
+        .map(|d| d.rules.as_slice())
+        .unwrap_or(&[]);
+
     let mut seen_fingerprints_by_file: HashMap<String, HashSet<String>> = HashMap::new();
 
-    for run in log.runs {
-        let tool_name = run
-            .tool
-            .as_ref()
-            .and_then(|t| t.driver.as_ref())
-            .and_then(|d| d.name.as_ref())
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let rules = run
-            .tool
-            .as_ref()
-            .and_then(|t| t.driver.as_ref())
-            .map(|d| d.rules.as_slice())
-            .unwrap_or(&[]);
-
-        for result in run.results {
-            let Some((path, line, column, end_line)) = extract_location(&result) else {
-                continue;
-            };
-            if line == 0 {
-                continue;
-            }
-
-            let severity = map_severity(result.level.as_deref());
-            let rule_id = resolve_rule_id(&result, rules);
-            let message = resolve_message(&result);
-            let fingerprint =
-                resolve_fingerprint(&result, &tool_name, &rule_id, &path, line, &message);
-
-            let entry = diagnostics.issues_by_file.entry(path.clone()).or_default();
-            let seen = seen_fingerprints_by_file
-                .entry(path.clone())
-                .or_insert_with(|| {
-                    let mut seen = HashSet::with_capacity(entry.len().max(16));
-                    seen.extend(entry.iter().map(|existing| existing.fingerprint.clone()));
-                    seen
-                });
-
-            if !seen.insert(fingerprint.clone()) {
-                continue;
-            }
-
-            let issue = Issue {
-                path,
-                line,
-                column,
-                end_line,
-                severity,
-                rule_id,
-                message,
-                source: tool_name.clone(),
-                fingerprint,
-            };
-            entry.push(issue);
+    for result in run.results {
+        let Some((path, line, column, end_line)) = extract_location(&result) else {
+            continue;
+        };
+        if line == 0 {
+            continue;
         }
+
+        let severity = map_severity(result.level.as_deref());
+        let rule_id = resolve_rule_id(&result, rules);
+        let message = resolve_message(&result);
+        let fingerprint = resolve_fingerprint(&result, &tool_name, &rule_id, &path, line, &message);
+
+        let entry = diagnostics.issues_by_file.entry(path.clone()).or_default();
+        let seen = seen_fingerprints_by_file
+            .entry(path.clone())
+            .or_insert_with(|| {
+                let mut seen = HashSet::with_capacity(entry.len().max(16));
+                seen.extend(entry.iter().map(|existing| existing.fingerprint.clone()));
+                seen
+            });
+
+        if !seen.insert(fingerprint.clone()) {
+            continue;
+        }
+
+        let issue = Issue {
+            path,
+            line,
+            column,
+            end_line,
+            severity,
+            rule_id,
+            message,
+            source: tool_name.clone(),
+            fingerprint,
+        };
+        entry.push(issue);
     }
 
-    Ok(diagnostics)
+    diagnostics
 }
 
 fn extract_location(result: &SarifResult) -> Option<(String, u32, Option<u32>, Option<u32>)> {
