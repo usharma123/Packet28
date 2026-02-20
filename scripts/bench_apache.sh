@@ -14,12 +14,27 @@ REUSE_REPO=0
 COVY_BIN="$COVY_BIN_DEFAULT"
 TIMINGS_PATH=""
 EXPECTED_TESTS_FILE=""
+AUTO_FALLBACK=1
+FALLBACK_SHARDS=6
+SETUP_THRESHOLD_S="15.0"
+WARM_CACHE=1
+OFFLINE=1
+PARAM_BUCKETING_ENABLED=0
 
 MAVEN_BASE_ARGS=()
+MAVEN_RUNTIME_ARGS=()
 MAVEN_TEST_GOALS=(
   org.jacoco:jacoco-maven-plugin:prepare-agent
   test
-  org.jacoco:jacoco-maven-plugin:report
+)
+
+PAR_PASS1_SHARDS=0
+PAR_PASS1_MEDIAN_SETUP_S="0.000"
+PAR_EFFECTIVE_SHARDS=0
+PAR_FALLBACK_USED=0
+
+BUCKETED_TEST_CLASSES=(
+  org.apache.commons.lang3.time.FastDateParser_TimeZoneStrategyTest
 )
 
 usage() {
@@ -28,8 +43,8 @@ Usage: scripts/bench_apache.sh [options]
 
 Runs Covy benchmark flows against apache/commons-lang:
 1) full maven + jacoco + covy check
-2) sequential sharded runs + covy merge
-3) parallel sharded runs + covy merge (two-pass: seed + measured)
+2) sequential sharded runs + jacoco exec merge + single covy ingest/report
+3) parallel sharded runs + jacoco exec merge + single covy ingest/report (two-pass: seed + measured)
 
 Options:
   --work-dir <path>      Benchmark workspace root (default: /tmp/covy-bench-apache-<timestamp>)
@@ -39,6 +54,15 @@ Options:
   --shards <n>           Number of shards for seq/par modes (default: 8)
   --modes <csv>          Subset of modes: full,seq,par (default: full,seq,par)
   --covy-bin <path>      Covy binary path (default: target/release/covy)
+  --auto-fallback        Enable automatic fallback from 8 shards to fallback shard count (default: enabled)
+  --no-auto-fallback     Disable shard-count fallback logic
+  --fallback-shards <n>  Shard count to use when fallback triggers (default: 6)
+  --setup-threshold-s <n>
+                         Median setup threshold in seconds to trigger fallback (default: 15.0)
+  --warm-cache           Run Maven warm-cache preflight before benchmark modes (default: enabled)
+  --no-warm-cache        Disable warm-cache preflight
+  --offline              Run Maven shard jobs in offline mode (default: enabled)
+  --online               Disable Maven offline mode for shard jobs
   --skip-build           Do not build Covy binary
   --reuse-repo           Reuse existing repo-dir instead of recloning
   -h, --help             Show this help
@@ -82,6 +106,66 @@ extract_full_test_summary() {
       }
     }
   ' "$log_file"
+}
+
+extract_surefire_test_exec_secs() {
+  local surefire_dir="$1"
+  python3 - "$surefire_dir" <<'PY'
+import glob
+import os
+import sys
+import xml.etree.ElementTree as ET
+
+reports_dir = sys.argv[1]
+paths = sorted(glob.glob(os.path.join(reports_dir, "TEST-*.xml")))
+if not paths:
+    print("0.000")
+    raise SystemExit(0)
+
+total = 0.0
+for path in paths:
+    root = ET.parse(path).getroot()
+    for testcase in root.iter("testcase"):
+        raw = testcase.attrib.get("time")
+        if not raw:
+            continue
+        try:
+            total += float(raw)
+        except ValueError:
+            continue
+print(f"{total:.3f}")
+PY
+}
+
+median_setup_secs() {
+  local status_tsv="$1"
+  python3 - "$status_tsv" <<'PY'
+import sys
+
+values = []
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 7:
+            continue
+        try:
+            values.append(float(parts[6]))
+        except ValueError:
+            continue
+
+if not values:
+    print("0.000")
+    raise SystemExit(0)
+
+values.sort()
+n = len(values)
+mid = n // 2
+if n % 2 == 1:
+    med = values[mid]
+else:
+    med = (values[mid - 1] + values[mid]) / 2.0
+print(f"{med:.3f}")
+PY
 }
 
 coverage_from_report_json() {
@@ -208,6 +292,9 @@ record_maven_invocation() {
   local tests_csv="${2:-}"
   {
     printf '%q ' "${MAVEN_BASE_ARGS[@]}"
+    if [[ "${#MAVEN_RUNTIME_ARGS[@]}" -gt 0 ]]; then
+      printf '%q ' "${MAVEN_RUNTIME_ARGS[@]}"
+    fi
     if [[ -n "$tests_csv" ]]; then
       printf '%q ' "-Dtest=$tests_csv"
     fi
@@ -227,19 +314,55 @@ collect_shard_union() {
   cat "$shard_dir"/shard-*.txt | sed '/^\s*$/d' | sort -u > "$out_file"
 }
 
+supports_param_bucketing() {
+  local test_file="$REPO_DIR/src/test/java/org/apache/commons/lang3/time/FastDateParser_TimeZoneStrategyTest.java"
+  [[ -f "$test_file" ]] || return 1
+  rg -q "TEST_SHARD_COUNT" "$test_file"
+}
+
+inject_bucketed_tests() {
+  local shard_dir="$1"
+  local shard_count="$2"
+  local class_name shard_file
+
+  [[ "$PARAM_BUCKETING_ENABLED" -eq 1 ]] || return 0
+
+  for class_name in "${BUCKETED_TEST_CLASSES[@]}"; do
+    local present=0
+    for shard_file in "$shard_dir"/shard-*.txt; do
+      if rg -qxF "$class_name" "$shard_file"; then
+        present=1
+        break
+      fi
+    done
+    [[ "$present" -eq 1 ]] || continue
+
+    for i in $(seq 1 "$shard_count"); do
+      shard_file="$shard_dir/shard-$i.txt"
+      if ! rg -qxF "$class_name" "$shard_file"; then
+        echo "$class_name" >> "$shard_file"
+      fi
+      sort -u "$shard_file" -o "$shard_file"
+    done
+  done
+}
+
 plan_shards() {
   local run_dir="$1"
   local label="$2"
+  local shard_count="$3"
 
   mkdir -p "$run_dir/shards" "$run_dir/meta"
   cp "$EXPECTED_TESTS_FILE" "$run_dir/tests.txt"
 
   "$COVY_BIN" shard plan \
-    --shards "$SHARDS" \
+    --shards "$shard_count" \
     --tests-file "$run_dir/tests.txt" \
     --timings "$TIMINGS_PATH" \
     --write-files "$run_dir/shards" \
     --json > "$run_dir/shard-plan.json"
+
+  inject_bucketed_tests "$run_dir/shards" "$shard_count"
 
   collect_shard_union "$run_dir/shards" "$run_dir/meta/planned-tests.txt"
   compare_test_sets \
@@ -255,9 +378,10 @@ run_one_shard() {
   local shard_name="$3"
   local run_dir="$4"
   local label="$5"
+  local shard_count="$6"
 
-  local tests_csv start end elapsed xml_src xml_dst bin_dst log_file ingest_log executed_file planned_file
-  local diff_file status_file xml_bytes
+  local tests_csv start end elapsed exec_dst log_file executed_file planned_file
+  local diff_file status_file exec_bytes test_exec setup_secs shard_index
 
   planned_file="$run_dir/meta/planned-$shard_name.txt"
   normalize_set "$shard_file" "$planned_file"
@@ -268,16 +392,32 @@ run_one_shard() {
 
   record_maven_invocation "$run_dir/meta/maven-$shard_name.cmd" "$tests_csv"
 
-  rm -f "$repo/target/jacoco.exec"
+  exec_dst="$run_dir/exec/$shard_name.exec"
+  rm -f "$repo/target/jacoco.exec" "$exec_dst"
   rm -rf "$repo/target/site/jacoco" "$repo/target/surefire-reports"
+
+  shard_index="${shard_name#shard-}"
+  shard_index="$((shard_index - 1))"
 
   start="$(date +%s)"
   set +e
   (
     cd "$repo"
-    "${MAVEN_BASE_ARGS[@]}" \
-      "-Dtest=$tests_csv" \
-      "${MAVEN_TEST_GOALS[@]}"
+    if [[ "$PARAM_BUCKETING_ENABLED" -eq 1 ]]; then
+      TEST_SHARD_INDEX="$shard_index" \
+        TEST_SHARD_COUNT="$shard_count" \
+        "${MAVEN_BASE_ARGS[@]}" \
+        "${MAVEN_RUNTIME_ARGS[@]}" \
+        "-Dtest=$tests_csv" \
+        "-Djacoco.destFile=$exec_dst" \
+        "${MAVEN_TEST_GOALS[@]}"
+    else
+      "${MAVEN_BASE_ARGS[@]}" \
+        "${MAVEN_RUNTIME_ARGS[@]}" \
+        "-Dtest=$tests_csv" \
+        "-Djacoco.destFile=$exec_dst" \
+        "${MAVEN_TEST_GOALS[@]}"
+    fi
   ) > "$run_dir/logs/mvn-$shard_name.log" 2>&1
   local mvn_ec=$?
   set -e
@@ -292,22 +432,14 @@ run_one_shard() {
   diff_file="$run_dir/meta/parity-$shard_name.diff"
   compare_test_sets "$planned_file" "$executed_file" "$diff_file" "$label $shard_name planned-vs-executed"
 
-  xml_src="$repo/target/site/jacoco/jacoco.xml"
-  xml_dst="$run_dir/xml/jacoco-$shard_name.xml"
-  bin_dst="$run_dir/bin/$shard_name.bin"
-  [[ -s "$xml_src" ]] || fail "$label: missing jacoco XML for $shard_name at $xml_src"
-  cp "$xml_src" "$xml_dst"
-  xml_bytes="$(wc -c < "$xml_dst" | tr -d ' ')"
-
-  ingest_log="$run_dir/logs/covy-ingest-$shard_name.log"
-  set +e
-  "$COVY_BIN" ingest "$xml_dst" --format jacoco --output "$bin_dst" --color never > "$ingest_log" 2>&1
-  local covy_ec=$?
-  set -e
-  [[ "$covy_ec" -eq 0 ]] || fail "$label: covy ingest failed for $shard_name (see $ingest_log)"
+  [[ -s "$exec_dst" ]] || fail "$label: missing jacoco exec for $shard_name at $exec_dst"
+  exec_bytes="$(wc -c < "$exec_dst" | tr -d ' ')"
+  test_exec="$(extract_surefire_test_exec_secs "$repo/target/surefire-reports")"
+  setup_secs="$(awk -v wall="$elapsed" -v tests="$test_exec" 'BEGIN{s=wall-tests; if(s<0)s=0; printf "%.3f", s}')"
 
   status_file="$run_dir/status/$shard_name.tsv"
-  printf "%s\t%s\t%s\t%s\t%s\n" "$shard_name" "$mvn_ec" "$covy_ec" "$elapsed" "$xml_bytes" > "$status_file"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "$shard_name" "$mvn_ec" "0" "$elapsed" "$exec_bytes" "$test_exec" "$setup_secs" > "$status_file"
 }
 
 finalize_shard_status() {
@@ -324,13 +456,212 @@ collect_executed_union() {
 
 merge_and_report() {
   local run_dir="$1"
+  local report_repo="$2"
+  local merge_pom="$run_dir/meta/jacoco-merge-pom.xml"
+  local merged_exec="$run_dir/jacoco/merged.exec"
+  local xml_file="$run_dir/jacoco/jacoco.xml"
+  local merge_log="$run_dir/logs/mvn-jacoco-merge.log"
+  local report_log="$run_dir/logs/mvn-jacoco-report.log"
 
-  /usr/bin/time -p -o "$run_dir/merged/merge.time" "$COVY_BIN" merge \
-    --coverage "$run_dir/bin/shard-*.bin" \
-    --output-coverage "$run_dir/merged/latest.bin" --json > "$run_dir/merged/merge-summary.json"
+  mkdir -p "$run_dir/jacoco" "$run_dir/report" "$run_dir/bin"
+  if ! compgen -G "$run_dir/exec/*.exec" >/dev/null; then
+    fail "No per-shard jacoco exec files found under $run_dir/exec"
+  fi
 
-  /usr/bin/time -p -o "$run_dir/merged/report.time" "$COVY_BIN" report \
-    --input "$run_dir/merged/latest.bin" --format json > "$run_dir/merged/report.json"
+  cat > "$merge_pom" <<EOF
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>local.covy</groupId>
+  <artifactId>jacoco-merge</artifactId>
+  <version>1.0.0</version>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>0.8.14</version>
+        <configuration>
+          <fileSets>
+            <fileSet>
+              <directory>$run_dir/exec</directory>
+              <includes>
+                <include>*.exec</include>
+              </includes>
+            </fileSet>
+          </fileSets>
+          <destFile>$merged_exec</destFile>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+EOF
+
+  {
+    printf '%q ' "${MAVEN_BASE_ARGS[@]}"
+    printf '%q ' "${MAVEN_RUNTIME_ARGS[@]}"
+    printf '%q ' "-f" "$merge_pom" "org.jacoco:jacoco-maven-plugin:merge"
+    echo
+  } > "$run_dir/meta/jacoco-merge.cmd"
+
+  set +e
+  /usr/bin/time -p -o "$run_dir/jacoco/merge.time" \
+    "${MAVEN_BASE_ARGS[@]}" "${MAVEN_RUNTIME_ARGS[@]}" \
+    -f "$merge_pom" org.jacoco:jacoco-maven-plugin:merge > "$merge_log" 2>&1
+  local merge_ec=$?
+  set -e
+  [[ "$merge_ec" -eq 0 ]] || fail "JaCoCo merge failed (see $merge_log)"
+  [[ -s "$merged_exec" ]] || fail "Merged JaCoCo exec not created: $merged_exec"
+
+  if [[ ! -d "$report_repo/target/classes" ]]; then
+    set +e
+    (
+      cd "$report_repo"
+      "${MAVEN_BASE_ARGS[@]}" "${MAVEN_RUNTIME_ARGS[@]}" -DskipTests test-compile
+    ) > "$run_dir/logs/mvn-ensure-classes.log" 2>&1
+    local classes_ec=$?
+    set -e
+    [[ "$classes_ec" -eq 0 ]] || fail "Unable to build classes for JaCoCo report (see $run_dir/logs/mvn-ensure-classes.log)"
+  fi
+
+  rm -f "$xml_file"
+  {
+    printf '%q ' "${MAVEN_BASE_ARGS[@]}"
+    printf '%q ' "${MAVEN_RUNTIME_ARGS[@]}"
+    printf '%q ' "-Djacoco.dataFile=$merged_exec" "-Djacoco.outputDirectory=$run_dir/jacoco" "-Djacoco.formats=XML"
+    printf '%q ' "org.jacoco:jacoco-maven-plugin:report"
+    echo
+  } > "$run_dir/meta/jacoco-report.cmd"
+
+  set +e
+  (
+    cd "$report_repo"
+    /usr/bin/time -p -o "$run_dir/jacoco/report.time" \
+      "${MAVEN_BASE_ARGS[@]}" "${MAVEN_RUNTIME_ARGS[@]}" \
+      "-Djacoco.dataFile=$merged_exec" \
+      "-Djacoco.outputDirectory=$run_dir/jacoco" \
+      -Djacoco.formats=XML \
+      org.jacoco:jacoco-maven-plugin:report
+  ) > "$report_log" 2>&1
+  local report_ec=$?
+  set -e
+  [[ "$report_ec" -eq 0 ]] || fail "JaCoCo report generation failed (see $report_log)"
+  [[ -s "$xml_file" ]] || fail "Missing merged JaCoCo XML at $xml_file"
+
+  set +e
+  /usr/bin/time -p -o "$run_dir/report/ingest.time" \
+    "$COVY_BIN" ingest "$xml_file" --format jacoco --output "$run_dir/bin/coverage.bin" --color never \
+    > "$run_dir/logs/covy-ingest.log" 2>&1
+  local ingest_ec=$?
+  set -e
+  [[ "$ingest_ec" -eq 0 ]] || fail "covy ingest failed (see $run_dir/logs/covy-ingest.log)"
+
+  /usr/bin/time -p -o "$run_dir/report/report.time" "$COVY_BIN" report \
+    --input "$run_dir/bin/coverage.bin" --format json > "$run_dir/report/report.json"
+}
+
+cache_state_snapshot() {
+  local repo_path="$1"
+  local prefix="$2"
+  local out_file="$3"
+
+  if [[ -d "$repo_path" ]]; then
+    local file_count byte_count
+    file_count="$(find "$repo_path" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    byte_count="$(du -sk "$repo_path" 2>/dev/null | awk '{print $1}')"
+    {
+      echo "${prefix}_state=present"
+      echo "${prefix}_files=$file_count"
+      echo "${prefix}_kilobytes=$byte_count"
+    } >> "$out_file"
+  else
+    {
+      echo "${prefix}_state=absent"
+      echo "${prefix}_files=0"
+      echo "${prefix}_kilobytes=0"
+    } >> "$out_file"
+  fi
+}
+
+record_global_metadata_start() {
+  local meta_dir="$WORK_DIR/meta"
+  local file="$meta_dir/environment.txt"
+  mkdir -p "$meta_dir"
+
+  {
+    echo "date_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "work_dir=$WORK_DIR"
+    echo "repo_dir=$REPO_DIR"
+    echo "timings_path=$TIMINGS_PATH"
+    echo "m2_repo=$M2_REPO"
+    echo "configured_shards=$SHARDS"
+    echo "auto_fallback=$AUTO_FALLBACK"
+    echo "fallback_shards=$FALLBACK_SHARDS"
+    echo "setup_threshold_s=$SETUP_THRESHOLD_S"
+    echo "warm_cache=$WARM_CACHE"
+    echo "offline=$OFFLINE"
+    echo "param_bucketing_enabled=$PARAM_BUCKETING_ENABLED"
+    echo "covy_sha=$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+    echo "target_repo_sha=$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+    printf 'maven_base_args='
+    printf '%q ' "${MAVEN_BASE_ARGS[@]}"
+    echo
+    printf 'maven_runtime_args='
+    printf '%q ' "${MAVEN_RUNTIME_ARGS[@]}"
+    echo
+  } > "$file"
+
+  cache_state_snapshot "$M2_REPO" "m2_start" "$file"
+  mvn -v > "$meta_dir/maven-version.txt" 2>&1 || true
+}
+
+record_global_metadata_end() {
+  local file="$WORK_DIR/meta/environment.txt"
+  {
+    echo "par_pass1_shards=$PAR_PASS1_SHARDS"
+    echo "par_pass1_median_setup_s=$PAR_PASS1_MEDIAN_SETUP_S"
+    echo "par_effective_shards=$PAR_EFFECTIVE_SHARDS"
+    echo "par_fallback_used=$PAR_FALLBACK_USED"
+  } >> "$file"
+  cache_state_snapshot "$M2_REPO" "m2_end" "$file"
+}
+
+warm_cache_once() {
+  local warm_dir="$WORK_DIR/warmup"
+  mkdir -p "$warm_dir"
+  log "Running Maven warm-cache preflight"
+
+  set +e
+  (
+    cd "$REPO_DIR"
+    "${MAVEN_BASE_ARGS[@]}" -DskipTests dependency:go-offline test-compile
+  ) > "$warm_dir/mvn-warmup.log" 2>&1
+  local warm_ec=$?
+  set -e
+  [[ "$warm_ec" -eq 0 ]] || fail "Warm-cache preflight failed (see $warm_dir/mvn-warmup.log)"
+
+  set +e
+  (
+    cd "$REPO_DIR"
+    "${MAVEN_BASE_ARGS[@]}" org.jacoco:jacoco-maven-plugin:help -Ddetail=false -Dgoal=merge
+  ) > "$warm_dir/mvn-jacoco-plugin.log" 2>&1
+  local jacoco_plugin_ec=$?
+  set -e
+  [[ "$jacoco_plugin_ec" -eq 0 ]] || fail "JaCoCo plugin prefetch failed (see $warm_dir/mvn-jacoco-plugin.log)"
+
+  if [[ "$OFFLINE" -eq 1 ]]; then
+    log "Validating offline Maven preflight"
+    set +e
+    (
+      cd "$REPO_DIR"
+      "${MAVEN_BASE_ARGS[@]}" -o -DskipTests test-compile
+    ) > "$warm_dir/mvn-offline-check.log" 2>&1
+    local offline_ec=$?
+    set -e
+    [[ "$offline_ec" -eq 0 ]] || fail "Offline validation failed (see $warm_dir/mvn-offline-check.log)"
+  fi
 }
 
 run_full() {
@@ -346,7 +677,7 @@ run_full() {
   set +e
   (
     cd "$REPO_DIR"
-    /usr/bin/time -p "${MAVEN_BASE_ARGS[@]}" "${MAVEN_TEST_GOALS[@]}"
+    /usr/bin/time -p "${MAVEN_BASE_ARGS[@]}" "${MAVEN_RUNTIME_ARGS[@]}" "${MAVEN_TEST_GOALS[@]}"
   ) >"$full_log" 2>&1
   FULL_MVN_EC=$?
   set -e
@@ -363,7 +694,7 @@ run_full() {
   log "Generating jacoco.xml for full run (if needed)"
   (
     cd "$REPO_DIR"
-    /usr/bin/time -p mvn -q -Dmaven.repo.local="$M2_REPO" org.jacoco:jacoco-maven-plugin:report
+    /usr/bin/time -p "${MAVEN_BASE_ARGS[@]}" "${MAVEN_RUNTIME_ARGS[@]}" org.jacoco:jacoco-maven-plugin:report
   ) >"$report_log" 2>&1
   FULL_REPORT_REAL="$(extract_real_secs "$report_log")"
 
@@ -377,10 +708,10 @@ run_full() {
 
 run_seq() {
   local dir="$WORK_DIR/seq"
-  mkdir -p "$dir/logs" "$dir/xml" "$dir/bin" "$dir/meta" "$dir/status" "$dir/merged"
+  mkdir -p "$dir/logs" "$dir/exec" "$dir/bin" "$dir/meta" "$dir/status" "$dir/jacoco" "$dir/report"
 
   log "Building shard plan for sequential mode"
-  plan_shards "$dir" "seq"
+  plan_shards "$dir" "seq" "$SHARDS"
 
   log "Running sequential shard jobs"
   local seq_start seq_end
@@ -388,7 +719,7 @@ run_seq() {
   for shard_file in "$dir"/shards/shard-*.txt; do
     local shard_name
     shard_name="$(basename "$shard_file" .txt)"
-    run_one_shard "$REPO_DIR" "$shard_file" "$shard_name" "$dir" "seq"
+    run_one_shard "$REPO_DIR" "$shard_file" "$shard_name" "$dir" "seq" "$SHARDS"
   done
   seq_end="$(date +%s)"
 
@@ -404,23 +735,24 @@ run_seq() {
     "seq expected-vs-executed"
 
   log "Merging sequential shard artifacts"
-  merge_and_report "$dir"
+  merge_and_report "$dir" "$REPO_DIR"
 
   local seq_cov
-  seq_cov="$(coverage_from_report_json "$dir/merged/report.json")"
+  seq_cov="$(coverage_from_report_json "$dir/report/report.json")"
   SEQ_COVERAGE_PCT="$(echo "$seq_cov" | awk '{print $1}')"
 }
 
 run_parallel_pass() {
   local pass_dir="$1"
   local pass_label="$2"
+  local shard_count="$3"
 
-  mkdir -p "$pass_dir/logs" "$pass_dir/xml" "$pass_dir/bin" "$pass_dir/meta" "$pass_dir/status" "$pass_dir/merged" "$pass_dir/clones"
+  mkdir -p "$pass_dir/logs" "$pass_dir/exec" "$pass_dir/bin" "$pass_dir/meta" "$pass_dir/status" "$pass_dir/jacoco" "$pass_dir/report" "$pass_dir/clones"
 
-  plan_shards "$pass_dir" "$pass_label"
+  plan_shards "$pass_dir" "$pass_label" "$shard_count"
 
   log "$pass_label: preparing isolated clones"
-  for i in $(seq 1 "$SHARDS"); do
+  for i in $(seq 1 "$shard_count"); do
     rm -rf "$pass_dir/clones/shard-$i"
     git clone --quiet --shared "$REPO_DIR" "$pass_dir/clones/shard-$i"
   done
@@ -429,14 +761,14 @@ run_parallel_pass() {
   pass_start="$(date +%s)"
 
   local pids=()
-  for i in $(seq 1 "$SHARDS"); do
+  for i in $(seq 1 "$shard_count"); do
     local shard_name="shard-$i"
     local repo="$pass_dir/clones/$shard_name"
     local shard_file="$pass_dir/shards/$shard_name.txt"
 
     [[ -f "$shard_file" ]] || fail "$pass_label: missing planned shard file $shard_file"
 
-    run_one_shard "$repo" "$shard_file" "$shard_name" "$pass_dir" "$pass_label" &
+    run_one_shard "$repo" "$shard_file" "$shard_name" "$pass_dir" "$pass_label" "$shard_count" &
     pids+=("$!")
   done
 
@@ -459,10 +791,10 @@ run_parallel_pass() {
     "$pass_dir/meta/executed-vs-expected.diff" \
     "$pass_label expected-vs-executed"
 
-  merge_and_report "$pass_dir"
+  merge_and_report "$pass_dir" "$REPO_DIR"
 
   local pass_cov
-  pass_cov="$(coverage_from_report_json "$pass_dir/merged/report.json")"
+  pass_cov="$(coverage_from_report_json "$pass_dir/report/report.json")"
 
   if [[ "$pass_label" == "par-pass1" ]]; then
     PAR_PASS1_WALL="$pass_wall"
@@ -477,9 +809,16 @@ run_par() {
   local pass2_dir="$dir/pass2"
   mkdir -p "$dir"
 
+  PAR_PASS1_SHARDS="$SHARDS"
+  PAR_EFFECTIVE_SHARDS="$SHARDS"
+  PAR_FALLBACK_USED=0
+
   log "Running parallel pass 1 (seed timings)"
   local pass1_out
-  pass1_out="$(run_parallel_pass "$pass1_dir" "par-pass1")"
+  pass1_out="$(run_parallel_pass "$pass1_dir" "par-pass1" "$PAR_PASS1_SHARDS")"
+
+  PAR_PASS1_MEDIAN_SETUP_S="$(median_setup_secs "$pass1_dir/meta/shard_status.tsv")"
+  log "par-pass1 median setup/build seconds: $PAR_PASS1_MEDIAN_SETUP_S"
 
   log "Updating timings from pass 1 JUnit XML"
   local update_glob="$pass1_dir/clones/shard-*/target/surefire-reports/TEST-*.xml"
@@ -493,9 +832,27 @@ run_par() {
     --junit-id-granularity class \
     --json > "$pass1_dir/meta/timings-update.json"
 
+  local use_fallback=0
+  if [[ "$AUTO_FALLBACK" -eq 1 && "$SHARDS" -eq 8 && "$FALLBACK_SHARDS" -gt 0 ]]; then
+    use_fallback="$(awk -v median="$PAR_PASS1_MEDIAN_SETUP_S" -v threshold="$SETUP_THRESHOLD_S" 'BEGIN{if (median > threshold) print 1; else print 0}')"
+  fi
+  if [[ "$use_fallback" -eq 1 ]]; then
+    PAR_EFFECTIVE_SHARDS="$FALLBACK_SHARDS"
+    PAR_FALLBACK_USED=1
+    log "Setup inflation detected (median=$PAR_PASS1_MEDIAN_SETUP_S > threshold=$SETUP_THRESHOLD_S), using fallback shard count: $PAR_EFFECTIVE_SHARDS"
+  fi
+
+  {
+    echo "pass1_shards=$PAR_PASS1_SHARDS"
+    echo "pass1_median_setup_s=$PAR_PASS1_MEDIAN_SETUP_S"
+    echo "setup_threshold_s=$SETUP_THRESHOLD_S"
+    echo "fallback_used=$PAR_FALLBACK_USED"
+    echo "effective_shards=$PAR_EFFECTIVE_SHARDS"
+  } > "$dir/meta/parallel-decision.txt"
+
   log "Running parallel pass 2 (measured)"
   local pass2_out
-  pass2_out="$(run_parallel_pass "$pass2_dir" "par-pass2")"
+  pass2_out="$(run_parallel_pass "$pass2_dir" "par-pass2" "$PAR_EFFECTIVE_SHARDS")"
 
   PAR_WALL="${pass2_out%%|*}"
   PAR_COVERAGE_PCT="${pass2_out##*|}"
@@ -524,7 +881,11 @@ print_summary() {
   echo "work_dir: $WORK_DIR"
   echo "repo_dir: $REPO_DIR"
   echo "timings_path: $TIMINGS_PATH"
-  echo "shards: $SHARDS"
+  echo "shards.configured: $SHARDS"
+  echo "offline: $OFFLINE"
+  echo "warm_cache: $WARM_CACHE"
+  echo "auto_fallback: $AUTO_FALLBACK"
+  echo "metadata: $WORK_DIR/meta/environment.txt"
   echo
   if has_mode full; then
     echo "full.mvn_exit_code: $FULL_MVN_EC"
@@ -547,10 +908,14 @@ print_summary() {
     echo
   fi
   if has_mode par; then
+    echo "par.pass1.shards: $PAR_PASS1_SHARDS"
     echo "par.pass1.wall_s: ${PAR_PASS1_WALL:-0}"
+    echo "par.pass1.median_setup_s: $PAR_PASS1_MEDIAN_SETUP_S"
     echo "par.wall_s: $PAR_WALL"
     echo "par.sum_shard_s: $PAR_SUM_SHARDS"
     echo "par.max_shard_s: $PAR_MAX_SHARD"
+    echo "par.fallback_used: $PAR_FALLBACK_USED"
+    echo "par.effective_shards: $PAR_EFFECTIVE_SHARDS"
     echo "par.coverage_pct: $PAR_COVERAGE_PCT"
     echo "par.pass1.dir: $WORK_DIR/par/pass1"
     echo "par.pass2.dir: $WORK_DIR/par/pass2"
@@ -599,6 +964,38 @@ parse_args() {
         COVY_BIN="$2"
         shift 2
         ;;
+      --auto-fallback)
+        AUTO_FALLBACK=1
+        shift
+        ;;
+      --no-auto-fallback)
+        AUTO_FALLBACK=0
+        shift
+        ;;
+      --fallback-shards)
+        FALLBACK_SHARDS="$2"
+        shift 2
+        ;;
+      --setup-threshold-s)
+        SETUP_THRESHOLD_S="$2"
+        shift 2
+        ;;
+      --warm-cache)
+        WARM_CACHE=1
+        shift
+        ;;
+      --no-warm-cache)
+        WARM_CACHE=0
+        shift
+        ;;
+      --offline)
+        OFFLINE=1
+        shift
+        ;;
+      --online)
+        OFFLINE=0
+        shift
+        ;;
       --skip-build)
         SKIP_BUILD=1
         shift
@@ -646,6 +1043,10 @@ main() {
     -DfailIfNoTests=false
     -Dsurefire.failIfNoSpecifiedTests=false
   )
+  MAVEN_RUNTIME_ARGS=()
+  if [[ "$OFFLINE" -eq 1 ]]; then
+    MAVEN_RUNTIME_ARGS=(-o)
+  fi
 
   if [[ "$SKIP_BUILD" -eq 0 ]]; then
     log "Building covy release binary"
@@ -661,6 +1062,20 @@ main() {
     git clone --depth 1 https://github.com/apache/commons-lang.git "$REPO_DIR" >/dev/null
   fi
 
+  if supports_param_bucketing; then
+    PARAM_BUCKETING_ENABLED=1
+    log "Parameter bucketing support detected in target repo"
+  else
+    PARAM_BUCKETING_ENABLED=0
+    log "Parameter bucketing support not detected in target repo"
+  fi
+
+  record_global_metadata_start
+
+  if [[ "$WARM_CACHE" -eq 1 ]]; then
+    warm_cache_once
+  fi
+
   EXPECTED_TESTS_FILE="$WORK_DIR/seq/meta/expected-tests.txt"
   build_expected_manifest "$EXPECTED_TESTS_FILE"
 
@@ -674,6 +1089,7 @@ main() {
     run_par
   fi
 
+  record_global_metadata_end
   print_summary
 }
 
