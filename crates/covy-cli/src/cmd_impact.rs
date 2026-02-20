@@ -75,7 +75,7 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     );
 
     if args.print_command {
-        let command = build_print_command(&result.selected_tests);
+        let command = build_print_command(&result.selected_tests, &map.test_language);
         println!("{command}");
     }
 
@@ -144,11 +144,36 @@ fn apply_policy(
     Ok(())
 }
 
-fn build_print_command(selected_tests: &[String]) -> String {
+fn build_print_command(
+    selected_tests: &[String],
+    test_language: &std::collections::BTreeMap<String, String>,
+) -> String {
     if selected_tests.is_empty() {
         return "echo \"no impacted tests\"".to_string();
     }
-    format!("mvn -Dtest={} test", selected_tests.join(","))
+
+    let mut java_tests = Vec::new();
+    let mut python_tests = Vec::new();
+    for test in selected_tests {
+        let language = test_language
+            .get(test)
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| if test.contains("::") { "python" } else { "java" });
+        if language.eq_ignore_ascii_case("python") {
+            python_tests.push(test.clone());
+        } else {
+            java_tests.push(test.clone());
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !java_tests.is_empty() {
+        parts.push(format!("mvn -Dtest={} test", java_tests.join(",")));
+    }
+    if !python_tests.is_empty() {
+        parts.push(format!("pytest {}", python_tests.join(" ")));
+    }
+    parts.join(" && ")
 }
 
 #[cfg(test)]
@@ -205,8 +230,42 @@ mod tests {
 
     #[test]
     fn test_build_print_command() {
-        let cmd = build_print_command(&["a.Test".to_string(), "b.Test".to_string()]);
+        let langs = std::collections::BTreeMap::new();
+        let cmd = build_print_command(&["a.Test".to_string(), "b.Test".to_string()], &langs);
         assert_eq!(cmd, "mvn -Dtest=a.Test,b.Test test");
-        assert_eq!(build_print_command(&[]), "echo \"no impacted tests\"");
+        assert_eq!(build_print_command(&[], &langs), "echo \"no impacted tests\"");
+    }
+
+    #[test]
+    fn test_build_print_command_python_nodeids() {
+        let mut langs = std::collections::BTreeMap::new();
+        langs.insert("tests/test_a.py::test_one".to_string(), "python".to_string());
+        langs.insert("tests/test_b.py::test_two".to_string(), "python".to_string());
+        let cmd = build_print_command(
+            &[
+                "tests/test_a.py::test_one".to_string(),
+                "tests/test_b.py::test_two".to_string(),
+            ],
+            &langs,
+        );
+        assert_eq!(cmd, "pytest tests/test_a.py::test_one tests/test_b.py::test_two");
+    }
+
+    #[test]
+    fn test_build_print_command_mixed_languages() {
+        let mut langs = std::collections::BTreeMap::new();
+        langs.insert("com.foo.BarTest".to_string(), "java".to_string());
+        langs.insert("tests/test_a.py::test_one".to_string(), "python".to_string());
+        let cmd = build_print_command(
+            &[
+                "com.foo.BarTest".to_string(),
+                "tests/test_a.py::test_one".to_string(),
+            ],
+            &langs,
+        );
+        assert_eq!(
+            cmd,
+            "mvn -Dtest=com.foo.BarTest test && pytest tests/test_a.py::test_one"
+        );
     }
 }
