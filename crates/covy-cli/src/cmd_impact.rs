@@ -75,11 +75,7 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     );
 
     if args.print_command {
-        let command = if result.selected_tests.is_empty() {
-            "echo \"no impacted tests\"".to_string()
-        } else {
-            format!("mvn -Dtest={} test", result.selected_tests.join(","))
-        };
+        let command = build_print_command(&result.selected_tests);
         println!("{command}");
     }
 
@@ -148,6 +144,13 @@ fn apply_policy(
     Ok(())
 }
 
+fn build_print_command(selected_tests: &[String]) -> String {
+    if selected_tests.is_empty() {
+        return "echo \"no impacted tests\"".to_string();
+    }
+    format!("mvn -Dtest={} test", selected_tests.join(","))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +201,12 @@ mod tests {
         .unwrap();
         apply_policy(&mut result, &diffs, &cfg, false, 5).unwrap();
         assert!(result.escalate_full_suite);
+    }
+
+    #[test]
+    fn test_build_print_command() {
+        let cmd = build_print_command(&["a.Test".to_string(), "b.Test".to_string()]);
+        assert_eq!(cmd, "mvn -Dtest=a.Test,b.Test test");
+        assert_eq!(build_print_command(&[]), "echo \"no impacted tests\"");
     }
 }
