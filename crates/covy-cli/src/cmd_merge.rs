@@ -46,6 +46,35 @@ pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
     let (diag_merged, skipped_diag) =
         covy_core::merge::merge_diagnostics_inputs(&diagnostics_inputs, strict)?;
 
+    let output_coverage = if args.output_coverage == ".covy/state/latest.bin" {
+        config.merge.output_coverage.as_str()
+    } else {
+        args.output_coverage.as_str()
+    };
+    let output_issues = if args.output_issues == ".covy/state/issues.bin" {
+        config.merge.output_issues.as_str()
+    } else {
+        args.output_issues.as_str()
+    };
+
+    if !coverage_inputs.is_empty() {
+        write_file(
+            Path::new(output_coverage),
+            &covy_core::cache::serialize_coverage(&coverage_merged)?,
+        )?;
+    }
+    if !diagnostics_inputs.is_empty() {
+        write_file(
+            Path::new(output_issues),
+            &covy_core::cache::serialize_diagnostics_with_metadata(
+                &diag_merged,
+                &covy_core::cache::DiagnosticsStateMetadata::normalized_for_repo_root(
+                    covy_core::cache::current_repo_root_id(None),
+                ),
+            )?,
+        )?;
+    }
+
     let summary = covy_core::merge::MergeSummary {
         coverage_inputs: coverage_inputs.len(),
         diagnostics_inputs: diagnostics_inputs.len(),
@@ -85,6 +114,14 @@ fn resolve_globs(patterns: &[String]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +130,13 @@ mod tests {
     fn test_resolve_globs_empty_ok() {
         let files = resolve_globs(&["/definitely/not/found/*.bin".to_string()]).unwrap();
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_write_file_creates_parent_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("state.bin");
+        write_file(&path, b"abc").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"abc");
     }
 }

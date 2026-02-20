@@ -552,3 +552,67 @@ fn test_merge_strict_fails_on_corrupt_artifacts() {
         .failure()
         .stderr(predicate::str::contains("Failed to merge coverage input"));
 }
+
+#[test]
+fn test_merge_writes_output_coverage_state() {
+    let dir = TempDir::new().unwrap();
+    let shard = dir.path().join("shard.bin");
+    let merged = dir.path().join("merged.bin");
+
+    covy_cmd()
+        .args([
+            "ingest",
+            &fixture("lcov/basic.info"),
+            "--output",
+            shard.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args([
+            "merge",
+            "--coverage",
+            shard.to_str().unwrap(),
+            "--output-coverage",
+            merged.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    assert!(merged.exists());
+}
+
+#[test]
+fn test_merge_writes_output_issues_state() {
+    let dir = TempDir::new().unwrap();
+    let shard = dir.path().join("issues-shard.bin");
+    let merged = dir.path().join("issues-merged.bin");
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args([
+            "ingest",
+            "--issues",
+            &fixture("sarif/basic.sarif"),
+        ])
+        .assert()
+        .success();
+
+    std::fs::copy(dir.path().join(".covy/state/issues.bin"), &shard).unwrap();
+
+    covy_cmd()
+        .args([
+            "merge",
+            "--issues",
+            shard.to_str().unwrap(),
+            "--output-issues",
+            merged.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    assert!(merged.exists());
+}
