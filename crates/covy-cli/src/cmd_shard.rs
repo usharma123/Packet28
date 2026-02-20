@@ -172,10 +172,14 @@ fn write_shard_files(dir: &str, plan: &covy_core::shard::ShardPlan) -> Result<()
 
 fn render_text(plan: &covy_core::shard::ShardPlan) {
     println!(
-        "shards={} total_ms={} makespan_ms={}",
+        "shards={} total_ms={} makespan_ms={} imbalance_ratio={:.3} parallel_efficiency={:.3} whale_count={} top_10_share={:.3}",
         plan.shards.len(),
         plan.total_predicted_duration_ms,
-        plan.makespan_ms
+        plan.makespan_ms,
+        plan.imbalance_ratio,
+        plan.parallel_efficiency,
+        plan.whale_count,
+        plan.top_10_share
     );
     for shard in &plan.shards {
         println!(

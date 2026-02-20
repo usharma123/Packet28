@@ -85,6 +85,10 @@ pub struct ShardPlan {
     pub shards: Vec<Shard>,
     pub total_predicted_duration_ms: u64,
     pub makespan_ms: u64,
+    pub imbalance_ratio: f64,
+    pub parallel_efficiency: f64,
+    pub whale_count: usize,
+    pub top_10_share: f64,
 }
 
 pub fn build_timed_jobs(
@@ -146,10 +150,16 @@ pub fn plan_shards_lpt(input: &[(String, u64)], shard_count: usize) -> ShardPlan
         .max()
         .unwrap_or(0);
 
+    let (imbalance_ratio, parallel_efficiency) = compute_load_metrics(&shards, total, makespan);
+    let whale_threshold = compute_whale_threshold_ms(input);
     ShardPlan {
         shards,
         total_predicted_duration_ms: total,
         makespan_ms: makespan,
+        imbalance_ratio,
+        parallel_efficiency,
+        whale_count: count_whales(input, whale_threshold),
+        top_10_share: compute_top_10_share(input, total),
     }
 }
 
@@ -216,11 +226,59 @@ pub fn plan_shards_whale_lpt(input: &[(String, u64)], shard_count: usize) -> Sha
         .max()
         .unwrap_or(0);
 
+    let (imbalance_ratio, parallel_efficiency) = compute_load_metrics(&shards, total, makespan);
     ShardPlan {
         shards,
         total_predicted_duration_ms: total,
         makespan_ms: makespan,
+        imbalance_ratio,
+        parallel_efficiency,
+        whale_count: count_whales(input, whale_threshold),
+        top_10_share: compute_top_10_share(input, total),
     }
+}
+
+fn count_whales(input: &[(String, u64)], whale_threshold: u64) -> usize {
+    input
+        .iter()
+        .filter(|(_, duration)| *duration > whale_threshold)
+        .count()
+}
+
+fn compute_top_10_share(input: &[(String, u64)], total: u64) -> f64 {
+    if total == 0 || input.is_empty() {
+        return 0.0;
+    }
+    let mut durations: Vec<u64> = input.iter().map(|(_, d)| *d).collect();
+    durations.sort_unstable_by(|a, b| b.cmp(a));
+    let top_sum: u64 = durations.into_iter().take(10).sum();
+    top_sum as f64 / total as f64
+}
+
+fn compute_load_metrics(shards: &[Shard], total: u64, makespan: u64) -> (f64, f64) {
+    if shards.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut loads: Vec<u64> = shards.iter().map(|s| s.predicted_duration_ms).collect();
+    loads.sort_unstable();
+    let median = if loads.len() % 2 == 1 {
+        loads[loads.len() / 2] as f64
+    } else {
+        let hi = loads.len() / 2;
+        let lo = hi - 1;
+        (loads[lo] as f64 + loads[hi] as f64) / 2.0
+    };
+    let imbalance_ratio = if median > 0.0 {
+        makespan as f64 / median
+    } else {
+        0.0
+    };
+    let parallel_efficiency = if makespan > 0 {
+        total as f64 / ((makespan as f64) * (shards.len() as f64))
+    } else {
+        1.0
+    };
+    (imbalance_ratio, parallel_efficiency)
 }
 
 #[cfg(test)]
@@ -239,6 +297,7 @@ mod tests {
         assert_eq!(plan.shards.len(), 2);
         assert_eq!(plan.total_predicted_duration_ms, 340);
         assert!(plan.makespan_ms <= 170);
+        assert!(plan.parallel_efficiency > 0.0);
     }
 
     #[test]
@@ -334,5 +393,18 @@ mod tests {
         let p2 = plan_shards_whale_lpt(&input, 2);
         assert_eq!(p1.shards[0].tests, p2.shards[0].tests);
         assert_eq!(p1.shards[1].tests, p2.shards[1].tests);
+    }
+
+    #[test]
+    fn test_plan_metrics_are_computed() {
+        let input = vec![
+            ("a".to_string(), 50),
+            ("b".to_string(), 40),
+            ("c".to_string(), 10),
+        ];
+        let plan = plan_shards_lpt(&input, 2);
+        assert!(plan.imbalance_ratio >= 1.0);
+        assert!(plan.parallel_efficiency > 0.0);
+        assert!(plan.top_10_share > 0.0);
     }
 }

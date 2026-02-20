@@ -508,7 +508,9 @@ fn test_shard_plan_json_and_file_outputs() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"shards\""));
+        .stdout(predicate::str::contains("\"shards\""))
+        .stdout(predicate::str::contains("\"imbalance_ratio\""))
+        .stdout(predicate::str::contains("\"parallel_efficiency\""));
 
     assert!(out_dir.join("shard-1.txt").exists());
     assert!(out_dir.join("shard-2.txt").exists());
