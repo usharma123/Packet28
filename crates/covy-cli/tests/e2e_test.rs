@@ -654,6 +654,39 @@ fn test_testmap_build_supports_python_language_metadata() {
 }
 
 #[test]
+fn test_testmap_build_writes_timings_output() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("manifest.jsonl");
+    let output = dir.path().join("testmap.bin");
+    let timings_output = dir.path().join("testtimings.bin");
+
+    let line = format!(
+        "{{\"test_id\":\"com.foo.BarTest\",\"language\":\"java\",\"duration_ms\":1234,\"coverage_report\":\"{}\"}}\n",
+        fixture("lcov/basic.info")
+    );
+    std::fs::write(&manifest, line).unwrap();
+
+    covy_cmd()
+        .args([
+            "testmap",
+            "build",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--timings-output",
+            timings_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&timings_output).unwrap();
+    let timings = covy_core::cache::deserialize_test_timings(&bytes).unwrap();
+    assert_eq!(timings.duration_ms.get("com.foo.BarTest"), Some(&1234));
+    assert_eq!(timings.sample_count.get("com.foo.BarTest"), Some(&1));
+}
+
+#[test]
 fn test_shard_plan_supports_python_nodeids() {
     let dir = TempDir::new().unwrap();
     let tests_file = dir.path().join("py-tests.txt");

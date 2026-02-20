@@ -61,6 +61,14 @@ pub fn run(args: TestmapArgs, _config_path: &str) -> Result<i32> {
             let bytes = covy_core::cache::serialize_testmap(&index)?;
             std::fs::write(output, bytes)?;
 
+            let timings = build_test_timing_history(&records);
+            let timings_output = Path::new(&build.timings_output);
+            if let Some(parent) = timings_output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let timing_bytes = covy_core::cache::serialize_test_timings(&timings)?;
+            std::fs::write(timings_output, timing_bytes)?;
+
             tracing::info!(
                 "Built testmap from {} manifest records across {} file(s)",
                 records.len(),
@@ -231,6 +239,25 @@ fn build_file_to_tests_index(
     file_to_tests
 }
 
+fn build_test_timing_history(records: &[ManifestRecord]) -> covy_core::testmap::TestTimingHistory {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut history = covy_core::testmap::TestTimingHistory {
+        generated_at: now,
+        ..Default::default()
+    };
+    for rec in records {
+        if let Some(duration_ms) = rec.duration_ms {
+            history.duration_ms.insert(rec.test_id.clone(), duration_ms);
+            history.sample_count.insert(rec.test_id.clone(), 1);
+            history.last_seen.insert(rec.test_id.clone(), now);
+        }
+    }
+    history
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +340,33 @@ mod tests {
         assert_eq!(normalize_language("java"), Some("java".to_string()));
         assert_eq!(normalize_language("py"), Some("python".to_string()));
         assert_eq!(normalize_language("ruby"), None);
+    }
+
+    #[test]
+    fn test_build_test_timing_history_from_manifest_durations() {
+        let records = vec![
+            ManifestRecord {
+                test_id: "com.foo.BarTest".to_string(),
+                language: Some("java".to_string()),
+                duration_ms: Some(1200),
+                coverage_report: Some("a.info".to_string()),
+                coverage_reports: Vec::new(),
+            },
+            ManifestRecord {
+                test_id: "tests/test_mod.py::test_one".to_string(),
+                language: Some("python".to_string()),
+                duration_ms: Some(900),
+                coverage_report: Some("b.info".to_string()),
+                coverage_reports: Vec::new(),
+            },
+        ];
+        let timings = build_test_timing_history(&records);
+        assert_eq!(timings.duration_ms.get("com.foo.BarTest"), Some(&1200));
+        assert_eq!(
+            timings.duration_ms.get("tests/test_mod.py::test_one"),
+            Some(&900)
+        );
+        assert_eq!(timings.sample_count.get("com.foo.BarTest"), Some(&1));
+        assert!(timings.generated_at > 0);
     }
 }
