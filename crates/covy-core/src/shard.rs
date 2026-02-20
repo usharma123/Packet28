@@ -12,6 +12,24 @@ pub struct ShardPlan {
     pub makespan_ms: u64,
 }
 
+pub fn build_timed_jobs(
+    test_ids: &[String],
+    timings: &crate::testmap::TestTimingHistory,
+    unknown_test_duration_ms: u64,
+) -> Vec<(String, u64)> {
+    test_ids
+        .iter()
+        .map(|test_id| {
+            let duration = timings
+                .duration_ms
+                .get(test_id)
+                .copied()
+                .unwrap_or(unknown_test_duration_ms);
+            (test_id.clone(), duration)
+        })
+        .collect()
+}
+
 /// Longest-processing-time-first bin-packing planner.
 pub fn plan_shards_lpt(input: &[(String, u64)], shard_count: usize) -> ShardPlan {
     if shard_count == 0 {
@@ -90,5 +108,18 @@ mod tests {
         let p2 = plan_shards_lpt(&input, 2);
         assert_eq!(p1.shards[0].tests, p2.shards[0].tests);
         assert_eq!(p1.shards[1].tests, p2.shards[1].tests);
+    }
+
+    #[test]
+    fn test_build_timed_jobs_uses_fallback_for_unknown_tests() {
+        let mut timings = crate::testmap::TestTimingHistory::default();
+        timings.duration_ms.insert("known".to_string(), 50);
+        let jobs = build_timed_jobs(
+            &["known".to_string(), "unknown".to_string()],
+            &timings,
+            8000,
+        );
+        assert_eq!(jobs[0], ("known".to_string(), 50));
+        assert_eq!(jobs[1], ("unknown".to_string(), 8000));
     }
 }
