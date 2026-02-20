@@ -7,9 +7,12 @@ use std::time::{Duration, SystemTime};
 use crate::diagnostics::{DiagnosticsData, DiagnosticsFormat, Issue, Severity};
 use crate::error::CovyError;
 use crate::model::CoverageData;
+use crate::testmap::{TestMapIndex, TestTimingHistory};
 
 pub const DIAGNOSTICS_STATE_SCHEMA_VERSION: u16 = 2;
 pub const DIAGNOSTICS_PATH_NORM_VERSION: u16 = 1;
+pub const TESTMAP_SCHEMA_VERSION: u16 = 1;
+pub const TESTTIMINGS_SCHEMA_VERSION: u16 = 1;
 const DIAGNOSTICS_MAGIC: &[u8; 9] = b"COVYDIAG2";
 
 /// File-system cache for coverage data keyed by hash.
@@ -217,6 +220,56 @@ pub fn deserialize_coverage(data: &[u8]) -> Result<CoverageData, CovyError> {
         format: None,
         timestamp,
     })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredTestTimingHistory {
+    schema_version: u16,
+    timings: TestTimingHistory,
+}
+
+/// Serialize TestMapIndex to bytes for storage.
+pub fn serialize_testmap(index: &TestMapIndex) -> Result<Vec<u8>, CovyError> {
+    let mut stored = index.clone();
+    stored.metadata.schema_version = TESTMAP_SCHEMA_VERSION;
+    bincode::serialize(&stored)
+        .map_err(|e| CovyError::Cache(format!("Failed to serialize testmap: {e}")))
+}
+
+/// Deserialize TestMapIndex from bytes.
+pub fn deserialize_testmap(data: &[u8]) -> Result<TestMapIndex, CovyError> {
+    let stored: TestMapIndex = bincode::deserialize(data)
+        .map_err(|e| CovyError::Cache(format!("Failed to deserialize testmap: {e}")))?;
+    if stored.metadata.schema_version != TESTMAP_SCHEMA_VERSION {
+        return Err(CovyError::Cache(format!(
+            "Unsupported testmap schema version {} (expected {})",
+            stored.metadata.schema_version, TESTMAP_SCHEMA_VERSION
+        )));
+    }
+    Ok(stored)
+}
+
+/// Serialize TestTimingHistory to bytes for storage.
+pub fn serialize_test_timings(timings: &TestTimingHistory) -> Result<Vec<u8>, CovyError> {
+    let stored = StoredTestTimingHistory {
+        schema_version: TESTTIMINGS_SCHEMA_VERSION,
+        timings: timings.clone(),
+    };
+    bincode::serialize(&stored)
+        .map_err(|e| CovyError::Cache(format!("Failed to serialize test timings: {e}")))
+}
+
+/// Deserialize TestTimingHistory from bytes.
+pub fn deserialize_test_timings(data: &[u8]) -> Result<TestTimingHistory, CovyError> {
+    let stored: StoredTestTimingHistory = bincode::deserialize(data)
+        .map_err(|e| CovyError::Cache(format!("Failed to deserialize test timings: {e}")))?;
+    if stored.schema_version != TESTTIMINGS_SCHEMA_VERSION {
+        return Err(CovyError::Cache(format!(
+            "Unsupported test timings schema version {} (expected {})",
+            stored.schema_version, TESTTIMINGS_SCHEMA_VERSION
+        )));
+    }
+    Ok(stored.timings)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -968,5 +1021,42 @@ mod tests {
         assert!(restored.issues_by_file.contains_key("src/a.rs"));
         assert!(!restored.issues_by_file.contains_key("src/b.rs"));
         assert!(meta.is_some());
+    }
+
+    #[test]
+    fn test_testmap_serialization_roundtrip() {
+        let mut index = TestMapIndex::default();
+        index
+            .test_to_files
+            .entry("com.foo.BarTest".to_string())
+            .or_default()
+            .insert("src/main/java/com/foo/Bar.java".to_string());
+        index
+            .file_to_tests
+            .entry("src/main/java/com/foo/Bar.java".to_string())
+            .or_default()
+            .insert("com.foo.BarTest".to_string());
+
+        let bytes = serialize_testmap(&index).unwrap();
+        let restored = deserialize_testmap(&bytes).unwrap();
+        assert_eq!(
+            restored.metadata.schema_version,
+            TESTMAP_SCHEMA_VERSION
+        );
+        assert_eq!(restored.test_to_files.len(), 1);
+        assert_eq!(restored.file_to_tests.len(), 1);
+    }
+
+    #[test]
+    fn test_testtimings_serialization_roundtrip() {
+        let mut timings = TestTimingHistory::default();
+        timings.duration_ms.insert("test_a".to_string(), 1200);
+        timings.sample_count.insert("test_a".to_string(), 3);
+        timings.last_seen.insert("test_a".to_string(), 100);
+
+        let bytes = serialize_test_timings(&timings).unwrap();
+        let restored = deserialize_test_timings(&bytes).unwrap();
+        assert_eq!(restored.duration_ms.get("test_a"), Some(&1200));
+        assert_eq!(restored.sample_count.get("test_a"), Some(&3));
     }
 }
