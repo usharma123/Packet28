@@ -96,6 +96,20 @@ pub struct ShardConfig {
     pub timings_path: String,
     pub algorithm: String,
     pub unknown_test_seconds: f64,
+    pub tiers: ShardTiersConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShardTiersConfig {
+    pub pr: ShardTierConfig,
+    pub nightly: ShardTierConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShardTierConfig {
+    pub exclude_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -225,6 +239,26 @@ impl Default for ShardConfig {
             timings_path: ".covy/state/testtimings.bin".to_string(),
             algorithm: "lpt".to_string(),
             unknown_test_seconds: 8.0,
+            tiers: ShardTiersConfig::default(),
+        }
+    }
+}
+
+impl Default for ShardTiersConfig {
+    fn default() -> Self {
+        Self {
+            pr: ShardTierConfig {
+                exclude_tags: vec!["slow".to_string()],
+            },
+            nightly: ShardTierConfig::default(),
+        }
+    }
+}
+
+impl Default for ShardTierConfig {
+    fn default() -> Self {
+        Self {
+            exclude_tags: Vec::new(),
         }
     }
 }
@@ -322,6 +356,8 @@ mod tests {
         assert_eq!(config.impact.fallback_mode, "fail-open");
         assert_eq!(config.shard.algorithm, "lpt");
         assert!((config.shard.unknown_test_seconds - 8.0).abs() < f64::EPSILON);
+        assert_eq!(config.shard.tiers.pr.exclude_tags, vec!["slow".to_string()]);
+        assert!(config.shard.tiers.nightly.exclude_tags.is_empty());
         assert!(config.merge.strict);
         assert_eq!(config.merge.output_coverage, ".covy/state/latest.bin");
     }

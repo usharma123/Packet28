@@ -29,6 +29,18 @@ pub struct ShardPlanArgs {
     #[arg(long)]
     pub tasks_json: Option<String>,
 
+    /// Planning tier (pr or nightly)
+    #[arg(long, default_value = "nightly")]
+    pub tier: String,
+
+    /// Include only tasks with at least one of these tags (repeatable)
+    #[arg(long)]
+    pub include_tag: Vec<String>,
+
+    /// Exclude tasks with any of these tags (repeatable)
+    #[arg(long)]
+    pub exclude_tag: Vec<String>,
+
     /// Input tests file
     #[arg(long)]
     pub tests_file: Option<String>,
@@ -89,10 +101,15 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     match args.command {
         ShardCommands::Plan(plan) => {
-            let tests = load_tests(&plan)?;
-            if tests.is_empty() {
-                anyhow::bail!("No tests provided for shard planning");
+            let tasks = load_tasks(&plan)?;
+            if tasks.is_empty() {
+                anyhow::bail!("No tasks provided for shard planning");
             }
+            let tasks = apply_tag_filters(tasks, &plan, &config)?;
+            if tasks.is_empty() {
+                anyhow::bail!("No tasks remained after applying tier/tag filters");
+            }
+            let tests: Vec<String> = tasks.into_iter().map(|task| task.id).collect();
             let timings_path = plan
                 .timings
                 .as_deref()
@@ -169,7 +186,13 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
     }
 }
 
-fn load_tests(args: &ShardPlanArgs) -> Result<Vec<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanningTask {
+    id: String,
+    tags: Vec<String>,
+}
+
+fn load_tasks(args: &ShardPlanArgs) -> Result<Vec<PlanningTask>> {
     let provided = [
         args.tasks_json.is_some(),
         args.tests_file.is_some(),
@@ -186,35 +209,45 @@ fn load_tests(args: &ShardPlanArgs) -> Result<Vec<String>> {
     }
 
     if let Some(path) = &args.tasks_json {
-        return load_tests_from_tasks_json(Path::new(path));
+        return load_tasks_from_tasks_json(Path::new(path));
     }
     if let Some(path) = &args.tests_file {
-        return load_tests_from_file(Path::new(path));
+        return load_tasks_from_file(Path::new(path));
     }
-    load_tests_from_impact_json(Path::new(args.impact_json.as_deref().unwrap_or_default()))
+    load_tasks_from_impact_json(Path::new(args.impact_json.as_deref().unwrap_or_default()))
 }
 
-fn load_tests_from_file(path: &Path) -> Result<Vec<String>> {
+fn load_tasks_from_file(path: &Path) -> Result<Vec<PlanningTask>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read tests file {}", path.display()))?;
     let tests = content
         .lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
+        .map(|id| PlanningTask {
+            id: id.to_string(),
+            tags: Vec::new(),
+        })
         .collect();
     Ok(tests)
 }
 
-fn load_tests_from_impact_json(path: &Path) -> Result<Vec<String>> {
+fn load_tasks_from_impact_json(path: &Path) -> Result<Vec<PlanningTask>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read impact JSON {}", path.display()))?;
     let impact: covy_core::impact::ImpactResult =
         serde_json::from_str(&content).context("Failed to parse impact JSON")?;
-    Ok(impact.selected_tests)
+    Ok(impact
+        .selected_tests
+        .into_iter()
+        .map(|id| PlanningTask {
+            id,
+            tags: Vec::new(),
+        })
+        .collect())
 }
 
-fn load_tests_from_tasks_json(path: &Path) -> Result<Vec<String>> {
+fn load_tasks_from_tasks_json(path: &Path) -> Result<Vec<PlanningTask>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read tasks JSON {}", path.display()))?;
     let tasks: covy_core::shard::TaskSet =
@@ -222,10 +255,58 @@ fn load_tests_from_tasks_json(path: &Path) -> Result<Vec<String>> {
     let ids = tasks
         .tasks
         .into_iter()
-        .map(|task| task.id.trim().to_string())
-        .filter(|id| !id.is_empty())
+        .map(|task| PlanningTask {
+            id: task.id.trim().to_string(),
+            tags: task.tags,
+        })
+        .filter(|task| !task.id.is_empty())
         .collect();
     Ok(ids)
+}
+
+fn apply_tag_filters(
+    tasks: Vec<PlanningTask>,
+    args: &ShardPlanArgs,
+    config: &CovyConfig,
+) -> Result<Vec<PlanningTask>> {
+    let tier = args.tier.trim().to_ascii_lowercase();
+    let mut exclude: std::collections::BTreeSet<String> = match tier.as_str() {
+        "pr" => config
+            .shard
+            .tiers
+            .pr
+            .exclude_tags
+            .iter()
+            .map(normalize_tag)
+            .collect(),
+        "nightly" => config
+            .shard
+            .tiers
+            .nightly
+            .exclude_tags
+            .iter()
+            .map(normalize_tag)
+            .collect(),
+        _ => anyhow::bail!("Unsupported tier '{}'. Expected 'pr' or 'nightly'", args.tier),
+    };
+    exclude.extend(args.exclude_tag.iter().map(normalize_tag));
+    let include: std::collections::BTreeSet<String> =
+        args.include_tag.iter().map(normalize_tag).collect();
+
+    let filtered = tasks
+        .into_iter()
+        .filter(|task| {
+            let task_tags: Vec<String> = task.tags.iter().map(normalize_tag).collect();
+            let include_ok = include.is_empty() || task_tags.iter().any(|tag| include.contains(tag));
+            let excluded = task_tags.iter().any(|tag| exclude.contains(tag));
+            include_ok && !excluded
+        })
+        .collect();
+    Ok(filtered)
+}
+
+fn normalize_tag(tag: impl AsRef<str>) -> String {
+    tag.as_ref().trim().to_ascii_lowercase()
 }
 
 fn load_timings(path: &Path) -> Result<covy_core::testmap::TestTimingHistory> {
@@ -386,8 +467,20 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("tests.txt");
         std::fs::write(&path, "a\n\nb\n").unwrap();
-        let tests = load_tests_from_file(&path).unwrap();
-        assert_eq!(tests, vec!["a".to_string(), "b".to_string()]);
+        let tests = load_tasks_from_file(&path).unwrap();
+        assert_eq!(
+            tests,
+            vec![
+                PlanningTask {
+                    id: "a".to_string(),
+                    tags: Vec::new()
+                },
+                PlanningTask {
+                    id: "b".to_string(),
+                    tags: Vec::new()
+                }
+            ]
+        );
     }
 
     #[test]
@@ -403,12 +496,18 @@ mod tests {
             "escalate_full_suite": false
         });
         std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
-        let tests = load_tests_from_impact_json(&path).unwrap();
+        let tests = load_tasks_from_impact_json(&path).unwrap();
         assert_eq!(
             tests,
             vec![
-                "tests/test_x.py::test_a".to_string(),
-                "tests/test_y.py::test_b".to_string()
+                PlanningTask {
+                    id: "tests/test_x.py::test_a".to_string(),
+                    tags: Vec::new()
+                },
+                PlanningTask {
+                    id: "tests/test_y.py::test_b".to_string(),
+                    tags: Vec::new()
+                }
             ]
         );
     }
@@ -425,14 +524,50 @@ mod tests {
             ]
         });
         std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
-        let tests = load_tests_from_tasks_json(&path).unwrap();
+        let tests = load_tasks_from_tasks_json(&path).unwrap();
         assert_eq!(
             tests,
             vec![
-                "com.foo.BarTest".to_string(),
-                "tests/test_mod.py::test_one".to_string()
+                PlanningTask {
+                    id: "com.foo.BarTest".to_string(),
+                    tags: Vec::new()
+                },
+                PlanningTask {
+                    id: "tests/test_mod.py::test_one".to_string(),
+                    tags: Vec::new()
+                }
             ]
         );
+    }
+
+    #[test]
+    fn test_apply_tag_filters_pr_excludes_slow() {
+        let tasks = vec![
+            PlanningTask {
+                id: "fast-test".to_string(),
+                tags: vec!["unit".to_string()],
+            },
+            PlanningTask {
+                id: "slow-test".to_string(),
+                tags: vec!["slow".to_string()],
+            },
+        ];
+        let args = ShardPlanArgs {
+            shards: 2,
+            tasks_json: None,
+            tier: "pr".to_string(),
+            include_tag: Vec::new(),
+            exclude_tag: Vec::new(),
+            tests_file: None,
+            impact_json: None,
+            timings: None,
+            unknown_test_seconds: None,
+            json: true,
+            write_files: None,
+        };
+        let filtered = apply_tag_filters(tasks, &args, &CovyConfig::default()).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "fast-test");
     }
 
     #[test]

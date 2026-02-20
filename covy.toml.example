@@ -69,6 +69,14 @@ algorithm = "lpt"
 # Predicted seconds for tests with no timing history
 unknown_test_seconds = 8.0
 
+[shard.tiers.pr]
+# Fast PR lane excludes slow-tagged tasks by default
+exclude_tags = ["slow"]
+
+[shard.tiers.nightly]
+# Nightly lane includes all tags by default
+exclude_tags = []
+
 [merge]
 # Fail on missing/corrupt shard artifacts
 strict = true

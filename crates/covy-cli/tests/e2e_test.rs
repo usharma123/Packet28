@@ -742,6 +742,68 @@ fn test_shard_plan_supports_tasks_json() {
 }
 
 #[test]
+fn test_shard_plan_pr_tier_excludes_slow_tagged_tasks() {
+    let dir = TempDir::new().unwrap();
+    let tasks_file = dir.path().join("tasks.json");
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "fast-test", "selector": "fast-test", "est_ms": 1000, "tags": ["unit"]},
+            {"id": "slow-test", "selector": "slow-test", "est_ms": 2000, "tags": ["slow"]}
+        ]
+    });
+    std::fs::write(&tasks_file, serde_json::to_string(&payload).unwrap()).unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "plan",
+            "--shards",
+            "2",
+            "--tasks-json",
+            tasks_file.to_str().unwrap(),
+            "--tier",
+            "pr",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fast-test"))
+        .stdout(predicate::str::contains("slow-test").not());
+}
+
+#[test]
+fn test_shard_plan_nightly_tier_keeps_slow_tagged_tasks() {
+    let dir = TempDir::new().unwrap();
+    let tasks_file = dir.path().join("tasks.json");
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "fast-test", "selector": "fast-test", "est_ms": 1000, "tags": ["unit"]},
+            {"id": "slow-test", "selector": "slow-test", "est_ms": 2000, "tags": ["slow"]}
+        ]
+    });
+    std::fs::write(&tasks_file, serde_json::to_string(&payload).unwrap()).unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "plan",
+            "--shards",
+            "2",
+            "--tasks-json",
+            tasks_file.to_str().unwrap(),
+            "--tier",
+            "nightly",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fast-test"))
+        .stdout(predicate::str::contains("slow-test"));
+}
+
+#[test]
 fn test_shard_update_ingests_jsonl_timings() {
     let dir = TempDir::new().unwrap();
     let jsonl = dir.path().join("timings.jsonl");
