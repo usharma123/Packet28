@@ -13,6 +13,9 @@ pub struct CovyConfig {
     pub gate: GateConfig,
     pub report: ReportConfig,
     pub cache: CacheConfig,
+    pub impact: ImpactConfig,
+    pub shard: ShardConfig,
+    pub merge: MergeConfig,
     pub path_mapping: PathMappingConfig,
 }
 
@@ -72,6 +75,39 @@ pub struct CacheConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct ImpactConfig {
+    pub testmap_path: String,
+    pub fresh_hours: u32,
+    pub full_suite_threshold: f64,
+    pub fallback_mode: String,
+    pub smoke: ImpactSmokeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ImpactSmokeConfig {
+    pub always: Vec<String>,
+    pub stale_extra: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShardConfig {
+    pub timings_path: String,
+    pub algorithm: String,
+    pub unknown_test_seconds: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MergeConfig {
+    pub strict: bool,
+    pub output_coverage: String,
+    pub output_issues: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct PathMappingConfig {
     pub rules: BTreeMap<String, String>,
 }
@@ -87,6 +123,9 @@ impl Default for CovyConfig {
             gate: GateConfig::default(),
             report: ReportConfig::default(),
             cache: CacheConfig::default(),
+            impact: ImpactConfig::default(),
+            shard: ShardConfig::default(),
+            merge: MergeConfig::default(),
             path_mapping: PathMappingConfig::default(),
         }
     }
@@ -159,6 +198,47 @@ impl Default for CacheConfig {
     }
 }
 
+impl Default for ImpactConfig {
+    fn default() -> Self {
+        Self {
+            testmap_path: ".covy/state/testmap.bin".to_string(),
+            fresh_hours: 24,
+            full_suite_threshold: 0.40,
+            fallback_mode: "fail-open".to_string(),
+            smoke: ImpactSmokeConfig::default(),
+        }
+    }
+}
+
+impl Default for ImpactSmokeConfig {
+    fn default() -> Self {
+        Self {
+            always: Vec::new(),
+            stale_extra: Vec::new(),
+        }
+    }
+}
+
+impl Default for ShardConfig {
+    fn default() -> Self {
+        Self {
+            timings_path: ".covy/state/testtimings.bin".to_string(),
+            algorithm: "lpt".to_string(),
+            unknown_test_seconds: 8.0,
+        }
+    }
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            strict: true,
+            output_coverage: ".covy/state/latest.bin".to_string(),
+            output_issues: ".covy/state/issues.bin".to_string(),
+        }
+    }
+}
+
 impl Default for PathMappingConfig {
     fn default() -> Self {
         Self {
@@ -227,5 +307,22 @@ mod tests {
         assert_eq!(config.gate.issues.max_new_errors, Some(0));
         assert_eq!(config.gate.issues.max_new_warnings, Some(5));
         assert_eq!(config.gate.issues.max_new_issues, Some(8));
+    }
+
+    #[test]
+    fn test_deserialize_impact_shard_merge_defaults() {
+        let raw = r#"
+            [project]
+            name = "demo"
+        "#;
+        let config: CovyConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.impact.testmap_path, ".covy/state/testmap.bin");
+        assert_eq!(config.impact.fresh_hours, 24);
+        assert!((config.impact.full_suite_threshold - 0.40).abs() < f64::EPSILON);
+        assert_eq!(config.impact.fallback_mode, "fail-open");
+        assert_eq!(config.shard.algorithm, "lpt");
+        assert!((config.shard.unknown_test_seconds - 8.0).abs() < f64::EPSILON);
+        assert!(config.merge.strict);
+        assert_eq!(config.merge.output_coverage, ".covy/state/latest.bin");
     }
 }

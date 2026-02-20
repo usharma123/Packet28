@@ -45,6 +45,37 @@ dir = ".covy/cache"
 # Evict cache entries older than this (days)
 max_age_days = 30
 
+[impact]
+# Testmap state used by covy impact
+testmap_path = ".covy/state/testmap.bin"
+# Freshness budget for the testmap in hours
+fresh_hours = 24
+# Escalate to full-suite lane if impacted tests exceed this ratio of known tests
+full_suite_threshold = 0.40
+# Impact fallback policy: "fail-open" or "fail-closed"
+fallback_mode = "fail-open"
+
+[impact.smoke]
+# Tests always included in impacted lane
+always = []
+# Extra tests included when testmap is stale
+stale_extra = []
+
+[shard]
+# Timing history state for shard planner
+timings_path = ".covy/state/testtimings.bin"
+# Planning algorithm (v1: lpt)
+algorithm = "lpt"
+# Predicted seconds for tests with no timing history
+unknown_test_seconds = 8.0
+
+[merge]
+# Fail on missing/corrupt shard artifacts
+strict = true
+# Canonical merged output paths
+output_coverage = ".covy/state/latest.bin"
+output_issues = ".covy/state/issues.bin"
+
 # Path mapping rules for translating coverage report paths to source paths.
 # Useful when build outputs use different paths than source.
 [path_mapping.rules]

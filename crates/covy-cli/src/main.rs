@@ -1,8 +1,12 @@
 mod cmd_check;
 mod cmd_diff;
 mod cmd_github;
+mod cmd_impact;
 mod cmd_ingest;
+mod cmd_merge;
 mod cmd_report;
+mod cmd_shard;
+mod cmd_testmap;
 
 use clap::{Parser, Subcommand};
 
@@ -39,6 +43,14 @@ enum Commands {
     Report(cmd_report::ReportArgs),
     /// Run PR quality gate against a diff
     Diff(cmd_diff::DiffArgs),
+    /// Build and inspect test impact maps
+    Testmap(cmd_testmap::TestmapArgs),
+    /// Compute impacted tests from a git diff
+    Impact(cmd_impact::ImpactArgs),
+    /// Plan and inspect test shard allocations
+    Shard(cmd_shard::ShardArgs),
+    /// Merge shard artifacts into canonical state
+    Merge(cmd_merge::MergeArgs),
     /// Post coverage report as a GitHub PR comment
     GithubComment(cmd_github::GithubCommentArgs),
 }
@@ -75,6 +87,10 @@ fn main() {
         Commands::Ingest(args) => cmd_ingest::run(args, &cli.config),
         Commands::Report(args) => cmd_report::run(args, &cli.config),
         Commands::Diff(args) => cmd_diff::run(args, &cli.config),
+        Commands::Testmap(args) => cmd_testmap::run(args, &cli.config),
+        Commands::Impact(args) => cmd_impact::run(args, &cli.config),
+        Commands::Shard(args) => cmd_shard::run(args, &cli.config),
+        Commands::Merge(args) => cmd_merge::run(args, &cli.config),
         Commands::GithubComment(args) => cmd_github::run(args, &cli.config),
     };
 
