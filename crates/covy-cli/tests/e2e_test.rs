@@ -486,3 +486,30 @@ fn test_impact_print_command_outputs_helper() {
         .success()
         .stdout(predicate::str::contains("echo \"no impacted tests\""));
 }
+
+#[test]
+fn test_shard_plan_json_and_file_outputs() {
+    let dir = TempDir::new().unwrap();
+    let tests_file = dir.path().join("tests.txt");
+    let out_dir = dir.path().join("shards");
+    std::fs::write(&tests_file, "t1\nt2\nt3\n").unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "plan",
+            "--shards",
+            "2",
+            "--tests-file",
+            tests_file.to_str().unwrap(),
+            "--write-files",
+            out_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"shards\""));
+
+    assert!(out_dir.join("shard-1.txt").exists());
+    assert!(out_dir.join("shard-2.txt").exists());
+}
