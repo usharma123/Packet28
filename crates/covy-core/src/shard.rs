@@ -1,3 +1,78 @@
+pub const TASK_SCHEMA_VERSION: u16 = 1;
+pub const SHARD_PLAN_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Task {
+    pub id: String,
+    pub selector: String,
+    pub est_ms: u64,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    #[serde(default)]
+    pub splittable: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TaskSet {
+    #[serde(default = "default_task_schema_version")]
+    pub schema_version: u16,
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+}
+
+impl Default for TaskSet {
+    fn default() -> Self {
+        Self {
+            schema_version: TASK_SCHEMA_VERSION,
+            tasks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PlannedTask {
+    pub id: String,
+    pub selector: String,
+    pub est_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PlannedShard {
+    pub id: usize,
+    #[serde(default)]
+    pub tasks: Vec<PlannedTask>,
+    pub predicted_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UniversalShardPlan {
+    #[serde(default = "default_shard_plan_schema_version")]
+    pub schema_version: u16,
+    pub algorithm: String,
+    #[serde(default)]
+    pub shards: Vec<PlannedShard>,
+}
+
+impl Default for UniversalShardPlan {
+    fn default() -> Self {
+        Self {
+            schema_version: SHARD_PLAN_SCHEMA_VERSION,
+            algorithm: "lpt".to_string(),
+            shards: Vec::new(),
+        }
+    }
+}
+
+fn default_task_schema_version() -> u16 {
+    TASK_SCHEMA_VERSION
+}
+
+fn default_shard_plan_schema_version() -> u16 {
+    SHARD_PLAN_SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct Shard {
     pub id: usize,
@@ -121,5 +196,33 @@ mod tests {
         );
         assert_eq!(jobs[0], ("known".to_string(), 50));
         assert_eq!(jobs[1], ("unknown".to_string(), 8000));
+    }
+
+    #[test]
+    fn test_taskset_defaults_schema_version() {
+        let taskset: TaskSet = serde_json::from_str(r#"{"tasks":[]}"#).unwrap();
+        assert_eq!(taskset.schema_version, TASK_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_task_defaults_optional_fields() {
+        let task: Task = serde_json::from_str(
+            r#"{
+                "id":"tests/test_mod.py::test_one",
+                "selector":"tests/test_mod.py::test_one",
+                "est_ms":1200
+            }"#,
+        )
+        .unwrap();
+        assert!(task.tags.is_empty());
+        assert!(task.module.is_none());
+        assert!(!task.splittable);
+    }
+
+    #[test]
+    fn test_universal_shard_plan_defaults_schema_version() {
+        let plan: UniversalShardPlan =
+            serde_json::from_str(r#"{"algorithm":"lpt","shards":[]}"#).unwrap();
+        assert_eq!(plan.schema_version, SHARD_PLAN_SCHEMA_VERSION);
     }
 }
