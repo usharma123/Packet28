@@ -531,7 +531,9 @@ fn test_merge_non_strict_skips_corrupt_artifacts() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"skipped_inputs\": 1"));
+        .stdout(predicate::str::contains("\"skipped_inputs\": 1"))
+        .stdout(predicate::str::contains("\"strict_mode\": false"))
+        .stdout(predicate::str::contains("\"output_coverage_path\""));
 }
 
 #[test]

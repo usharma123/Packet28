@@ -11,6 +11,9 @@ pub struct MergeSummary {
     pub skipped_inputs: usize,
     pub coverage_files_merged: usize,
     pub diagnostics_files_merged: usize,
+    pub strict_mode: bool,
+    pub output_coverage_path: Option<String>,
+    pub output_issues_path: Option<String>,
 }
 
 pub fn merge_coverage_inputs(

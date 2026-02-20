@@ -81,18 +81,30 @@ pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
         skipped_inputs: skipped_cov + skipped_diag,
         coverage_files_merged: coverage_merged.files.len(),
         diagnostics_files_merged: diag_merged.issues_by_file.len(),
+        strict_mode: strict,
+        output_coverage_path: if coverage_inputs.is_empty() {
+            None
+        } else {
+            Some(output_coverage.to_string())
+        },
+        output_issues_path: if diagnostics_inputs.is_empty() {
+            None
+        } else {
+            Some(output_issues.to_string())
+        },
     };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         println!(
-            "merge summary: coverage_inputs={} diagnostics_inputs={} skipped_inputs={} coverage_files_merged={} diagnostics_files_merged={}",
+            "merge summary: coverage_inputs={} diagnostics_inputs={} skipped_inputs={} coverage_files_merged={} diagnostics_files_merged={} strict_mode={}",
             summary.coverage_inputs,
             summary.diagnostics_inputs,
             summary.skipped_inputs,
             summary.coverage_files_merged,
-            summary.diagnostics_files_merged
+            summary.diagnostics_files_merged,
+            summary.strict_mode
         );
     }
 
