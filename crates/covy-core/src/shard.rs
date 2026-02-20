@@ -153,6 +153,76 @@ pub fn plan_shards_lpt(input: &[(String, u64)], shard_count: usize) -> ShardPlan
     }
 }
 
+pub fn compute_whale_threshold_ms(input: &[(String, u64)]) -> u64 {
+    if input.is_empty() {
+        return 30_000;
+    }
+
+    let mut durations: Vec<u64> = input.iter().map(|(_, d)| *d).collect();
+    durations.sort_unstable();
+    let idx = ((durations.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    let p95 = durations[idx.min(durations.len() - 1)];
+    std::cmp::max(30_000, p95.saturating_mul(2))
+}
+
+pub fn plan_shards_whale_lpt(input: &[(String, u64)], shard_count: usize) -> ShardPlan {
+    if shard_count == 0 {
+        return ShardPlan::default();
+    }
+
+    let mut jobs = input.to_vec();
+    jobs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let whale_threshold = compute_whale_threshold_ms(&jobs);
+    let mut whales = Vec::new();
+    let mut rest = Vec::new();
+    for job in jobs {
+        if job.1 > whale_threshold {
+            whales.push(job);
+        } else {
+            rest.push(job);
+        }
+    }
+
+    let mut shards: Vec<Shard> = (0..shard_count)
+        .map(|id| Shard {
+            id,
+            tests: Vec::new(),
+            predicted_duration_ms: 0,
+        })
+        .collect();
+
+    for (test_id, duration_ms) in whales.into_iter().chain(rest.into_iter()) {
+        let target = shards
+            .iter()
+            .min_by(|a, b| {
+                a.predicted_duration_ms
+                    .cmp(&b.predicted_duration_ms)
+                    .then_with(|| a.id.cmp(&b.id))
+            })
+            .map(|s| s.id)
+            .unwrap_or(0);
+
+        if let Some(shard) = shards.get_mut(target) {
+            shard.tests.push(test_id);
+            shard.predicted_duration_ms = shard.predicted_duration_ms.saturating_add(duration_ms);
+        }
+    }
+
+    let total = shards.iter().map(|s| s.predicted_duration_ms).sum();
+    let makespan = shards
+        .iter()
+        .map(|s| s.predicted_duration_ms)
+        .max()
+        .unwrap_or(0);
+
+    ShardPlan {
+        shards,
+        total_predicted_duration_ms: total,
+        makespan_ms: makespan,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +294,45 @@ mod tests {
         let plan: UniversalShardPlan =
             serde_json::from_str(r#"{"algorithm":"lpt","shards":[]}"#).unwrap();
         assert_eq!(plan.schema_version, SHARD_PLAN_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_compute_whale_threshold_uses_p95_rule() {
+        let jobs = vec![
+            ("a".to_string(), 1000),
+            ("b".to_string(), 2000),
+            ("c".to_string(), 3000),
+            ("d".to_string(), 4000),
+            ("e".to_string(), 5000),
+        ];
+        assert_eq!(compute_whale_threshold_ms(&jobs), 30_000);
+    }
+
+    #[test]
+    fn test_plan_shards_whale_lpt_assigns_large_outlier_first() {
+        let input = vec![
+            ("whale".to_string(), 90_000),
+            ("a".to_string(), 10_000),
+            ("b".to_string(), 9_000),
+            ("c".to_string(), 8_000),
+            ("d".to_string(), 7_000),
+        ];
+        let plan = plan_shards_whale_lpt(&input, 2);
+        assert_eq!(plan.shards.len(), 2);
+        assert!(plan.shards.iter().any(|s| s.tests.iter().any(|t| t == "whale")));
+    }
+
+    #[test]
+    fn test_plan_shards_whale_lpt_is_deterministic_on_ties() {
+        let input = vec![
+            ("b".to_string(), 10),
+            ("a".to_string(), 10),
+            ("d".to_string(), 10),
+            ("c".to_string(), 10),
+        ];
+        let p1 = plan_shards_whale_lpt(&input, 2);
+        let p2 = plan_shards_whale_lpt(&input, 2);
+        assert_eq!(p1.shards[0].tests, p2.shards[0].tests);
+        assert_eq!(p1.shards[1].tests, p2.shards[1].tests);
     }
 }
