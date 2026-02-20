@@ -406,3 +406,43 @@ fn test_testmap_build_writes_test_to_files_index() {
     assert!(map.file_to_tests[&covered_file].contains("com.foo.BarTest"));
     assert!(map.metadata.generated_at > 0);
 }
+
+#[test]
+fn test_impact_json_runs_with_diff_integration() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("manifest.jsonl");
+    let testmap = dir.path().join("testmap.bin");
+
+    let line = format!(
+        "{{\"test_id\":\"com.foo.BarTest\",\"language\":\"java\",\"coverage_report\":\"{}\"}}\n",
+        fixture("lcov/basic.info")
+    );
+    std::fs::write(&manifest, line).unwrap();
+
+    covy_cmd()
+        .args([
+            "testmap",
+            "build",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output",
+            testmap.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args([
+            "impact",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--testmap",
+            testmap.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"selected_tests\""));
+}
