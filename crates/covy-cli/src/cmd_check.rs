@@ -182,7 +182,20 @@ pub fn resolve_and_ingest(args: &CheckArgs, config: &CovyConfig) -> Result<Cover
     }
 
     if args.paths.is_empty() {
-        anyhow::bail!("No coverage files specified. Provide file paths or use --stdin.");
+        let state_path = Path::new(".covy/state/latest.bin");
+        if !state_path.exists() {
+            anyhow::bail!(
+                "No coverage files specified and no cached coverage state found at {}. Provide file paths, use --stdin, or run `covy ingest` first.",
+                state_path.display()
+            );
+        }
+        tracing::info!(
+            "Loading coverage from cached state {}",
+            state_path.display()
+        );
+        let bytes = std::fs::read(state_path)?;
+        let data = covy_core::cache::deserialize_coverage(&bytes)?;
+        return Ok(data);
     }
 
     // Resolve globs

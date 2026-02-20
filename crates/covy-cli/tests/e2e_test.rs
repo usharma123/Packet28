@@ -340,3 +340,31 @@ fn test_check_accepts_packed_issues_input() {
         .success()
         .stdout(predicate::str::contains("issue_counts"));
 }
+
+#[test]
+fn test_check_loads_coverage_from_state_by_default() {
+    covy_cmd()
+        .args(["ingest", &fixture("lcov/basic.info")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args(["check", "--base", "HEAD", "--head", "HEAD", "--report", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("passed"));
+}
+
+#[test]
+fn test_check_without_coverage_and_state_fails() {
+    let dir = TempDir::new().unwrap();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args(["check", "--base", "HEAD", "--head", "HEAD", "--report", "json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No coverage files specified and no cached coverage state found",
+        ));
+}
