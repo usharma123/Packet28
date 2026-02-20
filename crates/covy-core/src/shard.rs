@@ -12,6 +12,35 @@ pub struct ShardPlan {
     pub makespan_ms: u64,
 }
 
+/// Build a list of (test_id, duration_ms) pairs from test IDs using a timing history,
+/// falling back to `unknown_test_duration_ms` when a test has no recorded duration.
+///
+/// # Parameters
+///
+/// - `test_ids`: Ordered slice of test identifier strings to convert.
+/// - `timings`: Timing history mapping test IDs to their duration in milliseconds.
+/// - `unknown_test_duration_ms`: Duration to use for tests not present in `timings`.
+///
+/// # Returns
+///
+/// A `Vec<(String, u64)>` where each element is the test ID and its resolved duration in
+/// milliseconds, preserving the order of `test_ids`.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+///
+/// // Construct a timing history with one known test.
+/// let timings = crate::testmap::TestTimingHistory {
+///     duration_ms: HashMap::from([("known".to_string(), 50_u64)]),
+/// };
+///
+/// let test_ids = vec!["known".to_string(), "unknown".to_string()];
+/// let jobs = crate::shard::build_timed_jobs(&test_ids, &timings, 8000);
+///
+/// assert_eq!(jobs, vec![("known".to_string(), 50), ("unknown".to_string(), 8000)]);
+/// ```
 pub fn build_timed_jobs(
     test_ids: &[String],
     timings: &crate::testmap::TestTimingHistory,
@@ -30,7 +59,28 @@ pub fn build_timed_jobs(
         .collect()
 }
 
-/// Longest-processing-time-first bin-packing planner.
+/// Assigns tests to shards using the Longest-Processing-Time-first (LPT) bin-packing heuristic.
+///
+/// Jobs are placed in descending order of duration; each job is assigned to the shard with the
+/// smallest current predicted duration, with ties broken by the smaller shard id. If `shard_count`
+/// is zero, returns an empty default `ShardPlan`.
+///
+/// # Returns
+///
+/// A `ShardPlan` containing per-shard assignments and aggregate timing metrics:
+/// - `shards`: vector of `Shard` with `id`, assigned `tests`, and `predicted_duration_ms`
+/// - `total_predicted_duration_ms`: sum of all shard predicted durations
+/// - `makespan_ms`: maximum shard predicted duration
+///
+/// # Examples
+///
+/// ```
+/// let jobs = vec![("a".to_string(), 100), ("b".to_string(), 50), ("c".to_string(), 75)];
+/// let plan = plan_shards_lpt(&jobs, 2);
+/// assert_eq!(plan.shards.len(), 2);
+/// assert_eq!(plan.total_predicted_duration_ms, 225);
+/// assert!(plan.makespan_ms <= 125);
+/// ```
 pub fn plan_shards_lpt(input: &[(String, u64)], shard_count: usize) -> ShardPlan {
     if shard_count == 0 {
         return ShardPlan::default();

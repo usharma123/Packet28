@@ -31,6 +31,47 @@ pub struct MergeArgs {
     pub json: bool,
 }
 
+/// Merge coverage and diagnostics shard artifacts based on CLI arguments and configuration.
+///
+/// Loads configuration from `config_path` (falls back to defaults if missing), expands the
+/// glob patterns in `args` to find input shard files, merges found coverage and diagnostics
+/// inputs (respecting the resolved `strict` mode), writes merged state files when inputs
+/// are present, and prints a merge summary in either JSON or human-readable form.
+///
+/// - `args.coverage` and `args.issues` are expanded as glob patterns; if both yield no
+///   matches, the function returns an error.
+/// - Output paths use explicit CLI values unless they equal the built-in defaults, in
+///   which case corresponding values from the loaded configuration are used.
+/// - When coverage or diagnostics inputs are present, merged state is serialized and written
+///   to the chosen output paths (parent directories are created as needed).
+///
+/// # Parameters
+///
+/// - `args`: Command-line arguments controlling which globs to merge, strict mode, output
+///   paths, and whether to emit JSON summary.
+/// - `config_path`: Path to a Covy configuration file; missing or invalid files are ignored
+///   and replaced with defaults.
+///
+/// # Returns
+///
+/// `0` on success, or an error describing what went wrong.
+///
+/// # Examples
+///
+/// ```
+/// use covy_cli::cmd_merge::MergeArgs;
+/// // Construct args so that coverage globs match your shard files in practice.
+/// let args = MergeArgs {
+///     coverage: vec!["shards/coverage-*.bin".into()],
+///     issues: vec!["shards/issues-*.bin".into()],
+///     strict: None,
+///     output_coverage: ".covy/state/latest.bin".into(),
+///     output_issues: ".covy/state/issues.bin".into(),
+///     json: true,
+/// };
+/// let rc = crate::cmd_merge::run(args, "config.toml").unwrap();
+/// assert_eq!(rc, 0);
+/// ```
 pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let strict = args.strict.unwrap_or(config.merge.strict);
@@ -111,6 +152,20 @@ pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// Expands glob patterns into a flat list of file paths.
+///
+/// Each pattern is expanded using glob semantics and all matching paths are returned
+/// in a single Vec. If a pattern is syntactically invalid the function returns an error
+/// with context indicating which pattern failed. Patterns that match no files produce
+/// a warning via tracing but do not cause an error.
+///
+/// # Examples
+///
+/// ```
+/// let patterns: Vec<String> = vec![];
+/// let matched = resolve_globs(&patterns).unwrap();
+/// assert!(matched.is_empty());
+/// ```
 fn resolve_globs(patterns: &[String]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for pattern in patterns {
@@ -126,6 +181,19 @@ fn resolve_globs(patterns: &[String]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Writes `bytes` to `path`, creating any missing parent directories.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use std::fs;
+/// let dir = tempfile::tempdir().unwrap();
+/// let file_path = dir.path().join("a").join("b").join("file.bin");
+/// // write_file creates missing parents and writes the data
+/// write_file(&file_path, b"hello").unwrap();
+/// assert_eq!(fs::read(&file_path).unwrap(), b"hello");
+/// ```
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

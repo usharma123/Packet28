@@ -55,6 +55,16 @@ enum Commands {
     GithubComment(cmd_github::GithubCommentArgs),
 }
 
+/// Program entry point: parse CLI, configure logging and color, run the selected subcommand, and exit with its status.
+///
+/// This function parses command-line arguments, sets up the tracing subscriber filter based on `-v`/`-q` or the environment, applies the `--color` override, dispatches to the requested subcommand implementation, and terminates the process with the subcommand's returned exit code. If a subcommand returns an error, a formatted error is printed and the process exits with status code 2.
+///
+/// # Examples
+///
+/// ```
+/// // Invoke the CLI from a shell:
+/// // covy check --config covy.toml
+/// ```
 fn main() {
     let cli = Cli::parse();
 

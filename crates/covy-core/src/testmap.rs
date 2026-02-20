@@ -10,6 +10,25 @@ pub struct TestMapMetadata {
 }
 
 impl Default for TestMapMetadata {
+    /// Creates a default TestMapMetadata populated with a stable baseline for new indexes.
+    ///
+    /// The default values are:
+    /// - `schema_version = 1`
+    /// - `path_norm_version = 1`
+    /// - `repo_root_id = None`
+    /// - `generated_at = 0`
+    /// - `granularity = "file"`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let meta = crate::testmap::TestMapMetadata::default();
+    /// assert_eq!(meta.schema_version, 1);
+    /// assert_eq!(meta.path_norm_version, 1);
+    /// assert_eq!(meta.repo_root_id, None);
+    /// assert_eq!(meta.generated_at, 0);
+    /// assert_eq!(meta.granularity, "file");
+    /// ```
     fn default() -> Self {
         Self {
             schema_version: 1,

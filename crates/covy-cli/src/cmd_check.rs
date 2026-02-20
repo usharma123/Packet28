@@ -169,7 +169,27 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     Ok(if gate_result.passed { 0 } else { 1 })
 }
 
-/// Shared helper: resolve file paths/stdin and ingest coverage data.
+/// Resolve input sources (paths or stdin), ingest coverage data, and return a merged CoverageData.
+///
+/// If `args.stdin` is set, a format must be provided and coverage is read from standard input.
+/// If no paths are provided, a cached coverage state at `.covy/state/latest.bin` is loaded if present; otherwise an error is returned.
+/// When paths are provided, glob patterns are expanded (patterns that match nothing emit a warning); matching files are ingested,
+/// using the explicit format if given or auto-detection otherwise. Strip prefixes from `args.strip_prefix` and
+/// `config.ingest.strip_prefixes` are applied to file paths before merging.
+///
+/// Returns a `CoverageData` containing the merged results from the resolved input(s).
+///
+/// # Examples
+///
+/// ```no_run
+/// # use anyhow::Result;
+/// # use covy_core::{CovyConfig, CoverageData};
+/// # use crate::args::CheckArgs;
+/// # fn example(args: &CheckArgs, config: &CovyConfig) -> Result<CoverageData> {
+/// let data = crate::commands::check::resolve_and_ingest(args, config)?;
+/// # Ok(data)
+/// # }
+/// ```
 pub fn resolve_and_ingest(args: &CheckArgs, config: &CovyConfig) -> Result<CoverageData> {
     let format = parse_format(&args.format)?;
 

@@ -13,6 +13,35 @@ pub struct ImpactResult {
     pub escalate_full_suite: bool,
 }
 
+/// Selects tests impacted by the provided file diffs using the test map index.
+///
+/// For each `FileDiff`, this collects tests mapped from `diff.path` and from `diff.old_path` (if present).
+/// Any diff path that has no mapping is included in `missing_mappings`. The returned `ImpactResult`
+/// contains `selected_tests` (unique, sorted by key order), `missing_mappings`, and default values for
+/// other fields (`smoke_tests` empty, `stale = false`, `confidence = 1.0`, `escalate_full_suite = false`).
+///
+/// # Examples
+///
+/// ```
+/// use crate::testmap::TestMapIndex;
+/// use crate::model::{FileDiff, DiffStatus};
+///
+/// let mut index = TestMapIndex::default();
+/// index
+///     .file_to_tests
+///     .insert("src/a.rs".to_string(), vec!["tests::a".to_string()]);
+///
+/// let diffs = vec![FileDiff {
+///     path: "src/a.rs".to_string(),
+///     old_path: None,
+///     status: DiffStatus::Modified,
+///     changed_lines: Default::default(),
+/// }];
+///
+/// let result = select_impacted_tests(&index, &diffs);
+/// assert_eq!(result.selected_tests, vec!["tests::a".to_string()]);
+/// assert!(result.missing_mappings.is_empty());
+/// ```
 pub fn select_impacted_tests(index: &TestMapIndex, diffs: &[FileDiff]) -> ImpactResult {
     let mut tests: BTreeSet<String> = BTreeSet::new();
     let mut missing = BTreeSet::new();
@@ -57,6 +86,17 @@ mod tests {
     use super::*;
     use crate::model::{DiffStatus, FileDiff};
 
+    /// Creates a `FileDiff` representing a modified file at `path` with no `old_path` and no changed lines.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let d = diff("src/lib.rs");
+    /// assert_eq!(d.path, "src/lib.rs");
+    /// assert_eq!(d.old_path, None);
+    /// assert_eq!(d.status, DiffStatus::Modified);
+    /// assert!(d.changed_lines.is_empty());
+    /// ```
     fn diff(path: &str) -> FileDiff {
         FileDiff {
             path: path.to_string(),

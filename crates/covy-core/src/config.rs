@@ -115,6 +115,16 @@ pub struct PathMappingConfig {
 // Defaults
 
 impl Default for CovyConfig {
+    /// Construct a CovyConfig populated with default values for every configuration section.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = CovyConfig::default();
+    /// assert_eq!(cfg.project.source_root, ".");
+    /// assert!(cfg.cache.enabled);
+    /// assert_eq!(cfg.impact.full_suite_threshold, 0.40);
+    /// ```
     fn default() -> Self {
         Self {
             project: ProjectConfig::default(),
@@ -189,6 +199,19 @@ impl Default for ReportConfig {
 }
 
 impl Default for CacheConfig {
+    /// Create a `CacheConfig` populated with the standard defaults.
+    ///
+    /// The default enables caching, sets the cache directory to `.covy/cache`, and
+    /// sets the maximum age to 30 days.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = CacheConfig::default();
+    /// assert!(cfg.enabled);
+    /// assert_eq!(cfg.dir, ".covy/cache");
+    /// assert_eq!(cfg.max_age_days, 30);
+    /// ```
     fn default() -> Self {
         Self {
             enabled: true,
@@ -199,6 +222,24 @@ impl Default for CacheConfig {
 }
 
 impl Default for ImpactConfig {
+    /// Default configuration for impact analysis used when no user configuration is provided.
+    ///
+    /// Defaults:
+    /// - `testmap_path` = ".covy/state/testmap.bin"
+    /// - `fresh_hours` = 24
+    /// - `full_suite_threshold` = 0.40
+    /// - `fallback_mode` = "fail-open"
+    /// - `smoke` = `ImpactSmokeConfig::default()`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = ImpactConfig::default();
+    /// assert_eq!(cfg.testmap_path, ".covy/state/testmap.bin");
+    /// assert_eq!(cfg.fresh_hours, 24);
+    /// assert!((cfg.full_suite_threshold - 0.40).abs() < f64::EPSILON);
+    /// assert_eq!(cfg.fallback_mode, "fail-open");
+    /// ```
     fn default() -> Self {
         Self {
             testmap_path: ".covy/state/testmap.bin".to_string(),
@@ -211,6 +252,15 @@ impl Default for ImpactConfig {
 }
 
 impl Default for ImpactSmokeConfig {
+    /// Create a default ImpactSmokeConfig with empty `always` and `stale_extra` lists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = ImpactSmokeConfig::default();
+    /// assert!(cfg.always.is_empty());
+    /// assert!(cfg.stale_extra.is_empty());
+    /// ```
     fn default() -> Self {
         Self {
             always: Vec::new(),
@@ -220,6 +270,21 @@ impl Default for ImpactSmokeConfig {
 }
 
 impl Default for ShardConfig {
+    /// Creates a ShardConfig populated with default values.
+    ///
+    /// Defaults:
+    /// - `timings_path`: ".covy/state/testtimings.bin"
+    /// - `algorithm`: "lpt"
+    /// - `unknown_test_seconds`: 8.0
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = ShardConfig::default();
+    /// assert_eq!(cfg.timings_path, ".covy/state/testtimings.bin");
+    /// assert_eq!(cfg.algorithm, "lpt");
+    /// assert!((cfg.unknown_test_seconds - 8.0).abs() < 1e-6);
+    /// ```
     fn default() -> Self {
         Self {
             timings_path: ".covy/state/testtimings.bin".to_string(),
@@ -230,6 +295,21 @@ impl Default for ShardConfig {
 }
 
 impl Default for MergeConfig {
+    /// Create a MergeConfig populated with sensible defaults.
+    ///
+    /// Defaults:
+    /// - `strict = true`
+    /// - `output_coverage = ".covy/state/latest.bin"`
+    /// - `output_issues = ".covy/state/issues.bin"`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let m = MergeConfig::default();
+    /// assert!(m.strict);
+    /// assert_eq!(m.output_coverage, ".covy/state/latest.bin");
+    /// assert_eq!(m.output_issues, ".covy/state/issues.bin");
+    /// ```
     fn default() -> Self {
         Self {
             strict: true,
@@ -240,6 +320,16 @@ impl Default for MergeConfig {
 }
 
 impl Default for PathMappingConfig {
+    /// Create a `PathMappingConfig` with no mapping rules.
+    ///
+    /// The default configuration contains an empty `rules` map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = PathMappingConfig::default();
+    /// assert!(cfg.rules.is_empty());
+    /// ```
     fn default() -> Self {
         Self {
             rules: BTreeMap::new(),

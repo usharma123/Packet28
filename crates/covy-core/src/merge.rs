@@ -16,6 +16,33 @@ pub struct MergeSummary {
     pub output_issues_path: Option<String>,
 }
 
+/// Merges multiple coverage input files into a single `CoverageData`.
+///
+/// Attempts to read and deserialize each file in `paths` as coverage data and
+/// merges successful inputs into an aggregate. When `strict` is `true`, the
+/// function returns an error on the first failed read or deserialization;
+/// when `strict` is `false`, it skips malformed or unreadable inputs and counts
+/// them in the returned skipped count.
+///
+/// # Parameters
+///
+/// - `paths`: slice of file paths to coverage input files.
+/// - `strict`: if `true`, fail on the first bad input; if `false`, skip bad inputs.
+///
+/// # Returns
+///
+/// A tuple containing the merged `CoverageData` and the number of inputs that
+/// were skipped due to read/deserialization failures.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// // Merge an empty list of inputs yields an empty CoverageData and 0 skipped.
+/// let paths: Vec<PathBuf> = Vec::new();
+/// let (merged, skipped) = crate::merge::merge_coverage_inputs(&paths, false).unwrap();
+/// assert_eq!(skipped, 0);
+/// ```
 pub fn merge_coverage_inputs(
     paths: &[PathBuf],
     strict: bool,
@@ -44,6 +71,28 @@ pub fn merge_coverage_inputs(
     Ok((merged, skipped))
 }
 
+/// Merge multiple diagnostics input files into a single `DiagnosticsData`.
+///
+/// On success returns a tuple containing the merged diagnostics and the number of inputs that
+/// were skipped due to read or deserialize failures. If `strict` is `true`, the function
+/// returns an error on the first read or deserialize failure instead of skipping that input.
+///
+/// # Parameters
+///
+/// - `strict`: When `true`, fail on the first invalid or unreadable input; when `false`, skip
+///   invalid inputs and include them in the returned skipped count.
+///
+/// # Returns
+///
+/// A tuple `(DiagnosticsData, usize)` where the first element is the merged diagnostics data
+/// and the second element is the number of inputs that were skipped.
+///
+/// # Examples
+///
+/// ```
+/// let (merged, skipped) = merge_diagnostics_inputs(&[], true).unwrap();
+/// assert_eq!(skipped, 0);
+/// ```
 pub fn merge_diagnostics_inputs(
     paths: &[PathBuf],
     strict: bool,

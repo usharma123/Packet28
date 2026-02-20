@@ -28,6 +28,37 @@ pub struct ImpactArgs {
     pub print_command: bool,
 }
 
+/// Compute impacted tests using a testmap and a git diff, apply impact policy, and emit results.
+///
+/// Loads configuration from `config_path` (falls back to defaults), reads the testmap, computes diffs
+/// between `base` and `head` refs (from `args` or config), selects impacted tests, applies policy
+/// (including smoke tests and stale/fallback handling), and prints either a JSON summary, a list of
+/// impacted tests and a summary line, or a runnable command when requested.
+///
+/// # Parameters
+///
+/// - `args`: CLI options controlling base/head refs, testmap path, JSON output, and command printing.
+/// - `config_path`: Path to the configuration file to load; defaults are used when the file is missing.
+///
+/// # Returns
+///
+/// `Ok(0)` on success, or `Err` if reading/deserializing the testmap, computing diffs, or policy
+/// enforcement fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+/// let args = ImpactArgs {
+///     base: None,
+///     head: None,
+///     testmap: ".covy/state/testmap.bin".into(),
+///     json: false,
+///     print_command: false,
+/// };
+/// // `run` returns `Ok(0)` on success
+/// let _ = run(args, "covy.toml").unwrap();
+/// ```
 pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
@@ -82,6 +113,29 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// Determines whether a generated timestamp is considered stale relative to a freshness window.
+///
+/// The timestamp is treated as stale if `generated_at` is zero or if the elapsed time since
+/// `generated_at` exceeds `fresh_hours`.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::{SystemTime, UNIX_EPOCH};
+/// // timestamp 0 is always stale
+/// assert!(is_stale(0, 24));
+///
+/// let now = SystemTime::now()
+///     .duration_since(UNIX_EPOCH)
+///     .unwrap()
+///     .as_secs();
+/// // just-generated timestamp is not stale for a 24-hour window
+/// assert!(!is_stale(now, 24));
+///
+/// // a timestamp 25 hours ago is stale for a 24-hour window
+/// let old = now.saturating_sub(25 * 3600);
+/// assert!(is_stale(old, 24));
+/// ```
 fn is_stale(generated_at: u64, fresh_hours: u32) -> bool {
     if generated_at == 0 {
         return true;
@@ -94,6 +148,37 @@ fn is_stale(generated_at: u64, fresh_hours: u32) -> bool {
     now.saturating_sub(generated_at) > max_age
 }
 
+/// Adjusts an ImpactResult according to the configured impact policy, diff coverage, and staleness.
+///
+/// This updates `result` in place:
+/// - marks the result as stale when appropriate,
+/// - merges configured "smoke" tests (always and stale-extra when stale) into `result.selected_tests` and records them in `result.smoke_tests`,
+/// - recalculates `result.confidence` from the fraction of changed files that were mapped (reduced when stale),
+/// - sets `result.escalate_full_suite` when the selected/known test ratio exceeds the configured threshold,
+/// - and, when the config's `fallback_mode` is case-insensitive `"fail-closed"`, returns an error if any mappings are missing.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use covy_core::impact::ImpactResult;
+/// use covy_core::model::FileDiff;
+/// // Construct minimal test data (fields omitted for brevity)
+/// let mut result = ImpactResult {
+///     selected_tests: vec!["t1".to_string()],
+///     missing_mappings: vec![],
+///     smoke_tests: vec![],
+///     stale: false,
+///     confidence: 0.0,
+///     escalate_full_suite: false,
+///     ..Default::default()
+/// };
+/// let diffs: Vec<FileDiff> = vec![]; // no changes
+/// let config = crate::config::CovyConfig::default();
+/// // Should succeed and set confidence to 1.0 for no changes
+/// let _ = crate::cmd_impact::apply_policy(&mut result, &diffs, &config, false, 10).unwrap();
+/// assert_eq!(result.confidence, 1.0);
+/// ```
 fn apply_policy(
     result: &mut covy_core::impact::ImpactResult,
     diffs: &[covy_core::model::FileDiff],
@@ -144,6 +229,17 @@ fn apply_policy(
     Ok(())
 }
 
+/// Builds a shell command to run the provided tests, grouping Java tests into a single Maven `-Dtest` invocation and Python tests into a single `pytest` invocation.
+///
+/// If `selected_tests` is empty, returns `echo "no impacted tests"`.
+///
+/// # Examples
+///
+/// ```
+/// let selected = vec!["a.Test".to_string(), "tests::test_func".to_string()];
+/// let cmd = build_print_command(&selected, &std::collections::BTreeMap::new());
+/// assert_eq!(cmd, "mvn -Dtest=a.Test test && pytest tests::test_func");
+/// ```
 fn build_print_command(
     selected_tests: &[String],
     test_language: &std::collections::BTreeMap<String, String>,

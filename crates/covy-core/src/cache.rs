@@ -154,7 +154,21 @@ pub fn serialize_coverage(data: &CoverageData) -> Result<Vec<u8>, CovyError> {
     Ok(out)
 }
 
-/// Deserialize CoverageData from bytes.
+/// Deserialize coverage data previously produced by `serialize_coverage`.
+///
+/// Returns the reconstructed `CoverageData` on success; returns `Err(CovyError::Cache)` for truncated or malformed input or when bitmap deserialization fails.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use crate::model::CoverageData;
+///
+/// let coverage = CoverageData { files: BTreeMap::new(), format: None, timestamp: 42 };
+/// let bytes = serialize_coverage(&coverage).unwrap();
+/// let decoded = deserialize_coverage(&bytes).unwrap();
+/// assert_eq!(decoded.timestamp, 42);
+/// ```
 pub fn deserialize_coverage(data: &[u8]) -> Result<CoverageData, CovyError> {
     use roaring::RoaringBitmap;
     use std::io::Cursor;
@@ -228,7 +242,26 @@ struct StoredTestTimingHistory {
     timings: TestTimingHistory,
 }
 
-/// Serialize TestMapIndex to bytes for storage.
+/// Serialize a TestMapIndex into a versioned binary representation.
+///
+/// The function clones the provided index, sets its metadata.schema_version to
+/// the current TESTMAP_SCHEMA_VERSION, and returns the bincode-serialized bytes.
+///
+/// # Returns
+///
+/// A byte vector containing the serialized, versioned TestMapIndex.
+///
+/// # Errors
+///
+/// Returns `CovyError::Cache` if serialization fails.
+///
+/// # Examples
+///
+/// ```
+/// let index = TestMapIndex::default();
+/// let bytes = serialize_testmap(&index).expect("serialize");
+/// assert!(!bytes.is_empty());
+/// ```
 pub fn serialize_testmap(index: &TestMapIndex) -> Result<Vec<u8>, CovyError> {
     let mut stored = index.clone();
     stored.metadata.schema_version = TESTMAP_SCHEMA_VERSION;
@@ -236,7 +269,27 @@ pub fn serialize_testmap(index: &TestMapIndex) -> Result<Vec<u8>, CovyError> {
         .map_err(|e| CovyError::Cache(format!("Failed to serialize testmap: {e}")))
 }
 
-/// Deserialize TestMapIndex from bytes.
+/// Deserialize a `TestMapIndex` from a bincode-encoded byte slice.
+///
+/// This verifies that the contained `metadata.schema_version` equals
+/// `TESTMAP_SCHEMA_VERSION` and returns an error if the data is malformed or the
+/// schema version is unsupported.
+///
+/// # Errors
+///
+/// Returns `CovyError::Cache` if bincode deserialization fails or if the stored
+/// schema version does not match `TESTMAP_SCHEMA_VERSION`.
+///
+/// # Examples
+///
+/// ```
+/// # use covy_core::cache::{serialize_testmap, deserialize_testmap, TESTMAP_SCHEMA_VERSION};
+/// # use covy_core::structs::TestMapIndex;
+/// let index = TestMapIndex::default(); // construct a minimal index suitable for tests
+/// let bytes = serialize_testmap(&index).unwrap();
+/// let decoded = deserialize_testmap(&bytes).unwrap();
+/// assert_eq!(decoded.metadata.schema_version, TESTMAP_SCHEMA_VERSION);
+/// ```
 pub fn deserialize_testmap(data: &[u8]) -> Result<TestMapIndex, CovyError> {
     let stored: TestMapIndex = bincode::deserialize(data)
         .map_err(|e| CovyError::Cache(format!("Failed to deserialize testmap: {e}")))?;
@@ -249,7 +302,23 @@ pub fn deserialize_testmap(data: &[u8]) -> Result<TestMapIndex, CovyError> {
     Ok(stored)
 }
 
-/// Serialize TestTimingHistory to bytes for storage.
+/// Serialize a `TestTimingHistory` into a versioned binary representation.
+///
+/// The serialized bytes include a schema version header so deserialization can
+/// validate compatibility.
+///
+/// # Returns
+///
+/// `Ok(Vec<u8>)` containing the bincode-encoded representation with an embedded
+/// schema version; `Err(CovyError)` if serialization fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// let timings = TestTimingHistory::default();
+/// let bytes = serialize_test_timings(&timings).unwrap();
+/// assert!(!bytes.is_empty());
+/// ```
 pub fn serialize_test_timings(timings: &TestTimingHistory) -> Result<Vec<u8>, CovyError> {
     let stored = StoredTestTimingHistory {
         schema_version: TESTTIMINGS_SCHEMA_VERSION,
@@ -259,7 +328,19 @@ pub fn serialize_test_timings(timings: &TestTimingHistory) -> Result<Vec<u8>, Co
         .map_err(|e| CovyError::Cache(format!("Failed to serialize test timings: {e}")))
 }
 
-/// Deserialize TestTimingHistory from bytes.
+/// Deserialize a TestTimingHistory from its binary representation.
+///
+/// Validates the embedded schema version and returns an error if deserialization fails
+/// or the stored schema version does not match `TESTTIMINGS_SCHEMA_VERSION`.
+///
+/// # Examples
+///
+/// ```
+/// let timings = TestTimingHistory::default();
+/// let bytes = serialize_test_timings(&timings).unwrap();
+/// let decoded = deserialize_test_timings(&bytes).unwrap();
+/// assert_eq!(decoded, timings);
+/// ```
 pub fn deserialize_test_timings(data: &[u8]) -> Result<TestTimingHistory, CovyError> {
     let stored: StoredTestTimingHistory = bincode::deserialize(data)
         .map_err(|e| CovyError::Cache(format!("Failed to deserialize test timings: {e}")))?;
