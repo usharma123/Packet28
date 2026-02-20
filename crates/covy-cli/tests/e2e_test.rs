@@ -513,3 +513,42 @@ fn test_shard_plan_json_and_file_outputs() {
     assert!(out_dir.join("shard-1.txt").exists());
     assert!(out_dir.join("shard-2.txt").exists());
 }
+
+#[test]
+fn test_merge_non_strict_skips_corrupt_artifacts() {
+    let dir = TempDir::new().unwrap();
+    let bad = dir.path().join("bad.bin");
+    std::fs::write(&bad, b"broken").unwrap();
+
+    covy_cmd()
+        .args([
+            "merge",
+            "--coverage",
+            bad.to_str().unwrap(),
+            "--strict",
+            "false",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"skipped_inputs\": 1"));
+}
+
+#[test]
+fn test_merge_strict_fails_on_corrupt_artifacts() {
+    let dir = TempDir::new().unwrap();
+    let bad = dir.path().join("bad.bin");
+    std::fs::write(&bad, b"broken").unwrap();
+
+    covy_cmd()
+        .args([
+            "merge",
+            "--coverage",
+            bad.to_str().unwrap(),
+            "--strict",
+            "true",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Failed to merge coverage input"));
+}
