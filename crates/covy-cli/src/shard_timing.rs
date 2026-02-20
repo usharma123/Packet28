@@ -3,16 +3,25 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JunitIdGranularity {
+    Method,
+    Class,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimingObservation {
     pub test_id: String,
     pub duration_ms: u64,
 }
 
-pub fn parse_junit_xml_file(path: &Path) -> Result<Vec<TimingObservation>> {
+pub fn parse_junit_xml_file(
+    path: &Path,
+    granularity: JunitIdGranularity,
+) -> Result<Vec<TimingObservation>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read JUnit XML file {}", path.display()))?;
-    parse_junit_xml_content(&content)
+    parse_junit_xml_content(&content, granularity)
 }
 
 pub fn parse_timing_jsonl_file(path: &Path) -> Result<Vec<TimingObservation>> {
@@ -21,11 +30,17 @@ pub fn parse_timing_jsonl_file(path: &Path) -> Result<Vec<TimingObservation>> {
     parse_timing_jsonl_content(&content)
 }
 
-fn parse_junit_xml_content(content: &str) -> Result<Vec<TimingObservation>> {
+fn parse_junit_xml_content(
+    content: &str,
+    granularity: JunitIdGranularity,
+) -> Result<Vec<TimingObservation>> {
+    use std::collections::BTreeMap;
+
     let mut reader = quick_xml::Reader::from_str(content);
     reader.config_mut().trim_text(true);
 
     let mut out = Vec::new();
+    let mut class_agg: BTreeMap<String, u64> = BTreeMap::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
@@ -38,7 +53,9 @@ fn parse_junit_xml_content(content: &str) -> Result<Vec<TimingObservation>> {
                 let mut time: Option<String> = None;
                 for attr in e.attributes() {
                     let attr = attr.context("Invalid XML attribute in testcase element")?;
-                    let value = String::from_utf8_lossy(attr.value.as_ref()).trim().to_string();
+                    let value = String::from_utf8_lossy(attr.value.as_ref())
+                        .trim()
+                        .to_string();
                     match attr.key.as_ref() {
                         b"classname" => classname = Some(value),
                         b"name" => name = Some(value),
@@ -47,28 +64,60 @@ fn parse_junit_xml_content(content: &str) -> Result<Vec<TimingObservation>> {
                     }
                 }
 
-                let test_id = match (classname.as_deref(), name.as_deref()) {
-                    (Some(c), Some(n)) if !c.is_empty() && !n.is_empty() => format!("{c}.{n}"),
-                    (_, Some(n)) if !n.is_empty() => n.to_string(),
-                    (Some(c), _) if !c.is_empty() => c.to_string(),
-                    _ => String::new(),
-                };
-                if test_id.is_empty() {
-                    continue;
-                }
                 let duration_ms = time
                     .as_deref()
                     .and_then(parse_seconds_to_ms)
                     .unwrap_or_default();
-                out.push(TimingObservation {
-                    test_id,
-                    duration_ms,
-                });
+
+                match granularity {
+                    JunitIdGranularity::Method => {
+                        let test_id = match (classname.as_deref(), name.as_deref()) {
+                            (Some(c), Some(n)) if !c.is_empty() && !n.is_empty() => {
+                                format!("{c}.{n}")
+                            }
+                            (_, Some(n)) if !n.is_empty() => n.to_string(),
+                            (Some(c), _) if !c.is_empty() => c.to_string(),
+                            _ => String::new(),
+                        };
+                        if test_id.is_empty() {
+                            continue;
+                        }
+                        out.push(TimingObservation {
+                            test_id,
+                            duration_ms,
+                        });
+                    }
+                    JunitIdGranularity::Class => {
+                        let class_id = match classname.as_deref() {
+                            Some(c) if !c.is_empty() => c.to_string(),
+                            _ => match name.as_deref() {
+                                Some(n) if !n.is_empty() => n.to_string(),
+                                _ => String::new(),
+                            },
+                        };
+                        if class_id.is_empty() {
+                            continue;
+                        }
+                        let total = class_agg.entry(class_id).or_insert(0);
+                        *total = total.saturating_add(duration_ms);
+                    }
+                }
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(e) => anyhow::bail!("Failed to parse JUnit XML: {e}"),
         }
+    }
+
+    if granularity == JunitIdGranularity::Class {
+        out.extend(
+            class_agg
+                .into_iter()
+                .map(|(test_id, duration_ms)| TimingObservation {
+                    test_id,
+                    duration_ms,
+                }),
+        );
     }
 
     Ok(out)
@@ -120,7 +169,7 @@ mod tests {
                 <testcase name="tests/test_mod.py::test_two" time="0.500" />
             </testsuite>
         "#;
-        let obs = parse_junit_xml_content(xml).unwrap();
+        let obs = parse_junit_xml_content(xml, JunitIdGranularity::Method).unwrap();
         assert_eq!(obs.len(), 2);
         assert_eq!(
             obs[0],
@@ -135,6 +184,31 @@ mod tests {
                 test_id: "tests/test_mod.py::test_two".to_string(),
                 duration_ms: 500
             }
+        );
+    }
+
+    #[test]
+    fn test_parse_junit_xml_content_class_aggregates_durations() {
+        let xml = r#"
+            <testsuite name="suite">
+                <testcase classname="com.foo.BarTest" name="testOne" time="0.120" />
+                <testcase classname="com.foo.BarTest" name="testTwo" time="0.130" />
+                <testcase name="tests/test_mod.py::test_two" time="0.500" />
+            </testsuite>
+        "#;
+        let obs = parse_junit_xml_content(xml, JunitIdGranularity::Class).unwrap();
+        assert_eq!(
+            obs,
+            vec![
+                TimingObservation {
+                    test_id: "com.foo.BarTest".to_string(),
+                    duration_ms: 250
+                },
+                TimingObservation {
+                    test_id: "tests/test_mod.py::test_two".to_string(),
+                    duration_ms: 500
+                }
+            ]
         );
     }
 

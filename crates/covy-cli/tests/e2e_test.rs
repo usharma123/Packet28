@@ -349,7 +349,9 @@ fn test_check_loads_coverage_from_state_by_default() {
         .success();
 
     covy_cmd()
-        .args(["check", "--base", "HEAD", "--head", "HEAD", "--report", "json"])
+        .args([
+            "check", "--base", "HEAD", "--head", "HEAD", "--report", "json",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("passed"));
@@ -361,7 +363,9 @@ fn test_check_without_coverage_and_state_fails() {
 
     covy_cmd()
         .current_dir(dir.path())
-        .args(["check", "--base", "HEAD", "--head", "HEAD", "--report", "json"])
+        .args([
+            "check", "--base", "HEAD", "--head", "HEAD", "--report", "json",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -596,11 +600,7 @@ fn test_merge_writes_output_issues_state() {
 
     covy_cmd()
         .current_dir(dir.path())
-        .args([
-            "ingest",
-            "--issues",
-            &fixture("sarif/basic.sarif"),
-        ])
+        .args(["ingest", "--issues", &fixture("sarif/basic.sarif")])
         .assert()
         .success();
 
@@ -742,6 +742,52 @@ fn test_shard_plan_supports_tasks_json() {
 }
 
 #[test]
+fn test_shard_plan_accepts_whale_lpt_algorithm() {
+    let dir = TempDir::new().unwrap();
+    let tests_file = dir.path().join("tests.txt");
+    std::fs::write(&tests_file, "com.foo.A\ncom.foo.B\ncom.foo.C\n").unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "plan",
+            "--shards",
+            "2",
+            "--tests-file",
+            tests_file.to_str().unwrap(),
+            "--algorithm",
+            "whale-lpt",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"shards\""))
+        .stdout(predicate::str::contains("com.foo.A"));
+}
+
+#[test]
+fn test_shard_plan_rejects_invalid_algorithm() {
+    let dir = TempDir::new().unwrap();
+    let tests_file = dir.path().join("tests.txt");
+    std::fs::write(&tests_file, "com.foo.A\n").unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "plan",
+            "--shards",
+            "1",
+            "--tests-file",
+            tests_file.to_str().unwrap(),
+            "--algorithm",
+            "bad-algo",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value"));
+}
+
+#[test]
 fn test_shard_plan_pr_tier_excludes_slow_tagged_tasks() {
     let dir = TempDir::new().unwrap();
     let tasks_file = dir.path().join("tasks.json");
@@ -864,5 +910,71 @@ fn test_shard_update_ingests_junit_xml_timings() {
 
     let bytes = std::fs::read(&timings_bin).unwrap();
     let timings = covy_core::cache::deserialize_test_timings(&bytes).unwrap();
-    assert_eq!(timings.duration_ms.get("com.foo.BarTest.testOne"), Some(&250));
+    assert_eq!(
+        timings.duration_ms.get("com.foo.BarTest.testOne"),
+        Some(&250)
+    );
+}
+
+#[test]
+fn test_shard_update_ingests_junit_xml_timings_by_class() {
+    let dir = TempDir::new().unwrap();
+    let junit = dir.path().join("junit.xml");
+    let timings_bin = dir.path().join("testtimings.bin");
+    std::fs::write(
+        &junit,
+        r#"<testsuite>
+            <testcase classname="com.foo.BarTest" name="testOne" time="0.250"/>
+            <testcase classname="com.foo.BarTest" name="testTwo" time="0.150"/>
+          </testsuite>"#,
+    )
+    .unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "update",
+            "--junit-xml",
+            junit.to_str().unwrap(),
+            "--timings",
+            timings_bin.to_str().unwrap(),
+            "--junit-id-granularity",
+            "class",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tests_updated\": 1"));
+
+    let bytes = std::fs::read(&timings_bin).unwrap();
+    let timings = covy_core::cache::deserialize_test_timings(&bytes).unwrap();
+    assert_eq!(timings.duration_ms.get("com.foo.BarTest"), Some(&400));
+    assert!(timings.duration_ms.get("com.foo.BarTest.testOne").is_none());
+}
+
+#[test]
+fn test_shard_update_rejects_invalid_junit_id_granularity() {
+    let dir = TempDir::new().unwrap();
+    let jsonl = dir.path().join("timings.jsonl");
+    let timings_bin = dir.path().join("testtimings.bin");
+    std::fs::write(
+        &jsonl,
+        "{\"test_id\":\"com.foo.BarTest\",\"duration_ms\":1200}\n",
+    )
+    .unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "update",
+            "--timings-jsonl",
+            jsonl.to_str().unwrap(),
+            "--timings",
+            timings_bin.to_str().unwrap(),
+            "--junit-id-granularity",
+            "suite",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value"));
 }

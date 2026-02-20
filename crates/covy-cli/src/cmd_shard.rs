@@ -5,6 +5,31 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use covy_core::CovyConfig;
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum PlannerAlgorithmArg {
+    #[value(name = "lpt")]
+    Lpt,
+    #[value(name = "whale-lpt")]
+    WhaleLpt,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum JunitIdGranularityArg {
+    #[value(name = "method")]
+    Method,
+    #[value(name = "class")]
+    Class,
+}
+
+impl From<JunitIdGranularityArg> for crate::shard_timing::JunitIdGranularity {
+    fn from(value: JunitIdGranularityArg) -> Self {
+        match value {
+            JunitIdGranularityArg::Method => crate::shard_timing::JunitIdGranularity::Method,
+            JunitIdGranularityArg::Class => crate::shard_timing::JunitIdGranularity::Class,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct ShardArgs {
     #[command(subcommand)]
@@ -57,6 +82,10 @@ pub struct ShardPlanArgs {
     #[arg(long)]
     pub unknown_test_seconds: Option<f64>,
 
+    /// Planning algorithm (lpt or whale-lpt)
+    #[arg(long, value_enum)]
+    pub algorithm: Option<PlannerAlgorithmArg>,
+
     /// Emit JSON output
     #[arg(long)]
     pub json: bool,
@@ -83,6 +112,10 @@ pub struct ShardUpdateArgs {
     /// Optional JSON export path for the merged timings snapshot
     #[arg(long)]
     pub export_json: Option<String>,
+
+    /// JUnit test id granularity (method or class)
+    #[arg(long, value_enum, default_value = "method")]
+    pub junit_id_granularity: JunitIdGranularityArg,
 
     /// Emit JSON output
     #[arg(long)]
@@ -121,7 +154,13 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
                 .unwrap_or(config.shard.unknown_test_seconds);
             let unknown_ms = (unknown_seconds * 1000.0) as u64;
             let jobs = covy_core::shard::build_timed_jobs(&tests, &timings, unknown_ms);
-            let shard_plan = covy_core::shard::plan_shards_lpt(&jobs, plan.shards);
+            let algorithm = resolve_plan_algorithm(&plan, &config)?;
+            let shard_plan = match algorithm {
+                PlannerAlgorithmArg::Lpt => covy_core::shard::plan_shards_lpt(&jobs, plan.shards),
+                PlannerAlgorithmArg::WhaleLpt => {
+                    covy_core::shard::plan_shards_whale_lpt(&jobs, plan.shards)
+                }
+            };
 
             if let Some(dir) = plan.write_files.as_deref() {
                 write_shard_files(dir, &shard_plan)?;
@@ -146,10 +185,16 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
             let junit_files = resolve_globs(&update.junit_xml)?;
             let jsonl_files = resolve_globs(&update.timings_jsonl)?;
             if junit_files.is_empty() && jsonl_files.is_empty() {
-                anyhow::bail!("No timing inputs found. Provide --junit-xml and/or --timings-jsonl.");
+                anyhow::bail!(
+                    "No timing inputs found. Provide --junit-xml and/or --timings-jsonl."
+                );
             }
 
-            let observations = load_timing_observations(&junit_files, &jsonl_files)?;
+            let observations = load_timing_observations(
+                &junit_files,
+                &jsonl_files,
+                update.junit_id_granularity.into(),
+            )?;
             if observations.is_empty() {
                 anyhow::bail!("No timing observations found in provided inputs.");
             }
@@ -203,9 +248,7 @@ fn load_tasks(args: &ShardPlanArgs) -> Result<Vec<PlanningTask>> {
     .count();
 
     if provided != 1 {
-        anyhow::bail!(
-            "Provide exactly one of --tasks-json, --tests-file, or --impact-json"
-        );
+        anyhow::bail!("Provide exactly one of --tasks-json, --tests-file, or --impact-json");
     }
 
     if let Some(path) = &args.tasks_json {
@@ -287,7 +330,10 @@ fn apply_tag_filters(
             .iter()
             .map(normalize_tag)
             .collect(),
-        _ => anyhow::bail!("Unsupported tier '{}'. Expected 'pr' or 'nightly'", args.tier),
+        _ => anyhow::bail!(
+            "Unsupported tier '{}'. Expected 'pr' or 'nightly'",
+            args.tier
+        ),
     };
     exclude.extend(args.exclude_tag.iter().map(normalize_tag));
     let include: std::collections::BTreeSet<String> =
@@ -297,7 +343,8 @@ fn apply_tag_filters(
         .into_iter()
         .filter(|task| {
             let task_tags: Vec<String> = task.tags.iter().map(normalize_tag).collect();
-            let include_ok = include.is_empty() || task_tags.iter().any(|tag| include.contains(tag));
+            let include_ok =
+                include.is_empty() || task_tags.iter().any(|tag| include.contains(tag));
             let excluded = task_tags.iter().any(|tag| exclude.contains(tag));
             include_ok && !excluded
         })
@@ -307,6 +354,29 @@ fn apply_tag_filters(
 
 fn normalize_tag(tag: impl AsRef<str>) -> String {
     tag.as_ref().trim().to_ascii_lowercase()
+}
+
+fn resolve_plan_algorithm(
+    plan: &ShardPlanArgs,
+    config: &CovyConfig,
+) -> Result<PlannerAlgorithmArg> {
+    if let Some(algorithm) = plan.algorithm {
+        return Ok(algorithm);
+    }
+
+    let configured = config.shard.algorithm.trim();
+    if configured.is_empty() {
+        return Ok(PlannerAlgorithmArg::Lpt);
+    }
+
+    match configured.to_ascii_lowercase().as_str() {
+        "lpt" => Ok(PlannerAlgorithmArg::Lpt),
+        "whale-lpt" => Ok(PlannerAlgorithmArg::WhaleLpt),
+        _ => anyhow::bail!(
+            "Unsupported shard algorithm '{}'. Expected 'lpt' or 'whale-lpt'",
+            configured
+        ),
+    }
 }
 
 fn load_timings(path: &Path) -> Result<covy_core::testmap::TestTimingHistory> {
@@ -358,10 +428,14 @@ fn resolve_globs(patterns: &[String]) -> Result<Vec<PathBuf>> {
 fn load_timing_observations(
     junit_files: &[PathBuf],
     jsonl_files: &[PathBuf],
+    junit_id_granularity: crate::shard_timing::JunitIdGranularity,
 ) -> Result<Vec<crate::shard_timing::TimingObservation>> {
     let mut observations = Vec::new();
     for path in junit_files {
-        observations.extend(crate::shard_timing::parse_junit_xml_file(path)?);
+        observations.extend(crate::shard_timing::parse_junit_xml_file(
+            path,
+            junit_id_granularity,
+        )?);
     }
     for path in jsonl_files {
         observations.extend(crate::shard_timing::parse_timing_jsonl_file(path)?);
@@ -396,13 +470,16 @@ fn apply_timing_observations(
         let new_avg = new_total / durations.len() as u64;
 
         let prev_count = timings.sample_count.get(*test_id).copied().unwrap_or(0);
-        let prev_duration = timings.duration_ms.get(*test_id).copied().unwrap_or(new_avg);
+        let prev_duration = timings
+            .duration_ms
+            .get(*test_id)
+            .copied()
+            .unwrap_or(new_avg);
         let merged_count = prev_count.saturating_add(new_count);
         let merged_duration = if merged_count == 0 {
             new_avg
         } else {
-            (((prev_duration as u128 * prev_count as u128)
-                + (new_avg as u128 * new_count as u128))
+            (((prev_duration as u128 * prev_count as u128) + (new_avg as u128 * new_count as u128))
                 / (merged_count as u128)) as u64
         };
 
@@ -562,6 +639,7 @@ mod tests {
             impact_json: None,
             timings: None,
             unknown_test_seconds: None,
+            algorithm: None,
             json: true,
             write_files: None,
         };
@@ -604,5 +682,48 @@ mod tests {
         let loaded = load_timings(&path).unwrap();
         assert_eq!(loaded.duration_ms.get("t"), Some(&123));
         assert_eq!(loaded.sample_count.get("t"), Some(&1));
+    }
+
+    #[test]
+    fn test_resolve_plan_algorithm_prefers_cli_flag() {
+        let args = ShardPlanArgs {
+            shards: 1,
+            tasks_json: None,
+            tier: "nightly".to_string(),
+            include_tag: Vec::new(),
+            exclude_tag: Vec::new(),
+            tests_file: None,
+            impact_json: None,
+            timings: None,
+            unknown_test_seconds: None,
+            algorithm: Some(PlannerAlgorithmArg::WhaleLpt),
+            json: false,
+            write_files: None,
+        };
+        let cfg = CovyConfig::default();
+        let resolved = resolve_plan_algorithm(&args, &cfg).unwrap();
+        assert!(matches!(resolved, PlannerAlgorithmArg::WhaleLpt));
+    }
+
+    #[test]
+    fn test_resolve_plan_algorithm_rejects_invalid_config() {
+        let args = ShardPlanArgs {
+            shards: 1,
+            tasks_json: None,
+            tier: "nightly".to_string(),
+            include_tag: Vec::new(),
+            exclude_tag: Vec::new(),
+            tests_file: None,
+            impact_json: None,
+            timings: None,
+            unknown_test_seconds: None,
+            algorithm: None,
+            json: false,
+            write_files: None,
+        };
+        let mut cfg = CovyConfig::default();
+        cfg.shard.algorithm = "bad".to_string();
+        let err = resolve_plan_algorithm(&args, &cfg).unwrap_err();
+        assert!(err.to_string().contains("Unsupported shard algorithm"));
     }
 }
