@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -40,8 +41,18 @@ pub fn run(args: TestmapArgs, _config_path: &str) -> Result<i32> {
             }
             let records = read_manifest_records(&files)?;
             validate_manifest_records(&records)?;
+            let mut index = covy_core::testmap::TestMapIndex::default();
+            index.test_to_files = build_test_to_files_index(&records)?;
+
+            let output = Path::new(&build.output);
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let bytes = covy_core::cache::serialize_testmap(&index)?;
+            std::fs::write(output, bytes)?;
+
             tracing::info!(
-                "Validated {} manifest records from {} file(s)",
+                "Built testmap from {} manifest records across {} file(s)",
                 records.len(),
                 files.len()
             );
@@ -61,6 +72,19 @@ struct ManifestRecord {
     coverage_report: Option<String>,
     #[serde(default)]
     coverage_reports: Vec<String>,
+}
+
+impl ManifestRecord {
+    fn coverage_paths(&self) -> Vec<&str> {
+        let mut paths = Vec::new();
+        if let Some(path) = self.coverage_report.as_deref() {
+            paths.push(path);
+        }
+        for path in &self.coverage_reports {
+            paths.push(path.as_str());
+        }
+        paths
+    }
 }
 
 fn resolve_globs(patterns: &[String]) -> Result<Vec<PathBuf>> {
@@ -119,8 +143,31 @@ fn validate_manifest_records(records: &[ManifestRecord]) -> Result<()> {
                 rec.test_id
             );
         }
+        let _ = rec.duration_ms;
     }
     Ok(())
+}
+
+fn build_test_to_files_index(records: &[ManifestRecord]) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut test_to_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for rec in records {
+        let mut covered_files = BTreeSet::new();
+        for coverage_path in rec.coverage_paths() {
+            let coverage = covy_ingest::ingest_path(Path::new(coverage_path)).with_context(|| {
+                format!(
+                    "Failed to ingest coverage report '{}' for test '{}'",
+                    coverage_path, rec.test_id
+                )
+            })?;
+            for file in coverage.files.keys() {
+                covered_files.insert(file.clone());
+            }
+        }
+        test_to_files.insert(rec.test_id.clone(), covered_files);
+    }
+
+    Ok(test_to_files)
 }
 
 #[cfg(test)]
@@ -152,5 +199,17 @@ mod tests {
         assert!(err
             .to_string()
             .contains("must provide coverage_report or coverage_reports"));
+    }
+
+    #[test]
+    fn test_manifest_record_coverage_paths() {
+        let rec = ManifestRecord {
+            test_id: "t".to_string(),
+            language: None,
+            duration_ms: None,
+            coverage_report: Some("a.info".to_string()),
+            coverage_reports: vec!["b.info".to_string()],
+        };
+        assert_eq!(rec.coverage_paths(), vec!["a.info", "b.info"]);
     }
 }

@@ -368,3 +368,33 @@ fn test_check_without_coverage_and_state_fails() {
             "No coverage files specified and no cached coverage state found",
         ));
 }
+
+#[test]
+fn test_testmap_build_writes_test_to_files_index() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("manifest.jsonl");
+    let output = dir.path().join("testmap.bin");
+
+    let line = format!(
+        "{{\"test_id\":\"com.foo.BarTest\",\"language\":\"java\",\"coverage_report\":\"{}\"}}\n",
+        fixture("lcov/basic.info")
+    );
+    std::fs::write(&manifest, line).unwrap();
+
+    covy_cmd()
+        .args([
+            "testmap",
+            "build",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    let map = covy_core::cache::deserialize_testmap(&bytes).unwrap();
+    assert!(map.test_to_files.contains_key("com.foo.BarTest"));
+    assert!(!map.test_to_files["com.foo.BarTest"].is_empty());
+}
