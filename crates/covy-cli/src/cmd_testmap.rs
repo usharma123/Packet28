@@ -43,6 +43,15 @@ pub fn run(args: TestmapArgs, _config_path: &str) -> Result<i32> {
             validate_manifest_records(&records)?;
             let mut index = covy_core::testmap::TestMapIndex::default();
             index.test_to_files = build_test_to_files_index(&records)?;
+            index.file_to_tests = build_file_to_tests_index(&index.test_to_files);
+            index.metadata.schema_version = covy_core::cache::TESTMAP_SCHEMA_VERSION;
+            index.metadata.path_norm_version = covy_core::cache::DIAGNOSTICS_PATH_NORM_VERSION;
+            index.metadata.repo_root_id = covy_core::cache::current_repo_root_id(None);
+            index.metadata.generated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            index.metadata.granularity = "file".to_string();
 
             let output = Path::new(&build.output);
             if let Some(parent) = output.parent() {
@@ -154,12 +163,14 @@ fn build_test_to_files_index(records: &[ManifestRecord]) -> Result<BTreeMap<Stri
     for rec in records {
         let mut covered_files = BTreeSet::new();
         for coverage_path in rec.coverage_paths() {
-            let coverage = covy_ingest::ingest_path(Path::new(coverage_path)).with_context(|| {
+            let mut coverage =
+                covy_ingest::ingest_path(Path::new(coverage_path)).with_context(|| {
                 format!(
                     "Failed to ingest coverage report '{}' for test '{}'",
                     coverage_path, rec.test_id
                 )
             })?;
+            covy_core::pathmap::auto_normalize_paths(&mut coverage, None);
             for file in coverage.files.keys() {
                 covered_files.insert(file.clone());
             }
@@ -168,6 +179,21 @@ fn build_test_to_files_index(records: &[ManifestRecord]) -> Result<BTreeMap<Stri
     }
 
     Ok(test_to_files)
+}
+
+fn build_file_to_tests_index(
+    test_to_files: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut file_to_tests: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (test_id, files) in test_to_files {
+        for file in files {
+            file_to_tests
+                .entry(file.clone())
+                .or_default()
+                .insert(test_id.clone());
+        }
+    }
+    file_to_tests
 }
 
 #[cfg(test)]
@@ -211,5 +237,26 @@ mod tests {
             coverage_reports: vec!["b.info".to_string()],
         };
         assert_eq!(rec.coverage_paths(), vec!["a.info", "b.info"]);
+    }
+
+    #[test]
+    fn test_build_file_to_tests_index() {
+        let mut test_to_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        test_to_files
+            .entry("t1".to_string())
+            .or_default()
+            .insert("src/a.rs".to_string());
+        test_to_files
+            .entry("t2".to_string())
+            .or_default()
+            .insert("src/a.rs".to_string());
+        test_to_files
+            .entry("t2".to_string())
+            .or_default()
+            .insert("src/b.rs".to_string());
+
+        let idx = build_file_to_tests_index(&test_to_files);
+        assert_eq!(idx["src/a.rs"].len(), 2);
+        assert_eq!(idx["src/b.rs"].len(), 1);
     }
 }

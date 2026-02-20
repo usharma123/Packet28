@@ -397,4 +397,12 @@ fn test_testmap_build_writes_test_to_files_index() {
     let map = covy_core::cache::deserialize_testmap(&bytes).unwrap();
     assert!(map.test_to_files.contains_key("com.foo.BarTest"));
     assert!(!map.test_to_files["com.foo.BarTest"].is_empty());
+    let covered_file = map.test_to_files["com.foo.BarTest"]
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(map.file_to_tests.contains_key(&covered_file));
+    assert!(map.file_to_tests[&covered_file].contains("com.foo.BarTest"));
+    assert!(map.metadata.generated_at > 0);
 }
