@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn covy_cmd() -> Command {
-    Command::cargo_bin("covy").unwrap()
+    assert_cmd::cargo::cargo_bin_cmd!("covy")
 }
 
 fn fixture(rel: &str) -> String {
