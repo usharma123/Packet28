@@ -64,7 +64,7 @@ stale_extra = []
 [shard]
 # Timing history state for shard planner
 timings_path = ".covy/state/testtimings.bin"
-# Planning algorithm (v1: lpt)
+# Planning algorithm: "lpt" or "whale-lpt"
 algorithm = "lpt"
 # Predicted seconds for tests with no timing history
 unknown_test_seconds = 8.0

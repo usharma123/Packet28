@@ -52,6 +52,53 @@ max_new_warnings = 5
 # max_new_issues = 10
 ```
 
+## Sharding Workflow
+
+`covy` stays runner-agnostic: your CI executes tests, while `covy` plans shards and merges artifacts.
+
+1. Generate `tasks.json` from your test adapter:
+
+```json
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "com.foo.BarTest",
+      "selector": "com.foo.BarTest",
+      "est_ms": 1200,
+      "tags": ["unit"],
+      "module": "core"
+    },
+    {
+      "id": "tests/test_mod.py::test_one",
+      "selector": "tests/test_mod.py::test_one",
+      "est_ms": 900,
+      "tags": ["slow"]
+    }
+  ]
+}
+```
+
+2. Plan shards (PR tier excludes `slow` by default):
+
+```bash
+./target/release/covy shard plan --shards 8 --tasks-json tasks.json --tier pr --write-files .covy/shards --json
+```
+
+3. Run shard files with your test runner and produce coverage/diagnostics artifacts.
+
+4. Update timing history for future plans:
+
+```bash
+./target/release/covy shard update --junit-xml "artifacts/**/junit.xml" --timings-jsonl "artifacts/**/timings.jsonl" --json
+```
+
+5. Merge shard artifacts back into canonical state:
+
+```bash
+./target/release/covy merge --coverage "artifacts/**/coverage.bin" --issues "artifacts/**/issues.bin" --json
+```
+
 ## Benchmarking
 
 Use the standard benchmark harness in `benchmarks/`:
