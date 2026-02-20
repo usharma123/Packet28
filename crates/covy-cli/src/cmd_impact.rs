@@ -45,11 +45,12 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         )
     })?;
     let map = covy_core::cache::deserialize_testmap(&bytes)?;
+    let known_tests = map.test_to_files.len();
 
     let diffs = covy_core::diff::git_diff(base, head)?;
     let mut result = covy_core::impact::select_impacted_tests(&map, &diffs);
     let stale = is_stale(map.metadata.generated_at, config.impact.fresh_hours);
-    apply_policy(&mut result, &diffs, &config, stale)?;
+    apply_policy(&mut result, &diffs, &config, stale, known_tests)?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -63,6 +64,15 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
             println!("{test}");
         }
     }
+    println!(
+        "summary: selected={} known={} missing={} confidence={:.2} stale={} escalate_full_suite={}",
+        result.selected_tests.len(),
+        known_tests,
+        result.missing_mappings.len(),
+        result.confidence,
+        result.stale,
+        result.escalate_full_suite
+    );
 
     if args.print_command {
         let command = if result.selected_tests.is_empty() {
@@ -93,6 +103,7 @@ fn apply_policy(
     diffs: &[covy_core::model::FileDiff],
     config: &CovyConfig,
     stale: bool,
+    known_tests: usize,
 ) -> Result<()> {
     result.stale = stale;
 
@@ -118,6 +129,12 @@ fn apply_policy(
         confidence *= 0.75;
     }
     result.confidence = confidence.clamp(0.0, 1.0);
+    if known_tests > 0 {
+        let ratio = result.selected_tests.len() as f64 / known_tests as f64;
+        result.escalate_full_suite = ratio > config.impact.full_suite_threshold;
+    } else {
+        result.escalate_full_suite = false;
+    }
 
     if config.impact.fallback_mode.eq_ignore_ascii_case("fail-closed")
         && !result.missing_mappings.is_empty()
@@ -159,11 +176,27 @@ mod tests {
         )
         .unwrap();
 
-        apply_policy(&mut result, &diffs, &cfg, true).unwrap();
+        apply_policy(&mut result, &diffs, &cfg, true, 4).unwrap();
         assert!(result.selected_tests.contains(&"t1".to_string()));
         assert!(result.selected_tests.contains(&"smoke::always".to_string()));
         assert!(result.selected_tests.contains(&"smoke::stale".to_string()));
         assert!(result.stale);
         assert!((result.confidence - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_policy_sets_escalation_threshold() {
+        let mut cfg = CovyConfig::default();
+        cfg.impact.full_suite_threshold = 0.40;
+        let mut result = covy_core::impact::ImpactResult {
+            selected_tests: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            ..Default::default()
+        };
+        let diffs = covy_core::diff::parse_diff_output(
+            "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        apply_policy(&mut result, &diffs, &cfg, false, 5).unwrap();
+        assert!(result.escalate_full_suite);
     }
 }
