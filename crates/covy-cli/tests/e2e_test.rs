@@ -650,3 +650,29 @@ fn test_testmap_build_supports_python_language_metadata() {
         "python".to_string()
     );
 }
+
+#[test]
+fn test_shard_plan_supports_python_nodeids() {
+    let dir = TempDir::new().unwrap();
+    let tests_file = dir.path().join("py-tests.txt");
+    std::fs::write(
+        &tests_file,
+        "tests/test_mod.py::test_one\ntests/test_mod.py::test_two\n",
+    )
+    .unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "plan",
+            "--shards",
+            "2",
+            "--tests-file",
+            tests_file.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tests/test_mod.py::test_one"))
+        .stdout(predicate::str::contains("tests/test_mod.py::test_two"));
+}

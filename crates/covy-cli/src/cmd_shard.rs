@@ -168,4 +168,27 @@ mod tests {
         let tests = load_tests_from_file(&path).unwrap();
         assert_eq!(tests, vec!["a".to_string(), "b".to_string()]);
     }
+
+    #[test]
+    fn test_load_tests_from_impact_json_with_python_nodeids() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("impact.json");
+        let payload = serde_json::json!({
+            "selected_tests": ["tests/test_x.py::test_a", "tests/test_y.py::test_b"],
+            "smoke_tests": [],
+            "missing_mappings": [],
+            "stale": false,
+            "confidence": 1.0,
+            "escalate_full_suite": false
+        });
+        std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
+        let tests = load_tests_from_impact_json(&path).unwrap();
+        assert_eq!(
+            tests,
+            vec![
+                "tests/test_x.py::test_a".to_string(),
+                "tests/test_y.py::test_b".to_string()
+            ]
+        );
+    }
 }
