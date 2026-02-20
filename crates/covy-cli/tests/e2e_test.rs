@@ -676,3 +676,32 @@ fn test_shard_plan_supports_python_nodeids() {
         .stdout(predicate::str::contains("tests/test_mod.py::test_one"))
         .stdout(predicate::str::contains("tests/test_mod.py::test_two"));
 }
+
+#[test]
+fn test_shard_plan_supports_tasks_json() {
+    let dir = TempDir::new().unwrap();
+    let tasks_file = dir.path().join("tasks.json");
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "com.foo.BarTest", "selector": "com.foo.BarTest", "est_ms": 1000},
+            {"id": "tests/test_mod.py::test_one", "selector": "tests/test_mod.py::test_one", "est_ms": 800}
+        ]
+    });
+    std::fs::write(&tasks_file, serde_json::to_string(&payload).unwrap()).unwrap();
+
+    covy_cmd()
+        .args([
+            "shard",
+            "plan",
+            "--shards",
+            "2",
+            "--tasks-json",
+            tasks_file.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("com.foo.BarTest"))
+        .stdout(predicate::str::contains("tests/test_mod.py::test_one"));
+}

@@ -22,6 +22,10 @@ pub struct ShardPlanArgs {
     #[arg(long)]
     pub shards: usize,
 
+    /// Input tasks.json file
+    #[arg(long)]
+    pub tasks_json: Option<String>,
+
     /// Input tests file
     #[arg(long)]
     pub tests_file: Option<String>,
@@ -84,12 +88,28 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
 }
 
 fn load_tests(args: &ShardPlanArgs) -> Result<Vec<String>> {
-    match (&args.tests_file, &args.impact_json) {
-        (Some(path), None) => load_tests_from_file(Path::new(path)),
-        (None, Some(path)) => load_tests_from_impact_json(Path::new(path)),
-        (Some(_), Some(_)) => anyhow::bail!("Provide either --tests-file or --impact-json, not both"),
-        (None, None) => anyhow::bail!("One of --tests-file or --impact-json is required"),
+    let provided = [
+        args.tasks_json.is_some(),
+        args.tests_file.is_some(),
+        args.impact_json.is_some(),
+    ]
+    .into_iter()
+    .filter(|v| *v)
+    .count();
+
+    if provided != 1 {
+        anyhow::bail!(
+            "Provide exactly one of --tasks-json, --tests-file, or --impact-json"
+        );
     }
+
+    if let Some(path) = &args.tasks_json {
+        return load_tests_from_tasks_json(Path::new(path));
+    }
+    if let Some(path) = &args.tests_file {
+        return load_tests_from_file(Path::new(path));
+    }
+    load_tests_from_impact_json(Path::new(args.impact_json.as_deref().unwrap_or_default()))
 }
 
 fn load_tests_from_file(path: &Path) -> Result<Vec<String>> {
@@ -110,6 +130,20 @@ fn load_tests_from_impact_json(path: &Path) -> Result<Vec<String>> {
     let impact: covy_core::impact::ImpactResult =
         serde_json::from_str(&content).context("Failed to parse impact JSON")?;
     Ok(impact.selected_tests)
+}
+
+fn load_tests_from_tasks_json(path: &Path) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read tasks JSON {}", path.display()))?;
+    let tasks: covy_core::shard::TaskSet =
+        serde_json::from_str(&content).context("Failed to parse tasks JSON")?;
+    let ids = tasks
+        .tasks
+        .into_iter()
+        .map(|task| task.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    Ok(ids)
 }
 
 fn load_timings(path: &Path) -> Result<covy_core::testmap::TestTimingHistory> {
@@ -188,6 +222,28 @@ mod tests {
             vec![
                 "tests/test_x.py::test_a".to_string(),
                 "tests/test_y.py::test_b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_load_tests_from_tasks_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tasks.json");
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "tasks": [
+                {"id": "com.foo.BarTest", "selector": "com.foo.BarTest", "est_ms": 1200},
+                {"id": "tests/test_mod.py::test_one", "selector": "tests/test_mod.py::test_one", "est_ms": 900}
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
+        let tests = load_tests_from_tasks_json(&path).unwrap();
+        assert_eq!(
+            tests,
+            vec![
+                "com.foo.BarTest".to_string(),
+                "tests/test_mod.py::test_one".to_string()
             ]
         );
     }
