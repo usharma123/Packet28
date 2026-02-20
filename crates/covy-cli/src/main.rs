@@ -7,6 +7,7 @@ mod cmd_merge;
 mod cmd_report;
 mod cmd_shard;
 mod cmd_testmap;
+mod shard_timing;
 
 use clap::{Parser, Subcommand};
 

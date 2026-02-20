@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -14,6 +15,8 @@ pub struct ShardArgs {
 pub enum ShardCommands {
     /// Plan test shards for CI runners
     Plan(ShardPlanArgs),
+    /// Update timing history from runner timing artifacts
+    Update(ShardUpdateArgs),
 }
 
 #[derive(Args)]
@@ -51,6 +54,37 @@ pub struct ShardPlanArgs {
     pub write_files: Option<String>,
 }
 
+#[derive(Args)]
+pub struct ShardUpdateArgs {
+    /// JUnit XML timing inputs (supports globs)
+    #[arg(long)]
+    pub junit_xml: Vec<String>,
+
+    /// Generic timing JSONL inputs (supports globs)
+    #[arg(long)]
+    pub timings_jsonl: Vec<String>,
+
+    /// Timing history path
+    #[arg(long)]
+    pub timings: Option<String>,
+
+    /// Optional JSON export path for the merged timings snapshot
+    #[arg(long)]
+    pub export_json: Option<String>,
+
+    /// Emit JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ShardUpdateSummary {
+    observations_ingested: usize,
+    tests_updated: usize,
+    timings_path: String,
+    exported_json: Option<String>,
+}
+
 pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     match args.command {
@@ -82,6 +116,54 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
                 render_text(&shard_plan);
             }
 
+            Ok(0)
+        }
+        ShardCommands::Update(update) => {
+            let timings_path = update
+                .timings
+                .as_deref()
+                .unwrap_or(&config.shard.timings_path)
+                .to_string();
+            let mut timings = load_timings(Path::new(&timings_path))?;
+
+            let junit_files = resolve_globs(&update.junit_xml)?;
+            let jsonl_files = resolve_globs(&update.timings_jsonl)?;
+            if junit_files.is_empty() && jsonl_files.is_empty() {
+                anyhow::bail!("No timing inputs found. Provide --junit-xml and/or --timings-jsonl.");
+            }
+
+            let observations = load_timing_observations(&junit_files, &jsonl_files)?;
+            if observations.is_empty() {
+                anyhow::bail!("No timing observations found in provided inputs.");
+            }
+
+            let updated = apply_timing_observations(&mut timings, &observations);
+            write_timings(Path::new(&timings_path), &timings)?;
+
+            let exported_json = if let Some(path) = update.export_json.as_deref() {
+                write_timings_json(Path::new(path), &timings)?;
+                Some(path.to_string())
+            } else {
+                None
+            };
+
+            let summary = ShardUpdateSummary {
+                observations_ingested: observations.len(),
+                tests_updated: updated,
+                timings_path,
+                exported_json,
+            };
+            if update.json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!(
+                    "timings updated: observations={} tests_updated={} timings_path={}",
+                    summary.observations_ingested, summary.tests_updated, summary.timings_path
+                );
+                if let Some(path) = &summary.exported_json {
+                    println!("timings exported: {path}");
+                }
+            }
             Ok(0)
         }
     }
@@ -153,6 +235,107 @@ fn load_timings(path: &Path) -> Result<covy_core::testmap::TestTimingHistory> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read timings file {}", path.display()))?;
     covy_core::cache::deserialize_test_timings(&bytes).map_err(Into::into)
+}
+
+fn write_timings(path: &Path, timings: &covy_core::testmap::TestTimingHistory) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = covy_core::cache::serialize_test_timings(timings)?;
+    std::fs::write(path, bytes)
+        .with_context(|| format!("Failed to write timings file {}", path.display()))?;
+    Ok(())
+}
+
+fn write_timings_json(path: &Path, timings: &covy_core::testmap::TestTimingHistory) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(timings)?;
+    std::fs::write(path, json)
+        .with_context(|| format!("Failed to write timings JSON {}", path.display()))?;
+    Ok(())
+}
+
+fn resolve_globs(patterns: &[String]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for pattern in patterns {
+        let matches: Vec<_> = glob::glob(pattern)
+            .with_context(|| format!("Invalid glob pattern: {pattern}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if matches.is_empty() {
+            tracing::warn!("No files matched pattern: {pattern}");
+        }
+        files.extend(matches);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn load_timing_observations(
+    junit_files: &[PathBuf],
+    jsonl_files: &[PathBuf],
+) -> Result<Vec<crate::shard_timing::TimingObservation>> {
+    let mut observations = Vec::new();
+    for path in junit_files {
+        observations.extend(crate::shard_timing::parse_junit_xml_file(path)?);
+    }
+    for path in jsonl_files {
+        observations.extend(crate::shard_timing::parse_timing_jsonl_file(path)?);
+    }
+    Ok(observations)
+}
+
+fn apply_timing_observations(
+    timings: &mut covy_core::testmap::TestTimingHistory,
+    observations: &[crate::shard_timing::TimingObservation],
+) -> usize {
+    use std::collections::BTreeMap;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut grouped: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    for observation in observations {
+        grouped
+            .entry(observation.test_id.as_str())
+            .or_default()
+            .push(observation.duration_ms);
+    }
+
+    for (test_id, durations) in &grouped {
+        if durations.is_empty() {
+            continue;
+        }
+        let new_count = durations.len() as u32;
+        let new_total: u64 = durations.iter().sum();
+        let new_avg = new_total / durations.len() as u64;
+
+        let prev_count = timings.sample_count.get(*test_id).copied().unwrap_or(0);
+        let prev_duration = timings.duration_ms.get(*test_id).copied().unwrap_or(new_avg);
+        let merged_count = prev_count.saturating_add(new_count);
+        let merged_duration = if merged_count == 0 {
+            new_avg
+        } else {
+            (((prev_duration as u128 * prev_count as u128)
+                + (new_avg as u128 * new_count as u128))
+                / (merged_count as u128)) as u64
+        };
+
+        timings
+            .duration_ms
+            .insert((*test_id).to_string(), merged_duration);
+        timings
+            .sample_count
+            .insert((*test_id).to_string(), merged_count);
+        timings.last_seen.insert((*test_id).to_string(), now);
+    }
+
+    timings.generated_at = now;
+    grouped.len()
 }
 
 fn write_shard_files(dir: &str, plan: &covy_core::shard::ShardPlan) -> Result<()> {
@@ -250,5 +433,41 @@ mod tests {
                 "tests/test_mod.py::test_one".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_apply_timing_observations_updates_history() {
+        let mut timings = covy_core::testmap::TestTimingHistory::default();
+        timings.duration_ms.insert("t1".to_string(), 1000);
+        timings.sample_count.insert("t1".to_string(), 2);
+        let obs = vec![
+            crate::shard_timing::TimingObservation {
+                test_id: "t1".to_string(),
+                duration_ms: 2000,
+            },
+            crate::shard_timing::TimingObservation {
+                test_id: "t2".to_string(),
+                duration_ms: 800,
+            },
+        ];
+        let updated = apply_timing_observations(&mut timings, &obs);
+        assert_eq!(updated, 2);
+        assert!(timings.duration_ms.contains_key("t1"));
+        assert!(timings.duration_ms.contains_key("t2"));
+        assert_eq!(timings.sample_count["t1"], 3);
+        assert_eq!(timings.sample_count["t2"], 1);
+    }
+
+    #[test]
+    fn test_write_and_load_timings_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("timings.bin");
+        let mut timings = covy_core::testmap::TestTimingHistory::default();
+        timings.duration_ms.insert("t".to_string(), 123);
+        timings.sample_count.insert("t".to_string(), 1);
+        write_timings(&path, &timings).unwrap();
+        let loaded = load_timings(&path).unwrap();
+        assert_eq!(loaded.duration_ms.get("t"), Some(&123));
+        assert_eq!(loaded.sample_count.get("t"), Some(&1));
     }
 }
