@@ -24,6 +24,7 @@ impl Default for TestMapMetadata {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct TestMapIndex {
     pub metadata: TestMapMetadata,
+    pub test_language: BTreeMap<String, String>,
     pub test_to_files: BTreeMap<String, BTreeSet<String>>,
     pub file_to_tests: BTreeMap<String, BTreeSet<String>>,
 }

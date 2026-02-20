@@ -42,6 +42,7 @@ pub fn run(args: TestmapArgs, _config_path: &str) -> Result<i32> {
             let records = read_manifest_records(&files)?;
             validate_manifest_records(&records)?;
             let mut index = covy_core::testmap::TestMapIndex::default();
+            index.test_language = build_test_language_index(&records)?;
             index.test_to_files = build_test_to_files_index(&records)?;
             index.file_to_tests = build_file_to_tests_index(&index.test_to_files);
             index.metadata.schema_version = covy_core::cache::TESTMAP_SCHEMA_VERSION;
@@ -142,8 +143,17 @@ fn validate_manifest_records(records: &[ManifestRecord]) -> Result<()> {
         if rec.test_id.trim().is_empty() {
             anyhow::bail!("Record {} has empty test_id", idx + 1);
         }
-        if rec.language.as_deref().is_some_and(|s| s.trim().is_empty()) {
-            anyhow::bail!("Record {} has empty language", idx + 1);
+        if let Some(language) = rec.language.as_deref() {
+            if language.trim().is_empty() {
+                anyhow::bail!("Record {} has empty language", idx + 1);
+            }
+            if normalize_language(language).is_none() {
+                anyhow::bail!(
+                    "Record {} has unsupported language '{}' (expected java or python)",
+                    idx + 1,
+                    language
+                );
+            }
         }
         if rec.coverage_report.as_deref().is_none() && rec.coverage_reports.is_empty() {
             anyhow::bail!(
@@ -155,6 +165,31 @@ fn validate_manifest_records(records: &[ManifestRecord]) -> Result<()> {
         let _ = rec.duration_ms;
     }
     Ok(())
+}
+
+fn build_test_language_index(records: &[ManifestRecord]) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for rec in records {
+        let lang = if let Some(raw) = rec.language.as_deref() {
+            normalize_language(raw)
+                .ok_or_else(|| anyhow::anyhow!("Unsupported language '{}' for {}", raw, rec.test_id))?
+        } else if rec.test_id.contains("::") {
+            "python".to_string()
+        } else {
+            "java".to_string()
+        };
+        out.insert(rec.test_id.clone(), lang);
+    }
+    Ok(out)
+}
+
+fn normalize_language(raw: &str) -> Option<String> {
+    let lowered = raw.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "java" => Some("java".to_string()),
+        "python" | "py" => Some("python".to_string()),
+        _ => None,
+    }
 }
 
 fn build_test_to_files_index(records: &[ManifestRecord]) -> Result<BTreeMap<String, BTreeSet<String>>> {
@@ -258,5 +293,25 @@ mod tests {
         let idx = build_file_to_tests_index(&test_to_files);
         assert_eq!(idx["src/a.rs"].len(), 2);
         assert_eq!(idx["src/b.rs"].len(), 1);
+    }
+
+    #[test]
+    fn test_build_test_language_index_infers_python_nodeid() {
+        let records = vec![ManifestRecord {
+            test_id: "tests/test_a.py::test_x".to_string(),
+            language: None,
+            duration_ms: None,
+            coverage_report: Some("a.info".to_string()),
+            coverage_reports: Vec::new(),
+        }];
+        let map = build_test_language_index(&records).unwrap();
+        assert_eq!(map["tests/test_a.py::test_x"], "python");
+    }
+
+    #[test]
+    fn test_normalize_language() {
+        assert_eq!(normalize_language("java"), Some("java".to_string()));
+        assert_eq!(normalize_language("py"), Some("python".to_string()));
+        assert_eq!(normalize_language("ruby"), None);
     }
 }

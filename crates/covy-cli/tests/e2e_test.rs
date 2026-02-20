@@ -618,3 +618,35 @@ fn test_merge_writes_output_issues_state() {
 
     assert!(merged.exists());
 }
+
+#[test]
+fn test_testmap_build_supports_python_language_metadata() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("manifest.jsonl");
+    let output = dir.path().join("testmap.bin");
+
+    let line = format!(
+        "{{\"test_id\":\"tests/test_mod.py::test_case\",\"language\":\"python\",\"coverage_report\":\"{}\"}}\n",
+        fixture("lcov/basic.info")
+    );
+    std::fs::write(&manifest, line).unwrap();
+
+    covy_cmd()
+        .args([
+            "testmap",
+            "build",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    let map = covy_core::cache::deserialize_testmap(&bytes).unwrap();
+    assert_eq!(
+        map.test_language["tests/test_mod.py::test_case"],
+        "python".to_string()
+    );
+}
