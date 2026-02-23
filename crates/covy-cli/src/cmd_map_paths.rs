@@ -284,33 +284,29 @@ fn learn_strip_prefixes(
 
 fn write_strip_prefixes(config_path: &str, strip_prefixes: &[String]) -> Result<()> {
     let path = Path::new(config_path);
-    let mut root = if path.exists() {
+    let mut doc = if path.exists() {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        toml::from_str::<toml::Value>(&raw)
+        raw.parse::<toml_edit::DocumentMut>()
             .with_context(|| format!("Failed to parse {} as TOML", path.display()))?
     } else {
-        toml::Value::Table(Default::default())
+        toml_edit::DocumentMut::new()
     };
 
-    let root_table = root
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("Config root is not a TOML table"))?;
-    let paths_value = root_table
-        .entry("paths".to_string())
-        .or_insert_with(|| toml::Value::Table(Default::default()));
-    let paths_table = paths_value
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[paths] must be a TOML table"))?;
+    if !doc.as_table().contains_key("paths") {
+        doc["paths"] = toml_edit::table();
+    }
+    if !doc["paths"].is_table() {
+        anyhow::bail!("[paths] must be a TOML table");
+    }
 
-    let array = strip_prefixes
-        .iter()
-        .map(|s| toml::Value::String(s.clone()))
-        .collect::<Vec<_>>();
-    paths_table.insert("strip_prefix".to_string(), toml::Value::Array(array));
+    let mut array = toml_edit::Array::default();
+    for prefix in strip_prefixes {
+        array.push(prefix.as_str());
+    }
+    doc["paths"]["strip_prefix"] = toml_edit::value(array);
 
-    let rendered = toml::to_string_pretty(&root)?;
-    std::fs::write(path, rendered)
+    std::fs::write(path, doc.to_string())
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }

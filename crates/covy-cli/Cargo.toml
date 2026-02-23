@@ -21,6 +21,7 @@ glob.workspace = true
 ureq.workspace = true
 quick-xml.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 roaring.workspace = true
 
 [dev-dependencies]
