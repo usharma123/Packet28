@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::diagnostics::DiagnosticsData;
 use crate::model::{CoverageData, RepoSnapshot};
@@ -9,6 +11,7 @@ pub struct PathMapper {
     strip_prefixes: Vec<String>,
     rules: Vec<(String, String)>,
     ignore_globs: Vec<String>,
+    ignore_globs_lower: Vec<String>,
     case_sensitive: bool,
     /// Reverse index: filename → list of full paths in the repo.
     suffix_index: HashMap<String, Vec<String>>,
@@ -16,6 +19,8 @@ pub struct PathMapper {
     hash_index: HashMap<String, Vec<String>>,
     /// LRU cache of resolved mappings.
     cache: HashMap<String, Option<String>>,
+    /// Cached known-path index keyed by hash of known_paths.
+    cached_known_index: Option<(u64, Arc<HashMap<String, String>>)>,
 }
 
 impl PathMapper {
@@ -43,6 +48,14 @@ impl PathMapper {
             .map(|g| normalize_path(g.trim()))
             .filter(|g| !g.is_empty())
             .collect::<Vec<_>>();
+        let normalized_ignore_globs_lower = if case_sensitive {
+            Vec::new()
+        } else {
+            normalized_ignore_globs
+                .iter()
+                .map(|g| g.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        };
 
         if let Some(snap) = snapshot {
             for (path, hash) in &snap.file_hashes {
@@ -66,10 +79,12 @@ impl PathMapper {
             strip_prefixes: normalized_strip_prefixes,
             rules: normalized_rules,
             ignore_globs: normalized_ignore_globs,
+            ignore_globs_lower: normalized_ignore_globs_lower,
             case_sensitive,
             suffix_index,
             hash_index,
             cache: HashMap::new(),
+            cached_known_index: None,
         }
     }
 
@@ -86,16 +101,16 @@ impl PathMapper {
         result
     }
 
-    fn resolve_inner(&self, coverage_path: &str, known_paths: &[&str]) -> Option<String> {
+    fn resolve_inner(&mut self, coverage_path: &str, known_paths: &[&str]) -> Option<String> {
         let normalized = normalize_path(coverage_path);
         if self.is_ignored(&normalized) {
             return None;
         }
 
-        let known_index = self.build_known_index(known_paths);
+        let known_index = self.get_known_index(known_paths);
 
         // 1. Exact match
-        if let Some(exact) = self.find_known(&normalized, &known_index) {
+        if let Some(exact) = self.find_known(&normalized, known_index.as_ref()) {
             return Some(exact.to_string());
         }
 
@@ -104,7 +119,7 @@ impl PathMapper {
             if let Some(rest) = strip_path_prefix_with_case(&normalized, from, self.case_sensitive)
             {
                 let candidate = normalize_path(&format!("{to}{rest}"));
-                if let Some(found) = self.find_known(&candidate, &known_index) {
+                if let Some(found) = self.find_known(&candidate, known_index.as_ref()) {
                     return Some(found.to_string());
                 }
             }
@@ -116,7 +131,7 @@ impl PathMapper {
                 strip_path_prefix_with_case(&normalized, prefix, self.case_sensitive)
             {
                 let candidate = stripped.trim_start_matches('/');
-                if let Some(found) = self.find_known(candidate, &known_index) {
+                if let Some(found) = self.find_known(candidate, known_index.as_ref()) {
                     return Some(found.to_string());
                 }
             }
@@ -129,7 +144,7 @@ impl PathMapper {
 
         if let Some(snapshot_candidates) = self.suffix_index.get(&filename_key) {
             for candidate in snapshot_candidates {
-                if let Some(found) = self.find_known(candidate, &known_index) {
+                if let Some(found) = self.find_known(candidate, known_index.as_ref()) {
                     let score = common_suffix_len(
                         &normalize_case(found, self.case_sensitive),
                         &normalize_case(&normalized, self.case_sensitive),
@@ -172,38 +187,76 @@ impl PathMapper {
     }
 
     fn is_ignored(&self, path: &str) -> bool {
+        if self.case_sensitive {
+            for pattern in &self.ignore_globs {
+                if glob_matches(pattern, path) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         for pattern in &self.ignore_globs {
             if glob_matches(pattern, path) {
                 return true;
             }
-            if !self.case_sensitive {
-                let lower_pattern = pattern.to_ascii_lowercase();
-                let lower_path = path.to_ascii_lowercase();
-                if glob_matches(&lower_pattern, &lower_path) {
-                    return true;
-                }
+        }
+
+        let lower_path = path.to_ascii_lowercase();
+        for pattern in &self.ignore_globs_lower {
+            if glob_matches(pattern, &lower_path) {
+                return true;
             }
         }
         false
     }
 
-    fn build_known_index<'a>(&self, known_paths: &'a [&'a str]) -> HashMap<String, &'a str> {
+    fn build_known_index(&self, known_paths: &[&str]) -> HashMap<String, String> {
         let mut index = HashMap::with_capacity(known_paths.len());
         for &path in known_paths {
             let normalized = normalize_path(path);
             let key = normalize_case(&normalized, self.case_sensitive);
-            index.entry(key).or_insert(path);
+            index.entry(key).or_insert_with(|| path.to_string());
         }
         index
+    }
+
+    fn get_known_index(&mut self, known_paths: &[&str]) -> Arc<HashMap<String, String>> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        known_paths.len().hash(&mut hasher);
+        for path in known_paths {
+            path.hash(&mut hasher);
+        }
+        let known_paths_key = hasher.finish();
+
+        let needs_rebuild = self
+            .cached_known_index
+            .as_ref()
+            .map(|(cached_key, _)| *cached_key != known_paths_key)
+            .unwrap_or(true);
+        if needs_rebuild {
+            self.cached_known_index = Some((
+                known_paths_key,
+                Arc::new(self.build_known_index(known_paths)),
+            ));
+        }
+
+        Arc::clone(
+            &self
+            .cached_known_index
+            .as_ref()
+            .expect("known index cache must be initialized")
+            .1,
+        )
     }
 
     fn find_known<'a>(
         &self,
         candidate: &str,
-        known_index: &'a HashMap<String, &'a str>,
+        known_index: &'a HashMap<String, String>,
     ) -> Option<&'a str> {
         let key = normalize_case(&normalize_path(candidate), self.case_sensitive);
-        known_index.get(&key).copied()
+        known_index.get(&key).map(|s| s.as_str())
     }
 }
 
