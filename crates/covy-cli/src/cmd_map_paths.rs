@@ -45,7 +45,7 @@ pub fn run(args: MapPathsArgs, config_path: &str) -> Result<i32> {
         }
 
         let observed_paths = load_report_paths(&report_files)?;
-        let learned = learn_strip_prefixes(&observed_paths, &repo_files);
+        let learned = learn_strip_prefixes(&observed_paths, &repo_files, config.paths.case_sensitive);
 
         if learned.total == 0 {
             println!("No report paths were detected from configured reports.");
@@ -72,8 +72,12 @@ pub fn run(args: MapPathsArgs, config_path: &str) -> Result<i32> {
         }
 
         if args.write {
-            write_strip_prefixes(config_path, &learned.suggested_strip_prefixes)?;
-            println!("Updated {} with [paths].strip_prefix", config_path);
+            if learned.suggested_strip_prefixes.is_empty() {
+                println!("Skipping --write: no suggested strip_prefix rules to persist.");
+            } else {
+                write_strip_prefixes(config_path, &learned.suggested_strip_prefixes)?;
+                println!("Updated {} with [paths].strip_prefix", config_path);
+            }
         }
     }
 
@@ -99,7 +103,11 @@ struct ExplainResult {
 
 fn explain_path(path: &str, repo_files: &[String], config: &CovyConfig) -> ExplainResult {
     let input = normalize_path(path);
-    let known: BTreeSet<String> = repo_files
+    let normalized_repo_files = repo_files
+        .iter()
+        .map(|p| normalize_path(p))
+        .collect::<Vec<_>>();
+    let known: BTreeSet<String> = normalized_repo_files
         .iter()
         .map(|p| normalize_case(p, config.paths.case_sensitive))
         .collect();
@@ -171,7 +179,7 @@ fn explain_path(path: &str, repo_files: &[String], config: &CovyConfig) -> Expla
 
     let file_name = input.rsplit('/').next().unwrap_or(input.as_str());
     let mut best: Option<(&str, usize)> = None;
-    for repo in repo_files {
+    for repo in &normalized_repo_files {
         let repo_name = repo.rsplit('/').next().unwrap_or(repo.as_str());
         if normalize_case(repo_name, config.paths.case_sensitive)
             != normalize_case(file_name, config.paths.case_sensitive)
@@ -179,7 +187,7 @@ fn explain_path(path: &str, repo_files: &[String], config: &CovyConfig) -> Expla
             continue;
         }
         let score = common_suffix_len(
-            &normalize_case(repo, config.paths.case_sensitive),
+            &normalize_case(repo.as_str(), config.paths.case_sensitive),
             &normalize_case(&input, config.paths.case_sensitive),
         );
         best = choose_best(best, (repo.as_str(), score), config.paths.case_sensitive);
@@ -201,6 +209,8 @@ fn resolve_report_files(patterns: &[String]) -> Result<Vec<PathBuf>> {
             .collect();
         files.extend(matches);
     }
+    files.sort();
+    files.dedup();
     Ok(files)
 }
 
@@ -221,16 +231,26 @@ fn load_repo_files() -> Result<Vec<String>> {
     Ok(snapshot.file_hashes.keys().cloned().collect())
 }
 
-fn learn_strip_prefixes(report_paths: &[String], repo_files: &[String]) -> LearnResult {
+fn learn_strip_prefixes(
+    report_paths: &[String],
+    repo_files: &[String],
+    case_sensitive: bool,
+) -> LearnResult {
     let mut mapped = 0usize;
     let mut prefix_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unmapped_prefix_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let normalized_repo_files = repo_files
+        .iter()
+        .map(|repo| normalize_path(repo))
+        .collect::<Vec<_>>();
 
     for report_path in report_paths {
         let normalized = normalize_path(report_path);
-        if let Some((repo, _score)) = best_repo_suffix_match(&normalized, repo_files, true) {
+        if let Some((repo, _score)) =
+            best_repo_suffix_match(&normalized, &normalized_repo_files, case_sensitive)
+        {
             mapped += 1;
-            if normalized.ends_with(repo) {
+            if normalized.ends_with(&repo) {
                 let prefix = normalized[..normalized.len() - repo.len()]
                     .trim_end_matches('/')
                     .to_string();
@@ -301,17 +321,27 @@ fn contains_path(known: &BTreeSet<String>, candidate: &str, case_sensitive: bool
 
 fn best_repo_suffix_match<'a>(
     report_path: &str,
-    repo_files: &'a [String],
+    repo_files: &[String],
     case_sensitive: bool,
-) -> Option<(&'a str, usize)> {
-    let mut best: Option<(&str, usize)> = None;
+) -> Option<(String, usize)> {
+    let report_key = normalize_case(report_path, case_sensitive);
+    let mut best: Option<(String, usize)> = None;
     for repo in repo_files {
-        let repo_normalized = normalize_path(repo);
-        if normalize_case(report_path, case_sensitive)
-            .ends_with(&normalize_case(&repo_normalized, case_sensitive))
-        {
-            let score = repo_normalized.len();
-            best = choose_best(best, (repo.as_str(), score), case_sensitive);
+        let repo_key = normalize_case(repo, case_sensitive);
+        if report_key.ends_with(&repo_key) {
+            let score = repo.len();
+            match &best {
+                None => best = Some((repo.clone(), score)),
+                Some((best_path, best_score)) => {
+                    if score > *best_score
+                        || (score == *best_score
+                            && normalize_case(repo, case_sensitive)
+                                < normalize_case(best_path, case_sensitive))
+                    {
+                        best = Some((repo.clone(), score));
+                    }
+                }
+            }
         }
     }
     best
@@ -420,13 +450,30 @@ mod tests {
         ];
         let repo_files = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
 
-        let learned = learn_strip_prefixes(&report_paths, &repo_files);
+        let learned = learn_strip_prefixes(&report_paths, &repo_files, true);
         assert_eq!(learned.total, 2);
         assert_eq!(learned.mapped, 2);
         assert_eq!(
             learned.suggested_strip_prefixes,
             vec!["/__w/repo/repo".to_string()]
         );
+    }
+
+    #[test]
+    fn test_resolve_report_files_deduplicates_and_sorts() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.info");
+        let b = dir.path().join("b.info");
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+
+        let patterns = vec![
+            format!("{}/*.info", dir.path().display()),
+            format!("{}/a.info", dir.path().display()),
+        ];
+        let files = resolve_report_files(&patterns).unwrap();
+
+        assert_eq!(files, vec![a, b]);
     }
 
     #[test]
