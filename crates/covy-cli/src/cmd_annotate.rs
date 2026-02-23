@@ -82,54 +82,60 @@ fn build_sarif(
     max_findings: usize,
 ) -> serde_json::Value {
     let mut results = Vec::new();
-
-    for block in blocks {
-        let rule_id = if block.is_new_file {
-            "covy/coverage/new-file-uncovered"
-        } else {
-            "covy/coverage/changed-line-uncovered"
-        };
-        results.push(sarif_result_with_location(
-            rule_id,
-            "warning",
-            format!(
-                "Uncovered changed lines in {}:{}-{}",
-                block.file, block.start_line, block.end_line
-            ),
-            &block.file,
-            block.start_line,
-            block.end_line,
-        ));
-    }
-
-    if let Some(diag) = diagnostics {
-        for issue in diag.issues_on_changed_lines(diffs) {
-            let level = match issue.severity {
-                Severity::Error => "error",
-                Severity::Warning => "warning",
-                Severity::Note => "note",
+    'collect: {
+        for block in blocks {
+            if results.len() >= max_findings {
+                break 'collect;
+            }
+            let rule_id = if block.is_new_file {
+                "covy/coverage/new-file-uncovered"
+            } else {
+                "covy/coverage/changed-line-uncovered"
             };
             results.push(sarif_result_with_location(
-                "covy/issues/new-on-changed-lines",
-                level,
-                format!("[{}:{}] {}", issue.source, issue.rule_id, issue.message),
-                &issue.path,
-                issue.line,
-                issue.end_line.unwrap_or(issue.line),
+                rule_id,
+                "warning",
+                format!(
+                    "Uncovered changed lines in {}:{}-{}",
+                    block.file, block.start_line, block.end_line
+                ),
+                &block.file,
+                block.start_line,
+                block.end_line,
             ));
         }
-    }
 
-    for violation in violations {
-        results.push(serde_json::json!({
-            "ruleId": "covy/policy/threshold-fail",
-            "level": "error",
-            "message": { "text": violation }
-        }));
-    }
+        if let Some(diag) = diagnostics {
+            for issue in diag.issues_on_changed_lines(diffs) {
+                if results.len() >= max_findings {
+                    break 'collect;
+                }
+                let level = match issue.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                    Severity::Note => "note",
+                };
+                results.push(sarif_result_with_location(
+                    "covy/issues/new-on-changed-lines",
+                    level,
+                    format!("[{}:{}] {}", issue.source, issue.rule_id, issue.message),
+                    &issue.path,
+                    issue.line,
+                    issue.end_line.unwrap_or(issue.line),
+                ));
+            }
+        }
 
-    if results.len() > max_findings {
-        results.truncate(max_findings);
+        for violation in violations {
+            if results.len() >= max_findings {
+                break 'collect;
+            }
+            results.push(serde_json::json!({
+                "ruleId": "covy/policy/threshold-fail",
+                "level": "error",
+                "message": { "text": violation }
+            }));
+        }
     }
 
     serde_json::json!({
@@ -222,5 +228,25 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].start_line, 2);
         assert_eq!(blocks[0].end_line, 3);
+    }
+
+    #[test]
+    fn test_build_sarif_limits_findings_without_post_truncate() {
+        let blocks = vec![
+            BlockFinding {
+                file: "src/a.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                is_new_file: false,
+            },
+            BlockFinding {
+                file: "src/b.rs".to_string(),
+                start_line: 2,
+                end_line: 2,
+                is_new_file: false,
+            },
+        ];
+        let sarif = build_sarif(&blocks, None, &[], &["gate fail".to_string()], 1);
+        assert_eq!(sarif["runs"][0]["results"].as_array().unwrap().len(), 1);
     }
 }
