@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn covy_cmd() -> Command {
@@ -20,6 +20,32 @@ fn fixture(rel: &str) -> String {
         .join(rel)
         .to_string_lossy()
         .to_string()
+}
+
+fn setup_git_repo(dir: &Path) {
+    std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["init"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["add", "README.md"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .status()
+        .unwrap();
 }
 
 #[test]
@@ -555,30 +581,8 @@ fn test_impact_plan_outputs_stable_json_schema() {
 fn test_comment_writes_markdown_artifact() {
     let dir = TempDir::new().unwrap();
     let comment_path = dir.path().join("comment.md");
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args(["init"])
-        .status()
-        .unwrap();
     std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args(["add", "README.md"])
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args([
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ])
-        .status()
-        .unwrap();
+    setup_git_repo(dir.path());
 
     covy_cmd()
         .current_dir(dir.path())
@@ -611,30 +615,8 @@ fn test_comment_writes_markdown_artifact() {
 fn test_annotate_writes_sarif_artifact() {
     let dir = TempDir::new().unwrap();
     let sarif_path = dir.path().join("covy.sarif");
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args(["init"])
-        .status()
-        .unwrap();
     std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args(["add", "README.md"])
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args([
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ])
-        .status()
-        .unwrap();
+    setup_git_repo(dir.path());
 
     covy_cmd()
         .current_dir(dir.path())
@@ -669,30 +651,8 @@ fn test_pr_writes_both_artifacts() {
     let comment_path = dir.path().join("comment.md");
     let sarif_path = dir.path().join("covy.sarif");
 
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args(["init"])
-        .status()
-        .unwrap();
     std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args(["add", "README.md"])
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .current_dir(dir.path())
-        .args([
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ])
-        .status()
-        .unwrap();
+    setup_git_repo(dir.path());
 
     covy_cmd()
         .current_dir(dir.path())
