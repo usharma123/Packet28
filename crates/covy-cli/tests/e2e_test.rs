@@ -608,6 +608,62 @@ fn test_comment_writes_markdown_artifact() {
 }
 
 #[test]
+fn test_annotate_writes_sarif_artifact() {
+    let dir = TempDir::new().unwrap();
+    let sarif_path = dir.path().join("covy.sarif");
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["init"])
+        .status()
+        .unwrap();
+    std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["add", "README.md"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .status()
+        .unwrap();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args(["ingest", &fixture("lcov/basic.info")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args([
+            "annotate",
+            "--base-ref",
+            "HEAD",
+            "--head-ref",
+            "HEAD",
+            "--out",
+            sarif_path.to_str().unwrap(),
+            "--max-findings",
+            "200",
+        ])
+        .assert()
+        .success();
+
+    let content = std::fs::read_to_string(sarif_path).unwrap();
+    assert!(content.contains("\"version\": \"2.1.0\""));
+    assert!(content.contains("covy/coverage/changed-line-uncovered"));
+}
+
+#[test]
 fn test_impact_print_command_outputs_helper() {
     let dir = TempDir::new().unwrap();
     let manifest = dir.path().join("manifest.jsonl");
