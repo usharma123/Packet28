@@ -1,10 +1,100 @@
-use std::path::Path;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::{collections::BTreeSet, ffi::OsString};
 
 use anyhow::{Context, Result};
 use covy_core::config::GateConfig;
 use covy_core::diagnostics::DiagnosticsData;
 use covy_core::{CoverageData, CovyConfig, FileDiff};
 use roaring::RoaringBitmap;
+
+/// Resolve the report output format: use the explicit value if provided,
+/// otherwise default to "json" when stdout is piped (non-TTY) and "terminal"
+/// when running interactively.
+pub fn resolve_report_format(explicit: Option<&str>) -> String {
+    match explicit {
+        Some(fmt) => fmt.to_string(),
+        None if std::io::stdout().is_terminal() => "terminal".to_string(),
+        None => "json".to_string(),
+    }
+}
+
+/// Resolve whether JSON output should be emitted.
+/// `--json` always wins and conflicts with explicit non-json legacy formats.
+pub fn resolve_json_output(
+    json_flag: bool,
+    legacy_format: Option<&str>,
+    legacy_flag_name: &str,
+) -> Result<bool> {
+    if json_flag {
+        if let Some(fmt) = legacy_format {
+            if !fmt.eq_ignore_ascii_case("json") {
+                anyhow::bail!(
+                    "Conflicting output flags: --json and {} {}",
+                    legacy_flag_name,
+                    fmt
+                );
+            }
+        }
+        return Ok(true);
+    }
+
+    Ok(legacy_format.is_some_and(|fmt| fmt.eq_ignore_ascii_case("json")))
+}
+
+pub fn warn_if_legacy_flag_used(alias: &str, canonical: &str) {
+    if !deprecation_warnings_enabled() || global_quiet_enabled() || global_json_enabled() {
+        return;
+    }
+    let used = std::env::args().any(|arg| arg == alias);
+    if used {
+        eprintln!(
+            "warning: `{alias}` is deprecated; use `{canonical}` (to be removed after 2 minor releases)."
+        );
+    }
+}
+
+pub fn warn_if_legacy_flags_used(pairs: &[(&str, &str)]) {
+    for (alias, canonical) in pairs {
+        warn_if_legacy_flag_used(alias, canonical);
+    }
+}
+
+pub fn global_quiet_enabled() -> bool {
+    std::env::args().any(|arg| arg == "-q" || arg == "--quiet")
+}
+
+pub fn global_json_enabled() -> bool {
+    std::env::args().any(|arg| arg == "--json")
+}
+
+pub fn deprecation_warnings_enabled() -> bool {
+    match std::env::var("COVY_DEPRECATION_WARNINGS") {
+        Ok(v) => {
+            let normalized = v.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn maybe_warn_deprecated(message: &str) {
+    if deprecation_warnings_enabled() && !global_quiet_enabled() && !global_json_enabled() {
+        eprintln!("{message}");
+    }
+}
+
+/// Deserialize JSON with a helpful error message that includes an example of
+/// the expected JSON shape.
+pub fn deserialize_json_with_example<T: serde::de::DeserializeOwned>(
+    input: &str,
+    type_name: &str,
+    example: &str,
+) -> anyhow::Result<T> {
+    serde_json::from_str(input).map_err(|e| {
+        anyhow::anyhow!("Failed to parse {type_name}: {e}\n\nExpected JSON shape:\n{example}")
+    })
+}
 
 pub fn load_coverage_state(path: &str) -> Result<CoverageData> {
     let bytes =
@@ -107,4 +197,137 @@ pub fn compute_pr_shared_state(
         diffs,
         gate,
     })
+}
+
+/// Detect the git repository root directory.
+pub fn detect_repo_root() -> Result<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("Failed to detect git repository root")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to detect git repository root: {stderr}");
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        anyhow::bail!("Git repository root resolved to an empty path");
+    }
+    Ok(std::path::PathBuf::from(root))
+}
+
+/// Resolve glob patterns into matching file paths.
+pub fn resolve_report_globs(patterns: &[String]) -> Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    for pattern in patterns {
+        let matches: Vec<_> = glob::glob(pattern)
+            .with_context(|| format!("Invalid glob pattern: {pattern}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        files.extend(matches);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+pub fn resolve_report_globs_for_config(
+    config_path: &str,
+    patterns: &[String],
+) -> Result<Vec<std::path::PathBuf>> {
+    let base = config_base_dir(config_path)?;
+    let cwd = std::env::current_dir().ok();
+    let repo_root = detect_repo_root().ok();
+    let mut adjusted = Vec::new();
+
+    for pattern in patterns {
+        let path = Path::new(pattern);
+        if path.is_absolute() {
+            adjusted.push(pattern.clone());
+            continue;
+        }
+
+        let mut candidates: BTreeSet<OsString> = BTreeSet::new();
+        candidates.insert(OsString::from(pattern));
+        candidates.insert(base.join(path).into_os_string());
+        if let Some(cwd) = &cwd {
+            candidates.insert(cwd.join(path).into_os_string());
+        }
+        if let Some(repo_root) = &repo_root {
+            candidates.insert(repo_root.join(path).into_os_string());
+        }
+
+        for candidate in candidates {
+            adjusted.push(candidate.to_string_lossy().to_string());
+        }
+    }
+    resolve_report_globs(&adjusted)
+}
+
+fn config_base_dir(config_path: &str) -> Result<PathBuf> {
+    let path = Path::new(config_path);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let parent = abs.parent().map(Path::to_path_buf).unwrap_or(abs);
+    Ok(parent)
+}
+
+#[cfg(test)]
+pub(crate) fn cwd_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_report_globs_for_config_uses_config_dir() {
+        let _guard = cwd_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg_dir = dir.path().join("project");
+        let reports_dir = cfg_dir.join("reports");
+        std::fs::create_dir_all(&reports_dir).unwrap();
+        std::fs::write(reports_dir.join("lcov.info"), "TN:\n").unwrap();
+
+        let old = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let matches =
+            resolve_report_globs_for_config("project/covy.toml", &[String::from("reports/*.info")])
+                .unwrap();
+
+        std::env::set_current_dir(old).unwrap();
+
+        assert!(!matches.is_empty());
+        assert!(matches.iter().any(|p| p.ends_with("lcov.info")));
+    }
+
+    #[test]
+    fn test_resolve_report_globs_for_config_accepts_repo_relative_pattern() {
+        let _guard = cwd_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg_dir = dir.path().join("project");
+        let reports_dir = cfg_dir.join("reports");
+        std::fs::create_dir_all(&reports_dir).unwrap();
+        std::fs::write(reports_dir.join("a.info"), "TN:\n").unwrap();
+
+        let old = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let matches = resolve_report_globs_for_config(
+            "project/covy.toml",
+            &[String::from("project/reports/*.info")],
+        )
+        .unwrap();
+
+        std::env::set_current_dir(old).unwrap();
+
+        assert!(!matches.is_empty());
+        assert!(matches.iter().any(|p| p.ends_with("a.info")));
+    }
 }

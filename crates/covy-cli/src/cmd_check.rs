@@ -62,9 +62,14 @@ pub struct CheckArgs {
     #[arg(long)]
     max_new_warnings: Option<u32>,
 
-    /// Output format (terminal/json/markdown/github)
-    #[arg(long, default_value = "terminal")]
-    report: String,
+    /// Output format (terminal/json/markdown/github). Defaults to "terminal"
+    /// in interactive mode and "json" when stdout is piped.
+    #[arg(long)]
+    report: Option<String>,
+
+    /// Emit JSON output
+    #[arg(long)]
+    json: bool,
 
     /// Prefixes to strip from file paths in coverage data
     #[arg(long)]
@@ -74,6 +79,10 @@ pub struct CheckArgs {
     #[arg(long)]
     source_root: Option<String>,
 
+    /// Path to coverage state file
+    #[arg(long)]
+    input: Option<String>,
+
     /// Show missing line numbers
     #[arg(long)]
     show_missing: bool,
@@ -81,6 +90,12 @@ pub struct CheckArgs {
 
 pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
+    let report =
+        if crate::cmd_common::resolve_json_output(args.json, args.report.as_deref(), "--report")? {
+            "json".to_string()
+        } else {
+            crate::cmd_common::resolve_report_format(args.report.as_deref())
+        };
 
     // Ingest coverage data
     let mut coverage = resolve_and_ingest(&args, &config)?;
@@ -134,7 +149,7 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
         covy_core::gate::evaluate_full_gate(&gate_config, &coverage, loaded.data.as_ref(), &diffs);
 
     // Render
-    match args.report.as_str() {
+    match report.as_str() {
         "json" => {
             let json = covy_core::report::render_gate_json(&gate_result);
             println!("{json}");
@@ -174,10 +189,36 @@ pub fn resolve_and_ingest(args: &CheckArgs, config: &CovyConfig) -> Result<Cover
     let format = parse_format(&args.format)?;
 
     if args.stdin {
+        if !args.paths.is_empty() {
+            anyhow::bail!("Cannot combine positional coverage paths with --stdin");
+        }
+        if args.input.is_some() {
+            anyhow::bail!("Cannot combine --input with --stdin");
+        }
         let fmt = format.ok_or_else(|| {
             anyhow::anyhow!("--format is required when reading from --stdin (can't auto-detect)")
         })?;
         let data = covy_ingest::ingest_reader(std::io::stdin().lock(), fmt)?;
+        return Ok(data);
+    }
+
+    if let Some(path) = args.input.as_deref() {
+        if !args.paths.is_empty() {
+            anyhow::bail!("Cannot combine positional coverage paths with --input");
+        }
+        let state_path = Path::new(path);
+        if !state_path.exists() {
+            anyhow::bail!(
+                "No coverage data found at {}. Run `covy ingest` first or provide valid coverage paths.",
+                state_path.display()
+            );
+        }
+        tracing::info!(
+            "Loading coverage from configured state {}",
+            state_path.display()
+        );
+        let bytes = std::fs::read(state_path)?;
+        let data = covy_core::cache::deserialize_coverage(&bytes)?;
         return Ok(data);
     }
 

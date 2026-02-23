@@ -47,8 +47,8 @@ pub enum ShardCommands {
 #[derive(Args)]
 pub struct ShardPlanArgs {
     /// Number of shards
-    #[arg(long)]
-    pub shards: usize,
+    #[arg(long, required_unless_present = "schema")]
+    pub shards: Option<usize>,
 
     /// Input tasks.json file
     #[arg(long)]
@@ -93,6 +93,10 @@ pub struct ShardPlanArgs {
     /// Directory for shard output files
     #[arg(long)]
     pub write_files: Option<String>,
+
+    /// Print input schema/examples and exit
+    #[arg(long)]
+    pub schema: bool,
 }
 
 #[derive(Args)]
@@ -130,10 +134,35 @@ struct ShardUpdateSummary {
     exported_json: Option<String>,
 }
 
+const SHARD_PLAN_SCHEMA_EXAMPLES: &str = r#"{
+  "type": "shard-plan-input-schemas",
+  "tasks_json": {
+    "schema_version": 1,
+    "tasks": [
+      {"id": "com.foo.BarTest", "selector": "com.foo.BarTest", "est_ms": 1200, "tags": ["unit"]}
+    ]
+  },
+  "impact_json": {
+    "selected_tests": ["com.foo.BarTest", "tests/test_mod.py::test_one"],
+    "smoke_tests": [],
+    "missing_mappings": [],
+    "stale": false,
+    "confidence": 1.0,
+    "escalate_full_suite": false
+  }
+}"#;
+
 pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     match args.command {
         ShardCommands::Plan(plan) => {
+            if plan.schema {
+                println!("{SHARD_PLAN_SCHEMA_EXAMPLES}");
+                return Ok(0);
+            }
+            let shard_count = plan
+                .shards
+                .ok_or_else(|| anyhow::anyhow!("--shards is required"))?;
             let tasks = load_tasks(&plan)?;
             if tasks.is_empty() {
                 anyhow::bail!("No tasks provided for shard planning");
@@ -156,9 +185,9 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
             let jobs = covy_core::shard::build_timed_jobs(&tests, &timings, unknown_ms);
             let algorithm = resolve_plan_algorithm(&plan, &config)?;
             let shard_plan = match algorithm {
-                PlannerAlgorithmArg::Lpt => covy_core::shard::plan_shards_lpt(&jobs, plan.shards),
+                PlannerAlgorithmArg::Lpt => covy_core::shard::plan_shards_lpt(&jobs, shard_count),
                 PlannerAlgorithmArg::WhaleLpt => {
-                    covy_core::shard::plan_shards_whale_lpt(&jobs, plan.shards)
+                    covy_core::shard::plan_shards_whale_lpt(&jobs, shard_count)
                 }
             };
 
@@ -275,11 +304,23 @@ fn load_tasks_from_file(path: &Path) -> Result<Vec<PlanningTask>> {
     Ok(tests)
 }
 
+const IMPACT_RESULT_EXAMPLE: &str = r#"{
+  "selected_tests": ["com.foo.BarTest", "tests/test_x.py::test_a"],
+  "smoke_tests": [],
+  "missing_mappings": [],
+  "stale": false,
+  "confidence": 1.0,
+  "escalate_full_suite": false
+}"#;
+
 fn load_tasks_from_impact_json(path: &Path) -> Result<Vec<PlanningTask>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read impact JSON {}", path.display()))?;
-    let impact: covy_core::impact::ImpactResult =
-        serde_json::from_str(&content).context("Failed to parse impact JSON")?;
+    let impact: covy_core::impact::ImpactResult = crate::cmd_common::deserialize_json_with_example(
+        &content,
+        "ImpactResult",
+        IMPACT_RESULT_EXAMPLE,
+    )?;
     Ok(impact
         .selected_tests
         .into_iter()
@@ -290,11 +331,19 @@ fn load_tasks_from_impact_json(path: &Path) -> Result<Vec<PlanningTask>> {
         .collect())
 }
 
+const TASKSET_EXAMPLE: &str = r#"{
+  "schema_version": 1,
+  "tasks": [
+    {"id": "com.foo.BarTest", "selector": "com.foo.BarTest", "est_ms": 1200, "tags": ["unit"]},
+    {"id": "tests/test_mod.py::test_one", "selector": "tests/test_mod.py::test_one", "est_ms": 900}
+  ]
+}"#;
+
 fn load_tasks_from_tasks_json(path: &Path) -> Result<Vec<PlanningTask>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read tasks JSON {}", path.display()))?;
     let tasks: covy_core::shard::TaskSet =
-        serde_json::from_str(&content).context("Failed to parse tasks JSON")?;
+        crate::cmd_common::deserialize_json_with_example(&content, "TaskSet", TASKSET_EXAMPLE)?;
     let ids = tasks
         .tasks
         .into_iter()
@@ -630,7 +679,7 @@ mod tests {
             },
         ];
         let args = ShardPlanArgs {
-            shards: 2,
+            shards: Some(2),
             tasks_json: None,
             tier: "pr".to_string(),
             include_tag: Vec::new(),
@@ -642,6 +691,7 @@ mod tests {
             algorithm: None,
             json: true,
             write_files: None,
+            schema: false,
         };
         let filtered = apply_tag_filters(tasks, &args, &CovyConfig::default()).unwrap();
         assert_eq!(filtered.len(), 1);
@@ -687,7 +737,7 @@ mod tests {
     #[test]
     fn test_resolve_plan_algorithm_prefers_cli_flag() {
         let args = ShardPlanArgs {
-            shards: 1,
+            shards: Some(1),
             tasks_json: None,
             tier: "nightly".to_string(),
             include_tag: Vec::new(),
@@ -699,6 +749,7 @@ mod tests {
             algorithm: Some(PlannerAlgorithmArg::WhaleLpt),
             json: false,
             write_files: None,
+            schema: false,
         };
         let cfg = CovyConfig::default();
         let resolved = resolve_plan_algorithm(&args, &cfg).unwrap();
@@ -708,7 +759,7 @@ mod tests {
     #[test]
     fn test_resolve_plan_algorithm_rejects_invalid_config() {
         let args = ShardPlanArgs {
-            shards: 1,
+            shards: Some(1),
             tasks_json: None,
             tier: "nightly".to_string(),
             include_tag: Vec::new(),
@@ -720,6 +771,7 @@ mod tests {
             algorithm: None,
             json: false,
             write_files: None,
+            schema: false,
         };
         let mut cfg = CovyConfig::default();
         cfg.shard.algorithm = "bad".to_string();

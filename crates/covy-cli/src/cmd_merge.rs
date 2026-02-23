@@ -19,11 +19,11 @@ pub struct MergeArgs {
     pub strict: Option<bool>,
 
     /// Output coverage state path
-    #[arg(long, default_value = ".covy/state/latest.bin")]
+    #[arg(long, default_value = ".covy/state/latest.bin", alias = "out-coverage")]
     pub output_coverage: String,
 
     /// Output diagnostics state path
-    #[arg(long, default_value = ".covy/state/issues.bin")]
+    #[arg(long, default_value = ".covy/state/issues.bin", alias = "out-issues")]
     pub output_issues: String,
 
     /// Emit JSON output
@@ -32,6 +32,10 @@ pub struct MergeArgs {
 }
 
 pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
+    crate::cmd_common::warn_if_legacy_flags_used(&[
+        ("--out-coverage", "--output-coverage"),
+        ("--out-issues", "--output-issues"),
+    ]);
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let strict = args.strict.unwrap_or(config.merge.strict);
 
@@ -94,7 +98,7 @@ pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
         },
     };
 
-    if args.json {
+    if args.json || crate::cmd_common::global_quiet_enabled() {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         println!(

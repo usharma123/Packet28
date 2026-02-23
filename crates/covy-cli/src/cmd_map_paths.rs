@@ -18,9 +18,17 @@ pub struct MapPathsArgs {
     /// Explain how a path maps into repository-relative path
     #[arg(long)]
     pub explain: Option<String>,
+
+    /// Coverage report file paths/globs to use for --learn (overrides [ingest].report_paths)
+    #[arg(long = "paths")]
+    pub paths: Vec<String>,
+
+    /// Emit JSON output
+    #[arg(long)]
+    pub json: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct LearnResult {
     mapped: usize,
     total: usize,
@@ -36,65 +44,101 @@ pub fn run(args: MapPathsArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let repo_files = load_repo_files()?;
 
+    let mut learned_result: Option<LearnResult> = None;
+    let mut explain_result: Option<ExplainResult> = None;
+    let mut wrote_config = false;
+
     if args.learn {
-        let report_files = resolve_report_files(&config.ingest.report_paths)?;
+        let report_files = if args.paths.is_empty() {
+            resolve_report_files_from_config(config_path, &config.ingest.report_paths)?
+        } else {
+            crate::cmd_common::resolve_report_globs(&args.paths)?
+        };
         if report_files.is_empty() {
             anyhow::bail!(
-                "No report files found from [ingest].report_paths. Configure report globs in covy.toml first."
+                "No report files found. Provide --paths <globs> or configure [ingest].report_paths in covy.toml."
             );
         }
 
         let observed_paths = load_report_paths(&report_files)?;
-        let learned = learn_strip_prefixes(&observed_paths, &repo_files, config.paths.case_sensitive);
+        let learned =
+            learn_strip_prefixes(&observed_paths, &repo_files, config.paths.case_sensitive);
 
-        if learned.total == 0 {
-            println!("No report paths were detected from configured reports.");
-        } else {
-            let pct = (learned.mapped as f64 / learned.total as f64) * 100.0;
-            println!(
-                "Mapped paths: {}/{} ({pct:.1}%)",
-                learned.mapped, learned.total
-            );
-            if learned.suggested_strip_prefixes.is_empty() {
-                println!("No strip_prefix suggestions generated.");
+        if !args.json {
+            if learned.total == 0 {
+                println!("No report paths were detected from configured reports.");
             } else {
-                println!("Suggested strip_prefix rules:");
-                for prefix in &learned.suggested_strip_prefixes {
-                    println!("  - {prefix}");
+                let pct = (learned.mapped as f64 / learned.total as f64) * 100.0;
+                println!(
+                    "Mapped paths: {}/{} ({pct:.1}%)",
+                    learned.mapped, learned.total
+                );
+                if learned.suggested_strip_prefixes.is_empty() {
+                    println!("No strip_prefix suggestions generated.");
+                } else {
+                    println!("Suggested strip_prefix rules:");
+                    for prefix in &learned.suggested_strip_prefixes {
+                        println!("  - {prefix}");
+                    }
                 }
-            }
-            if !learned.unmapped_prefixes.is_empty() {
-                println!("Top unmapped prefixes:");
-                for (prefix, count) in learned.unmapped_prefixes.iter().take(5) {
-                    println!("  - {prefix} ({count})");
+                if !learned.unmapped_prefixes.is_empty() {
+                    println!("Top unmapped prefixes:");
+                    for (prefix, count) in learned.unmapped_prefixes.iter().take(5) {
+                        println!("  - {prefix} ({count})");
+                    }
                 }
             }
         }
 
         if args.write {
             if learned.suggested_strip_prefixes.is_empty() {
-                println!("Skipping --write: no suggested strip_prefix rules to persist.");
+                if !args.json {
+                    println!("Skipping --write: no suggested strip_prefix rules to persist.");
+                }
             } else {
                 write_strip_prefixes(config_path, &learned.suggested_strip_prefixes)?;
-                println!("Updated {} with [paths].strip_prefix", config_path);
+                wrote_config = true;
+                if !args.json {
+                    println!("Updated {} with [paths].strip_prefix", config_path);
+                }
             }
         }
+        learned_result = Some(learned);
     }
 
     if let Some(path) = args.explain.as_deref() {
         let explanation = explain_path(path, &repo_files, &config);
-        println!("input: {}", explanation.input);
-        println!("rule: {}", explanation.rule);
-        match explanation.mapped {
-            Some(mapped) => println!("mapped: {mapped}"),
-            None => println!("mapped: (no match)"),
+        if args.json {
+            explain_result = Some(explanation);
+        } else {
+            println!("input: {}", explanation.input);
+            println!("rule: {}", explanation.rule);
+            match explanation.mapped {
+                Some(mapped) => println!("mapped: {mapped}"),
+                None => println!("mapped: (no match)"),
+            }
         }
+    }
+
+    if args.json {
+        #[derive(serde::Serialize)]
+        struct MapPathsJsonOutput {
+            learn: Option<LearnResult>,
+            explain: Option<ExplainResult>,
+            wrote_config: bool,
+        }
+        let out = MapPathsJsonOutput {
+            learn: learned_result,
+            explain: explain_result,
+            wrote_config,
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
     }
 
     Ok(0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct ExplainResult {
     input: String,
     rule: String,
@@ -200,18 +244,11 @@ fn explain_path(path: &str, repo_files: &[String], config: &CovyConfig) -> Expla
     }
 }
 
-fn resolve_report_files(patterns: &[String]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for pattern in patterns {
-        let matches: Vec<_> = glob::glob(pattern)
-            .with_context(|| format!("Invalid glob pattern: {pattern}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        files.extend(matches);
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
+fn resolve_report_files_from_config(
+    config_path: &str,
+    patterns: &[String],
+) -> Result<Vec<PathBuf>> {
+    crate::cmd_common::resolve_report_globs_for_config(config_path, patterns)
 }
 
 fn load_report_paths(report_files: &[PathBuf]) -> Result<Vec<String>> {
@@ -243,12 +280,18 @@ fn learn_strip_prefixes(
         .iter()
         .map(|repo| normalize_path(repo))
         .collect::<Vec<_>>();
+    let known_repo_refs: Vec<&str> = normalized_repo_files.iter().map(|s| s.as_str()).collect();
+    let mut mapper = covy_core::pathmap::PathMapper::with_options(
+        Vec::new(),
+        BTreeMap::new(),
+        Vec::new(),
+        case_sensitive,
+        None,
+    );
 
     for report_path in report_paths {
         let normalized = normalize_path(report_path);
-        if let Some((repo, _score)) =
-            best_repo_suffix_match(&normalized, &normalized_repo_files, case_sensitive)
-        {
+        if let Some(repo) = mapper.resolve(&normalized, &known_repo_refs) {
             mapped += 1;
             if normalized.ends_with(&repo) {
                 let prefix = normalized[..normalized.len() - repo.len()]
@@ -313,34 +356,6 @@ fn write_strip_prefixes(config_path: &str, strip_prefixes: &[String]) -> Result<
 
 fn contains_path(known: &BTreeSet<String>, candidate: &str, case_sensitive: bool) -> bool {
     known.contains(&normalize_case(candidate, case_sensitive))
-}
-
-fn best_repo_suffix_match<'a>(
-    report_path: &str,
-    repo_files: &[String],
-    case_sensitive: bool,
-) -> Option<(String, usize)> {
-    let report_key = normalize_case(report_path, case_sensitive);
-    let mut best: Option<(String, usize)> = None;
-    for repo in repo_files {
-        let repo_key = normalize_case(repo, case_sensitive);
-        if report_key.ends_with(&repo_key) {
-            let score = repo.len();
-            match &best {
-                None => best = Some((repo.clone(), score)),
-                Some((best_path, best_score)) => {
-                    if score > *best_score
-                        || (score == *best_score
-                            && normalize_case(repo, case_sensitive)
-                                < normalize_case(best_path, case_sensitive))
-                    {
-                        best = Some((repo.clone(), score));
-                    }
-                }
-            }
-        }
-    }
-    best
 }
 
 fn choose_best<'a>(
@@ -467,7 +482,7 @@ mod tests {
             format!("{}/*.info", dir.path().display()),
             format!("{}/a.info", dir.path().display()),
         ];
-        let files = resolve_report_files(&patterns).unwrap();
+        let files = crate::cmd_common::resolve_report_globs(&patterns).unwrap();
 
         assert_eq!(files, vec![a, b]);
     }
@@ -489,6 +504,21 @@ mod tests {
             Some("src/main/java/com/App.java".to_string())
         );
         assert!(result.rule.starts_with("replace_prefix:"));
+    }
+
+    #[test]
+    fn test_learn_counts_package_style_paths_as_mapped() {
+        let report_paths = vec![
+            "com/example/Calculator.java".to_string(),
+            "com/example/StringUtils.java".to_string(),
+        ];
+        let repo_files = vec![
+            "JavaTest/src/main/java/com/example/Calculator.java".to_string(),
+            "JavaTest/src/main/java/com/example/StringUtils.java".to_string(),
+        ];
+        let learned = learn_strip_prefixes(&report_paths, &repo_files, true);
+        assert_eq!(learned.total, 2);
+        assert_eq!(learned.mapped, 2);
     }
 
     #[test]

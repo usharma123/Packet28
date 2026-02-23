@@ -10,6 +10,10 @@ pub struct ReportArgs {
     #[arg(short, long)]
     format: Option<String>,
 
+    /// Emit JSON output
+    #[arg(long)]
+    json: bool,
+
     /// Sort by (name/coverage)
     #[arg(long, default_value = "name")]
     sort: String,
@@ -34,7 +38,12 @@ pub struct ReportArgs {
 pub fn run(args: ReportArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
 
-    let format = args.format.as_deref().unwrap_or(&config.report.format);
+    let format =
+        if crate::cmd_common::resolve_json_output(args.json, args.format.as_deref(), "--format")? {
+            "json"
+        } else {
+            args.format.as_deref().unwrap_or(&config.report.format)
+        };
 
     if args.issues {
         let issue_path = Path::new(".covy/state/issues.bin");

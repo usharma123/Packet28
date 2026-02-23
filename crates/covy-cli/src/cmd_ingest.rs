@@ -37,11 +37,26 @@ pub struct IngestArgs {
     merge: bool,
 
     /// Output file path (default: .covy/state/latest.bin)
-    #[arg(short, long)]
+    #[arg(short, long, alias = "out")]
     output: Option<String>,
+
+    /// Emit JSON summary output
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(serde::Serialize)]
+struct IngestSummary {
+    coverage_inputs: usize,
+    coverage_files_tracked: usize,
+    diagnostics_inputs: usize,
+    diagnostics_total_issues: usize,
+    output_coverage_path: String,
+    output_issues_path: Option<String>,
 }
 
 pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
+    crate::cmd_common::warn_if_legacy_flag_used("--out", "--output");
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
 
     // Resolve coverage globs
@@ -132,6 +147,9 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
     let bytes = covy_core::cache::serialize_coverage(&combined)?;
     std::fs::write(output_path, bytes)?;
 
+    let mut diagnostics_input_count = 0usize;
+    let mut diagnostics_total_issues = 0usize;
+
     // Process diagnostics, if requested
     if !args.issues.is_empty() {
         let mut diagnostics = if args.merge {
@@ -141,6 +159,7 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
         };
 
         let issue_files = resolve_globs(&args.issues)?;
+        diagnostics_input_count = issue_files.len();
         if issue_files.is_empty() {
             anyhow::bail!("No diagnostics files found");
         }
@@ -152,6 +171,7 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
         }
 
         covy_core::pathmap::auto_normalize_issue_paths(&mut diagnostics, source_root);
+        diagnostics_total_issues = diagnostics.total_issues();
 
         let issue_path = Path::new(".covy/state/issues.bin");
         if let Some(parent) = issue_path.parent() {
@@ -180,6 +200,22 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
 
     if let Some(pct) = combined.total_coverage_pct() {
         tracing::info!("Total coverage: {pct:.1}%");
+    }
+
+    if args.json || crate::cmd_common::global_quiet_enabled() {
+        let summary = IngestSummary {
+            coverage_inputs: files.len(),
+            coverage_files_tracked: combined.files.len(),
+            diagnostics_inputs: diagnostics_input_count,
+            diagnostics_total_issues,
+            output_coverage_path: output_path.display().to_string(),
+            output_issues_path: if diagnostics_input_count > 0 {
+                Some(".covy/state/issues.bin".to_string())
+            } else {
+                None
+            },
+        };
+        println!("{}", serde_json::to_string_pretty(&summary)?);
     }
 
     Ok(0)

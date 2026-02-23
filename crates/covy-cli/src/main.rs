@@ -7,6 +7,7 @@ mod cmd_doctor;
 mod cmd_github;
 mod cmd_impact;
 mod cmd_ingest;
+mod cmd_init;
 mod cmd_map_paths;
 mod cmd_merge;
 mod cmd_pr;
@@ -60,6 +61,8 @@ enum Commands {
     Annotate(cmd_annotate::AnnotateArgs),
     /// One-shot PR artifact generation
     Pr(cmd_pr::PrArgs),
+    /// Initialize covy.toml and .covy/ directory
+    Init(cmd_init::InitArgs),
     /// Diagnose setup and integration issues
     Doctor(cmd_doctor::DoctorArgs),
     /// Learn and inspect path mapping rules
@@ -73,7 +76,27 @@ enum Commands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let mut msg = err.to_string();
+            let replacements = [
+                ("--out-comment", "--output-comment"),
+                ("--out-sarif", "--output-sarif"),
+                ("--out-coverage", "--output-coverage"),
+                ("--out-issues", "--output-issues"),
+            ];
+            for (legacy, canonical) in replacements {
+                msg = msg.replace(legacy, canonical);
+            }
+            if err.use_stderr() {
+                eprint!("{msg}");
+            } else {
+                print!("{msg}");
+            }
+            std::process::exit(err.exit_code());
+        }
+    };
 
     // Set up tracing
     let filter = if cli.verbose {
@@ -88,6 +111,7 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
         )
+        .with_writer(std::io::stderr)
         .with_target(false)
         .without_time()
         .init();
@@ -109,6 +133,7 @@ fn main() {
         Commands::Comment(args) => cmd_comment::run(args, &cli.config),
         Commands::Annotate(args) => cmd_annotate::run(args, &cli.config),
         Commands::Pr(args) => cmd_pr::run(args, &cli.config),
+        Commands::Init(args) => cmd_init::run(args, &cli.config),
         Commands::Doctor(args) => cmd_doctor::run(args, &cli.config),
         Commands::MapPaths(args) => cmd_map_paths::run(args, &cli.config),
         Commands::Shard(args) => cmd_shard::run(args, &cli.config),

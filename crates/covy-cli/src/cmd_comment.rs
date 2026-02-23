@@ -4,9 +4,7 @@ use anyhow::Result;
 use clap::Args;
 use covy_core::{CoverageData, CovyConfig, FileDiff};
 
-use crate::cmd_common::{
-    compute_pr_shared_state, compute_uncovered_blocks_generic, PrSharedState,
-};
+use crate::cmd_common::{compute_pr_shared_state, compute_uncovered_blocks_generic, PrSharedState};
 
 #[derive(Args)]
 pub struct CommentArgs {
@@ -23,8 +21,12 @@ pub struct CommentArgs {
     pub format: String,
 
     /// Output path for comment markdown
+    #[arg(long = "output", alias = "out")]
+    pub output: Option<String>,
+
+    /// Emit JSON summary output
     #[arg(long)]
-    pub out: Option<String>,
+    pub json: bool,
 
     /// Maximum uncovered blocks to show
     #[arg(long, default_value_t = 5)]
@@ -46,7 +48,16 @@ struct LineBlock {
     end_line: u32,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CommentRenderSummary {
+    pub output_path: Option<String>,
+    pub wrote_stdout: bool,
+    pub bytes: usize,
+    pub gate_passed: bool,
+}
+
 pub fn run(args: CommentArgs, config_path: &str) -> Result<i32> {
+    crate::cmd_common::warn_if_legacy_flag_used("--out", "--output");
     let shared = compute_pr_shared_state(
         config_path,
         args.base_ref.as_deref(),
@@ -54,11 +65,17 @@ pub fn run(args: CommentArgs, config_path: &str) -> Result<i32> {
         &args.coverage_state_path,
         &args.diagnostics_state_path,
     )?;
-    render_from_state(&args, &shared)?;
+    let summary = render_from_state(&args, &shared)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    }
     Ok(0)
 }
 
-pub(crate) fn render_from_state(args: &CommentArgs, shared: &PrSharedState) -> Result<()> {
+pub(crate) fn render_from_state(
+    args: &CommentArgs,
+    shared: &PrSharedState,
+) -> Result<CommentRenderSummary> {
     if !args.format.eq_ignore_ascii_case("markdown") {
         anyhow::bail!(
             "Unsupported --format '{}'; only markdown is supported",
@@ -76,16 +93,24 @@ pub(crate) fn render_from_state(args: &CommentArgs, shared: &PrSharedState) -> R
         shared.gate.changed_coverage_pct,
     );
 
-    if let Some(path) = args.out.as_deref() {
+    let bytes = markdown.len();
+    let wrote_stdout = args.output.is_none() && !args.json;
+
+    if let Some(path) = args.output.as_deref() {
         if let Some(parent) = Path::new(path).parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, markdown)?;
-    } else {
+    } else if wrote_stdout {
         print!("{markdown}");
     }
 
-    Ok(())
+    Ok(CommentRenderSummary {
+        output_path: args.output.clone(),
+        wrote_stdout,
+        bytes,
+        gate_passed: shared.gate.passed,
+    })
 }
 
 fn suggested_tests(diffs: &[FileDiff], config: &CovyConfig) -> Result<Vec<String>> {
@@ -112,10 +137,10 @@ fn suggested_tests(diffs: &[FileDiff], config: &CovyConfig) -> Result<Vec<String
 
 fn compute_uncovered_blocks(coverage: &CoverageData, diffs: &[FileDiff]) -> Vec<LineBlock> {
     compute_uncovered_blocks_generic(coverage, diffs, |diff, start, end| LineBlock {
-            file: diff.path.clone(),
-            start_line: start,
-            end_line: end,
-        })
+        file: diff.path.clone(),
+        start_line: start,
+        end_line: end,
+    })
 }
 
 fn render_comment_markdown(

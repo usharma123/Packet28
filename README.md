@@ -17,7 +17,7 @@ cargo build --release -p covy-cli
 
 # Use the built binary for real runs
 ./target/release/covy ingest tests/fixtures/lcov/basic.info --issues tests/fixtures/sarif/basic.sarif
-./target/release/covy check tests/fixtures/lcov/basic.info --issues tests/fixtures/sarif/basic.sarif --max-new-errors 0
+./target/release/covy check tests/fixtures/lcov/basic.info --issues tests/fixtures/sarif/basic.sarif --max-new-errors 0 --json
 ./target/release/covy report --issues
 ```
 
@@ -33,11 +33,26 @@ Example:
 
 ```bash
 # Good for perf
-./target/release/covy check tests/fixtures/lcov/basic.info --base HEAD --head HEAD --report json > /dev/null
+./target/release/covy check tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json > /dev/null
 
 # Not suitable for perf benchmarking
-cargo run -q -p covy-cli -- check tests/fixtures/lcov/basic.info --base HEAD --head HEAD --report json > /dev/null
+cargo run -q -p covy-cli -- check tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json > /dev/null
 ```
+
+## Machine Mode Contract
+
+- Use `--json` for machine-readable stdout payloads.
+- Logs/warnings/errors are emitted to stderr.
+- Exit codes:
+  - `0` success
+  - `1` quality/gate failure
+  - `2` usage/runtime failure
+- `covy ingest -q` and `covy merge -q` emit JSON summaries even without `--json`.
+- Deprecation warnings for legacy aliases are suppressed in `--json` / `-q` machine mode.
+  Set `COVY_DEPRECATION_WARNINGS=1` to re-enable deprecation warnings.
+
+Output flags use `--output*` as canonical names. Legacy aliases such as `--out`, `--out-comment`,
+`--out-sarif`, `--out-coverage`, and `--out-issues` are accepted with deprecation warnings.
 
 ## Configuration
 
@@ -77,7 +92,7 @@ Build test impact map from per-test coverage:
 ```bash
 ./target/release/covy impact record \
   --base-ref main \
-  --out .covy/state/testmap.bin \
+  --output .covy/state/testmap.bin \
   --per-test-lcov-dir artifacts/per-test-lcov \
   --summary-json .covy/state/testmap.json
 ```
@@ -100,6 +115,13 @@ Optional execution:
 ./target/release/covy impact run --plan plan.json -- pytest {tests}
 ```
 
+Print input schema/examples:
+
+```bash
+./target/release/covy impact record --schema
+./target/release/covy impact run --schema
+```
+
 `{tests}` is a placeholder in this README, not special `covy` syntax. Replace it with real pytest path/pattern arguments.
 
 Example (single test file):
@@ -119,19 +141,25 @@ Example (directory + `-k` expression; quote when your shell could split/expand u
 Generate PR comment markdown:
 
 ```bash
-./target/release/covy comment --base-ref origin/main --head-ref HEAD --format markdown --out comment.md
+./target/release/covy comment --base-ref origin/main --head-ref HEAD --format markdown --output comment.md
 ```
 
 Generate SARIF annotations:
 
 ```bash
-./target/release/covy annotate --out covy.sarif --max-findings 200
+./target/release/covy annotate --output covy.sarif --max-findings 200
 ```
 
 One-shot artifact generation:
 
 ```bash
-./target/release/covy pr --out-comment comment.md --out-sarif covy.sarif
+./target/release/covy pr --output-comment comment.md --output-sarif covy.sarif
+```
+
+Machine summary for one-shot artifacts:
+
+```bash
+./target/release/covy pr --output-comment comment.md --output-sarif covy.sarif --json
 ```
 
 State paths for `comment`, `annotate`, and `pr` default to `.covy/state/latest.bin` and
@@ -146,6 +174,8 @@ Check repo/ref/config/report-path health:
 ./target/release/covy doctor --base-ref origin/main --head-ref HEAD
 ```
 
+`[ingest].report_paths` patterns are resolved relative to the directory containing your `--config` file.
+
 Learn/write mapping rules:
 
 ```bash
@@ -156,6 +186,27 @@ Explain one path mapping decision:
 
 ```bash
 ./target/release/covy map-paths --explain /__w/repo/repo/src/main/java/com/foo/App.java
+```
+
+Machine-readable diagnostics:
+
+```bash
+./target/release/covy doctor --json
+./target/release/covy map-paths --learn --json
+```
+
+## Project Initialization
+
+Initialize `covy.toml` and `.covy/` in the current directory:
+
+```bash
+./target/release/covy init
+```
+
+Initialize at git repo root instead:
+
+```bash
+./target/release/covy init --repo-root
 ```
 
 ## CI Templates
@@ -196,6 +247,18 @@ Reference templates:
 
 ```bash
 ./target/release/covy shard plan --shards 8 --tasks-json tasks.json --tier pr --write-files .covy/shards --json
+```
+
+Print shard plan input schemas:
+
+```bash
+./target/release/covy shard plan --schema
+```
+
+`testmap build` also supports JSON summary output:
+
+```bash
+./target/release/covy testmap build --manifest manifests/*.jsonl --output .covy/state/testmap.bin --json
 ```
 
 3. Run shard files with your test runner and produce coverage/diagnostics artifacts.

@@ -41,9 +41,14 @@ pub struct DiffArgs {
     #[arg(long)]
     no_issues_state: bool,
 
-    /// Output format (terminal/json)
-    #[arg(long, default_value = "terminal")]
-    report: String,
+    /// Output format (terminal/json). Defaults to "terminal" in interactive
+    /// mode and "json" when stdout is piped.
+    #[arg(long)]
+    report: Option<String>,
+
+    /// Emit JSON output
+    #[arg(long)]
+    json: bool,
 
     /// Coverage report files to ingest (instead of loading state)
     #[arg(long)]
@@ -56,6 +61,12 @@ pub struct DiffArgs {
 
 pub fn run(args: DiffArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
+    let report =
+        if crate::cmd_common::resolve_json_output(args.json, args.report.as_deref(), "--report")? {
+            "json".to_string()
+        } else {
+            crate::cmd_common::resolve_report_format(args.report.as_deref())
+        };
 
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
@@ -114,7 +125,7 @@ pub fn run(args: DiffArgs, config_path: &str) -> Result<i32> {
         covy_core::gate::evaluate_full_gate(&gate_config, &coverage, loaded.data.as_ref(), &diffs);
 
     // Output
-    match args.report.as_str() {
+    match report.as_str() {
         "json" => {
             let json = covy_core::report::render_gate_json(&result);
             println!("{json}");

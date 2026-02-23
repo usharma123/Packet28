@@ -15,6 +15,10 @@ pub struct DoctorArgs {
     /// Head ref for validation (default from config)
     #[arg(long)]
     pub head_ref: Option<String>,
+
+    /// Emit JSON output
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +29,21 @@ struct MappingStats {
     suggested_strip_prefixes: Vec<String>,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct DoctorSummary {
+    config_path: String,
+    config_base_dir: String,
+    repo_root: String,
+    report_files: usize,
+    parsed_report_paths: usize,
+    mapped: usize,
+    total: usize,
+    mapped_pct: f64,
+    unmapped_prefixes: Vec<(String, usize)>,
+    suggested_strip_prefixes: Vec<String>,
+    next_step: String,
+}
+
 pub fn run(args: DoctorArgs, config_path: &str) -> Result<i32> {
     let config = load_config_checked(config_path)?;
     let base = args.base_ref.as_deref().unwrap_or(&config.diff.base);
@@ -33,27 +52,80 @@ pub fn run(args: DoctorArgs, config_path: &str) -> Result<i32> {
     ensure_git_available()?;
     validate_git_refs(base, head)?;
 
-    let repo_root = detect_repo_root()?;
-    println!("Repo root: {}", repo_root.display());
+    let repo_root = crate::cmd_common::detect_repo_root()?;
+    let config_path_abs = std::fs::canonicalize(Path::new(config_path))
+        .unwrap_or_else(|_| Path::new(config_path).to_path_buf());
+    let config_base_dir = config_path_abs
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
 
-    let report_files = resolve_report_files(&config.ingest.report_paths)?;
+    let report_files = crate::cmd_common::resolve_report_globs_for_config(
+        config_path,
+        &config.ingest.report_paths,
+    )?;
     if report_files.is_empty() {
-        println!("No report files matched [ingest].report_paths");
-        println!("Next: configure [ingest].report_paths and run covy map-paths --learn --write");
+        if args.json {
+            let summary = DoctorSummary {
+                config_path: config_path_abs.display().to_string(),
+                config_base_dir: config_base_dir.display().to_string(),
+                repo_root: repo_root.display().to_string(),
+                report_files: 0,
+                parsed_report_paths: 0,
+                mapped: 0,
+                total: 0,
+                mapped_pct: 0.0,
+                unmapped_prefixes: Vec::new(),
+                suggested_strip_prefixes: Vec::new(),
+                next_step: "configure [ingest].report_paths and run covy map-paths --learn --write"
+                    .to_string(),
+            };
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            println!("Repo root: {}", repo_root.display());
+            println!("No report files matched [ingest].report_paths");
+            println!(
+                "Next: configure [ingest].report_paths and run covy map-paths --learn --write"
+            );
+        }
         return Ok(0);
     }
 
     let report_paths = parse_report_paths_quick(&report_files)?;
-    println!("Parsed reports: {} files", report_paths.len());
 
     let stats = evaluate_mapping(&report_paths, &config, &repo_root)?;
+    let pct = if stats.total == 0 {
+        0.0
+    } else {
+        (stats.mapped as f64 / stats.total as f64) * 100.0
+    };
+
+    if args.json {
+        let summary = DoctorSummary {
+            config_path: config_path_abs.display().to_string(),
+            config_base_dir: config_base_dir.display().to_string(),
+            repo_root: repo_root.display().to_string(),
+            report_files: report_files.len(),
+            parsed_report_paths: report_paths.len(),
+            mapped: stats.mapped,
+            total: stats.total,
+            mapped_pct: pct,
+            unmapped_prefixes: stats.unmapped_prefixes.clone(),
+            suggested_strip_prefixes: stats.suggested_strip_prefixes.clone(),
+            next_step: "run covy map-paths --learn --write".to_string(),
+        };
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(0);
+    }
+
+    println!("Repo root: {}", repo_root.display());
+    println!("Parsed reports: {} files", report_paths.len());
     if stats.total == 0 {
         println!("Mapped paths: 0/0 (0.0%)");
         println!("No file paths were extracted from reports.");
         return Ok(0);
     }
 
-    let pct = (stats.mapped as f64 / stats.total as f64) * 100.0;
     println!("Mapped paths: {}/{} ({pct:.1}%)", stats.mapped, stats.total);
 
     if !stats.unmapped_prefixes.is_empty() {
@@ -106,36 +178,6 @@ fn validate_git_refs(base: &str, head: &str) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn detect_repo_root() -> Result<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .context("Failed to detect git repository root")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to detect git repository root: {stderr}");
-    }
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if root.is_empty() {
-        anyhow::bail!("Git repository root resolved to an empty path");
-    }
-    Ok(PathBuf::from(root))
-}
-
-fn resolve_report_files(patterns: &[String]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for pattern in patterns {
-        let matches: Vec<_> = glob::glob(pattern)
-            .with_context(|| format!("Invalid report glob pattern: {pattern}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        files.extend(matches);
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
 }
 
 fn parse_report_paths_quick(report_files: &[PathBuf]) -> Result<Vec<String>> {

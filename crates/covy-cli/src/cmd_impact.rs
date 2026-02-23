@@ -55,8 +55,12 @@ pub struct ImpactRecordArgs {
     pub base_ref: String,
 
     /// Output testmap path
-    #[arg(long, default_value = ".covy/state/testmap.bin")]
-    pub out: String,
+    #[arg(
+        long = "output",
+        default_value = ".covy/state/testmap.bin",
+        alias = "out"
+    )]
+    pub output: String,
 
     /// Directory containing per-test LCOV reports
     #[arg(long)]
@@ -77,6 +81,10 @@ pub struct ImpactRecordArgs {
     /// Optional summary json output path
     #[arg(long)]
     pub summary_json: Option<String>,
+
+    /// Print input schema/example and exit
+    #[arg(long)]
+    pub schema: bool,
 }
 
 #[derive(Args, Default)]
@@ -110,10 +118,14 @@ pub struct ImpactPlanArgs {
 pub struct ImpactRunArgs {
     /// Path to impact plan json
     #[arg(long)]
-    pub plan: String,
+    pub plan: Option<String>,
+
+    /// Print input schema/example and exit
+    #[arg(long)]
+    pub schema: bool,
 
     /// Command template to execute (provide after --)
-    #[arg(last = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
 
@@ -123,7 +135,7 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         Some(ImpactCommand::Plan(plan)) => run_plan(plan, config_path),
         Some(ImpactCommand::Run(run)) => run_impact_run(run),
         None => {
-            eprintln!(
+            crate::cmd_common::maybe_warn_deprecated(
                 "warning: `covy impact` legacy mode is deprecated; use `covy impact plan` and `covy impact run`."
             );
             run_legacy(args.legacy, config_path)
@@ -185,6 +197,12 @@ struct RecordSummary {
 }
 
 fn run_record(args: ImpactRecordArgs) -> Result<i32> {
+    crate::cmd_common::warn_if_legacy_flag_used("--out", "--output");
+    if args.schema {
+        println!("{IMPACT_RECORD_MANIFEST_EXAMPLE}");
+        return Ok(0);
+    }
+
     let mut by_test: BTreeMap<String, TestCoverageInput> = BTreeMap::new();
 
     if let Some(dir) = args.per_test_lcov_dir.as_deref() {
@@ -207,9 +225,9 @@ fn run_record(args: ImpactRecordArgs) -> Result<i32> {
     }
 
     let (index, mut summary) = build_testmap_index(by_test, &args.base_ref)?;
-    summary.output = args.out.clone();
+    summary.output = args.output.clone();
 
-    let output = Path::new(&args.out);
+    let output = Path::new(&args.output);
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -263,17 +281,53 @@ fn run_plan(args: ImpactPlanArgs, config_path: &str) -> Result<i32> {
     Ok(0)
 }
 
+const IMPACT_PLAN_EXAMPLE: &str = r#"{
+  "changed_lines_total": 42,
+  "changed_lines_covered_by_plan": 30,
+  "plan_coverage_pct": 0.71,
+  "tests": [
+    {"id": "com.foo.BarTest", "name": "com.foo.BarTest", "estimated_overlap_lines": 10, "marginal_gain_lines": 5}
+  ],
+  "uncovered_blocks": [
+    {"file": "src/main/java/com/foo/Bar.java", "start_line": 101, "end_line": 104}
+  ],
+  "next_command": "covy impact run --plan plan.json -- <your-test-command-template>"
+}"#;
+
+const IMPACT_RECORD_MANIFEST_EXAMPLE: &str = r#"{
+  "type": "impact-record-manifest-jsonl",
+  "description": "One JSON object per line.",
+  "example_line": {
+    "test_id": "com.foo.BarTest",
+    "language": "java",
+    "coverage_report": "path/to/jacoco.xml",
+    "coverage_reports": ["path/to/jacoco.xml", "path/to/extra.xml"]
+  }
+}"#;
+
 fn run_impact_run(args: ImpactRunArgs) -> Result<i32> {
+    if args.schema {
+        println!("{IMPACT_PLAN_EXAMPLE}");
+        return Ok(0);
+    }
+
+    let plan_path = args.plan.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("Missing --plan. Use: covy impact run --plan plan.json -- <command>")
+    })?;
+
     if args.command.is_empty() {
         anyhow::bail!(
             "No command template provided. Use: covy impact run --plan plan.json -- <command>"
         );
     }
 
-    let content = std::fs::read_to_string(&args.plan)
-        .with_context(|| format!("Failed to read plan at {}", args.plan))?;
-    let plan: covy_core::impact::ImpactPlan =
-        serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", args.plan))?;
+    let content = std::fs::read_to_string(plan_path)
+        .with_context(|| format!("Failed to read plan at {plan_path}"))?;
+    let plan: covy_core::impact::ImpactPlan = crate::cmd_common::deserialize_json_with_example(
+        &content,
+        "ImpactPlan",
+        IMPACT_PLAN_EXAMPLE,
+    )?;
 
     let tests: Vec<String> = plan.tests.iter().map(|t| t.id.clone()).collect();
     if tests.is_empty() {
@@ -372,9 +426,9 @@ fn collect_inputs_from_manifest(
         if line.is_empty() {
             continue;
         }
-        let rec: ManifestRecord = serde_json::from_str(line).with_context(|| {
-            format!(
-                "Invalid JSON in test report manifest {} at line {}",
+        let rec: ManifestRecord = serde_json::from_str(line).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid JSON in test report manifest {} at line {}: {e}\n\nExpected JSONL shape (one per line):\n  {{\"test_id\": \"com.foo.BarTest\", \"coverage_report\": \"path/to/jacoco.xml\"}}",
                 path,
                 idx + 1
             )
@@ -930,7 +984,8 @@ mod tests {
         std::fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
 
         let result = run_impact_run(ImpactRunArgs {
-            plan: plan_path.to_string_lossy().to_string(),
+            plan: Some(plan_path.to_string_lossy().to_string()),
+            schema: false,
             command: vec!["definitely-not-a-command".to_string()],
         })
         .unwrap();
@@ -953,7 +1008,8 @@ mod tests {
         std::fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
 
         let code = run_impact_run(ImpactRunArgs {
-            plan: plan_path.to_string_lossy().to_string(),
+            plan: Some(plan_path.to_string_lossy().to_string()),
+            schema: false,
             command: vec!["true".to_string(), "{tests}".to_string()],
         })
         .unwrap();

@@ -72,7 +72,7 @@ pub struct GithubCommentArgs {
 }
 
 pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
-    eprintln!(
+    crate::cmd_common::maybe_warn_deprecated(
         "warning: `covy github-comment` is deprecated; use `covy comment` + `covy annotate` (or `covy pr`)."
     );
 

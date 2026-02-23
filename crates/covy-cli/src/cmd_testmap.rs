@@ -30,11 +30,45 @@ pub struct TestmapBuildArgs {
     /// Output timing map path
     #[arg(long, default_value = ".covy/state/testtimings.bin")]
     pub timings_output: String,
+
+    /// Emit JSON summary output
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print input schema/example and exit
+    #[arg(long)]
+    pub schema: bool,
 }
+
+#[derive(serde::Serialize)]
+struct TestmapBuildSummary {
+    manifest_files: usize,
+    records: usize,
+    tests: usize,
+    files: usize,
+    output_testmap_path: String,
+    output_timings_path: String,
+}
+
+const TESTMAP_MANIFEST_SCHEMA_EXAMPLE: &str = r#"{
+  "type": "testmap-build-manifest-jsonl",
+  "description": "One JSON object per line.",
+  "example_line": {
+    "test_id": "com.foo.BarTest",
+    "language": "java",
+    "duration_ms": 1200,
+    "coverage_report": "path/to/jacoco.xml",
+    "coverage_reports": ["path/to/jacoco.xml", "path/to/extra.xml"]
+  }
+}"#;
 
 pub fn run(args: TestmapArgs, _config_path: &str) -> Result<i32> {
     match args.command {
         TestmapCommands::Build(build) => {
+            if build.schema {
+                println!("{TESTMAP_MANIFEST_SCHEMA_EXAMPLE}");
+                return Ok(0);
+            }
             let files = resolve_globs(&build.manifest)?;
             if files.is_empty() {
                 anyhow::bail!("No manifest files found");
@@ -69,11 +103,23 @@ pub fn run(args: TestmapArgs, _config_path: &str) -> Result<i32> {
             let timing_bytes = covy_core::cache::serialize_test_timings(&timings)?;
             std::fs::write(timings_output, timing_bytes)?;
 
-            tracing::info!(
-                "Built testmap from {} manifest records across {} file(s)",
-                records.len(),
-                files.len()
-            );
+            if build.json {
+                let summary = TestmapBuildSummary {
+                    manifest_files: files.len(),
+                    records: records.len(),
+                    tests: index.test_to_files.len(),
+                    files: index.file_to_tests.len(),
+                    output_testmap_path: build.output.clone(),
+                    output_timings_path: build.timings_output.clone(),
+                };
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                tracing::info!(
+                    "Built testmap from {} manifest records across {} file(s)",
+                    records.len(),
+                    files.len()
+                );
+            }
             Ok(0)
         }
     }
@@ -130,9 +176,9 @@ fn read_manifest_records(files: &[PathBuf]) -> Result<Vec<ManifestRecord>> {
             if line.is_empty() {
                 continue;
             }
-            let rec: ManifestRecord = serde_json::from_str(line).with_context(|| {
-                format!(
-                    "Invalid JSON on {} line {}",
+            let rec: ManifestRecord = serde_json::from_str(line).map_err(|e| {
+                anyhow::anyhow!(
+                    "Invalid JSON on {} line {}: {e}\n\nExpected JSONL shape (one per line):\n  {{\"test_id\": \"com.foo.BarTest\", \"language\": \"java\", \"duration_ms\": 1200, \"coverage_report\": \"path/to/report.xml\"}}",
                     file.display(),
                     idx + 1
                 )
@@ -179,8 +225,9 @@ fn build_test_language_index(records: &[ManifestRecord]) -> Result<BTreeMap<Stri
     let mut out = BTreeMap::new();
     for rec in records {
         let lang = if let Some(raw) = rec.language.as_deref() {
-            normalize_language(raw)
-                .ok_or_else(|| anyhow::anyhow!("Unsupported language '{}' for {}", raw, rec.test_id))?
+            normalize_language(raw).ok_or_else(|| {
+                anyhow::anyhow!("Unsupported language '{}' for {}", raw, rec.test_id)
+            })?
         } else if rec.test_id.contains("::") {
             "python".to_string()
         } else {
@@ -200,7 +247,9 @@ fn normalize_language(raw: &str) -> Option<String> {
     }
 }
 
-fn build_test_to_files_index(records: &[ManifestRecord]) -> Result<BTreeMap<String, BTreeSet<String>>> {
+fn build_test_to_files_index(
+    records: &[ManifestRecord],
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let mut test_to_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for rec in records {
@@ -208,11 +257,11 @@ fn build_test_to_files_index(records: &[ManifestRecord]) -> Result<BTreeMap<Stri
         for coverage_path in rec.coverage_paths() {
             let mut coverage =
                 covy_ingest::ingest_path(Path::new(coverage_path)).with_context(|| {
-                format!(
-                    "Failed to ingest coverage report '{}' for test '{}'",
-                    coverage_path, rec.test_id
-                )
-            })?;
+                    format!(
+                        "Failed to ingest coverage report '{}' for test '{}'",
+                        coverage_path, rec.test_id
+                    )
+                })?;
             covy_core::pathmap::auto_normalize_paths(&mut coverage, None);
             for file in coverage.files.keys() {
                 covered_files.insert(file.clone());

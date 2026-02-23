@@ -5,15 +5,13 @@ use clap::Args;
 use covy_core::diagnostics::Severity;
 use covy_core::{CoverageData, DiffStatus, FileDiff};
 
-use crate::cmd_common::{
-    compute_pr_shared_state, compute_uncovered_blocks_generic, PrSharedState,
-};
+use crate::cmd_common::{compute_pr_shared_state, compute_uncovered_blocks_generic, PrSharedState};
 
 #[derive(Args)]
 pub struct AnnotateArgs {
     /// Output SARIF path
-    #[arg(long)]
-    pub out: String,
+    #[arg(long = "output", alias = "out")]
+    pub output: String,
 
     /// Base ref for diff
     #[arg(long)]
@@ -26,6 +24,10 @@ pub struct AnnotateArgs {
     /// Maximum findings to emit
     #[arg(long, default_value_t = 200)]
     pub max_findings: usize,
+
+    /// Emit JSON summary output
+    #[arg(long)]
+    pub json: bool,
 
     /// Path to coverage state file
     #[arg(long, default_value = ".covy/state/latest.bin")]
@@ -44,7 +46,14 @@ struct BlockFinding {
     is_new_file: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AnnotateRenderSummary {
+    pub output_path: String,
+    pub findings: usize,
+}
+
 pub fn run(args: AnnotateArgs, config_path: &str) -> Result<i32> {
+    crate::cmd_common::warn_if_legacy_flag_used("--out", "--output");
     let shared = compute_pr_shared_state(
         config_path,
         args.base_ref.as_deref(),
@@ -52,11 +61,17 @@ pub fn run(args: AnnotateArgs, config_path: &str) -> Result<i32> {
         &args.coverage_state_path,
         &args.diagnostics_state_path,
     )?;
-    render_from_state(&args, &shared)?;
+    let summary = render_from_state(&args, &shared)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    }
     Ok(0)
 }
 
-pub(crate) fn render_from_state(args: &AnnotateArgs, shared: &PrSharedState) -> Result<()> {
+pub(crate) fn render_from_state(
+    args: &AnnotateArgs,
+    shared: &PrSharedState,
+) -> Result<AnnotateRenderSummary> {
     let blocks = uncovered_blocks(&shared.coverage, &shared.diffs);
     let sarif = build_sarif(
         &blocks,
@@ -65,23 +80,31 @@ pub(crate) fn render_from_state(args: &AnnotateArgs, shared: &PrSharedState) -> 
         &shared.gate.violations,
         args.max_findings,
     );
+    let findings = sarif["runs"][0]["results"]
+        .as_array()
+        .map_or(0, |r| r.len());
 
-    if let Some(parent) = Path::new(&args.out).parent() {
+    if let Some(parent) = Path::new(&args.output).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&args.out, serde_json::to_string_pretty(&sarif)?)?;
-    println!("Wrote SARIF: {}", args.out);
+    std::fs::write(&args.output, serde_json::to_string_pretty(&sarif)?)?;
+    if !args.json {
+        println!("Wrote SARIF: {}", args.output);
+    }
 
-    Ok(())
+    Ok(AnnotateRenderSummary {
+        output_path: args.output.clone(),
+        findings,
+    })
 }
 
 fn uncovered_blocks(coverage: &CoverageData, diffs: &[FileDiff]) -> Vec<BlockFinding> {
     compute_uncovered_blocks_generic(coverage, diffs, |diff, start, end| BlockFinding {
-            file: diff.path.clone(),
-            start_line: start,
-            end_line: end,
-            is_new_file: diff.status == DiffStatus::Added,
-        })
+        file: diff.path.clone(),
+        start_line: start,
+        end_line: end,
+        is_new_file: diff.status == DiffStatus::Added,
+    })
 }
 
 fn build_sarif(
