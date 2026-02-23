@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Args;
+use clap::{Args, Subcommand};
 use covy_core::CovyConfig;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -7,6 +7,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Args)]
 pub struct ImpactArgs {
+    #[command(subcommand)]
+    pub command: Option<ImpactCommand>,
+
+    #[command(flatten)]
+    pub legacy: LegacyImpactArgs,
+}
+
+#[derive(Subcommand)]
+pub enum ImpactCommand {
+    /// Build or update per-test impact map
+    Record(ImpactRecordArgs),
+    /// Plan tests for a git diff
+    Plan(ImpactPlanArgs),
+    /// Execute a previously generated impact plan
+    Run(ImpactRunArgs),
+}
+
+#[derive(Args, Default)]
+pub struct LegacyImpactArgs {
     /// Base ref for diff (default: main)
     #[arg(long)]
     pub base: Option<String>,
@@ -28,7 +47,31 @@ pub struct ImpactArgs {
     pub print_command: bool,
 }
 
+#[derive(Args, Default)]
+pub struct ImpactRecordArgs {}
+
+#[derive(Args, Default)]
+pub struct ImpactPlanArgs {}
+
+#[derive(Args, Default)]
+pub struct ImpactRunArgs {}
+
 pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
+    match args.command {
+        Some(ImpactCommand::Record(_)) => {
+            anyhow::bail!("`covy impact record` is not implemented yet")
+        }
+        Some(ImpactCommand::Plan(_)) => {
+            anyhow::bail!("`covy impact plan` is not implemented yet")
+        }
+        Some(ImpactCommand::Run(_)) => {
+            anyhow::bail!("`covy impact run` is not implemented yet")
+        }
+        None => run_legacy(args.legacy, config_path),
+    }
+}
+
+fn run_legacy(args: LegacyImpactArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
@@ -132,7 +175,10 @@ fn apply_policy(
         result.escalate_full_suite = false;
     }
 
-    if config.impact.fallback_mode.eq_ignore_ascii_case("fail-closed")
+    if config
+        .impact
+        .fallback_mode
+        .eq_ignore_ascii_case("fail-closed")
         && !result.missing_mappings.is_empty()
     {
         anyhow::bail!(
@@ -158,7 +204,13 @@ fn build_print_command(
         let language = test_language
             .get(test)
             .map(|s| s.as_str())
-            .unwrap_or_else(|| if test.contains("::") { "python" } else { "java" });
+            .unwrap_or_else(|| {
+                if test.contains("::") {
+                    "python"
+                } else {
+                    "java"
+                }
+            });
         if language.eq_ignore_ascii_case("python") {
             python_tests.push(test.clone());
         } else {
@@ -233,14 +285,23 @@ mod tests {
         let langs = std::collections::BTreeMap::new();
         let cmd = build_print_command(&["a.Test".to_string(), "b.Test".to_string()], &langs);
         assert_eq!(cmd, "mvn -Dtest=a.Test,b.Test test");
-        assert_eq!(build_print_command(&[], &langs), "echo \"no impacted tests\"");
+        assert_eq!(
+            build_print_command(&[], &langs),
+            "echo \"no impacted tests\""
+        );
     }
 
     #[test]
     fn test_build_print_command_python_nodeids() {
         let mut langs = std::collections::BTreeMap::new();
-        langs.insert("tests/test_a.py::test_one".to_string(), "python".to_string());
-        langs.insert("tests/test_b.py::test_two".to_string(), "python".to_string());
+        langs.insert(
+            "tests/test_a.py::test_one".to_string(),
+            "python".to_string(),
+        );
+        langs.insert(
+            "tests/test_b.py::test_two".to_string(),
+            "python".to_string(),
+        );
         let cmd = build_print_command(
             &[
                 "tests/test_a.py::test_one".to_string(),
@@ -248,14 +309,20 @@ mod tests {
             ],
             &langs,
         );
-        assert_eq!(cmd, "pytest tests/test_a.py::test_one tests/test_b.py::test_two");
+        assert_eq!(
+            cmd,
+            "pytest tests/test_a.py::test_one tests/test_b.py::test_two"
+        );
     }
 
     #[test]
     fn test_build_print_command_mixed_languages() {
         let mut langs = std::collections::BTreeMap::new();
         langs.insert("com.foo.BarTest".to_string(), "java".to_string());
-        langs.insert("tests/test_a.py::test_one".to_string(), "python".to_string());
+        langs.insert(
+            "tests/test_a.py::test_one".to_string(),
+            "python".to_string(),
+        );
         let cmd = build_print_command(
             &[
                 "com.foo.BarTest".to_string(),
