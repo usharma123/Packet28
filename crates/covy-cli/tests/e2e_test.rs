@@ -761,6 +761,62 @@ fn test_impact_print_command_outputs_helper() {
 }
 
 #[test]
+fn test_impact_legacy_emits_deprecation_warning() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("manifest.jsonl");
+    let testmap = dir.path().join("testmap.bin");
+
+    let line = format!(
+        "{{\"test_id\":\"com.foo.BarTest\",\"language\":\"java\",\"coverage_report\":\"{}\"}}\n",
+        fixture("lcov/basic.info")
+    );
+    std::fs::write(&manifest, line).unwrap();
+
+    covy_cmd()
+        .args([
+            "testmap",
+            "build",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output",
+            testmap.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args([
+            "impact",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--testmap",
+            testmap.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("deprecated"));
+}
+
+#[test]
+fn test_github_comment_emits_deprecation_warning() {
+    covy_cmd()
+        .args([
+            "github-comment",
+            &fixture("lcov/basic.info"),
+            "--dry-run",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("deprecated"));
+}
+
+#[test]
 fn test_shard_plan_json_and_file_outputs() {
     let dir = TempDir::new().unwrap();
     let tests_file = dir.path().join("tests.txt");

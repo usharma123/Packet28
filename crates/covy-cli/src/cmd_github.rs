@@ -72,6 +72,10 @@ pub struct GithubCommentArgs {
 }
 
 pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
+    eprintln!(
+        "warning: `covy github-comment` is deprecated; use `covy comment` + `covy annotate` (or `covy pr`)."
+    );
+
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
 
     // Build a CheckArgs-compatible ingest

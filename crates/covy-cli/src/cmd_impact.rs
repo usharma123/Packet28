@@ -122,7 +122,12 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         Some(ImpactCommand::Record(record)) => run_record(record),
         Some(ImpactCommand::Plan(plan)) => run_plan(plan, config_path),
         Some(ImpactCommand::Run(run)) => run_impact_run(run),
-        None => run_legacy(args.legacy, config_path),
+        None => {
+            eprintln!(
+                "warning: `covy impact` legacy mode is deprecated; use `covy impact plan` and `covy impact run`."
+            );
+            run_legacy(args.legacy, config_path)
+        }
     }
 }
 
