@@ -37,7 +37,7 @@ struct BlockFinding {
 }
 
 pub fn run(args: AnnotateArgs, config_path: &str) -> Result<i32> {
-    let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
+    let config = CovyConfig::load(Path::new(config_path))?;
     let base = args.base_ref.as_deref().unwrap_or(&config.diff.base);
     let head = args.head_ref.as_deref().unwrap_or(&config.diff.head);
 
