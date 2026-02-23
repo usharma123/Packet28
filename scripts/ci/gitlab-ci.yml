@@ -18,3 +18,5 @@ covy_pr:
     paths:
       - comment.md
       - covy.sarif
+    reports:
+      sast: covy.sarif
