@@ -1,0 +1,11 @@
+[project]
+name = "Coverage"
+
+[ingest]
+report_paths = [
+  "coverage.lcov",
+]
+
+[diff]
+base = "origin/main"
+head = "HEAD"

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [],
+      "tool": {
+        "driver": {
+          "name": "covy",
+          "rules": [
+            {
+              "id": "covy/coverage/changed-line-uncovered"
+            },
+            {
+              "id": "covy/coverage/new-file-uncovered"
+            },
+            {
+              "id": "covy/issues/new-on-changed-lines"
+            },
+            {
+              "id": "covy/policy/threshold-fail"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

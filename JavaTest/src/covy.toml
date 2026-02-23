@@ -1,0 +1,11 @@
+[project]
+name = "src"
+
+[ingest]
+# Add your coverage report globs here:
+# report_paths = ["**/jacoco.xml", "**/lcov.info"]
+report_paths = []
+
+[diff]
+base = "origin/main"
+head = "HEAD"

@@ -1,0 +1,9 @@
+[project]
+name = "java-test"
+
+[ingest]
+report_paths = ["JavaTest/target/site/jacoco/jacoco.xml"]
+
+[diff]
+base = "origin/main"
+head = "HEAD"
