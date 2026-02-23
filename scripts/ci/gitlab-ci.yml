@@ -9,9 +9,9 @@ covy_pr:
     - ./target/release/covy ingest coverage/lcov.info --issues reports/sarif.sarif
     - ./target/release/covy pr --base-ref origin/$CI_DEFAULT_BRANCH --head-ref HEAD --out-comment comment.md --out-sarif covy.sarif
     - |
-      curl --request POST \
+      curl --fail --request POST \
         --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-        --form "body=$(cat comment.md)" \
+        --form "body=<comment.md" \
         "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
   artifacts:
     when: always
