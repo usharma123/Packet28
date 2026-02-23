@@ -664,6 +664,63 @@ fn test_annotate_writes_sarif_artifact() {
 }
 
 #[test]
+fn test_pr_writes_both_artifacts() {
+    let dir = TempDir::new().unwrap();
+    let comment_path = dir.path().join("comment.md");
+    let sarif_path = dir.path().join("covy.sarif");
+
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["init"])
+        .status()
+        .unwrap();
+    std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["add", "README.md"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .status()
+        .unwrap();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args(["ingest", &fixture("lcov/basic.info")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args([
+            "pr",
+            "--base-ref",
+            "HEAD",
+            "--head-ref",
+            "HEAD",
+            "--out-comment",
+            comment_path.to_str().unwrap(),
+            "--out-sarif",
+            sarif_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(comment_path.exists());
+    assert!(sarif_path.exists());
+}
+
+#[test]
 fn test_impact_print_command_outputs_helper() {
     let dir = TempDir::new().unwrap();
     let manifest = dir.path().join("manifest.jsonl");
