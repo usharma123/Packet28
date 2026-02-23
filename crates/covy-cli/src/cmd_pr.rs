@@ -24,6 +24,14 @@ pub struct PrArgs {
     /// Maximum findings in SARIF output
     #[arg(long, default_value_t = 200)]
     pub max_findings: usize,
+
+    /// Path to coverage state file
+    #[arg(long, default_value = ".covy/state/latest.bin")]
+    pub coverage_state_path: String,
+
+    /// Path to diagnostics state file
+    #[arg(long, default_value = ".covy/state/issues.bin")]
+    pub diagnostics_state_path: String,
 }
 
 pub fn run(args: PrArgs, config_path: &str) -> Result<i32> {
@@ -31,6 +39,8 @@ pub fn run(args: PrArgs, config_path: &str) -> Result<i32> {
         config_path,
         args.base_ref.as_deref(),
         args.head_ref.as_deref(),
+        &args.coverage_state_path,
+        &args.diagnostics_state_path,
     )?;
 
     let comment_args = crate::cmd_comment::CommentArgs {
@@ -39,6 +49,8 @@ pub fn run(args: PrArgs, config_path: &str) -> Result<i32> {
         format: "markdown".to_string(),
         out: Some(args.out_comment.clone()),
         max_uncovered: 5,
+        coverage_state_path: args.coverage_state_path.clone(),
+        diagnostics_state_path: args.diagnostics_state_path.clone(),
     };
     crate::cmd_comment::render_from_state(&comment_args, &shared)?;
 
@@ -47,6 +59,8 @@ pub fn run(args: PrArgs, config_path: &str) -> Result<i32> {
         base_ref: args.base_ref,
         head_ref: args.head_ref,
         max_findings: args.max_findings,
+        coverage_state_path: args.coverage_state_path,
+        diagnostics_state_path: args.diagnostics_state_path,
     };
     crate::cmd_annotate::render_from_state(&annotate_args, &shared)?;
 

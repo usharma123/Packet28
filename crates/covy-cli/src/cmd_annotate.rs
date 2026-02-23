@@ -26,6 +26,14 @@ pub struct AnnotateArgs {
     /// Maximum findings to emit
     #[arg(long, default_value_t = 200)]
     pub max_findings: usize,
+
+    /// Path to coverage state file
+    #[arg(long, default_value = ".covy/state/latest.bin")]
+    pub coverage_state_path: String,
+
+    /// Path to diagnostics state file
+    #[arg(long, default_value = ".covy/state/issues.bin")]
+    pub diagnostics_state_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +49,8 @@ pub fn run(args: AnnotateArgs, config_path: &str) -> Result<i32> {
         config_path,
         args.base_ref.as_deref(),
         args.head_ref.as_deref(),
+        &args.coverage_state_path,
+        &args.diagnostics_state_path,
     )?;
     render_from_state(&args, &shared)?;
     Ok(0)

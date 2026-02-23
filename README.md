@@ -134,6 +134,10 @@ One-shot artifact generation:
 ./target/release/covy pr --out-comment comment.md --out-sarif covy.sarif
 ```
 
+State paths for `comment`, `annotate`, and `pr` default to `.covy/state/latest.bin` and
+`.covy/state/issues.bin`, and can be overridden with `--coverage-state-path` and
+`--diagnostics-state-path`.
+
 ## Doctor + Path Mapping
 
 Check repo/ref/config/report-path health:

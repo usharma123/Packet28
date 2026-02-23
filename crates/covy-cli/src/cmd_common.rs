@@ -75,16 +75,18 @@ pub fn compute_pr_shared_state(
     config_path: &str,
     base_ref: Option<&str>,
     head_ref: Option<&str>,
+    coverage_state_path: &str,
+    diagnostics_state_path: &str,
 ) -> Result<PrSharedState> {
     let config = CovyConfig::load(Path::new(config_path))?;
     let base = base_ref.unwrap_or(&config.diff.base);
     let head = head_ref.unwrap_or(&config.diff.head);
 
-    let mut coverage = load_coverage_state(".covy/state/latest.bin")?;
+    let mut coverage = load_coverage_state(coverage_state_path)?;
     covy_core::pathmap::auto_normalize_paths(&mut coverage, None);
 
     let diffs = covy_core::diff::git_diff(base, head)?;
-    let diagnostics = load_diagnostics_if_present(".covy/state/issues.bin")?;
+    let diagnostics = load_diagnostics_if_present(diagnostics_state_path)?;
 
     let gate = covy_core::gate::evaluate_full_gate(
         &GateConfig {
