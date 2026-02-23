@@ -1,6 +1,7 @@
 mod cmd_annotate;
 mod cmd_check;
 mod cmd_comment;
+mod cmd_common;
 mod cmd_diff;
 mod cmd_doctor;
 mod cmd_github;

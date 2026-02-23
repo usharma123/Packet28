@@ -1,11 +1,12 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Args;
 use covy_core::config::GateConfig;
-use covy_core::diagnostics::DiagnosticsData;
 use covy_core::{CoverageData, CovyConfig, FileDiff};
 use roaring::RoaringBitmap;
+
+use crate::cmd_common::{load_coverage_state, load_diagnostics_if_present};
 
 #[derive(Args)]
 pub struct CommentArgs {
@@ -87,22 +88,6 @@ pub fn run(args: CommentArgs, config_path: &str) -> Result<i32> {
     }
 
     Ok(0)
-}
-
-fn load_coverage_state(path: &str) -> Result<CoverageData> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("Failed to read coverage state at {path}"))?;
-    covy_core::cache::deserialize_coverage(&bytes).map_err(Into::into)
-}
-
-fn load_diagnostics_if_present(path: &str) -> Result<Option<DiagnosticsData>> {
-    if !Path::new(path).exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(path)?;
-    let mut data = covy_core::cache::deserialize_diagnostics(&bytes)?;
-    covy_core::pathmap::auto_normalize_issue_paths(&mut data, None);
-    Ok(Some(data))
 }
 
 fn suggested_tests(diffs: &[FileDiff], config: &CovyConfig) -> Result<Vec<String>> {
