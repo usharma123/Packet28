@@ -1,0 +1,61 @@
+{
+  "results": [
+    {
+      "command": "testmap build",
+      "mean": 0.784944917,
+      "stddev": null,
+      "median": 0.784944917,
+      "user": 0.26780699999999996,
+      "system": 0.32950199999999996,
+      "min": 0.784944917,
+      "max": 0.784944917,
+      "times": [
+        0.784944917
+      ],
+      "memory_usage_byte": [
+        4964352
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "impact record",
+      "mean": 0.8061485,
+      "stddev": null,
+      "median": 0.8061485,
+      "user": 0.271791,
+      "system": 0.342945,
+      "min": 0.8061485,
+      "max": 0.8061485,
+      "times": [
+        0.8061485
+      ],
+      "memory_usage_byte": [
+        5275648
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "impact plan",
+      "mean": 0.008748334,
+      "stddev": null,
+      "median": 0.008748334,
+      "user": 0.002611,
+      "system": 0.003179,
+      "min": 0.008748334,
+      "max": 0.008748334,
+      "times": [
+        0.008748334
+      ],
+      "memory_usage_byte": [
+        5275648
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

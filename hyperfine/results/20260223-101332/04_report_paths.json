@@ -1,0 +1,80 @@
+{
+  "results": [
+    {
+      "command": "report terminal",
+      "mean": 0.0040035,
+      "stddev": null,
+      "median": 0.0040035,
+      "user": 0.000852,
+      "system": 0.0009599999999999999,
+      "min": 0.0040035,
+      "max": 0.0040035,
+      "times": [
+        0.0040035
+      ],
+      "memory_usage_byte": [
+        4341760
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "report json",
+      "mean": 0.002791041,
+      "stddev": null,
+      "median": 0.002791041,
+      "user": 0.001259,
+      "system": 0.0008449999999999999,
+      "min": 0.002791041,
+      "max": 0.002791041,
+      "times": [
+        0.002791041
+      ],
+      "memory_usage_byte": [
+        5013504
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "report below 80 json",
+      "mean": 0.002244458,
+      "stddev": null,
+      "median": 0.002244458,
+      "user": 0.0008129999999999999,
+      "system": 0.0007869999999999999,
+      "min": 0.002244458,
+      "max": 0.002244458,
+      "times": [
+        0.002244458
+      ],
+      "memory_usage_byte": [
+        5013504
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "report summary-only json",
+      "mean": 0.002184708,
+      "stddev": null,
+      "median": 0.002184708,
+      "user": 0.000808,
+      "system": 0.000716,
+      "min": 0.002184708,
+      "max": 0.002184708,
+      "times": [
+        0.002184708
+      ],
+      "memory_usage_byte": [
+        5013504
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

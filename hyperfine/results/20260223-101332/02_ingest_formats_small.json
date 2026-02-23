@@ -1,0 +1,99 @@
+{
+  "results": [
+    {
+      "command": "lcov",
+      "mean": 0.006325916,
+      "stddev": null,
+      "median": 0.006325916,
+      "user": 0.002301,
+      "system": 0.00261,
+      "min": 0.006325916,
+      "max": 0.006325916,
+      "times": [
+        0.006325916
+      ],
+      "memory_usage_byte": [
+        4456448
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "cobertura",
+      "mean": 0.006283875,
+      "stddev": null,
+      "median": 0.006283875,
+      "user": 0.002351,
+      "system": 0.002487,
+      "min": 0.006283875,
+      "max": 0.006283875,
+      "times": [
+        0.006283875
+      ],
+      "memory_usage_byte": [
+        4554752
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "jacoco",
+      "mean": 0.006149333000000001,
+      "stddev": null,
+      "median": 0.006149333000000001,
+      "user": 0.002235,
+      "system": 0.002386,
+      "min": 0.006149333000000001,
+      "max": 0.006149333000000001,
+      "times": [
+        0.006149333000000001
+      ],
+      "memory_usage_byte": [
+        4554752
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "gocov",
+      "mean": 0.006321875,
+      "stddev": null,
+      "median": 0.006321875,
+      "user": 0.002418,
+      "system": 0.002435,
+      "min": 0.006321875,
+      "max": 0.006321875,
+      "times": [
+        0.006321875
+      ],
+      "memory_usage_byte": [
+        5242880
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "llvm-cov",
+      "mean": 0.006284958,
+      "stddev": null,
+      "median": 0.006284958,
+      "user": 0.002228,
+      "system": 0.00257,
+      "min": 0.006284958,
+      "max": 0.006284958,
+      "times": [
+        0.006284958
+      ],
+      "memory_usage_byte": [
+        5242880
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

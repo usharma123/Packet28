@@ -1,0 +1,23 @@
+{
+  "results": [
+    {
+      "command": "fail-under-total 101",
+      "mean": 0.011689667,
+      "stddev": null,
+      "median": 0.011689667,
+      "user": 0.003858,
+      "system": 0.004680999999999999,
+      "min": 0.011689667,
+      "max": 0.011689667,
+      "times": [
+        0.011689667
+      ],
+      "memory_usage_byte": [
+        5128192
+      ],
+      "exit_codes": [
+        1
+      ]
+    }
+  ]
+}

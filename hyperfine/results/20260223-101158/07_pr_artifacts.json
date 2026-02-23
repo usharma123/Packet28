@@ -1,0 +1,80 @@
+{
+  "results": [
+    {
+      "command": "diff json",
+      "mean": 0.015219458000000002,
+      "stddev": null,
+      "median": 0.015219458000000002,
+      "user": 0.0039559999999999994,
+      "system": 0.005299,
+      "min": 0.015219458000000002,
+      "max": 0.015219458000000002,
+      "times": [
+        0.015219458000000002
+      ],
+      "memory_usage_byte": [
+        5128192
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "comment markdown",
+      "mean": 0.023529375,
+      "stddev": null,
+      "median": 0.023529375,
+      "user": 0.011573,
+      "system": 0.007979,
+      "min": 0.023529375,
+      "max": 0.023529375,
+      "times": [
+        0.023529375
+      ],
+      "memory_usage_byte": [
+        22855680
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "annotate sarif",
+      "mean": 0.023700791000000002,
+      "stddev": null,
+      "median": 0.023700791000000002,
+      "user": 0.011564999999999999,
+      "system": 0.008241,
+      "min": 0.023700791000000002,
+      "max": 0.023700791000000002,
+      "times": [
+        0.023700791000000002
+      ],
+      "memory_usage_byte": [
+        22970368
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "pr one-shot",
+      "mean": 0.025421167,
+      "stddev": null,
+      "median": 0.025421167,
+      "user": 0.01189,
+      "system": 0.008876,
+      "min": 0.025421167,
+      "max": 0.025421167,
+      "times": [
+        0.025421167
+      ],
+      "memory_usage_byte": [
+        23166976
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}
