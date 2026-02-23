@@ -107,15 +107,21 @@ pub struct ImpactPlanArgs {
 }
 
 #[derive(Args, Default)]
-pub struct ImpactRunArgs {}
+pub struct ImpactRunArgs {
+    /// Path to impact plan json
+    #[arg(long)]
+    pub plan: String,
+
+    /// Command template to execute (provide after --)
+    #[arg(last = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<String>,
+}
 
 pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     match args.command {
         Some(ImpactCommand::Record(record)) => run_record(record),
         Some(ImpactCommand::Plan(plan)) => run_plan(plan, config_path),
-        Some(ImpactCommand::Run(_)) => {
-            anyhow::bail!("`covy impact run` is not implemented yet")
-        }
+        Some(ImpactCommand::Run(run)) => run_impact_run(run),
         None => run_legacy(args.legacy, config_path),
     }
 }
@@ -250,6 +256,65 @@ fn run_plan(args: ImpactPlanArgs, config_path: &str) -> Result<i32> {
     let plan = covy_core::impact::plan_impacted_tests(&map, &diffs, max_tests, target_coverage);
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(0)
+}
+
+fn run_impact_run(args: ImpactRunArgs) -> Result<i32> {
+    if args.command.is_empty() {
+        anyhow::bail!(
+            "No command template provided. Use: covy impact run --plan plan.json -- <command>"
+        );
+    }
+
+    let content = std::fs::read_to_string(&args.plan)
+        .with_context(|| format!("Failed to read plan at {}", args.plan))?;
+    let plan: covy_core::impact::ImpactPlan =
+        serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", args.plan))?;
+
+    let tests: Vec<String> = plan.tests.iter().map(|t| t.id.clone()).collect();
+    if tests.is_empty() {
+        println!("No tests selected in plan; skipping execution.");
+        return Ok(0);
+    }
+
+    let final_command = build_run_command_args(&args.command, &tests);
+    if final_command.is_empty() {
+        anyhow::bail!("Resolved command is empty");
+    }
+
+    let executable = &final_command[0];
+    let status = Command::new(executable)
+        .args(&final_command[1..])
+        .status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn build_run_command_args(template: &[String], tests: &[String]) -> Vec<String> {
+    let tests_joined = tests.join(" ");
+    let tests_csv = tests.join(",");
+    let mut expanded = Vec::new();
+    let mut had_placeholder = false;
+
+    for token in template {
+        if token == "{tests}" {
+            had_placeholder = true;
+            expanded.extend(tests.iter().cloned());
+            continue;
+        }
+
+        if token.contains("{tests}") || token.contains("{tests_csv}") {
+            had_placeholder = true;
+        }
+        let replaced = token
+            .replace("{tests_csv}", &tests_csv)
+            .replace("{tests}", &tests_joined);
+        expanded.push(replaced);
+    }
+
+    if !had_placeholder {
+        expanded.extend(tests.iter().cloned());
+    }
+
+    expanded
 }
 
 fn collect_inputs_from_dir(
@@ -812,5 +877,81 @@ mod tests {
         let err =
             collect_inputs_from_manifest(manifest.to_str().unwrap(), &mut by_test).unwrap_err();
         assert!(err.to_string().contains("empty test_id"));
+    }
+
+    #[test]
+    fn test_build_run_command_args_expands_placeholders() {
+        let template = vec![
+            "pytest".to_string(),
+            "{tests}".to_string(),
+            "--maxfail=1".to_string(),
+            "--csv={tests_csv}".to_string(),
+        ];
+        let tests = vec!["a::one".to_string(), "b::two".to_string()];
+        let cmd = build_run_command_args(&template, &tests);
+        assert_eq!(
+            cmd,
+            vec![
+                "pytest".to_string(),
+                "a::one".to_string(),
+                "b::two".to_string(),
+                "--maxfail=1".to_string(),
+                "--csv=a::one,b::two".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_run_command_args_appends_tests_when_no_placeholders() {
+        let template = vec!["pytest".to_string(), "-q".to_string()];
+        let tests = vec!["a::one".to_string(), "b::two".to_string()];
+        let cmd = build_run_command_args(&template, &tests);
+        assert_eq!(
+            cmd,
+            vec![
+                "pytest".to_string(),
+                "-q".to_string(),
+                "a::one".to_string(),
+                "b::two".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_run_impact_run_skips_execution_for_empty_plan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plan_path = dir.path().join("plan.json");
+        let plan = covy_core::impact::ImpactPlan::default();
+        std::fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+
+        let result = run_impact_run(ImpactRunArgs {
+            plan: plan_path.to_string_lossy().to_string(),
+            command: vec!["definitely-not-a-command".to_string()],
+        })
+        .unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_run_impact_run_executes_command() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plan_path = dir.path().join("plan.json");
+        let plan = covy_core::impact::ImpactPlan {
+            tests: vec![covy_core::impact::PlannedTest {
+                id: "com.foo.BarTest".to_string(),
+                name: "com.foo.BarTest".to_string(),
+                estimated_overlap_lines: 1,
+                marginal_gain_lines: 1,
+            }],
+            ..Default::default()
+        };
+        std::fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+
+        let code = run_impact_run(ImpactRunArgs {
+            plan: plan_path.to_string_lossy().to_string(),
+            command: vec!["true".to_string(), "{tests}".to_string()],
+        })
+        .unwrap();
+        assert_eq!(code, 0);
     }
 }
