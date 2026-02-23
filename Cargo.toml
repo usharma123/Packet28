@@ -7,6 +7,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.75"
+description = "Fast Rust CLI for coverage and diagnostics gating"
+repository = "https://github.com/usharma123/Covy"
+homepage = "https://github.com/usharma123/Covy"
 
 [workspace.dependencies]
 # Core
