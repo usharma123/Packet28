@@ -22,7 +22,11 @@ jobs:
 
       - name: Ingest coverage (example)
         run: |
-          ./target/release/covy ingest coverage/lcov.info --issues reports/sarif.sarif
+          if [ -f coverage/lcov.info ] && [ -f reports/sarif.sarif ]; then
+            ./target/release/covy ingest coverage/lcov.info --issues reports/sarif.sarif
+          else
+            echo "Skipping ingest example: customize report paths for your repository."
+          fi
 
       - name: Generate PR artifacts
         run: |
