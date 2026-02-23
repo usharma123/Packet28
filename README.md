@@ -21,6 +21,17 @@ cargo build --release -p covy-cli
 ./target/release/covy report --issues
 ```
 
+## Recent Changes (v0.2.0)
+
+- `covy ingest` now auto-resolves `[ingest].report_paths` from `covy.toml` when positional coverage paths are omitted.
+- `covy ingest` now returns clearer "no input files" errors with matched-config hints.
+- `covy report` adds `--below <percent>` to focus on low-coverage files.
+- `covy report` adds `--summary-only` to print only total coverage (terminal or JSON).
+- CLI tracing ergonomics improved for automation: `--json` / `-q` default to warn-level logs, and `COVY_LOG` overrides the filter.
+- Added `JavaTest/` Maven example project with JaCoCo + SARIF artifacts for Java workflow validation.
+- Removed stale benchmark submodule pointers (`commons-lang-rebench`, `commons-lang-sharded`).
+- Workspace and crate metadata updated for crates.io release, with version bumped to `0.2.0`.
+
 ## Performance Notes (Important)
 
 - Don’t use `cargo run` for perf measurements; it adds startup overhead per invocation.
@@ -58,6 +69,8 @@ Output flags use `--output*` as canonical names. Legacy aliases such as `--out`,
 
 Use `covy.toml` (see `covy.toml.example`).
 
+If `covy ingest` is run without coverage path arguments, it will try `[ingest].report_paths` from the config automatically.
+
 Issue gate config:
 
 ```toml
@@ -83,6 +96,20 @@ strip_prefix = ["/home/runner/work/repo/repo", "/__w/repo/repo"]
 replace_prefix = [{ from = "/workspace", to = "." }]
 ignore_globs = ["**/target/**", "**/node_modules/**", "**/bazel-out/**"]
 case_sensitive = true
+```
+
+## Coverage Report Filtering
+
+Focus on only low-coverage files:
+
+```bash
+./target/release/covy report --below 80
+```
+
+Emit only total coverage for CI summaries:
+
+```bash
+./target/release/covy report --summary-only --json
 ```
 
 ## TIA Workflow
@@ -292,3 +319,13 @@ It includes:
 - scale tests for `50k` and `200k` SARIF issues
 
 See `benchmarks/README.md` for details.
+
+## Java + JaCoCo Example
+
+Use `JavaTest/` for a full Java sample (Maven tests, JaCoCo XML, and SARIF artifacts).
+
+```bash
+cd JavaTest
+mvn -q test jacoco:report
+../target/release/covy ingest target/site/jacoco/jacoco.xml --format jacoco --issues annotations.sarif --json
+```
