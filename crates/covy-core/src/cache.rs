@@ -11,7 +11,7 @@ use crate::testmap::{TestMapIndex, TestTimingHistory};
 
 pub const DIAGNOSTICS_STATE_SCHEMA_VERSION: u16 = 2;
 pub const DIAGNOSTICS_PATH_NORM_VERSION: u16 = 1;
-pub const TESTMAP_SCHEMA_VERSION: u16 = 1;
+pub const TESTMAP_SCHEMA_VERSION: u16 = 2;
 pub const TESTTIMINGS_SCHEMA_VERSION: u16 = 1;
 const DIAGNOSTICS_MAGIC: &[u8; 9] = b"COVYDIAG2";
 
@@ -228,6 +228,23 @@ struct StoredTestTimingHistory {
     timings: TestTimingHistory,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LegacyTestMapMetadataV1 {
+    schema_version: u16,
+    path_norm_version: u16,
+    repo_root_id: Option<String>,
+    generated_at: u64,
+    granularity: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LegacyTestMapIndexV1 {
+    metadata: LegacyTestMapMetadataV1,
+    test_language: std::collections::BTreeMap<String, String>,
+    test_to_files: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    file_to_tests: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
 /// Serialize TestMapIndex to bytes for storage.
 pub fn serialize_testmap(index: &TestMapIndex) -> Result<Vec<u8>, CovyError> {
     let mut stored = index.clone();
@@ -238,15 +255,39 @@ pub fn serialize_testmap(index: &TestMapIndex) -> Result<Vec<u8>, CovyError> {
 
 /// Deserialize TestMapIndex from bytes.
 pub fn deserialize_testmap(data: &[u8]) -> Result<TestMapIndex, CovyError> {
-    let stored: TestMapIndex = bincode::deserialize(data)
-        .map_err(|e| CovyError::Cache(format!("Failed to deserialize testmap: {e}")))?;
-    if stored.metadata.schema_version != TESTMAP_SCHEMA_VERSION {
+    if let Ok(stored) = bincode::deserialize::<TestMapIndex>(data) {
+        if stored.metadata.schema_version == TESTMAP_SCHEMA_VERSION {
+            return Ok(stored);
+        }
+        if stored.metadata.schema_version == 1 {
+            return Ok(stored);
+        }
         return Err(CovyError::Cache(format!(
-            "Unsupported testmap schema version {} (expected {})",
+            "Unsupported testmap schema version {} (expected {} or 1)",
             stored.metadata.schema_version, TESTMAP_SCHEMA_VERSION
         )));
     }
-    Ok(stored)
+
+    let legacy: LegacyTestMapIndexV1 = bincode::deserialize(data)
+        .map_err(|e| CovyError::Cache(format!("Failed to deserialize testmap: {e}")))?;
+    Ok(TestMapIndex {
+        metadata: crate::testmap::TestMapMetadata {
+            schema_version: legacy.metadata.schema_version,
+            path_norm_version: legacy.metadata.path_norm_version,
+            repo_root_id: legacy.metadata.repo_root_id,
+            generated_at: legacy.metadata.generated_at,
+            granularity: legacy.metadata.granularity,
+            commit_sha: None,
+            created_at: None,
+            toolchain_fingerprint: None,
+        },
+        test_language: legacy.test_language,
+        test_to_files: legacy.test_to_files,
+        file_to_tests: legacy.file_to_tests,
+        tests: Vec::new(),
+        file_index: Vec::new(),
+        coverage: Vec::new(),
+    })
 }
 
 /// Serialize TestTimingHistory to bytes for storage.
@@ -1045,6 +1086,52 @@ mod tests {
         );
         assert_eq!(restored.test_to_files.len(), 1);
         assert_eq!(restored.file_to_tests.len(), 1);
+    }
+
+    #[test]
+    fn test_testmap_deserialize_legacy_v1_payload() {
+        let legacy = LegacyTestMapIndexV1 {
+            metadata: LegacyTestMapMetadataV1 {
+                schema_version: 1,
+                path_norm_version: 1,
+                repo_root_id: Some("deadbeef".to_string()),
+                generated_at: 123,
+                granularity: "file".to_string(),
+            },
+            test_language: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("com.foo.BarTest".to_string(), "java".to_string());
+                m
+            },
+            test_to_files: {
+                let mut m = std::collections::BTreeMap::new();
+                m.entry("com.foo.BarTest".to_string())
+                    .or_insert_with(std::collections::BTreeSet::new)
+                    .insert("src/main/java/com/foo/Bar.java".to_string());
+                m
+            },
+            file_to_tests: {
+                let mut m = std::collections::BTreeMap::new();
+                m.entry("src/main/java/com/foo/Bar.java".to_string())
+                    .or_insert_with(std::collections::BTreeSet::new)
+                    .insert("com.foo.BarTest".to_string());
+                m
+            },
+        };
+
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let restored = deserialize_testmap(&bytes).unwrap();
+        assert_eq!(restored.metadata.schema_version, 1);
+        assert_eq!(
+            restored
+                .test_to_files
+                .get("com.foo.BarTest")
+                .map(|s| s.len())
+                .unwrap_or_default(),
+            1
+        );
+        assert!(restored.tests.is_empty());
+        assert!(restored.coverage.is_empty());
     }
 
     #[test]
