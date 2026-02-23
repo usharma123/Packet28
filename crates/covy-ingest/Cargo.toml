@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-covy-core = { version = "0.1.0", path = "../covy-core" }
+covy-core = { version = "0.2.0", path = "../covy-core" }
 roaring.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

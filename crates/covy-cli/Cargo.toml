@@ -13,8 +13,8 @@ name = "covy"
 path = "src/main.rs"
 
 [dependencies]
-covy-core = { version = "0.1.0", path = "../covy-core" }
-covy-ingest = { version = "0.1.0", path = "../covy-ingest" }
+covy-core = { version = "0.2.0", path = "../covy-core" }
+covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true
