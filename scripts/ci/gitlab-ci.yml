@@ -1,5 +1,5 @@
 covy_pr:
-  image: rust:latest
+  image: rust:1.76
   stage: test
   rules:
     - if: '$CI_MERGE_REQUEST_IID'
