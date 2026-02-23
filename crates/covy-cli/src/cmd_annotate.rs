@@ -5,9 +5,10 @@ use clap::Args;
 use covy_core::config::GateConfig;
 use covy_core::diagnostics::Severity;
 use covy_core::{CoverageData, CovyConfig, DiffStatus, FileDiff};
-use roaring::RoaringBitmap;
 
-use crate::cmd_common::{load_coverage_state, load_diagnostics_if_present};
+use crate::cmd_common::{
+    compute_uncovered_blocks_generic, load_coverage_state, load_diagnostics_if_present,
+};
 
 #[derive(Args)]
 pub struct AnnotateArgs {
@@ -78,47 +79,12 @@ pub fn run(args: AnnotateArgs, config_path: &str) -> Result<i32> {
 }
 
 fn uncovered_blocks(coverage: &CoverageData, diffs: &[FileDiff]) -> Vec<BlockFinding> {
-    let mut blocks = Vec::new();
-
-    for diff in diffs {
-        let mut uncovered = RoaringBitmap::new();
-        if let Some(fc) = coverage.files.get(&diff.path) {
-            let missing = &fc.lines_instrumented - &fc.lines_covered;
-            uncovered |= &(&diff.changed_lines & &missing);
-        } else {
-            uncovered |= &diff.changed_lines;
-        }
-
-        let lines: Vec<u32> = uncovered.iter().collect();
-        if lines.is_empty() {
-            continue;
-        }
-
-        let mut start = lines[0];
-        let mut end = lines[0];
-        for line in lines.iter().skip(1) {
-            if *line == end + 1 {
-                end = *line;
-            } else {
-                blocks.push(BlockFinding {
-                    file: diff.path.clone(),
-                    start_line: start,
-                    end_line: end,
-                    is_new_file: diff.status == DiffStatus::Added,
-                });
-                start = *line;
-                end = *line;
-            }
-        }
-        blocks.push(BlockFinding {
+    compute_uncovered_blocks_generic(coverage, diffs, |diff, start, end| BlockFinding {
             file: diff.path.clone(),
             start_line: start,
             end_line: end,
             is_new_file: diff.status == DiffStatus::Added,
-        });
-    }
-
-    blocks
+        })
 }
 
 fn build_sarif(
@@ -226,6 +192,7 @@ fn sarif_result_with_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roaring::RoaringBitmap;
 
     #[test]
     fn test_build_sarif_has_required_top_level_shape() {

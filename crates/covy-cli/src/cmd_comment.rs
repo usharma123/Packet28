@@ -4,9 +4,10 @@ use anyhow::Result;
 use clap::Args;
 use covy_core::config::GateConfig;
 use covy_core::{CoverageData, CovyConfig, FileDiff};
-use roaring::RoaringBitmap;
 
-use crate::cmd_common::{load_coverage_state, load_diagnostics_if_present};
+use crate::cmd_common::{
+    compute_uncovered_blocks_generic, load_coverage_state, load_diagnostics_if_present,
+};
 
 #[derive(Args)]
 pub struct CommentArgs {
@@ -113,45 +114,11 @@ fn suggested_tests(diffs: &[FileDiff], config: &CovyConfig) -> Result<Vec<String
 }
 
 fn compute_uncovered_blocks(coverage: &CoverageData, diffs: &[FileDiff]) -> Vec<LineBlock> {
-    let mut blocks = Vec::new();
-
-    for diff in diffs {
-        let mut uncovered = RoaringBitmap::new();
-        if let Some(fc) = coverage.files.get(&diff.path) {
-            let missing = &fc.lines_instrumented - &fc.lines_covered;
-            uncovered |= &(&diff.changed_lines & &missing);
-        } else {
-            uncovered |= &diff.changed_lines;
-        }
-
-        let lines: Vec<u32> = uncovered.iter().collect();
-        if lines.is_empty() {
-            continue;
-        }
-
-        let mut start = lines[0];
-        let mut end = lines[0];
-        for line in lines.iter().skip(1) {
-            if *line == end + 1 {
-                end = *line;
-            } else {
-                blocks.push(LineBlock {
-                    file: diff.path.clone(),
-                    start_line: start,
-                    end_line: end,
-                });
-                start = *line;
-                end = *line;
-            }
-        }
-        blocks.push(LineBlock {
+    compute_uncovered_blocks_generic(coverage, diffs, |diff, start, end| LineBlock {
             file: diff.path.clone(),
             start_line: start,
             end_line: end,
-        });
-    }
-
-    blocks
+        })
 }
 
 fn render_comment_markdown(
@@ -214,6 +181,7 @@ fn render_comment_markdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roaring::RoaringBitmap;
 
     #[test]
     fn test_render_comment_markdown_basic_snapshot_shape() {
