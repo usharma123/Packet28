@@ -5,49 +5,66 @@ use crate::diagnostics::{DiagnosticsData, Issue, Severity};
 use crate::model::{CoverageData, FileDiff, QualityGateResult};
 
 /// Render coverage report to terminal.
-pub fn render_terminal(coverage: &CoverageData, show_missing: bool, sort_by: &str) {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+///
+/// `below_threshold` — if `Some(t)`, only files with coverage < t% are shown.
+/// `summary_only` — if true, skip the per-file table and print only the total.
+pub fn render_terminal(
+    coverage: &CoverageData,
+    show_missing: bool,
+    sort_by: &str,
+    below_threshold: Option<f64>,
+    summary_only: bool,
+) {
+    if !summary_only {
+        let mut table = Table::new();
+        table.set_content_arrangement(ContentArrangement::Dynamic);
 
-    let mut headers = vec!["File", "Lines", "Covered", "Coverage"];
-    if show_missing {
-        headers.push("Missing");
-    }
-    table.set_header(headers);
-
-    let mut entries: Vec<_> = coverage.files.iter().collect();
-    match sort_by {
-        "coverage" => entries.sort_by(|a, b| {
-            let pa = a.1.line_coverage_pct().unwrap_or(0.0);
-            let pb = b.1.line_coverage_pct().unwrap_or(0.0);
-            pa.partial_cmp(&pb).unwrap()
-        }),
-        "name" => entries.sort_by_key(|(k, _)| (*k).clone()),
-        _ => entries.sort_by_key(|(k, _)| (*k).clone()),
-    }
-
-    for (path, fc) in &entries {
-        let pct = fc.line_coverage_pct().unwrap_or(0.0);
-        let color = coverage_color(pct);
-        let pct_str = format!("{pct:.1}%");
-
-        let mut row = vec![
-            Cell::new(path),
-            Cell::new(fc.lines_instrumented.len()),
-            Cell::new(fc.lines_covered.len()),
-            Cell::new(&pct_str).fg(color),
-        ];
-
+        let mut headers = vec!["File", "Lines", "Covered", "Coverage"];
         if show_missing {
-            let missing = &fc.lines_instrumented - &fc.lines_covered;
-            let missing_str = format_line_ranges(&missing);
-            row.push(Cell::new(missing_str));
+            headers.push("Missing");
+        }
+        table.set_header(headers);
+
+        let mut entries: Vec<_> = coverage.files.iter().collect();
+
+        // Apply --below filter
+        if let Some(threshold) = below_threshold {
+            entries.retain(|(_, fc)| fc.line_coverage_pct().unwrap_or(0.0) < threshold);
         }
 
-        table.add_row(row);
-    }
+        match sort_by {
+            "coverage" => entries.sort_by(|a, b| {
+                let pa = a.1.line_coverage_pct().unwrap_or(0.0);
+                let pb = b.1.line_coverage_pct().unwrap_or(0.0);
+                pa.partial_cmp(&pb).unwrap()
+            }),
+            "name" => entries.sort_by_key(|(k, _)| (*k).clone()),
+            _ => entries.sort_by_key(|(k, _)| (*k).clone()),
+        }
 
-    println!("{table}");
+        for (path, fc) in &entries {
+            let pct = fc.line_coverage_pct().unwrap_or(0.0);
+            let color = coverage_color(pct);
+            let pct_str = format!("{pct:.1}%");
+
+            let mut row = vec![
+                Cell::new(path),
+                Cell::new(fc.lines_instrumented.len()),
+                Cell::new(fc.lines_covered.len()),
+                Cell::new(&pct_str).fg(color),
+            ];
+
+            if show_missing {
+                let missing = &fc.lines_instrumented - &fc.lines_covered;
+                let missing_str = format_line_ranges(&missing);
+                row.push(Cell::new(missing_str));
+            }
+
+            table.add_row(row);
+        }
+
+        println!("{table}");
+    }
 
     // Summary
     if let Some(total) = coverage.total_coverage_pct() {
@@ -157,27 +174,42 @@ pub fn render_gate_result(result: &QualityGateResult) {
 }
 
 /// Render coverage data as JSON.
-pub fn render_json(coverage: &CoverageData) -> String {
-    let mut files = Vec::new();
-    for (path, fc) in &coverage.files {
-        let covered: Vec<u32> = fc.lines_covered.iter().collect();
-        let instrumented: Vec<u32> = fc.lines_instrumented.iter().collect();
-        let missing: Vec<u32> = (&fc.lines_instrumented - &fc.lines_covered)
-            .iter()
-            .collect();
-        files.push(serde_json::json!({
-            "path": path,
-            "lines_covered": covered.len(),
-            "lines_instrumented": instrumented.len(),
-            "coverage_pct": fc.line_coverage_pct().unwrap_or(0.0),
-            "missing_lines": missing,
-        }));
-    }
-
-    let report = serde_json::json!({
+///
+/// `below_threshold` — if `Some(t)`, only files with coverage < t% are included.
+/// `summary_only` — if true, omit the `files` array entirely.
+pub fn render_json(
+    coverage: &CoverageData,
+    below_threshold: Option<f64>,
+    summary_only: bool,
+) -> String {
+    let mut report = serde_json::json!({
         "total_coverage_pct": coverage.total_coverage_pct().unwrap_or(0.0),
-        "files": files,
     });
+
+    if !summary_only {
+        let mut files = Vec::new();
+        for (path, fc) in &coverage.files {
+            let pct = fc.line_coverage_pct().unwrap_or(0.0);
+            if let Some(threshold) = below_threshold {
+                if pct >= threshold {
+                    continue;
+                }
+            }
+            let covered: Vec<u32> = fc.lines_covered.iter().collect();
+            let instrumented: Vec<u32> = fc.lines_instrumented.iter().collect();
+            let missing: Vec<u32> = (&fc.lines_instrumented - &fc.lines_covered)
+                .iter()
+                .collect();
+            files.push(serde_json::json!({
+                "path": path,
+                "lines_covered": covered.len(),
+                "lines_instrumented": instrumented.len(),
+                "coverage_pct": pct,
+                "missing_lines": missing,
+            }));
+        }
+        report["files"] = serde_json::json!(files);
+    }
 
     serde_json::to_string_pretty(&report).unwrap_or_default()
 }
@@ -507,7 +539,7 @@ mod tests {
         fc.lines_instrumented.insert(3);
         coverage.files.insert("test.rs".to_string(), fc);
 
-        let json = render_json(&coverage);
+        let json = render_json(&coverage, None, false);
         assert!(json.contains("test.rs"));
         assert!(json.contains("66."));
     }

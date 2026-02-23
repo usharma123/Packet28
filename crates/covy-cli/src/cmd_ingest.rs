@@ -72,7 +72,37 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
         files.extend(matches);
     }
 
+    // If no CLI paths given, fall back to config report_paths
+    if files.is_empty() && !args.stdin && args.paths.is_empty() {
+        if !config.ingest.report_paths.is_empty() {
+            tracing::debug!(
+                "No CLI paths given, trying config report_paths: {:?}",
+                config.ingest.report_paths
+            );
+            let config_files = crate::cmd_common::resolve_report_globs_for_config(
+                config_path,
+                &config.ingest.report_paths,
+            )?;
+            // Canonicalize to deduplicate paths resolved from different bases
+            let mut seen = std::collections::HashSet::new();
+            for f in config_files {
+                let canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
+                if seen.insert(canonical) {
+                    files.push(f);
+                }
+            }
+        }
+    }
+
     if files.is_empty() && !args.stdin && args.issues.is_empty() {
+        if !config.ingest.report_paths.is_empty() {
+            anyhow::bail!(
+                "No input files found.\n  \
+                 hint: [ingest].report_paths = {:?} matched 0 files.\n        \
+                 Provide paths as arguments, use --stdin, or check your covy.toml config.",
+                config.ingest.report_paths
+            );
+        }
         anyhow::bail!("No input files found. Provide coverage paths, --stdin, or --issues.");
     }
 

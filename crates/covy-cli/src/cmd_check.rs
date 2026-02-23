@@ -173,7 +173,7 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
             );
         }
         _ => {
-            covy_core::report::render_terminal(&coverage, args.show_missing, "name");
+            covy_core::report::render_terminal(&coverage, args.show_missing, "name", None, false);
             if let Some(diag) = loaded.data.as_ref() {
                 covy_core::report::render_issues_terminal(diag, Some(&diffs));
             }

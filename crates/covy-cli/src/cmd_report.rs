@@ -33,6 +33,14 @@ pub struct ReportArgs {
     /// Render diagnostics issues from .covy/state/issues.bin
     #[arg(long)]
     issues: bool,
+
+    /// Only show files with coverage below this threshold (percent)
+    #[arg(long)]
+    below: Option<f64>,
+
+    /// Print only the total coverage summary line (no per-file table)
+    #[arg(long)]
+    summary_only: bool,
 }
 
 pub fn run(args: ReportArgs, config_path: &str) -> Result<i32> {
@@ -87,11 +95,18 @@ pub fn run(args: ReportArgs, config_path: &str) -> Result<i32> {
 
     match format {
         "json" => {
-            let json = covy_core::report::render_json(&coverage);
+            let json =
+                covy_core::report::render_json(&coverage, args.below, args.summary_only);
             println!("{json}");
         }
         _ => {
-            covy_core::report::render_terminal(&coverage, show_missing, &args.sort);
+            covy_core::report::render_terminal(
+                &coverage,
+                show_missing,
+                &args.sort,
+                args.below,
+                args.summary_only,
+            );
         }
     }
 

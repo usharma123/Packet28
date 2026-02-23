@@ -99,18 +99,21 @@ fn main() {
     };
 
     // Set up tracing
-    let filter = if cli.verbose {
-        "debug"
-    } else if cli.quiet {
-        "error"
+    let json_enabled = cmd_common::global_json_enabled();
+    let filter = if cli.quiet || json_enabled {
+        "warn"
+    } else if cli.verbose {
+        "covy_cli=debug,covy_core=debug,covy_ingest=debug,info"
     } else {
         "info"
     };
+    let env_filter = std::env::var("COVY_LOG")
+        .ok()
+        .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
+        .or_else(|| tracing_subscriber::EnvFilter::try_from_default_env().ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(filter));
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
+        .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .with_target(false)
         .without_time()
