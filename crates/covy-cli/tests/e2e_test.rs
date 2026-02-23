@@ -23,17 +23,24 @@ fn fixture(rel: &str) -> String {
 }
 
 fn setup_git_repo(dir: &Path) {
-    std::process::Command::new("git")
+    let init_status = std::process::Command::new("git")
         .current_dir(dir)
         .args(["init"])
         .status()
-        .unwrap();
-    std::process::Command::new("git")
+        .expect("failed to execute `git init`");
+    assert!(init_status.success(), "`git init` exited with {init_status}");
+
+    let add_status = std::process::Command::new("git")
         .current_dir(dir)
         .args(["add", "README.md"])
         .status()
-        .unwrap();
-    std::process::Command::new("git")
+        .expect("failed to execute `git add README.md`");
+    assert!(
+        add_status.success(),
+        "`git add README.md` exited with {add_status}"
+    );
+
+    let commit_status = std::process::Command::new("git")
         .current_dir(dir)
         .args([
             "-c",
@@ -45,7 +52,11 @@ fn setup_git_repo(dir: &Path) {
             "init",
         ])
         .status()
-        .unwrap();
+        .expect("failed to execute initial git commit");
+    assert!(
+        commit_status.success(),
+        "`git commit -m init` exited with {commit_status}"
+    );
 }
 
 #[test]
