@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use covy_core::CovyConfig;
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Args)]
@@ -48,7 +49,35 @@ pub struct LegacyImpactArgs {
 }
 
 #[derive(Args, Default)]
-pub struct ImpactRecordArgs {}
+pub struct ImpactRecordArgs {
+    /// Base ref used for metadata tagging (default: main)
+    #[arg(long, default_value = "main")]
+    pub base_ref: String,
+
+    /// Output testmap path
+    #[arg(long, default_value = ".covy/state/testmap.bin")]
+    pub out: String,
+
+    /// Directory containing per-test LCOV reports
+    #[arg(long)]
+    pub per_test_lcov_dir: Option<String>,
+
+    /// Directory containing per-test JaCoCo reports
+    #[arg(long)]
+    pub per_test_jacoco_dir: Option<String>,
+
+    /// Directory containing per-test Cobertura reports
+    #[arg(long)]
+    pub per_test_cobertura_dir: Option<String>,
+
+    /// JSONL manifest with test_id + coverage_report(s)
+    #[arg(long)]
+    pub test_report: Option<String>,
+
+    /// Optional summary json output path
+    #[arg(long)]
+    pub summary_json: Option<String>,
+}
 
 #[derive(Args, Default)]
 pub struct ImpactPlanArgs {}
@@ -58,9 +87,7 @@ pub struct ImpactRunArgs {}
 
 pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     match args.command {
-        Some(ImpactCommand::Record(_)) => {
-            anyhow::bail!("`covy impact record` is not implemented yet")
-        }
+        Some(ImpactCommand::Record(record)) => run_record(record),
         Some(ImpactCommand::Plan(_)) => {
             anyhow::bail!("`covy impact plan` is not implemented yet")
         }
@@ -68,6 +95,346 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
             anyhow::bail!("`covy impact run` is not implemented yet")
         }
         None => run_legacy(args.legacy, config_path),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InputFormat {
+    Auto,
+    Lcov,
+    JaCoCo,
+    Cobertura,
+}
+
+#[derive(Debug, Clone)]
+struct ReportSpec {
+    path: PathBuf,
+    format: InputFormat,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TestCoverageInput {
+    id: String,
+    language: Option<String>,
+    reports: Vec<ReportSpec>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ManifestRecord {
+    test_id: String,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    coverage_report: Option<String>,
+    #[serde(default)]
+    coverage_reports: Vec<String>,
+}
+
+impl ManifestRecord {
+    fn coverage_paths(&self) -> Vec<&str> {
+        let mut paths = Vec::new();
+        if let Some(path) = self.coverage_report.as_deref() {
+            paths.push(path);
+        }
+        for path in &self.coverage_reports {
+            paths.push(path.as_str());
+        }
+        paths
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RecordSummary {
+    tests_total: usize,
+    files_total: usize,
+    non_empty_cells: usize,
+    output: String,
+}
+
+fn run_record(args: ImpactRecordArgs) -> Result<i32> {
+    let mut by_test: BTreeMap<String, TestCoverageInput> = BTreeMap::new();
+
+    if let Some(dir) = args.per_test_lcov_dir.as_deref() {
+        collect_inputs_from_dir(dir, InputFormat::Lcov, &mut by_test)?;
+    }
+    if let Some(dir) = args.per_test_jacoco_dir.as_deref() {
+        collect_inputs_from_dir(dir, InputFormat::JaCoCo, &mut by_test)?;
+    }
+    if let Some(dir) = args.per_test_cobertura_dir.as_deref() {
+        collect_inputs_from_dir(dir, InputFormat::Cobertura, &mut by_test)?;
+    }
+    if let Some(path) = args.test_report.as_deref() {
+        collect_inputs_from_manifest(path, &mut by_test)?;
+    }
+
+    if by_test.is_empty() {
+        anyhow::bail!(
+            "No per-test coverage inputs found. Provide at least one of --per-test-*-dir or --test-report."
+        );
+    }
+
+    let (index, mut summary) = build_testmap_index(by_test, &args.base_ref)?;
+    summary.output = args.out.clone();
+
+    let output = Path::new(&args.out);
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = covy_core::cache::serialize_testmap(&index)?;
+    std::fs::write(output, bytes)?;
+
+    if let Some(summary_path) = args.summary_json.as_deref() {
+        let summary_path = Path::new(summary_path);
+        if let Some(parent) = summary_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&summary)?;
+        std::fs::write(summary_path, json)?;
+    }
+
+    println!(
+        "Recorded testmap: tests={} files={} cells={} out={}",
+        summary.tests_total, summary.files_total, summary.non_empty_cells, summary.output
+    );
+    Ok(0)
+}
+
+fn collect_inputs_from_dir(
+    dir: &str,
+    format: InputFormat,
+    by_test: &mut BTreeMap<String, TestCoverageInput>,
+) -> Result<()> {
+    let dir_path = Path::new(dir);
+    if !dir_path.exists() {
+        anyhow::bail!("Coverage directory does not exist: {}", dir_path.display());
+    }
+    for entry in std::fs::read_dir(dir_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let test_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Cannot infer test id from {}", path.display()))?
+            .to_string();
+
+        let language = infer_language_from_test_id(&test_id);
+        let input = by_test
+            .entry(test_id.clone())
+            .or_insert_with(|| TestCoverageInput {
+                id: test_id.clone(),
+                language: Some(language.clone()),
+                reports: Vec::new(),
+            });
+        if input.language.is_none() {
+            input.language = Some(language);
+        }
+        input.reports.push(ReportSpec { path, format });
+    }
+    Ok(())
+}
+
+fn collect_inputs_from_manifest(
+    path: &str,
+    by_test: &mut BTreeMap<String, TestCoverageInput>,
+) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read test report manifest {}", path))?;
+    for (idx, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rec: ManifestRecord = serde_json::from_str(line).with_context(|| {
+            format!(
+                "Invalid JSON in test report manifest {} at line {}",
+                path,
+                idx + 1
+            )
+        })?;
+        if rec.test_id.trim().is_empty() {
+            anyhow::bail!("Manifest {} line {} has empty test_id", path, idx + 1);
+        }
+        if rec.coverage_paths().is_empty() {
+            anyhow::bail!(
+                "Manifest {} line {} has no coverage_report(s) for test '{}'",
+                path,
+                idx + 1,
+                rec.test_id
+            );
+        }
+
+        let input = by_test
+            .entry(rec.test_id.clone())
+            .or_insert_with(|| TestCoverageInput {
+                id: rec.test_id.clone(),
+                language: rec.language.clone(),
+                reports: Vec::new(),
+            });
+        if input.language.is_none() {
+            input.language = rec.language.clone();
+        }
+        for coverage_path in rec.coverage_paths() {
+            input.reports.push(ReportSpec {
+                path: PathBuf::from(coverage_path),
+                format: InputFormat::Auto,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn build_testmap_index(
+    by_test: BTreeMap<String, TestCoverageInput>,
+    base_ref: &str,
+) -> Result<(covy_core::testmap::TestMapIndex, RecordSummary)> {
+    let mut index = covy_core::testmap::TestMapIndex::default();
+    index.metadata.schema_version = covy_core::cache::TESTMAP_SCHEMA_VERSION;
+    index.metadata.path_norm_version = covy_core::cache::DIAGNOSTICS_PATH_NORM_VERSION;
+    index.metadata.repo_root_id = covy_core::cache::current_repo_root_id(None);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    index.metadata.generated_at = now;
+    index.metadata.created_at = Some(now);
+    index.metadata.granularity = "line".to_string();
+    index.metadata.commit_sha = resolve_commit_sha(base_ref);
+
+    let mut per_test_lines: BTreeMap<String, BTreeMap<String, Vec<u32>>> = BTreeMap::new();
+    let mut file_index_set: BTreeSet<String> = BTreeSet::new();
+
+    for (test_id, input) in by_test {
+        let canonical_test_id = if input.id.trim().is_empty() {
+            test_id.clone()
+        } else {
+            input.id.clone()
+        };
+        if input.reports.is_empty() {
+            continue;
+        }
+        let mut combined = covy_core::CoverageData::new();
+        for report in &input.reports {
+            let data = match report.format {
+                InputFormat::Auto => covy_ingest::ingest_path(&report.path),
+                InputFormat::Lcov => covy_ingest::ingest_path_with_format(
+                    &report.path,
+                    covy_core::CoverageFormat::Lcov,
+                ),
+                InputFormat::JaCoCo => covy_ingest::ingest_path_with_format(
+                    &report.path,
+                    covy_core::CoverageFormat::JaCoCo,
+                ),
+                InputFormat::Cobertura => covy_ingest::ingest_path_with_format(
+                    &report.path,
+                    covy_core::CoverageFormat::Cobertura,
+                ),
+            }
+            .with_context(|| {
+                format!(
+                    "Failed to parse coverage report '{}' for test '{}'",
+                    report.path.display(),
+                    canonical_test_id
+                )
+            })?;
+            combined.merge(&data);
+        }
+
+        covy_core::pathmap::auto_normalize_paths(&mut combined, None);
+        let mut line_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+
+        for (file, fc) in &combined.files {
+            file_index_set.insert(file.clone());
+            let lines: Vec<u32> = fc.lines_covered.iter().collect();
+            line_map.insert(file.clone(), lines);
+            index
+                .test_to_files
+                .entry(canonical_test_id.clone())
+                .or_default()
+                .insert(file.clone());
+            index
+                .file_to_tests
+                .entry(file.clone())
+                .or_default()
+                .insert(canonical_test_id.clone());
+        }
+
+        let language = input
+            .language
+            .clone()
+            .unwrap_or_else(|| infer_language_from_test_id(&canonical_test_id));
+        index
+            .test_language
+            .insert(canonical_test_id.clone(), normalize_language(&language));
+        per_test_lines.insert(canonical_test_id, line_map);
+    }
+
+    index.tests = per_test_lines.keys().cloned().collect();
+    index.file_index = file_index_set.into_iter().collect();
+
+    let mut coverage = Vec::with_capacity(index.tests.len());
+    let mut non_empty_cells = 0usize;
+    for test_id in &index.tests {
+        let mut row = Vec::with_capacity(index.file_index.len());
+        let map = per_test_lines.get(test_id);
+        for file in &index.file_index {
+            let lines = map
+                .and_then(|m| m.get(file))
+                .cloned()
+                .unwrap_or_else(Vec::new);
+            if !lines.is_empty() {
+                non_empty_cells += 1;
+            }
+            row.push(lines);
+        }
+        coverage.push(row);
+    }
+    index.coverage = coverage;
+
+    let summary = RecordSummary {
+        tests_total: index.tests.len(),
+        files_total: index.file_index.len(),
+        non_empty_cells,
+        output: String::new(),
+    };
+
+    Ok((index, summary))
+}
+
+fn resolve_commit_sha(base_ref: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", base_ref])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+fn normalize_language(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "python" | "py" => "python".to_string(),
+        "go" => "go".to_string(),
+        "custom" => "custom".to_string(),
+        _ => "java".to_string(),
+    }
+}
+
+fn infer_language_from_test_id(test_id: &str) -> String {
+    if test_id.contains("::") || test_id.ends_with(".py") {
+        "python".to_string()
+    } else {
+        "java".to_string()
     }
 }
 
@@ -231,6 +598,7 @@ fn build_print_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_is_stale_with_zero_timestamp() {
@@ -334,5 +702,62 @@ mod tests {
             cmd,
             "mvn -Dtest=com.foo.BarTest test && pytest tests/test_a.py::test_one"
         );
+    }
+
+    fn fixture(rel: &str) -> PathBuf {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        workspace.join("tests").join("fixtures").join(rel)
+    }
+
+    #[test]
+    fn test_build_testmap_index_populates_v2_fields() {
+        let mut by_test = BTreeMap::new();
+        by_test.insert(
+            "com.foo.BarTest".to_string(),
+            TestCoverageInput {
+                id: "com.foo.BarTest".to_string(),
+                language: Some("java".to_string()),
+                reports: vec![ReportSpec {
+                    path: fixture("lcov/basic.info"),
+                    format: InputFormat::Auto,
+                }],
+            },
+        );
+
+        let (index, summary) = build_testmap_index(by_test, "HEAD").unwrap();
+        assert_eq!(summary.tests_total, 1);
+        assert_eq!(index.tests, vec!["com.foo.BarTest".to_string()]);
+        assert!(!index.file_index.is_empty());
+        assert_eq!(index.coverage.len(), 1);
+        assert_eq!(index.coverage[0].len(), index.file_index.len());
+        assert_eq!(
+            index
+                .test_to_files
+                .get("com.foo.BarTest")
+                .map(|s| s.len())
+                .unwrap_or_default(),
+            index.file_index.len()
+        );
+    }
+
+    #[test]
+    fn test_collect_inputs_from_manifest_rejects_empty_test_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest = dir.path().join("manifest.jsonl");
+        std::fs::write(
+            &manifest,
+            "{\"test_id\":\"\",\"coverage_report\":\"tests/fixtures/lcov/basic.info\"}\n",
+        )
+        .unwrap();
+
+        let mut by_test = BTreeMap::new();
+        let err =
+            collect_inputs_from_manifest(manifest.to_str().unwrap(), &mut by_test).unwrap_err();
+        assert!(err.to_string().contains("empty test_id"));
     }
 }

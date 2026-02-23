@@ -452,6 +452,50 @@ fn test_impact_json_runs_with_diff_integration() {
 }
 
 #[test]
+fn test_impact_record_builds_v2_testmap() {
+    let dir = TempDir::new().unwrap();
+    let per_test_dir = dir.path().join("per-test-lcov");
+    std::fs::create_dir_all(&per_test_dir).unwrap();
+    std::fs::copy(
+        fixture("lcov/basic.info"),
+        per_test_dir.join("com.foo.BarTest.info"),
+    )
+    .unwrap();
+
+    let testmap = dir.path().join("testmap.bin");
+    let summary = dir.path().join("testmap.json");
+
+    covy_cmd()
+        .args([
+            "impact",
+            "record",
+            "--base-ref",
+            "HEAD",
+            "--out",
+            testmap.to_str().unwrap(),
+            "--per-test-lcov-dir",
+            per_test_dir.to_str().unwrap(),
+            "--summary-json",
+            summary.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(testmap.exists());
+    assert!(summary.exists());
+
+    let bytes = std::fs::read(&testmap).unwrap();
+    let map = covy_core::cache::deserialize_testmap(&bytes).unwrap();
+    assert_eq!(
+        map.metadata.schema_version,
+        covy_core::cache::TESTMAP_SCHEMA_VERSION
+    );
+    assert!(!map.tests.is_empty());
+    assert!(!map.file_index.is_empty());
+    assert_eq!(map.tests.len(), map.coverage.len());
+}
+
+#[test]
 fn test_impact_print_command_outputs_helper() {
     let dir = TempDir::new().unwrap();
     let manifest = dir.path().join("manifest.jsonl");
