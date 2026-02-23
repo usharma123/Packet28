@@ -240,9 +240,89 @@ compare_test_sets() {
 build_expected_manifest() {
   local out_file="$1"
   mkdir -p "$(dirname "$out_file")"
-  rg --files "$REPO_DIR/src/test/java" -g '*Test.java' \
-    | sed -E 's#^.*/src/test/java/##; s#/#.#g; s#\.java$##' \
-    | sort -u > "$out_file"
+
+  python3 - "$REPO_DIR/src/test/java" "$out_file" <<'PY'
+import pathlib
+import re
+import sys
+
+tests_root = pathlib.Path(sys.argv[1])
+out_file = pathlib.Path(sys.argv[2])
+
+if not tests_root.exists():
+    raise SystemExit(f"Missing test source directory: {tests_root}")
+
+
+def is_abstract_top_level_class(content: str, class_name: str) -> bool:
+    pattern = re.compile(
+        rf"^\s*(?P<mods>(?:(?:public|protected|private|abstract|static|final|sealed|non-sealed)\s+)*)class\s+{re.escape(class_name)}\b",
+        re.MULTILINE,
+    )
+    match = pattern.search(content)
+    if not match:
+        return False
+    modifiers = match.group("mods").split()
+    return "abstract" in modifiers
+
+
+def extends_test_base_class(content: str, class_name: str) -> bool:
+    pattern = re.compile(
+        rf"^\s*(?:(?:public|protected|private|abstract|static|final|sealed|non-sealed)\s+)*class\s+{re.escape(class_name)}\b(?:\s+extends\s+(?P<base>[A-Za-z0-9_$.]+(?:\s*<[^{{>]+>)?))?",
+        re.MULTILINE,
+    )
+    match = pattern.search(content)
+    if not match:
+        return False
+    base = (match.group("base") or "").strip()
+    if not base:
+        return False
+    base = re.sub(r"<.*>$", "", base).strip().split(".")[-1]
+    return base.endswith("Test") or base.endswith("TestCase")
+
+
+def has_runnable_junit_signal(content: str) -> bool:
+    return any(
+        marker in content
+        for marker in (
+            "@Test",
+            "@ParameterizedTest",
+            "@RepeatedTest",
+            "@TestFactory",
+            "@TestTemplate",
+            "@Nested",
+        )
+    )
+
+
+def is_jmh_only_test(content: str) -> bool:
+    has_jmh = "org.openjdk.jmh.annotations" in content or "@Benchmark" in content
+    has_junit = "org.junit" in content
+    return has_jmh and not has_junit
+
+
+selected = []
+for java_file in sorted(tests_root.rglob("*Test.java")):
+    try:
+        content = java_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"Failed to read {java_file}: {exc}") from exc
+
+    class_name = java_file.stem
+    if is_abstract_top_level_class(content, class_name):
+        continue
+    if is_jmh_only_test(content):
+        continue
+    if not has_runnable_junit_signal(content) and not extends_test_base_class(content, class_name):
+        continue
+
+    fqcn = ".".join(java_file.relative_to(tests_root).with_suffix("").parts)
+    selected.append(fqcn)
+
+if not selected:
+    raise SystemExit(f"No runnable *Test.java classes discovered under {tests_root}")
+
+out_file.write_text("".join(f"{name}\n" for name in sorted(set(selected))), encoding="utf-8")
+PY
 
   if [[ ! -s "$out_file" ]]; then
     fail "No tests discovered in $REPO_DIR/src/test/java with pattern *Test.java"
@@ -276,7 +356,7 @@ for path in paths:
     for testcase in root.iter("testcase"):
         classname = (testcase.attrib.get("classname") or "").strip()
         if classname:
-            classes.add(classname)
+            classes.add(classname.split("$", 1)[0])
 
 if not classes:
     raise SystemExit(f"No testcase classname entries found in {reports_dir}")
@@ -460,6 +540,7 @@ merge_and_report() {
   local merge_pom="$run_dir/meta/jacoco-merge-pom.xml"
   local merged_exec="$run_dir/jacoco/merged.exec"
   local xml_file="$run_dir/jacoco/jacoco.xml"
+  local fallback_xml="$report_repo/target/site/jacoco/jacoco.xml"
   local merge_log="$run_dir/logs/mvn-jacoco-merge.log"
   local report_log="$run_dir/logs/mvn-jacoco-report.log"
 
@@ -548,7 +629,13 @@ EOF
   local report_ec=$?
   set -e
   [[ "$report_ec" -eq 0 ]] || fail "JaCoCo report generation failed (see $report_log)"
-  [[ -s "$xml_file" ]] || fail "Missing merged JaCoCo XML at $xml_file"
+  if [[ ! -s "$xml_file" ]]; then
+    if [[ -s "$fallback_xml" ]]; then
+      cp "$fallback_xml" "$xml_file"
+    else
+      fail "Missing merged JaCoCo XML at $xml_file"
+    fi
+  fi
 
   set +e
   /usr/bin/time -p -o "$run_dir/report/ingest.time" \
@@ -807,7 +894,7 @@ run_par() {
   local dir="$WORK_DIR/par"
   local pass1_dir="$dir/pass1"
   local pass2_dir="$dir/pass2"
-  mkdir -p "$dir"
+  mkdir -p "$dir" "$dir/meta"
 
   PAR_PASS1_SHARDS="$SHARDS"
   PAR_EFFECTIVE_SHARDS="$SHARDS"
@@ -816,6 +903,7 @@ run_par() {
   log "Running parallel pass 1 (seed timings)"
   local pass1_out
   pass1_out="$(run_parallel_pass "$pass1_dir" "par-pass1" "$PAR_PASS1_SHARDS")"
+  PAR_PASS1_WALL="${pass1_out%%|*}"
 
   PAR_PASS1_MEDIAN_SETUP_S="$(median_setup_secs "$pass1_dir/meta/shard_status.tsv")"
   log "par-pass1 median setup/build seconds: $PAR_PASS1_MEDIAN_SETUP_S"
