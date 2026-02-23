@@ -496,6 +496,62 @@ fn test_impact_record_builds_v2_testmap() {
 }
 
 #[test]
+fn test_impact_plan_outputs_stable_json_schema() {
+    let dir = TempDir::new().unwrap();
+    let per_test_dir = dir.path().join("per-test-lcov");
+    std::fs::create_dir_all(&per_test_dir).unwrap();
+    std::fs::copy(
+        fixture("lcov/basic.info"),
+        per_test_dir.join("com.foo.BarTest.info"),
+    )
+    .unwrap();
+
+    let testmap = dir.path().join("testmap.bin");
+
+    covy_cmd()
+        .args([
+            "impact",
+            "record",
+            "--base-ref",
+            "HEAD",
+            "--out",
+            testmap.to_str().unwrap(),
+            "--per-test-lcov-dir",
+            per_test_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args([
+            "impact",
+            "plan",
+            "--base-ref",
+            "HEAD",
+            "--head-ref",
+            "HEAD",
+            "--testmap",
+            testmap.to_str().unwrap(),
+            "--max-tests",
+            "5",
+            "--target-coverage",
+            "0.9",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"changed_lines_total\""))
+        .stdout(predicate::str::contains(
+            "\"changed_lines_covered_by_plan\"",
+        ))
+        .stdout(predicate::str::contains("\"plan_coverage_pct\""))
+        .stdout(predicate::str::contains("\"tests\""))
+        .stdout(predicate::str::contains("\"uncovered_blocks\""))
+        .stdout(predicate::str::contains("\"next_command\""));
+}
+
+#[test]
 fn test_impact_print_command_outputs_helper() {
     let dir = TempDir::new().unwrap();
     let manifest = dir.path().join("manifest.jsonl");

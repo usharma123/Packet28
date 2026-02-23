@@ -80,7 +80,31 @@ pub struct ImpactRecordArgs {
 }
 
 #[derive(Args, Default)]
-pub struct ImpactPlanArgs {}
+pub struct ImpactPlanArgs {
+    /// Base ref for diff
+    #[arg(long, default_value = "origin/main")]
+    pub base_ref: String,
+
+    /// Head ref for diff
+    #[arg(long, default_value = "HEAD")]
+    pub head_ref: String,
+
+    /// Path to testmap state
+    #[arg(long, default_value = ".covy/state/testmap.bin")]
+    pub testmap: String,
+
+    /// Maximum number of tests to select
+    #[arg(long)]
+    pub max_tests: Option<usize>,
+
+    /// Target changed-lines coverage as a ratio in [0,1]
+    #[arg(long)]
+    pub target_coverage: Option<f64>,
+
+    /// Output format (json only for now)
+    #[arg(long, default_value = "json")]
+    pub format: String,
+}
 
 #[derive(Args, Default)]
 pub struct ImpactRunArgs {}
@@ -88,9 +112,7 @@ pub struct ImpactRunArgs {}
 pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     match args.command {
         Some(ImpactCommand::Record(record)) => run_record(record),
-        Some(ImpactCommand::Plan(_)) => {
-            anyhow::bail!("`covy impact plan` is not implemented yet")
-        }
+        Some(ImpactCommand::Plan(plan)) => run_plan(plan, config_path),
         Some(ImpactCommand::Run(_)) => {
             anyhow::bail!("`covy impact run` is not implemented yet")
         }
@@ -196,6 +218,37 @@ fn run_record(args: ImpactRecordArgs) -> Result<i32> {
         "Recorded testmap: tests={} files={} cells={} out={}",
         summary.tests_total, summary.files_total, summary.non_empty_cells, summary.output
     );
+    Ok(0)
+}
+
+fn run_plan(args: ImpactPlanArgs, config_path: &str) -> Result<i32> {
+    if !args.format.eq_ignore_ascii_case("json") {
+        anyhow::bail!(
+            "Unsupported --format '{}'; only 'json' is supported",
+            args.format
+        );
+    }
+
+    let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
+    let max_tests = args.max_tests.unwrap_or(config.impact.max_tests);
+    let target_coverage = args
+        .target_coverage
+        .unwrap_or(config.impact.target_coverage)
+        .clamp(0.0, 1.0);
+
+    let bytes = std::fs::read(&args.testmap)
+        .with_context(|| format!("Failed to read testmap at {}", args.testmap))?;
+    let map = covy_core::cache::deserialize_testmap(&bytes)?;
+    if map.coverage.is_empty() || map.file_index.is_empty() || map.tests.is_empty() {
+        anyhow::bail!(
+            "Testmap '{}' does not include line-level v2 coverage data. Rebuild with `covy impact record`.",
+            args.testmap
+        );
+    }
+
+    let diffs = covy_core::diff::git_diff(&args.base_ref, &args.head_ref)?;
+    let plan = covy_core::impact::plan_impacted_tests(&map, &diffs, max_tests, target_coverage);
+    println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(0)
 }
 
