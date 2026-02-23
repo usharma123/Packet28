@@ -7,7 +7,9 @@ use crate::model::{CoverageData, RepoSnapshot};
 /// Strategies for mapping coverage file paths to repository file paths.
 pub struct PathMapper {
     strip_prefixes: Vec<String>,
-    rules: BTreeMap<String, String>,
+    rules: Vec<(String, String)>,
+    ignore_globs: Vec<String>,
+    case_sensitive: bool,
     /// Reverse index: filename → list of full paths in the repo.
     suffix_index: HashMap<String, Vec<String>>,
     /// Content hash index for fallback matching.
@@ -22,15 +24,32 @@ impl PathMapper {
         rules: BTreeMap<String, String>,
         snapshot: Option<&RepoSnapshot>,
     ) -> Self {
+        Self::with_options(strip_prefixes, rules, Vec::new(), !cfg!(windows), snapshot)
+    }
+
+    pub fn with_options(
+        strip_prefixes: Vec<String>,
+        rules: BTreeMap<String, String>,
+        ignore_globs: Vec<String>,
+        case_sensitive: bool,
+        snapshot: Option<&RepoSnapshot>,
+    ) -> Self {
         let mut suffix_index = HashMap::new();
         let mut hash_index = HashMap::new();
+        let normalized_strip_prefixes = normalize_prefixes(strip_prefixes);
+        let normalized_rules = normalize_rules(rules);
+        let normalized_ignore_globs = ignore_globs
+            .into_iter()
+            .map(|g| normalize_path(g.trim()))
+            .filter(|g| !g.is_empty())
+            .collect::<Vec<_>>();
 
         if let Some(snap) = snapshot {
             for (path, hash) in &snap.file_hashes {
                 // Build suffix index by filename
                 if let Some(filename) = path.rsplit('/').next() {
                     suffix_index
-                        .entry(filename.to_string())
+                        .entry(normalize_case(filename, case_sensitive))
                         .or_insert_with(Vec::new)
                         .push(path.clone());
                 }
@@ -43,8 +62,10 @@ impl PathMapper {
         }
 
         Self {
-            strip_prefixes,
-            rules,
+            strip_prefixes: normalized_strip_prefixes,
+            rules: normalized_rules,
+            ignore_globs: normalized_ignore_globs,
+            case_sensitive,
             suffix_index,
             hash_index,
             cache: HashMap::new(),
@@ -54,62 +75,88 @@ impl PathMapper {
     /// Resolve a coverage file path to a repository file path.
     /// Strategy chain: exact match → rule substitution → strip prefix → suffix match.
     pub fn resolve(&mut self, coverage_path: &str, known_paths: &[&str]) -> Option<String> {
-        if let Some(cached) = self.cache.get(coverage_path) {
+        let cache_key = normalize_case(&normalize_path(coverage_path), self.case_sensitive);
+        if let Some(cached) = self.cache.get(&cache_key) {
             return cached.clone();
         }
 
         let result = self.resolve_inner(coverage_path, known_paths);
-        self.cache.insert(coverage_path.to_string(), result.clone());
+        self.cache.insert(cache_key, result.clone());
         result
     }
 
     fn resolve_inner(&self, coverage_path: &str, known_paths: &[&str]) -> Option<String> {
+        let normalized = normalize_path(coverage_path);
+        if self.is_ignored(&normalized) {
+            return None;
+        }
+
+        let known_index = self.build_known_index(known_paths);
+
         // 1. Exact match
-        if known_paths.contains(&coverage_path) {
-            return Some(coverage_path.to_string());
+        if let Some(exact) = self.find_known(&normalized, &known_index) {
+            return Some(exact.to_string());
         }
 
         // 2. Rule substitution
         for (from, to) in &self.rules {
-            if coverage_path.starts_with(from.as_str()) {
-                let candidate = format!("{}{}", to, &coverage_path[from.len()..]);
-                if known_paths.contains(&candidate.as_str()) {
-                    return Some(candidate);
+            if let Some(rest) = strip_path_prefix_with_case(&normalized, from, self.case_sensitive)
+            {
+                let candidate = normalize_path(&format!("{to}{rest}"));
+                if let Some(found) = self.find_known(&candidate, &known_index) {
+                    return Some(found.to_string());
                 }
             }
         }
 
         // 3. Strip prefix
         for prefix in &self.strip_prefixes {
-            let stripped = coverage_path
-                .strip_prefix(prefix.as_str())
-                .unwrap_or(coverage_path);
-            if stripped != coverage_path && known_paths.contains(&stripped) {
-                return Some(stripped.to_string());
+            if let Some(stripped) =
+                strip_path_prefix_with_case(&normalized, prefix, self.case_sensitive)
+            {
+                let candidate = stripped.trim_start_matches('/');
+                if let Some(found) = self.find_known(candidate, &known_index) {
+                    return Some(found.to_string());
+                }
             }
         }
 
         // 4. Suffix match (by filename)
-        let filename = coverage_path.rsplit('/').next().unwrap_or(coverage_path);
-        if let Some(candidates) = self.suffix_index.get(filename) {
-            if candidates.len() == 1 {
-                return Some(candidates[0].clone());
-            }
-            // If multiple, try finding the best suffix match
-            let normalized = normalize_path(coverage_path);
-            let mut best: Option<&str> = None;
-            let mut best_score = 0;
-            for candidate in candidates {
-                let score = common_suffix_len(&normalized, candidate);
-                if score > best_score {
-                    best_score = score;
-                    best = Some(candidate);
+        let filename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+        let filename_key = normalize_case(filename, self.case_sensitive);
+        let mut best: Option<(&str, usize)> = None;
+
+        if let Some(snapshot_candidates) = self.suffix_index.get(&filename_key) {
+            for candidate in snapshot_candidates {
+                if let Some(found) = self.find_known(candidate, &known_index) {
+                    let score = common_suffix_len(
+                        &normalize_case(found, self.case_sensitive),
+                        &normalize_case(&normalized, self.case_sensitive),
+                    );
+                    best = pick_better_match(best, (found, score), self.case_sensitive);
                 }
             }
-            return best.map(|s| s.to_string());
         }
 
-        None
+        if best.is_none() {
+            for known in known_paths {
+                let known_normalized = normalize_path(known);
+                let known_filename = known_normalized
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(known_normalized.as_str());
+                if normalize_case(known_filename, self.case_sensitive) != filename_key {
+                    continue;
+                }
+                let score = common_suffix_len(
+                    &normalize_case(&known_normalized, self.case_sensitive),
+                    &normalize_case(&normalized, self.case_sensitive),
+                );
+                best = pick_better_match(best, (known, score), self.case_sensitive);
+            }
+        }
+
+        best.map(|(path, _)| path.to_string())
     }
 
     /// Resolve using content hash as fallback.
@@ -121,6 +168,41 @@ impl PathMapper {
                 None
             }
         })
+    }
+
+    fn is_ignored(&self, path: &str) -> bool {
+        for pattern in &self.ignore_globs {
+            if glob_matches(pattern, path) {
+                return true;
+            }
+            if !self.case_sensitive {
+                let lower_pattern = pattern.to_ascii_lowercase();
+                let lower_path = path.to_ascii_lowercase();
+                if glob_matches(&lower_pattern, &lower_path) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn build_known_index<'a>(&self, known_paths: &'a [&'a str]) -> HashMap<String, &'a str> {
+        let mut index = HashMap::with_capacity(known_paths.len());
+        for &path in known_paths {
+            let normalized = normalize_path(path);
+            let key = normalize_case(&normalized, self.case_sensitive);
+            index.entry(key).or_insert(path);
+        }
+        index
+    }
+
+    fn find_known<'a>(
+        &self,
+        candidate: &str,
+        known_index: &'a HashMap<String, &'a str>,
+    ) -> Option<&'a str> {
+        let key = normalize_case(&normalize_path(candidate), self.case_sensitive);
+        known_index.get(&key).copied()
     }
 }
 
@@ -270,7 +352,95 @@ fn git_toplevel() -> Option<String> {
 }
 
 fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/")
+    let normalized = path.replace('\\', "/");
+    if let Some(stripped) = normalized.strip_prefix("./") {
+        stripped.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_case(path: &str, case_sensitive: bool) -> String {
+    if case_sensitive {
+        path.to_string()
+    } else {
+        path.to_ascii_lowercase()
+    }
+}
+
+fn normalize_prefixes(prefixes: Vec<String>) -> Vec<String> {
+    let mut out = prefixes
+        .into_iter()
+        .map(|p| normalize_path(p.trim()))
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    out.dedup();
+    out
+}
+
+fn normalize_rules(rules: BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut out = rules
+        .into_iter()
+        .map(|(from, to)| (normalize_path(from.trim()), normalize_path(to.trim())))
+        .filter(|(from, _)| !from.is_empty())
+        .collect::<Vec<_>>();
+    out.sort_by(|(a_from, _), (b_from, _)| {
+        b_from
+            .len()
+            .cmp(&a_from.len())
+            .then_with(|| a_from.cmp(b_from))
+    });
+    out
+}
+
+fn strip_path_prefix_with_case<'a>(
+    path: &'a str,
+    prefix: &str,
+    case_sensitive: bool,
+) -> Option<&'a str> {
+    if case_sensitive {
+        return path.strip_prefix(prefix);
+    }
+
+    let lower_path = path.to_ascii_lowercase();
+    let lower_prefix = prefix.to_ascii_lowercase();
+    if !lower_path.starts_with(&lower_prefix) {
+        return None;
+    }
+    Some(&path[prefix.len()..])
+}
+
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    glob::Pattern::new(pattern)
+        .map(|p| p.matches(path))
+        .unwrap_or(false)
+}
+
+fn pick_better_match<'a>(
+    current: Option<(&'a str, usize)>,
+    candidate: (&'a str, usize),
+    case_sensitive: bool,
+) -> Option<(&'a str, usize)> {
+    match current {
+        None => Some(candidate),
+        Some((best_path, best_score)) => {
+            if candidate.1 > best_score {
+                return Some(candidate);
+            }
+            if candidate.1 < best_score {
+                return Some((best_path, best_score));
+            }
+
+            let candidate_key = normalize_case(candidate.0, case_sensitive);
+            let best_key = normalize_case(best_path, case_sensitive);
+            if candidate_key < best_key {
+                Some(candidate)
+            } else {
+                Some((best_path, best_score))
+            }
+        }
+    }
 }
 
 fn common_suffix_len(a: &str, b: &str) -> usize {
@@ -315,6 +485,52 @@ mod tests {
         assert_eq!(
             mapper.resolve("/build/classes/com/App.java", &known),
             Some("src/main/java/com/App.java".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ignore_glob_never_resolves() {
+        let mut mapper = PathMapper::with_options(
+            vec![],
+            BTreeMap::new(),
+            vec!["**/bazel-out/**".to_string()],
+            true,
+            None,
+        );
+        let known = vec!["src/main.rs"];
+        assert_eq!(
+            mapper.resolve("bazel-out/k8-fastbuild/bin/main.rs", &known),
+            None
+        );
+    }
+
+    #[test]
+    fn test_case_insensitive_exact_match() {
+        let mut mapper = PathMapper::with_options(vec![], BTreeMap::new(), vec![], false, None);
+        let known = vec!["Src/Main.rs"];
+        assert_eq!(
+            mapper.resolve("src/main.rs", &known),
+            Some("Src/Main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_strip_prefix_removes_leading_separator() {
+        let mut mapper = PathMapper::new(vec!["/workspace".to_string()], BTreeMap::new(), None);
+        let known = vec!["src/main.rs"];
+        assert_eq!(
+            mapper.resolve("/workspace/src/main.rs", &known),
+            Some("src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_suffix_match_is_deterministic_on_ties() {
+        let mut mapper = PathMapper::new(vec![], BTreeMap::new(), None);
+        let known = vec!["a/foo/main.rs", "b/foo/main.rs"];
+        assert_eq!(
+            mapper.resolve("/tmp/work/foo/main.rs", &known),
+            Some("a/foo/main.rs".to_string())
         );
     }
 
