@@ -100,6 +100,20 @@ Optional execution:
 ./target/release/covy impact run --plan plan.json -- pytest {tests}
 ```
 
+`{tests}` is a placeholder in this README, not special `covy` syntax. Replace it with real pytest path/pattern arguments.
+
+Example (single test file):
+
+```bash
+./target/release/covy impact run --plan plan.json -- pytest tests/test_example.py
+```
+
+Example (directory + `-k` expression; quote when your shell could split/expand unexpectedly):
+
+```bash
+./target/release/covy impact run --plan plan.json -- pytest tests/ -k "mytest"
+```
+
 ## PR Artifacts
 
 Generate PR comment markdown:
