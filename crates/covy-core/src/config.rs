@@ -16,6 +16,8 @@ pub struct CovyConfig {
     pub impact: ImpactConfig,
     pub shard: ShardConfig,
     pub merge: MergeConfig,
+    pub paths: PathsConfig,
+    #[serde(alias = "path_mapping")]
     pub path_mapping: PathMappingConfig,
 }
 
@@ -77,6 +79,12 @@ pub struct CacheConfig {
 #[serde(default)]
 pub struct ImpactConfig {
     pub testmap_path: String,
+    pub max_tests: usize,
+    pub target_coverage: f64,
+    pub stale_after_days: u32,
+    pub allow_stale: bool,
+    pub test_id_strategy: String,
+    // Legacy fields kept for backward compatibility.
     pub fresh_hours: u32,
     pub full_suite_threshold: f64,
     pub fallback_mode: String,
@@ -126,6 +134,22 @@ pub struct PathMappingConfig {
     pub rules: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PathsConfig {
+    pub strip_prefix: Vec<String>,
+    pub replace_prefix: Vec<ReplacePrefixRule>,
+    pub ignore_globs: Vec<String>,
+    pub case_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReplacePrefixRule {
+    pub from: String,
+    pub to: String,
+}
+
 // Defaults
 
 impl Default for CovyConfig {
@@ -140,6 +164,7 @@ impl Default for CovyConfig {
             impact: ImpactConfig::default(),
             shard: ShardConfig::default(),
             merge: MergeConfig::default(),
+            paths: PathsConfig::default(),
             path_mapping: PathMappingConfig::default(),
         }
     }
@@ -216,6 +241,11 @@ impl Default for ImpactConfig {
     fn default() -> Self {
         Self {
             testmap_path: ".covy/state/testmap.bin".to_string(),
+            max_tests: 25,
+            target_coverage: 0.90,
+            stale_after_days: 14,
+            allow_stale: true,
+            test_id_strategy: "junit".to_string(),
             fresh_hours: 24,
             full_suite_threshold: 0.40,
             fallback_mode: "fail-open".to_string(),
@@ -277,6 +307,30 @@ impl Default for PathMappingConfig {
     fn default() -> Self {
         Self {
             rules: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for PathsConfig {
+    fn default() -> Self {
+        Self {
+            strip_prefix: Vec::new(),
+            replace_prefix: Vec::new(),
+            ignore_globs: vec![
+                "**/target/**".to_string(),
+                "**/node_modules/**".to_string(),
+                "**/bazel-out/**".to_string(),
+            ],
+            case_sensitive: !cfg!(windows),
+        }
+    }
+}
+
+impl Default for ReplacePrefixRule {
+    fn default() -> Self {
+        Self {
+            from: String::new(),
+            to: String::new(),
         }
     }
 }
@@ -351,6 +405,11 @@ mod tests {
         "#;
         let config: CovyConfig = toml::from_str(raw).unwrap();
         assert_eq!(config.impact.testmap_path, ".covy/state/testmap.bin");
+        assert_eq!(config.impact.max_tests, 25);
+        assert!((config.impact.target_coverage - 0.90).abs() < f64::EPSILON);
+        assert_eq!(config.impact.stale_after_days, 14);
+        assert!(config.impact.allow_stale);
+        assert_eq!(config.impact.test_id_strategy, "junit");
         assert_eq!(config.impact.fresh_hours, 24);
         assert!((config.impact.full_suite_threshold - 0.40).abs() < f64::EPSILON);
         assert_eq!(config.impact.fallback_mode, "fail-open");
@@ -360,5 +419,56 @@ mod tests {
         assert!(config.shard.tiers.nightly.exclude_tags.is_empty());
         assert!(config.merge.strict);
         assert_eq!(config.merge.output_coverage, ".covy/state/latest.bin");
+    }
+
+    #[test]
+    fn test_deserialize_new_paths_and_impact_v2_fields() {
+        let raw = r#"
+            [impact]
+            testmap_path = ".covy/state/t.bin"
+            max_tests = 12
+            target_coverage = 0.95
+            stale_after_days = 7
+            allow_stale = false
+            test_id_strategy = "pytest"
+
+            [paths]
+            strip_prefix = ["/home/runner/work/repo/repo", "/__w/repo/repo"]
+            ignore_globs = ["**/bazel-out/**"]
+            case_sensitive = false
+
+            [[paths.replace_prefix]]
+            from = "/workspace"
+            to = "."
+        "#;
+        let config: CovyConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.impact.testmap_path, ".covy/state/t.bin");
+        assert_eq!(config.impact.max_tests, 12);
+        assert!((config.impact.target_coverage - 0.95).abs() < f64::EPSILON);
+        assert_eq!(config.impact.stale_after_days, 7);
+        assert!(!config.impact.allow_stale);
+        assert_eq!(config.impact.test_id_strategy, "pytest");
+        assert_eq!(config.paths.strip_prefix.len(), 2);
+        assert_eq!(config.paths.replace_prefix.len(), 1);
+        assert_eq!(config.paths.replace_prefix[0].from, "/workspace");
+        assert_eq!(config.paths.replace_prefix[0].to, ".");
+        assert_eq!(
+            config.paths.ignore_globs,
+            vec!["**/bazel-out/**".to_string()]
+        );
+        assert!(!config.paths.case_sensitive);
+    }
+
+    #[test]
+    fn test_deserialize_legacy_path_mapping_still_supported() {
+        let raw = r#"
+            [path_mapping.rules]
+            "/build/classes/" = "src/main/java/"
+        "#;
+        let config: CovyConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            config.path_mapping.rules.get("/build/classes/"),
+            Some(&"src/main/java/".to_string())
+        );
     }
 }
