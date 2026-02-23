@@ -46,18 +46,19 @@ impl PathMapper {
 
         if let Some(snap) = snapshot {
             for (path, hash) in &snap.file_hashes {
+                let normalized_path = normalize_path(path);
                 // Build suffix index by filename
-                if let Some(filename) = path.rsplit('/').next() {
+                if let Some(filename) = normalized_path.rsplit('/').next() {
                     suffix_index
                         .entry(normalize_case(filename, case_sensitive))
                         .or_insert_with(Vec::new)
-                        .push(path.clone());
+                        .push(normalized_path.clone());
                 }
                 // Build hash index
                 hash_index
                     .entry(hash.clone())
                     .or_insert_with(Vec::new)
-                    .push(path.clone());
+                    .push(normalized_path.clone());
             }
         }
 
