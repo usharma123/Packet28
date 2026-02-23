@@ -2,12 +2,11 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::Args;
-use covy_core::config::GateConfig;
 use covy_core::diagnostics::Severity;
-use covy_core::{CoverageData, CovyConfig, DiffStatus, FileDiff};
+use covy_core::{CoverageData, DiffStatus, FileDiff};
 
 use crate::cmd_common::{
-    compute_uncovered_blocks_generic, load_coverage_state, load_diagnostics_if_present,
+    compute_pr_shared_state, compute_uncovered_blocks_generic, PrSharedState,
 };
 
 #[derive(Args)]
@@ -38,34 +37,22 @@ struct BlockFinding {
 }
 
 pub fn run(args: AnnotateArgs, config_path: &str) -> Result<i32> {
-    let config = CovyConfig::load(Path::new(config_path))?;
-    let base = args.base_ref.as_deref().unwrap_or(&config.diff.base);
-    let head = args.head_ref.as_deref().unwrap_or(&config.diff.head);
+    let shared = compute_pr_shared_state(
+        config_path,
+        args.base_ref.as_deref(),
+        args.head_ref.as_deref(),
+    )?;
+    render_from_state(&args, &shared)?;
+    Ok(0)
+}
 
-    let mut coverage = load_coverage_state(".covy/state/latest.bin")?;
-    covy_core::pathmap::auto_normalize_paths(&mut coverage, None);
-
-    let diffs = covy_core::diff::git_diff(base, head)?;
-    let diagnostics = load_diagnostics_if_present(".covy/state/issues.bin")?;
-
-    let gate = covy_core::gate::evaluate_full_gate(
-        &GateConfig {
-            fail_under_total: config.gate.fail_under_total,
-            fail_under_changed: config.gate.fail_under_changed,
-            fail_under_new: config.gate.fail_under_new,
-            issues: config.gate.issues.clone(),
-        },
-        &coverage,
-        diagnostics.as_ref(),
-        &diffs,
-    );
-
-    let blocks = uncovered_blocks(&coverage, &diffs);
+pub(crate) fn render_from_state(args: &AnnotateArgs, shared: &PrSharedState) -> Result<()> {
+    let blocks = uncovered_blocks(&shared.coverage, &shared.diffs);
     let sarif = build_sarif(
         &blocks,
-        diagnostics.as_ref(),
-        &diffs,
-        &gate.violations,
+        shared.diagnostics.as_ref(),
+        &shared.diffs,
+        &shared.gate.violations,
         args.max_findings,
     );
 
@@ -75,7 +62,7 @@ pub fn run(args: AnnotateArgs, config_path: &str) -> Result<i32> {
     std::fs::write(&args.out, serde_json::to_string_pretty(&sarif)?)?;
     println!("Wrote SARIF: {}", args.out);
 
-    Ok(0)
+    Ok(())
 }
 
 fn uncovered_blocks(coverage: &CoverageData, diffs: &[FileDiff]) -> Vec<BlockFinding> {
