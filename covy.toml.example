@@ -46,8 +46,19 @@ dir = ".covy/cache"
 max_age_days = 30
 
 [impact]
-# Testmap state used by covy impact
+# Testmap state used by covy impact plan
 testmap_path = ".covy/state/testmap.bin"
+# Maximum tests selected by `covy impact plan`
+max_tests = 25
+# Target changed-lines coverage ratio [0.0 - 1.0]
+target_coverage = 0.90
+# Staleness policy
+stale_after_days = 14
+allow_stale = true
+# Test id strategy for `covy impact record`
+test_id_strategy = "junit"
+
+# Legacy impact settings (kept for compatibility with legacy `covy impact` mode)
 # Freshness budget for the testmap in hours
 fresh_hours = 24
 # Escalate to full-suite lane if impacted tests exceed this ratio of known tests
@@ -84,7 +95,16 @@ strict = true
 output_coverage = ".covy/state/latest.bin"
 output_issues = ".covy/state/issues.bin"
 
-# Path mapping rules for translating coverage report paths to source paths.
-# Useful when build outputs use different paths than source.
+[paths]
+# Prefixes removed from report paths before matching repo paths.
+strip_prefix = ["/home/runner/work/repo/repo", "/__w/repo/repo"]
+# Replace prefix rules for container/workspace remapping.
+replace_prefix = [{ from = "/workspace", to = "." }]
+# Glob patterns ignored by mapping/doctor.
+ignore_globs = ["**/target/**", "**/node_modules/**", "**/bazel-out/**"]
+# Path matching mode (set false for case-insensitive repos/CI paths).
+case_sensitive = true
+
+# Legacy path mapping table (still supported).
 [path_mapping.rules]
 # "/build/classes/" = "src/main/java/"

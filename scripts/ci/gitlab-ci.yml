@@ -1,0 +1,20 @@
+covy_pr:
+  image: rust:latest
+  stage: test
+  rules:
+    - if: '$CI_MERGE_REQUEST_IID'
+  script:
+    - apt-get update && apt-get install -y git curl
+    - cargo build --release -p covy-cli
+    - ./target/release/covy ingest coverage/lcov.info --issues reports/sarif.sarif
+    - ./target/release/covy pr --base-ref origin/$CI_DEFAULT_BRANCH --head-ref HEAD --out-comment comment.md --out-sarif covy.sarif
+    - |
+      curl --request POST \
+        --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        --form "body=$(cat comment.md)" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
+  artifacts:
+    when: always
+    paths:
+      - comment.md
+      - covy.sarif
