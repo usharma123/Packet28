@@ -1,0 +1,48 @@
+name: covy-pr
+
+on:
+  pull_request:
+
+jobs:
+  covy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build covy
+        run: cargo build --release -p covy-cli
+
+      - name: Ingest coverage (example)
+        run: |
+          if [ -f coverage/lcov.info ] && [ -f reports/sarif.sarif ]; then
+            ./target/release/covy ingest coverage/lcov.info --issues reports/sarif.sarif
+          else
+            echo "Skipping ingest example: customize report paths for your repository."
+          fi
+
+      - name: Generate PR artifacts
+        run: |
+          ./target/release/covy pr \
+            --base-ref origin/${{ github.base_ref }} \
+            --head-ref HEAD \
+            --out-comment comment.md \
+            --out-sarif covy.sarif
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: covy.sarif
+
+      - name: Post PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --edit-last --create-if-none --body-file comment.md

@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn covy_cmd() -> Command {
@@ -20,6 +20,43 @@ fn fixture(rel: &str) -> String {
         .join(rel)
         .to_string_lossy()
         .to_string()
+}
+
+fn setup_git_repo(dir: &Path) {
+    let init_status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["init"])
+        .status()
+        .expect("failed to execute `git init`");
+    assert!(init_status.success(), "`git init` exited with {init_status}");
+
+    let add_status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["add", "README.md"])
+        .status()
+        .expect("failed to execute `git add README.md`");
+    assert!(
+        add_status.success(),
+        "`git add README.md` exited with {add_status}"
+    );
+
+    let commit_status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .status()
+        .expect("failed to execute initial git commit");
+    assert!(
+        commit_status.success(),
+        "`git commit -m init` exited with {commit_status}"
+    );
 }
 
 #[test]
@@ -452,6 +489,209 @@ fn test_impact_json_runs_with_diff_integration() {
 }
 
 #[test]
+fn test_impact_record_builds_v2_testmap() {
+    let dir = TempDir::new().unwrap();
+    let per_test_dir = dir.path().join("per-test-lcov");
+    std::fs::create_dir_all(&per_test_dir).unwrap();
+    std::fs::copy(
+        fixture("lcov/basic.info"),
+        per_test_dir.join("com.foo.BarTest.info"),
+    )
+    .unwrap();
+
+    let testmap = dir.path().join("testmap.bin");
+    let summary = dir.path().join("testmap.json");
+
+    covy_cmd()
+        .args([
+            "impact",
+            "record",
+            "--base-ref",
+            "HEAD",
+            "--out",
+            testmap.to_str().unwrap(),
+            "--per-test-lcov-dir",
+            per_test_dir.to_str().unwrap(),
+            "--summary-json",
+            summary.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(testmap.exists());
+    assert!(summary.exists());
+
+    let bytes = std::fs::read(&testmap).unwrap();
+    let map = covy_core::cache::deserialize_testmap(&bytes).unwrap();
+    assert_eq!(
+        map.metadata.schema_version,
+        covy_core::cache::TESTMAP_SCHEMA_VERSION
+    );
+    assert!(!map.tests.is_empty());
+    assert!(!map.file_index.is_empty());
+    assert_eq!(map.tests.len(), map.coverage.len());
+}
+
+#[test]
+fn test_impact_plan_outputs_stable_json_schema() {
+    let dir = TempDir::new().unwrap();
+    let per_test_dir = dir.path().join("per-test-lcov");
+    std::fs::create_dir_all(&per_test_dir).unwrap();
+    std::fs::copy(
+        fixture("lcov/basic.info"),
+        per_test_dir.join("com.foo.BarTest.info"),
+    )
+    .unwrap();
+
+    let testmap = dir.path().join("testmap.bin");
+
+    covy_cmd()
+        .args([
+            "impact",
+            "record",
+            "--base-ref",
+            "HEAD",
+            "--out",
+            testmap.to_str().unwrap(),
+            "--per-test-lcov-dir",
+            per_test_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args([
+            "impact",
+            "plan",
+            "--base-ref",
+            "HEAD",
+            "--head-ref",
+            "HEAD",
+            "--testmap",
+            testmap.to_str().unwrap(),
+            "--max-tests",
+            "5",
+            "--target-coverage",
+            "0.9",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"changed_lines_total\""))
+        .stdout(predicate::str::contains(
+            "\"changed_lines_covered_by_plan\"",
+        ))
+        .stdout(predicate::str::contains("\"plan_coverage_pct\""))
+        .stdout(predicate::str::contains("\"tests\""))
+        .stdout(predicate::str::contains("\"uncovered_blocks\""))
+        .stdout(predicate::str::contains("\"next_command\""));
+}
+
+#[test]
+fn test_comment_writes_markdown_artifact() {
+    let dir = TempDir::new().unwrap();
+    let comment_path = dir.path().join("comment.md");
+    std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
+    setup_git_repo(dir.path());
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args(["ingest", &fixture("lcov/basic.info")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args([
+            "comment",
+            "--base-ref",
+            "HEAD",
+            "--head-ref",
+            "HEAD",
+            "--format",
+            "markdown",
+            "--out",
+            comment_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let content = std::fs::read_to_string(comment_path).unwrap();
+    assert!(content.contains("gate:"));
+    assert!(content.contains("<!-- covy -->"));
+}
+
+#[test]
+fn test_annotate_writes_sarif_artifact() {
+    let dir = TempDir::new().unwrap();
+    let sarif_path = dir.path().join("covy.sarif");
+    std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
+    setup_git_repo(dir.path());
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args(["ingest", &fixture("lcov/basic.info")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args([
+            "annotate",
+            "--base-ref",
+            "HEAD",
+            "--head-ref",
+            "HEAD",
+            "--out",
+            sarif_path.to_str().unwrap(),
+            "--max-findings",
+            "200",
+        ])
+        .assert()
+        .success();
+
+    let content = std::fs::read_to_string(sarif_path).unwrap();
+    assert!(content.contains("\"version\": \"2.1.0\""));
+    assert!(content.contains("covy/coverage/changed-line-uncovered"));
+}
+
+#[test]
+fn test_pr_writes_both_artifacts() {
+    let dir = TempDir::new().unwrap();
+    let comment_path = dir.path().join("comment.md");
+    let sarif_path = dir.path().join("covy.sarif");
+
+    std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
+    setup_git_repo(dir.path());
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args(["ingest", &fixture("lcov/basic.info")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args([
+            "pr",
+            "--base-ref",
+            "HEAD",
+            "--head-ref",
+            "HEAD",
+            "--out-comment",
+            comment_path.to_str().unwrap(),
+            "--out-sarif",
+            sarif_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(comment_path.exists());
+    assert!(sarif_path.exists());
+}
+
+#[test]
 fn test_impact_print_command_outputs_helper() {
     let dir = TempDir::new().unwrap();
     let manifest = dir.path().join("manifest.jsonl");
@@ -489,6 +729,62 @@ fn test_impact_print_command_outputs_helper() {
         .assert()
         .success()
         .stdout(predicate::str::contains("echo \"no impacted tests\""));
+}
+
+#[test]
+fn test_impact_legacy_emits_deprecation_warning() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("manifest.jsonl");
+    let testmap = dir.path().join("testmap.bin");
+
+    let line = format!(
+        "{{\"test_id\":\"com.foo.BarTest\",\"language\":\"java\",\"coverage_report\":\"{}\"}}\n",
+        fixture("lcov/basic.info")
+    );
+    std::fs::write(&manifest, line).unwrap();
+
+    covy_cmd()
+        .args([
+            "testmap",
+            "build",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output",
+            testmap.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .args([
+            "impact",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--testmap",
+            testmap.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("deprecated"));
+}
+
+#[test]
+fn test_github_comment_emits_deprecation_warning() {
+    covy_cmd()
+        .args([
+            "github-comment",
+            &fixture("lcov/basic.info"),
+            "--dry-run",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("deprecated"));
 }
 
 #[test]

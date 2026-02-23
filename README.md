@@ -52,6 +52,119 @@ max_new_warnings = 5
 # max_new_issues = 10
 ```
 
+Impact + path config:
+
+```toml
+[impact]
+testmap_path = ".covy/state/testmap.bin"
+max_tests = 25
+target_coverage = 0.90
+stale_after_days = 14
+allow_stale = true
+test_id_strategy = "junit"
+
+[paths]
+strip_prefix = ["/home/runner/work/repo/repo", "/__w/repo/repo"]
+replace_prefix = [{ from = "/workspace", to = "." }]
+ignore_globs = ["**/target/**", "**/node_modules/**", "**/bazel-out/**"]
+case_sensitive = true
+```
+
+## TIA Workflow
+
+Build test impact map from per-test coverage:
+
+```bash
+./target/release/covy impact record \
+  --base-ref main \
+  --out .covy/state/testmap.bin \
+  --per-test-lcov-dir artifacts/per-test-lcov \
+  --summary-json .covy/state/testmap.json
+```
+
+Plan tests for a diff:
+
+```bash
+./target/release/covy impact plan \
+  --base-ref origin/main \
+  --head-ref HEAD \
+  --testmap .covy/state/testmap.bin \
+  --max-tests 25 \
+  --target-coverage 0.9 \
+  --format json > plan.json
+```
+
+Optional execution:
+
+```bash
+./target/release/covy impact run --plan plan.json -- pytest {tests}
+```
+
+`{tests}` is a placeholder in this README, not special `covy` syntax. Replace it with real pytest path/pattern arguments.
+
+Example (single test file):
+
+```bash
+./target/release/covy impact run --plan plan.json -- pytest tests/test_example.py
+```
+
+Example (directory + `-k` expression; quote when your shell could split/expand unexpectedly):
+
+```bash
+./target/release/covy impact run --plan plan.json -- pytest tests/ -k "mytest"
+```
+
+## PR Artifacts
+
+Generate PR comment markdown:
+
+```bash
+./target/release/covy comment --base-ref origin/main --head-ref HEAD --format markdown --out comment.md
+```
+
+Generate SARIF annotations:
+
+```bash
+./target/release/covy annotate --out covy.sarif --max-findings 200
+```
+
+One-shot artifact generation:
+
+```bash
+./target/release/covy pr --out-comment comment.md --out-sarif covy.sarif
+```
+
+State paths for `comment`, `annotate`, and `pr` default to `.covy/state/latest.bin` and
+`.covy/state/issues.bin`, and can be overridden with `--coverage-state-path` and
+`--diagnostics-state-path`.
+
+## Doctor + Path Mapping
+
+Check repo/ref/config/report-path health:
+
+```bash
+./target/release/covy doctor --base-ref origin/main --head-ref HEAD
+```
+
+Learn/write mapping rules:
+
+```bash
+./target/release/covy map-paths --learn --write
+```
+
+Explain one path mapping decision:
+
+```bash
+./target/release/covy map-paths --explain /__w/repo/repo/src/main/java/com/foo/App.java
+```
+
+## CI Templates
+
+Reference templates:
+
+- GitHub Actions: `scripts/ci/github-actions.yml`
+- GitLab CI: `scripts/ci/gitlab-ci.yml`
+
 ## Sharding Workflow
 
 `covy` stays runner-agnostic: your CI executes tests, while `covy` plans shards and merges artifacts.

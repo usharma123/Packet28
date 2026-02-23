@@ -1,9 +1,15 @@
+mod cmd_annotate;
 mod cmd_check;
+mod cmd_comment;
+mod cmd_common;
 mod cmd_diff;
+mod cmd_doctor;
 mod cmd_github;
 mod cmd_impact;
 mod cmd_ingest;
+mod cmd_map_paths;
 mod cmd_merge;
+mod cmd_pr;
 mod cmd_report;
 mod cmd_shard;
 mod cmd_testmap;
@@ -48,6 +54,16 @@ enum Commands {
     Testmap(cmd_testmap::TestmapArgs),
     /// Compute impacted tests from a git diff
     Impact(cmd_impact::ImpactArgs),
+    /// Render PR comment markdown artifacts
+    Comment(cmd_comment::CommentArgs),
+    /// Generate SARIF annotations
+    Annotate(cmd_annotate::AnnotateArgs),
+    /// One-shot PR artifact generation
+    Pr(cmd_pr::PrArgs),
+    /// Diagnose setup and integration issues
+    Doctor(cmd_doctor::DoctorArgs),
+    /// Learn and inspect path mapping rules
+    MapPaths(cmd_map_paths::MapPathsArgs),
     /// Plan and inspect test shard allocations
     Shard(cmd_shard::ShardArgs),
     /// Merge shard artifacts into canonical state
@@ -90,6 +106,11 @@ fn main() {
         Commands::Diff(args) => cmd_diff::run(args, &cli.config),
         Commands::Testmap(args) => cmd_testmap::run(args, &cli.config),
         Commands::Impact(args) => cmd_impact::run(args, &cli.config),
+        Commands::Comment(args) => cmd_comment::run(args, &cli.config),
+        Commands::Annotate(args) => cmd_annotate::run(args, &cli.config),
+        Commands::Pr(args) => cmd_pr::run(args, &cli.config),
+        Commands::Doctor(args) => cmd_doctor::run(args, &cli.config),
+        Commands::MapPaths(args) => cmd_map_paths::run(args, &cli.config),
         Commands::Shard(args) => cmd_shard::run(args, &cli.config),
         Commands::Merge(args) => cmd_merge::run(args, &cli.config),
         Commands::GithubComment(args) => cmd_github::run(args, &cli.config),
