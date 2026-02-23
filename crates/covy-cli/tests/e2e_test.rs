@@ -552,6 +552,62 @@ fn test_impact_plan_outputs_stable_json_schema() {
 }
 
 #[test]
+fn test_comment_writes_markdown_artifact() {
+    let dir = TempDir::new().unwrap();
+    let comment_path = dir.path().join("comment.md");
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["init"])
+        .status()
+        .unwrap();
+    std::fs::write(dir.path().join("README.md"), "init\n").unwrap();
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["add", "README.md"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .status()
+        .unwrap();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args(["ingest", &fixture("lcov/basic.info")])
+        .assert()
+        .success();
+
+    covy_cmd()
+        .current_dir(dir.path())
+        .args([
+            "comment",
+            "--base-ref",
+            "HEAD",
+            "--head-ref",
+            "HEAD",
+            "--format",
+            "markdown",
+            "--out",
+            comment_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let content = std::fs::read_to_string(comment_path).unwrap();
+    assert!(content.contains("gate:"));
+    assert!(content.contains("<!-- covy -->"));
+}
+
+#[test]
 fn test_impact_print_command_outputs_helper() {
     let dir = TempDir::new().unwrap();
     let manifest = dir.path().join("manifest.jsonl");
