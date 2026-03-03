@@ -1,0 +1,22 @@
+[package]
+name = "diffy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "diffy"
+path = "src/main.rs"
+
+[dependencies]
+diffy-core = { version = "0.2.0", path = "../diffy-core" }
+suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
+suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
+covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
+clap.workspace = true
+anyhow.workspace = true
+colored.workspace = true
