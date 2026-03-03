@@ -1,8 +1,10 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Args;
+use suite_foundation_core::doctor::{
+    collect_report_paths, ensure_git_available, validate_git_refs,
+};
 use suite_foundation_core::path_diagnose::{diagnose_paths, load_repo_paths, PathDiagnosisRequest};
 use suite_foundation_core::CovyConfig;
 
@@ -83,7 +85,11 @@ pub fn run(args: DoctorArgs, config_path: &str) -> Result<i32> {
         return Ok(0);
     }
 
-    let report_paths = parse_report_paths_quick(&report_files)?;
+    let report_paths = collect_report_paths(&report_files, |report| {
+        let coverage = covy_ingest::ingest_path(report)
+            .with_context(|| format!("Failed to parse report {}", report.display()))?;
+        Ok(coverage.files.keys().cloned().collect())
+    })?;
     let parsed_report_paths = report_paths.len();
     let repo_paths = load_repo_paths(&repo_root)?;
     let stats = diagnose_paths(PathDiagnosisRequest::from_config(
@@ -150,41 +156,6 @@ fn load_config_checked(config_path: &str) -> Result<CovyConfig> {
     CovyConfig::load(Path::new(config_path))
         .with_context(|| format!("Invalid config at {config_path}"))
         .map_err(Into::into)
-}
-
-fn ensure_git_available() -> Result<()> {
-    let output = Command::new("git")
-        .arg("--version")
-        .output()
-        .context("git is not available in PATH")?;
-    if !output.status.success() {
-        anyhow::bail!("git command is unavailable");
-    }
-    Ok(())
-}
-
-fn validate_git_refs(base: &str, head: &str) -> Result<()> {
-    for r in [base, head] {
-        let output = Command::new("git")
-            .args(["rev-parse", "--verify", r])
-            .output()
-            .with_context(|| format!("Failed to resolve git ref '{r}'"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Failed to resolve git ref '{r}': {stderr}");
-        }
-    }
-    Ok(())
-}
-
-fn parse_report_paths_quick(report_files: &[PathBuf]) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
-    for report in report_files {
-        let coverage = covy_ingest::ingest_path(report)
-            .with_context(|| format!("Failed to parse report {}", report.display()))?;
-        paths.extend(coverage.files.keys().cloned());
-    }
-    Ok(paths)
 }
 
 #[cfg(test)]

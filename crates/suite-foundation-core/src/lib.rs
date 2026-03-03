@@ -19,6 +19,8 @@ pub mod testmap {
 
 pub mod cache;
 pub mod config;
+pub mod config_edit;
+pub mod doctor;
 pub mod path_diagnose;
 pub mod pathmap;
 pub mod snapshot;

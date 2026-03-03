@@ -17,6 +17,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 bincode.workspace = true
 glob.workspace = true
 ignore.workspace = true

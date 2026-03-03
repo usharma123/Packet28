@@ -53,16 +53,6 @@ impl Default for TestmapRunnerOptions {
     }
 }
 
-#[derive(serde::Serialize)]
-struct TestmapBuildSummary {
-    manifest_files: usize,
-    records: usize,
-    tests: usize,
-    files: usize,
-    output_testmap_path: String,
-    output_timings_path: String,
-}
-
 pub fn run_testmap_command(args: TestmapArgs, options: &TestmapRunnerOptions) -> Result<i32> {
     match args.command {
         TestmapCommands::Build(build) => run_testmap_build(build, options),
@@ -78,33 +68,26 @@ pub fn run_testmap_build(build: TestmapBuildArgs, options: &TestmapRunnerOptions
         return Ok(0);
     }
 
-    let response = testy_core::pipeline_testmap::run_testmap(
-        testy_core::pipeline_testmap::TestMapRequest {
-            manifest_globs: build.manifest,
-            output_testmap_path: build.output,
-            output_timings_path: build.timings_output,
+    let adapters = adapters::default_testmap_adapters();
+    let output = testy_core::command_testmap::run_testmap_build(
+        testy_core::command_testmap::TestmapBuildArgs {
+            manifest: build.manifest,
+            output: build.output,
+            timings_output: build.timings_output,
         },
-        &adapters::default_testmap_adapters(),
+        &adapters,
     )?;
 
-    for warning in &response.warnings {
+    for warning in &output.warnings {
         (options.emit_warning)(warning);
     }
 
     if build.json {
-        let summary = TestmapBuildSummary {
-            manifest_files: response.stats.manifest_files,
-            records: response.stats.records,
-            tests: response.stats.tests,
-            files: response.stats.files,
-            output_testmap_path: response.output_testmap_path,
-            output_timings_path: response.output_timings_path,
-        };
-        println!("{}", serde_json::to_string_pretty(&summary)?);
+        println!("{}", serde_json::to_string_pretty(&output.summary)?);
     } else {
         (options.emit_text)(&format!(
             "Built testmap from {} manifest records across {} file(s)",
-            response.stats.records, response.stats.manifest_files
+            output.summary.records, output.summary.manifest_files
         ));
     }
 

@@ -21,6 +21,9 @@ pub mod cache {
     pub use suite_foundation_core::cache::*;
 }
 
+pub mod command_impact;
+pub mod command_shard;
+pub mod command_testmap;
 pub mod impact;
 pub mod merge;
 pub mod pipeline;

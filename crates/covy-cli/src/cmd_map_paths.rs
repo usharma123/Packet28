@@ -1,7 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Args;
+use suite_foundation_core::config_edit::write_strip_prefixes;
+use suite_foundation_core::doctor::collect_report_paths;
 use suite_foundation_core::path_diagnose::{
     explain_path_mapping, learn_path_mapping, load_repo_paths, PathExplainRequest,
     PathExplainResponse, PathLearnRequest, PathLearnResponse,
@@ -59,7 +61,12 @@ pub fn run(args: MapPathsArgs, config_path: &str) -> Result<i32> {
             );
         }
 
-        let observed_paths = load_report_paths(&report_files)?;
+        let observed_paths = collect_report_paths(&report_files, |report| {
+            let mut coverage = covy_ingest::ingest_path(report)
+                .with_context(|| format!("Failed to parse coverage report {}", report.display()))?;
+            suite_foundation_core::pathmap::auto_normalize_paths(&mut coverage, None);
+            Ok(coverage.files.keys().cloned().collect())
+        })?;
         let learned = learn_path_mapping(PathLearnRequest::new(
             observed_paths,
             repo_files.clone(),
@@ -139,46 +146,6 @@ pub fn run(args: MapPathsArgs, config_path: &str) -> Result<i32> {
     }
 
     Ok(0)
-}
-
-fn load_report_paths(report_files: &[PathBuf]) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
-    for report in report_files {
-        let mut coverage = covy_ingest::ingest_path(report)
-            .with_context(|| format!("Failed to parse coverage report {}", report.display()))?;
-        suite_foundation_core::pathmap::auto_normalize_paths(&mut coverage, None);
-        paths.extend(coverage.files.keys().cloned());
-    }
-    Ok(paths)
-}
-
-fn write_strip_prefixes(config_path: &str, strip_prefixes: &[String]) -> Result<()> {
-    let path = Path::new(config_path);
-    let mut doc = if path.exists() {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        raw.parse::<toml_edit::DocumentMut>()
-            .with_context(|| format!("Failed to parse {} as TOML", path.display()))?
-    } else {
-        toml_edit::DocumentMut::new()
-    };
-
-    if !doc.as_table().contains_key("paths") {
-        doc["paths"] = toml_edit::table();
-    }
-    if !doc["paths"].is_table() {
-        anyhow::bail!("[paths] must be a TOML table");
-    }
-
-    let mut array = toml_edit::Array::default();
-    for prefix in strip_prefixes {
-        array.push(prefix.as_str());
-    }
-    doc["paths"]["strip_prefix"] = toml_edit::value(array);
-
-    std::fs::write(path, doc.to_string())
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]
