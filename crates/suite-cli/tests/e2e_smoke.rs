@@ -62,9 +62,9 @@ fn write_governed_context(path: &Path) {
 version: 1
 policy:
   tools:
-    allowlist: ["diffy", "contextq"]
+    allowlist: ["diffy", "testy", "contextq"]
   reducers:
-    allowlist: ["analyze", "assemble", "contextq.assemble"]
+    allowlist: ["analyze", "impact", "assemble", "contextq.assemble"]
   paths:
     include: ["**"]
     exclude: []
@@ -198,6 +198,47 @@ fn test_suite_test_impact_smoke() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"selected_tests\""));
+}
+
+#[test]
+fn test_suite_test_impact_governed_smoke() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("manifest.jsonl");
+    let testmap = dir.path().join("testmap.bin");
+    let context = dir.path().join("context.yaml");
+    write_manifest(&manifest);
+    write_governed_context(&context);
+
+    suite_cmd()
+        .args([
+            "test",
+            "map",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output",
+            testmap.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    suite_cmd()
+        .args([
+            "test",
+            "impact",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--testmap",
+            testmap.to_str().unwrap(),
+            "--json",
+            "--context-config",
+            context.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"final_packet\""))
+        .stdout(predicate::str::contains("\"tool\": \"contextq\""));
 }
 
 #[test]

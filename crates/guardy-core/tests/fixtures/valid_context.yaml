@@ -1,0 +1,15 @@
+version: 1
+policy:
+  tools:
+    allowlist: ["diffy", "contextq"]
+  reducers:
+    allowlist: ["analyze", "assemble", "contextq.assemble"]
+  paths:
+    include: ["src/**", "tests/**"]
+    exclude: ["src/private/**"]
+  token_budget:
+    cap: 500
+  runtime_budget:
+    cap_ms: 1500
+  redaction:
+    forbidden_patterns: ["(?i)password"]

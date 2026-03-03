@@ -72,6 +72,57 @@ policy:
     forbidden_patterns: ["(?i)password", "(?i)secret"]
 ```
 
+## Governed Local Workflow (V1)
+
+1. Validate policy config:
+
+```bash
+./target/release/suite guard validate --config context.yaml
+```
+
+2. Run diff analysis through the governed kernel path:
+
+```bash
+./target/release/suite diff analyze \
+  --coverage tests/fixtures/lcov/basic.info \
+  --base HEAD \
+  --head HEAD \
+  --no-issues-state \
+  --json \
+  --context-config context.yaml \
+  --context-budget-tokens 1200
+```
+
+3. Run impact analysis through the same governed kernel path:
+
+```bash
+./target/release/suite test impact \
+  --base HEAD \
+  --head HEAD \
+  --testmap .covy/state/testmap.bin \
+  --json \
+  --context-config context.yaml \
+  --context-budget-tokens 1200
+```
+
+4. Validate a packet directly against policy:
+
+```bash
+./target/release/suite guard check --packet packet.json --config context.yaml
+```
+
+5. Assemble one or more packet files with a hard budget:
+
+```bash
+./target/release/suite context assemble \
+  --packet a.json \
+  --packet b.json \
+  --budget-tokens 1200 \
+  --budget-bytes 24000
+```
+
+`suite diff analyze` and `suite test impact` now both route reducers through `context-kernel-core`, and when `--context-config` is set they continue into governed `contextq` assembly with kernel governance audit metadata.
+
 ## Recent Changes (v0.2.0)
 
 - `covy ingest` now auto-resolves `[ingest].report_paths` from `covy.toml` when positional coverage paths are omitted.

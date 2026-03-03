@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use clap::Args;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use suite_foundation_core::config::{GateConfig, IssueGateConfig};
 use suite_foundation_core::CovyConfig;
 
@@ -157,6 +157,14 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     let governed_context_config = args.context_config.clone();
     let governed_budget_tokens = args.context_budget_tokens;
     let governed_budget_bytes = args.context_budget_bytes;
+    let policy_context = governed_context_config
+        .as_ref()
+        .map(|config_path| {
+            json!({
+                "config_path": config_path,
+            })
+        })
+        .unwrap_or(Value::Null);
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let report =
         if crate::cmd_common::resolve_json_output(args.json, args.report.as_deref(), "--report")? {
@@ -189,6 +197,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "diffy.analyze".to_string(),
         reducer_input: serde_json::to_value(kernel_input)?,
+        policy_context: policy_context.clone(),
         ..context_kernel_core::KernelRequest::default()
     })?;
 

@@ -1,0 +1,12 @@
+{
+  "packet_id": "diffy-analyze-v1",
+  "tool": "diffy",
+  "reducer": "analyze",
+  "paths": ["src/private/secret.rs"],
+  "token_usage": 900,
+  "runtime_ms": 2100,
+  "payload": {
+    "summary": "password=abc123"
+  },
+  "text_blobs": ["password=abc123"]
+}

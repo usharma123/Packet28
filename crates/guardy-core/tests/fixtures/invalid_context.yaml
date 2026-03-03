@@ -1,0 +1,15 @@
+version: 2
+policy:
+  tools:
+    allowlist: [""]
+  reducers:
+    allowlist: ["analyze"]
+  paths:
+    include: ["[broken"]
+    exclude: []
+  token_budget:
+    cap: 0
+  runtime_budget:
+    cap_ms: 0
+  redaction:
+    forbidden_patterns: ["("]

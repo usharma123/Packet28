@@ -1,0 +1,21 @@
+{
+  "packet_id": "diffy-analyze-v1",
+  "tool": "diffy",
+  "reducer": "analyze",
+  "paths": ["src/lib.rs"],
+  "sections": [
+    {
+      "id": "diff-summary",
+      "title": "Critical regression",
+      "body": "error uncovered lines in src/lib.rs",
+      "refs": [
+        { "kind": "file", "value": "src/lib.rs", "relevance": 0.9 },
+        { "kind": "symbol", "value": "foo::bar", "relevance": 0.7 }
+      ],
+      "relevance": 1.2
+    }
+  ],
+  "refs": [
+    { "kind": "file", "value": "src/lib.rs", "relevance": 0.8 }
+  ]
+}

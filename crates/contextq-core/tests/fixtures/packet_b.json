@@ -1,0 +1,19 @@
+{
+  "packet_id": "testy-impact-v1",
+  "tool": "testy",
+  "reducer": "impact",
+  "paths": ["src/lib.rs", "src/extra.rs"],
+  "sections": [
+    {
+      "id": "impact-summary",
+      "title": "Impacted tests",
+      "body": "selected tests for changed files",
+      "refs": [
+        { "kind": "file", "value": "src/lib.rs", "relevance": 0.7 },
+        { "kind": "symbol", "value": "foo::bar", "relevance": 0.6 },
+        { "kind": "symbol", "value": "baz::qux", "relevance": 0.55 }
+      ],
+      "relevance": 0.8
+    }
+  ]
+}
