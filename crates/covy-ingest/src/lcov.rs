@@ -59,9 +59,9 @@ fn parse_lcov(text: &str) -> Result<CoverageData, CovyError> {
             // Start new file
             current_file = Some(path.to_string());
             current_coverage = FileCoverage::new();
-        } else if line.starts_with("DA:") {
+        } else if let Some(stripped) = line.strip_prefix("DA:") {
             // DA:line_number,execution_count[,checksum]
-            let parts: Vec<&str> = line[3..].splitn(3, ',').collect();
+            let parts: Vec<&str> = stripped.splitn(3, ',').collect();
             if parts.len() >= 2 {
                 if let Ok(line_no) = parts[0].parse::<u32>() {
                     let count: u64 = parts[1].parse().unwrap_or(0);
@@ -71,9 +71,9 @@ fn parse_lcov(text: &str) -> Result<CoverageData, CovyError> {
                     }
                 }
             }
-        } else if line.starts_with("BRDA:") {
+        } else if let Some(stripped) = line.strip_prefix("BRDA:") {
             // BRDA:line,block,branch,taken
-            let parts: Vec<&str> = line[5..].splitn(4, ',').collect();
+            let parts: Vec<&str> = stripped.splitn(4, ',').collect();
             if parts.len() >= 4 {
                 if let (Ok(line_no), Ok(block)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
                 {
@@ -83,9 +83,9 @@ fn parse_lcov(text: &str) -> Result<CoverageData, CovyError> {
             }
         } else if line.starts_with("FN:") {
             // FN:line_number,function_name — just record it
-        } else if line.starts_with("FNDA:") {
+        } else if let Some(stripped) = line.strip_prefix("FNDA:") {
             // FNDA:execution_count,function_name
-            let parts: Vec<&str> = line[5..].splitn(2, ',').collect();
+            let parts: Vec<&str> = stripped.splitn(2, ',').collect();
             if parts.len() == 2 {
                 let count: u64 = parts[0].parse().unwrap_or(0);
                 current_coverage
@@ -97,7 +97,7 @@ fn parse_lcov(text: &str) -> Result<CoverageData, CovyError> {
                 result
                     .files
                     .entry(path)
-                    .or_insert_with(FileCoverage::new)
+                    .or_default()
                     .merge(&current_coverage);
                 current_coverage = FileCoverage::new();
             }

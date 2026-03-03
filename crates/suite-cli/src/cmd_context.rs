@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Args;
 
 #[derive(Args)]
@@ -19,16 +19,28 @@ pub struct AssembleArgs {
 }
 
 pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
-    let packet_paths: Vec<PathBuf> = args.packets.into_iter().map(PathBuf::from).collect();
+    let input_packets = args
+        .packets
+        .iter()
+        .map(|path| context_kernel_core::load_packet_file(Path::new(path)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let assembled = contextq_core::assemble_packet_files(
-        &packet_paths,
-        contextq_core::AssembleOptions {
-            budget_tokens: args.budget_tokens,
-            budget_bytes: args.budget_bytes,
+    let kernel = context_kernel_core::Kernel::with_v1_reducers();
+    let response = kernel.execute(context_kernel_core::KernelRequest {
+        target: "contextq.assemble".to_string(),
+        input_packets,
+        budget: context_kernel_core::ExecutionBudget {
+            token_cap: Some(args.budget_tokens),
+            byte_cap: Some(args.budget_bytes),
+            runtime_ms_cap: None,
         },
-    )?;
+        ..context_kernel_core::KernelRequest::default()
+    })?;
 
-    println!("{}", serde_json::to_string_pretty(&assembled)?);
+    let assembled = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    println!("{}", serde_json::to_string_pretty(&assembled.body)?);
     Ok(0)
 }

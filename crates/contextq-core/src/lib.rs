@@ -624,12 +624,7 @@ fn exceeds_budget_usize(used: usize, add: usize, cap: usize) -> bool {
 }
 
 fn enforce_budget(payload: &mut AssembledPayload, options: AssembleOptions) {
-    loop {
-        let serialized = match serde_json::to_string(payload) {
-            Ok(text) => text,
-            Err(_) => break,
-        };
-
+    while let Ok(serialized) = serde_json::to_string(payload) {
         let token_estimate = estimate_tokens(&serialized);
         let byte_estimate = serialized.len();
 
@@ -657,8 +652,6 @@ fn enforce_budget(payload: &mut AssembledPayload, options: AssembleOptions) {
             payload.sections.pop();
             continue;
         }
-
-        break;
     }
 }
 

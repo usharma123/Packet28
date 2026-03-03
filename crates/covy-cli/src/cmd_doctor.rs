@@ -155,7 +155,6 @@ pub fn run(args: DoctorArgs, config_path: &str) -> Result<i32> {
 fn load_config_checked(config_path: &str) -> Result<CovyConfig> {
     CovyConfig::load(Path::new(config_path))
         .with_context(|| format!("Invalid config at {config_path}"))
-        .map_err(Into::into)
 }
 
 #[cfg(test)]

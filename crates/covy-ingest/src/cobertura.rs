@@ -65,7 +65,7 @@ fn parse_cobertura(data: &[u8]) -> Result<CoverageData, CovyError> {
                                 result
                                     .files
                                     .entry(resolved)
-                                    .or_insert_with(FileCoverage::new)
+                                    .or_default()
                                     .merge(&current_coverage);
                                 current_coverage = FileCoverage::new();
                             }
@@ -103,7 +103,7 @@ fn parse_cobertura(data: &[u8]) -> Result<CoverageData, CovyError> {
                             result
                                 .files
                                 .entry(resolved)
-                                .or_insert_with(FileCoverage::new)
+                                .or_default()
                                 .merge(&current_coverage);
                             current_coverage = FileCoverage::new();
                         }

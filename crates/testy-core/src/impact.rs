@@ -84,12 +84,12 @@ pub fn plan_impacted_tests(
                 .or_insert_with(|| index.file_index[file_idx].clone());
             mapped_remaining
                 .entry(file_idx)
-                .or_insert_with(RoaringBitmap::new)
+                .or_default()
                 .extend(changed.iter());
         } else {
             unmapped_remaining
                 .entry(diff.path.clone())
-                .or_insert_with(RoaringBitmap::new)
+                .or_default()
                 .extend(changed.iter());
         }
     }
@@ -300,15 +300,16 @@ mod tests {
     }
 
     fn basic_v2_map() -> TestMapIndex {
-        let mut map = TestMapIndex::default();
-        map.tests = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
-        map.file_index = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
-        map.coverage = vec![
-            vec![vec![10, 11], vec![]],
-            vec![vec![11], vec![20, 21]],
-            vec![vec![10], vec![20]],
-        ];
-        map
+        TestMapIndex {
+            tests: vec!["t1".to_string(), "t2".to_string(), "t3".to_string()],
+            file_index: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            coverage: vec![
+                vec![vec![10, 11], vec![]],
+                vec![vec![11], vec![20, 21]],
+                vec![vec![10], vec![20]],
+            ],
+            ..TestMapIndex::default()
+        }
     }
 
     #[test]
@@ -349,10 +350,12 @@ mod tests {
 
     #[test]
     fn test_plan_impacted_tests_deterministic_tie_break() {
-        let mut map = TestMapIndex::default();
-        map.tests = vec!["aaa".to_string(), "bbb".to_string()];
-        map.file_index = vec!["src/a.rs".to_string()];
-        map.coverage = vec![vec![vec![1]], vec![vec![1]]];
+        let map = TestMapIndex {
+            tests: vec!["aaa".to_string(), "bbb".to_string()],
+            file_index: vec!["src/a.rs".to_string()],
+            coverage: vec![vec![vec![1]], vec![vec![1]]],
+            ..TestMapIndex::default()
+        };
         let diffs = vec![diff_with_lines("src/a.rs", &[1])];
 
         let plan = plan_impacted_tests(&map, &diffs, 1, 1.0);
@@ -361,10 +364,12 @@ mod tests {
 
     #[test]
     fn test_uncovered_blocks_compact_ranges() {
-        let mut map = TestMapIndex::default();
-        map.tests = vec!["t1".to_string()];
-        map.file_index = vec!["src/a.rs".to_string()];
-        map.coverage = vec![vec![vec![1, 2]]];
+        let map = TestMapIndex {
+            tests: vec!["t1".to_string()],
+            file_index: vec!["src/a.rs".to_string()],
+            coverage: vec![vec![vec![1, 2]]],
+            ..TestMapIndex::default()
+        };
         let diffs = vec![diff_with_lines("src/a.rs", &[1, 2, 3, 5])];
 
         let plan = plan_impacted_tests(&map, &diffs, 1, 1.0);

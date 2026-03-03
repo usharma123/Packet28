@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::error::CovyError;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct CovyConfig {
     pub project: ProjectConfig,
@@ -28,7 +28,7 @@ pub struct ProjectConfig {
     pub source_root: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct IngestConfig {
     pub report_paths: Vec<String>,
@@ -42,7 +42,7 @@ pub struct DiffConfig {
     pub head: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct GateConfig {
     pub fail_under_total: Option<f64>,
@@ -52,7 +52,7 @@ pub struct GateConfig {
     pub issues: IssueGateConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct IssueGateConfig {
     pub max_new_errors: Option<u32>,
@@ -91,7 +91,7 @@ pub struct ImpactConfig {
     pub smoke: ImpactSmokeConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ImpactSmokeConfig {
     pub always: Vec<String>,
@@ -114,7 +114,7 @@ pub struct ShardTiersConfig {
     pub nightly: ShardTierConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ShardTierConfig {
     pub exclude_tags: Vec<String>,
@@ -128,7 +128,7 @@ pub struct MergeConfig {
     pub output_issues: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct PathMappingConfig {
     pub rules: BTreeMap<String, String>,
@@ -143,7 +143,7 @@ pub struct PathsConfig {
     pub case_sensitive: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ReplacePrefixRule {
     pub from: String,
@@ -151,24 +151,6 @@ pub struct ReplacePrefixRule {
 }
 
 // Defaults
-
-impl Default for CovyConfig {
-    fn default() -> Self {
-        Self {
-            project: ProjectConfig::default(),
-            ingest: IngestConfig::default(),
-            diff: DiffConfig::default(),
-            gate: GateConfig::default(),
-            report: ReportConfig::default(),
-            cache: CacheConfig::default(),
-            impact: ImpactConfig::default(),
-            shard: ShardConfig::default(),
-            merge: MergeConfig::default(),
-            paths: PathsConfig::default(),
-            path_mapping: PathMappingConfig::default(),
-        }
-    }
-}
 
 impl Default for ProjectConfig {
     fn default() -> Self {
@@ -179,41 +161,11 @@ impl Default for ProjectConfig {
     }
 }
 
-impl Default for IngestConfig {
-    fn default() -> Self {
-        Self {
-            report_paths: Vec::new(),
-            strip_prefixes: Vec::new(),
-        }
-    }
-}
-
 impl Default for DiffConfig {
     fn default() -> Self {
         Self {
             base: "main".to_string(),
             head: "HEAD".to_string(),
-        }
-    }
-}
-
-impl Default for GateConfig {
-    fn default() -> Self {
-        Self {
-            fail_under_total: None,
-            fail_under_changed: None,
-            fail_under_new: None,
-            issues: IssueGateConfig::default(),
-        }
-    }
-}
-
-impl Default for IssueGateConfig {
-    fn default() -> Self {
-        Self {
-            max_new_errors: None,
-            max_new_warnings: None,
-            max_new_issues: None,
         }
     }
 }
@@ -254,15 +206,6 @@ impl Default for ImpactConfig {
     }
 }
 
-impl Default for ImpactSmokeConfig {
-    fn default() -> Self {
-        Self {
-            always: Vec::new(),
-            stale_extra: Vec::new(),
-        }
-    }
-}
-
 impl Default for ShardConfig {
     fn default() -> Self {
         Self {
@@ -285,28 +228,12 @@ impl Default for ShardTiersConfig {
     }
 }
 
-impl Default for ShardTierConfig {
-    fn default() -> Self {
-        Self {
-            exclude_tags: Vec::new(),
-        }
-    }
-}
-
 impl Default for MergeConfig {
     fn default() -> Self {
         Self {
             strict: true,
             output_coverage: ".covy/state/latest.bin".to_string(),
             output_issues: ".covy/state/issues.bin".to_string(),
-        }
-    }
-}
-
-impl Default for PathMappingConfig {
-    fn default() -> Self {
-        Self {
-            rules: BTreeMap::new(),
         }
     }
 }
@@ -322,15 +249,6 @@ impl Default for PathsConfig {
                 "**/bazel-out/**".to_string(),
             ],
             case_sensitive: !cfg!(windows),
-        }
-    }
-}
-
-impl Default for ReplacePrefixRule {
-    fn default() -> Self {
-        Self {
-            from: String::new(),
-            to: String::new(),
         }
     }
 }

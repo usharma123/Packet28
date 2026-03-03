@@ -249,12 +249,14 @@ fn run_legacy_select(
     apply_policy(
         &mut result,
         &diffs,
-        stale,
-        known_tests,
-        args.full_suite_threshold,
-        &args.fallback_mode,
-        &args.smoke_always,
-        &args.smoke_stale_extra,
+        PolicyOptions {
+            stale,
+            known_tests,
+            full_suite_threshold: args.full_suite_threshold,
+            fallback_mode: &args.fallback_mode,
+            smoke_always: &args.smoke_always,
+            smoke_stale_extra: &args.smoke_stale_extra,
+        },
     )?;
 
     let print_command = if args.include_print_command {
@@ -530,21 +532,25 @@ fn is_stale(generated_at: u64, fresh_hours: u32) -> bool {
     now.saturating_sub(generated_at) > max_age
 }
 
-fn apply_policy(
-    result: &mut ImpactResult,
-    diffs: &[crate::model::FileDiff],
+struct PolicyOptions<'a> {
     stale: bool,
     known_tests: usize,
     full_suite_threshold: f64,
-    fallback_mode: &str,
-    smoke_always: &[String],
-    smoke_stale_extra: &[String],
-) -> Result<()> {
-    result.stale = stale;
+    fallback_mode: &'a str,
+    smoke_always: &'a [String],
+    smoke_stale_extra: &'a [String],
+}
 
-    let mut smoke: BTreeSet<String> = smoke_always.iter().cloned().collect();
-    if stale {
-        smoke.extend(smoke_stale_extra.iter().cloned());
+fn apply_policy(
+    result: &mut ImpactResult,
+    diffs: &[crate::model::FileDiff],
+    options: PolicyOptions<'_>,
+) -> Result<()> {
+    result.stale = options.stale;
+
+    let mut smoke: BTreeSet<String> = options.smoke_always.iter().cloned().collect();
+    if options.stale {
+        smoke.extend(options.smoke_stale_extra.iter().cloned());
     }
 
     let mut selected: BTreeSet<String> = result.selected_tests.iter().cloned().collect();
@@ -560,18 +566,20 @@ fn apply_policy(
     } else {
         mapped as f64 / total_changed as f64
     };
-    if stale {
+    if options.stale {
         confidence *= 0.75;
     }
     result.confidence = confidence.clamp(0.0, 1.0);
-    if known_tests > 0 {
-        let ratio = result.selected_tests.len() as f64 / known_tests as f64;
-        result.escalate_full_suite = ratio > full_suite_threshold;
+    if options.known_tests > 0 {
+        let ratio = result.selected_tests.len() as f64 / options.known_tests as f64;
+        result.escalate_full_suite = ratio > options.full_suite_threshold;
     } else {
         result.escalate_full_suite = false;
     }
 
-    if fallback_mode.eq_ignore_ascii_case("fail-closed") && !result.missing_mappings.is_empty() {
+    if options.fallback_mode.eq_ignore_ascii_case("fail-closed")
+        && !result.missing_mappings.is_empty()
+    {
         anyhow::bail!(
             "Impact mapping missing for {} changed file(s) in fail-closed mode",
             result.missing_mappings.len()
@@ -745,10 +753,12 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let testmap = dir.path().join("testmap.bin");
 
-        let mut map = crate::testmap::TestMapIndex::default();
-        map.tests = vec!["t1".to_string()];
-        map.file_index = vec!["src/a.rs".to_string()];
-        map.coverage = vec![vec![vec![1]]];
+        let mut map = crate::testmap::TestMapIndex {
+            tests: vec!["t1".to_string()],
+            file_index: vec!["src/a.rs".to_string()],
+            coverage: vec![vec![vec![1]]],
+            ..crate::testmap::TestMapIndex::default()
+        };
         map.test_to_files.insert(
             "t1".to_string(),
             ["src/a.rs".to_string()].into_iter().collect(),

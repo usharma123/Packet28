@@ -21,9 +21,8 @@ pub trait Ingestor: Send + Sync {
 pub fn detect_format(path: &Path, content: &[u8]) -> Result<CoverageFormat, CovyError> {
     // Check extension first
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        match ext {
-            "info" => return Ok(CoverageFormat::Lcov),
-            _ => {}
+        if ext == "info" {
+            return Ok(CoverageFormat::Lcov);
         }
     }
 

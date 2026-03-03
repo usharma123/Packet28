@@ -1,4 +1,4 @@
-use covy_core::model::{CoverageData, CoverageFormat, FileCoverage};
+use covy_core::model::{CoverageData, CoverageFormat};
 use covy_core::CovyError;
 use serde::Deserialize;
 
@@ -49,10 +49,7 @@ fn parse_llvmcov(data: &[u8]) -> Result<CoverageData, CovyError> {
 
     for data_entry in &export.data {
         for file in &data_entry.files {
-            let fc = result
-                .files
-                .entry(file.filename.clone())
-                .or_insert_with(FileCoverage::new);
+            let fc = result.files.entry(file.filename.clone()).or_default();
 
             // Walk segments to determine line coverage.
             // Each segment: [line, col, count, has_count, is_region_entry, ...]

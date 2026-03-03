@@ -1595,7 +1595,7 @@ fn test_shard_update_ingests_junit_xml_timings_by_class() {
     let bytes = std::fs::read(&timings_bin).unwrap();
     let timings = suite_foundation_core::cache::deserialize_test_timings(&bytes).unwrap();
     assert_eq!(timings.duration_ms.get("com.foo.BarTest"), Some(&400));
-    assert!(timings.duration_ms.get("com.foo.BarTest.testOne").is_none());
+    assert!(!timings.duration_ms.contains_key("com.foo.BarTest.testOne"));
 }
 
 #[test]

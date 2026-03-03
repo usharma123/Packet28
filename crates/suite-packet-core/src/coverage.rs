@@ -115,10 +115,7 @@ impl CoverageData {
     /// Merge another CoverageData into this one.
     pub fn merge(&mut self, other: &CoverageData) {
         for (path, fc) in &other.files {
-            self.files
-                .entry(path.clone())
-                .or_insert_with(FileCoverage::new)
-                .merge(fc);
+            self.files.entry(path.clone()).or_default().merge(fc);
         }
     }
 }

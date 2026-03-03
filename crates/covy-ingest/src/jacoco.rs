@@ -59,7 +59,7 @@ fn parse_jacoco(data: &[u8]) -> Result<CoverageData, CovyError> {
                             result
                                 .files
                                 .entry(path)
-                                .or_insert_with(FileCoverage::new)
+                                .or_default()
                                 .merge(&current_coverage);
                             current_coverage = FileCoverage::new();
                         }
@@ -89,7 +89,7 @@ fn parse_jacoco(data: &[u8]) -> Result<CoverageData, CovyError> {
                         result
                             .files
                             .entry(path)
-                            .or_insert_with(FileCoverage::new)
+                            .or_default()
                             .merge(&current_coverage);
                         current_coverage = FileCoverage::new();
                     }

@@ -127,14 +127,14 @@ pub fn parse_diff_output(diff_text: &str) -> Result<Vec<FileDiff>, CovyError> {
             }
             current_status = DiffStatus::Modified;
             current_old_path = None;
-        } else if line.starts_with("+++ b/") {
-            current_path = Some(line[6..].to_string());
+        } else if let Some(stripped) = line.strip_prefix("+++ b/") {
+            current_path = Some(stripped.to_string());
         } else if line.starts_with("+++ /dev/null") {
             // File was deleted — we skip deleted files (filtered by --diff-filter)
         } else if line.starts_with("new file") {
             current_status = DiffStatus::Added;
-        } else if line.starts_with("rename from ") {
-            current_old_path = Some(line["rename from ".len()..].to_string());
+        } else if let Some(stripped) = line.strip_prefix("rename from ") {
+            current_old_path = Some(stripped.to_string());
             current_status = DiffStatus::Renamed;
         } else if line.starts_with("@@") {
             // Parse @@ -old,count +new,count @@ ...

@@ -73,23 +73,25 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
     }
 
     // If no CLI paths given, fall back to config report_paths
-    if files.is_empty() && !args.stdin && args.paths.is_empty() {
-        if !config.ingest.report_paths.is_empty() {
-            tracing::debug!(
-                "No CLI paths given, trying config report_paths: {:?}",
-                config.ingest.report_paths
-            );
-            let config_files = crate::cmd_common::resolve_report_globs_for_config(
-                config_path,
-                &config.ingest.report_paths,
-            )?;
-            // Canonicalize to deduplicate paths resolved from different bases
-            let mut seen = std::collections::HashSet::new();
-            for f in config_files {
-                let canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
-                if seen.insert(canonical) {
-                    files.push(f);
-                }
+    if files.is_empty()
+        && !args.stdin
+        && args.paths.is_empty()
+        && !config.ingest.report_paths.is_empty()
+    {
+        tracing::debug!(
+            "No CLI paths given, trying config report_paths: {:?}",
+            config.ingest.report_paths
+        );
+        let config_files = crate::cmd_common::resolve_report_globs_for_config(
+            config_path,
+            &config.ingest.report_paths,
+        )?;
+        // Canonicalize to deduplicate paths resolved from different bases
+        let mut seen = std::collections::HashSet::new();
+        for f in config_files {
+            let canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
+            if seen.insert(canonical) {
+                files.push(f);
             }
         }
     }

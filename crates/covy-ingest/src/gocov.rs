@@ -1,7 +1,7 @@
 use regex::Regex;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
-use covy_core::model::{CoverageData, CoverageFormat, FileCoverage};
+use covy_core::model::{CoverageData, CoverageFormat};
 use covy_core::CovyError;
 
 use crate::Ingestor;
@@ -9,8 +9,11 @@ use crate::Ingestor;
 pub struct GoCovIngestor;
 
 // Go coverprofile line: file:startLine.startCol,endLine.endCol numStatements count
-static LINE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.+):(\d+)\.\d+,(\d+)\.\d+\s+\d+\s+(\d+)$").unwrap());
+static LINE_RE: OnceLock<Regex> = OnceLock::new();
+
+fn line_re() -> &'static Regex {
+    LINE_RE.get_or_init(|| Regex::new(r"^(.+):(\d+)\.\d+,(\d+)\.\d+\s+\d+\s+(\d+)$").unwrap())
+}
 
 impl Ingestor for GoCovIngestor {
     fn format(&self) -> CoverageFormat {
@@ -54,7 +57,7 @@ fn parse_gocov(text: &str) -> Result<CoverageData, CovyError> {
             continue;
         }
 
-        if let Some(caps) = LINE_RE.captures(line) {
+        if let Some(caps) = line_re().captures(line) {
             let raw_path = &caps[1];
             let start_line: u32 = caps[2].parse().unwrap_or(0);
             let end_line: u32 = caps[3].parse().unwrap_or(0);
@@ -82,10 +85,7 @@ fn parse_gocov(text: &str) -> Result<CoverageData, CovyError> {
                 raw_path
             };
 
-            let fc = result
-                .files
-                .entry(path.to_string())
-                .or_insert_with(FileCoverage::new);
+            let fc = result.files.entry(path.to_string()).or_default();
 
             // Expand line range into bitmap
             for line_no in start_line..=end_line {

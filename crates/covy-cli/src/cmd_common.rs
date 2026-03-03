@@ -87,10 +87,10 @@ pub fn maybe_warn_deprecated(message: &str) {
 
 pub fn default_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineIngestAdapters {
     diffy_core::pipeline::PipelineIngestAdapters {
-        ingest_coverage_auto: ingest_coverage_auto,
-        ingest_coverage_with_format: ingest_coverage_with_format,
-        ingest_coverage_stdin: ingest_coverage_stdin,
-        ingest_diagnostics: ingest_diagnostics,
+        ingest_coverage_auto,
+        ingest_coverage_with_format,
+        ingest_coverage_stdin,
+        ingest_diagnostics,
     }
 }
 

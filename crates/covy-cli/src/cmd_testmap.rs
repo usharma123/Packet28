@@ -4,8 +4,8 @@ pub type TestmapArgs = testy_cli_common::testmap::TestmapArgs;
 
 const TESTMAP_RUNNER_OPTIONS: testy_cli_common::testmap::TestmapRunnerOptions =
     testy_cli_common::testmap::TestmapRunnerOptions {
-        emit_warning: emit_warning,
-        emit_text: emit_text,
+        emit_warning,
+        emit_text,
     };
 
 pub fn run(args: TestmapArgs, _config_path: &str) -> Result<i32> {

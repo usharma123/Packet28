@@ -23,9 +23,8 @@ pub fn build_snapshot(root: &Path) -> Result<RepoSnapshot, CovyError> {
         .build();
 
     for entry in walker {
-        let entry = entry
-            .map_err(|e| CovyError::IoRaw(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        let entry = entry.map_err(|e| CovyError::IoRaw(std::io::Error::other(e)))?;
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let path = entry.path();
