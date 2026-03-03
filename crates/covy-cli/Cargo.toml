@@ -13,8 +13,11 @@ name = "covy"
 path = "src/main.rs"
 
 [dependencies]
-covy-core = { version = "0.2.0", path = "../covy-core" }
 covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
+diffy-core = { version = "0.2.0", path = "../diffy-core" }
+testy-core = { version = "0.2.0", path = "../testy-core" }
+suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
+suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true

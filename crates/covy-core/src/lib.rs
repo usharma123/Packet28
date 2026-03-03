@@ -1,3 +1,10 @@
+//! Temporary compatibility shim.
+//!
+//! `covy-cli` now depends on domain crates directly
+//! (`diffy-core`, `testy-core`, `suite-foundation-core`, `suite-packet-core`).
+//! Keep this crate as a backward-compatible re-export surface only.
+//! Do not add new orchestration or business logic here.
+
 pub mod model {
     pub use suite_packet_core::coverage::*;
     pub use suite_packet_core::gate::*;

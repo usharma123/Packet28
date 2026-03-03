@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use covy_core::path_diagnose::{
+use suite_foundation_core::path_diagnose::{
     explain_path_mapping, learn_path_mapping, load_repo_paths, PathExplainRequest,
     PathExplainResponse, PathLearnRequest, PathLearnResponse,
 };
-use covy_core::CovyConfig;
+use suite_foundation_core::CovyConfig;
 
 #[derive(Args)]
 pub struct MapPathsArgs {
@@ -146,7 +146,7 @@ fn load_report_paths(report_files: &[PathBuf]) -> Result<Vec<String>> {
     for report in report_files {
         let mut coverage = covy_ingest::ingest_path(report)
             .with_context(|| format!("Failed to parse coverage report {}", report.display()))?;
-        covy_core::pathmap::auto_normalize_paths(&mut coverage, None);
+        suite_foundation_core::pathmap::auto_normalize_paths(&mut coverage, None);
         paths.extend(coverage.files.keys().cloned());
     }
     Ok(paths)

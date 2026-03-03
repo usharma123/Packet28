@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use covy_core::diagnostics::DiagnosticsData;
-use covy_core::model::{CoverageData, CoverageFormat};
-use covy_core::CovyConfig;
+use suite_foundation_core::CovyConfig;
+use suite_packet_core::diagnostics::DiagnosticsData;
+use suite_packet_core::{CoverageData, CoverageFormat};
 
 #[derive(Args)]
 pub struct IngestArgs {
@@ -161,7 +161,7 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
 
     // Normalize coverage paths (auto-detect or use --source-root)
     let source_root = args.source_root.as_deref().map(Path::new);
-    covy_core::pathmap::auto_normalize_paths(&mut combined, source_root);
+    suite_foundation_core::pathmap::auto_normalize_paths(&mut combined, source_root);
 
     // Save coverage state
     let output_path = args
@@ -174,7 +174,7 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let bytes = covy_core::cache::serialize_coverage(&combined)?;
+    let bytes = suite_foundation_core::cache::serialize_coverage(&combined)?;
     std::fs::write(output_path, bytes)?;
 
     let mut diagnostics_input_count = 0usize;
@@ -200,17 +200,17 @@ pub fn run(args: IngestArgs, config_path: &str) -> Result<i32> {
             diagnostics.merge(&data);
         }
 
-        covy_core::pathmap::auto_normalize_issue_paths(&mut diagnostics, source_root);
+        suite_foundation_core::pathmap::auto_normalize_issue_paths(&mut diagnostics, source_root);
         diagnostics_total_issues = diagnostics.total_issues();
 
         let issue_path = Path::new(".covy/state/issues.bin");
         if let Some(parent) = issue_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let bytes = covy_core::cache::serialize_diagnostics_with_metadata(
+        let bytes = suite_foundation_core::cache::serialize_diagnostics_with_metadata(
             &diagnostics,
-            &covy_core::cache::DiagnosticsStateMetadata::normalized_for_repo_root(
-                covy_core::cache::current_repo_root_id(source_root),
+            &suite_foundation_core::cache::DiagnosticsStateMetadata::normalized_for_repo_root(
+                suite_foundation_core::cache::current_repo_root_id(source_root),
             ),
         )?;
         std::fs::write(issue_path, bytes)?;
@@ -256,7 +256,7 @@ fn load_existing_coverage(output: &Option<String>, config: &CovyConfig) -> Resul
     let path = Path::new(path);
     if path.exists() {
         let bytes = std::fs::read(path)?;
-        let data = covy_core::cache::deserialize_coverage(&bytes)?;
+        let data = suite_foundation_core::cache::deserialize_coverage(&bytes)?;
         Ok(data)
     } else {
         let _ = config; // suppress unused warning
@@ -268,7 +268,7 @@ fn load_existing_issues() -> Result<DiagnosticsData> {
     let path = Path::new(".covy/state/issues.bin");
     if path.exists() {
         let bytes = std::fs::read(path)?;
-        let data = covy_core::cache::deserialize_diagnostics(&bytes)?;
+        let data = suite_foundation_core::cache::deserialize_diagnostics(&bytes)?;
         Ok(data)
     } else {
         Ok(DiagnosticsData::new())
@@ -316,7 +316,7 @@ fn load_diagnostics_input(path: &Path) -> Result<DiagnosticsData> {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
     {
         let bytes = std::fs::read(path)?;
-        let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
+        let diagnostics = suite_foundation_core::cache::deserialize_diagnostics(&bytes)?;
         return Ok(diagnostics);
     }
 

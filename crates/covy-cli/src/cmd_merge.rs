@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use covy_core::CovyConfig;
+use suite_foundation_core::CovyConfig;
 
 #[derive(Args)]
 pub struct MergeArgs {
@@ -46,9 +46,9 @@ pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
     }
 
     let (coverage_merged, skipped_cov) =
-        covy_core::merge::merge_coverage_inputs(&coverage_inputs, strict)?;
+        testy_core::merge::merge_coverage_inputs(&coverage_inputs, strict)?;
     let (diag_merged, skipped_diag) =
-        covy_core::merge::merge_diagnostics_inputs(&diagnostics_inputs, strict)?;
+        testy_core::merge::merge_diagnostics_inputs(&diagnostics_inputs, strict)?;
 
     let output_coverage = if args.output_coverage == ".covy/state/latest.bin" {
         config.merge.output_coverage.as_str()
@@ -64,22 +64,22 @@ pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
     if !coverage_inputs.is_empty() {
         write_file(
             Path::new(output_coverage),
-            &covy_core::cache::serialize_coverage(&coverage_merged)?,
+            &suite_foundation_core::cache::serialize_coverage(&coverage_merged)?,
         )?;
     }
     if !diagnostics_inputs.is_empty() {
         write_file(
             Path::new(output_issues),
-            &covy_core::cache::serialize_diagnostics_with_metadata(
+            &suite_foundation_core::cache::serialize_diagnostics_with_metadata(
                 &diag_merged,
-                &covy_core::cache::DiagnosticsStateMetadata::normalized_for_repo_root(
-                    covy_core::cache::current_repo_root_id(None),
+                &suite_foundation_core::cache::DiagnosticsStateMetadata::normalized_for_repo_root(
+                    suite_foundation_core::cache::current_repo_root_id(None),
                 ),
             )?,
         )?;
     }
 
-    let summary = covy_core::merge::MergeSummary {
+    let summary = testy_core::merge::MergeSummary {
         coverage_inputs: coverage_inputs.len(),
         diagnostics_inputs: diagnostics_inputs.len(),
         skipped_inputs: skipped_cov + skipped_diag,

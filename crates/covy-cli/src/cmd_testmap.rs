@@ -56,14 +56,14 @@ fn run_build(build: TestmapBuildArgs) -> Result<i32> {
     if build.schema {
         println!(
             "{}",
-            covy_core::testmap_pipeline::TESTMAP_MANIFEST_SCHEMA_EXAMPLE
+            testy_core::pipeline_testmap::TESTMAP_MANIFEST_SCHEMA_EXAMPLE
         );
         return Ok(0);
     }
 
     let adapters = crate::cmd_common::default_testmap_adapters();
-    let response = covy_core::testmap_pipeline::run_testmap(
-        covy_core::testmap_pipeline::TestMapRequest {
+    let response = testy_core::pipeline_testmap::run_testmap(
+        testy_core::pipeline_testmap::TestMapRequest {
             manifest_globs: build.manifest,
             output_testmap_path: build.output,
             output_timings_path: build.timings_output,

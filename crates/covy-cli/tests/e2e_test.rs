@@ -482,7 +482,7 @@ fn test_testmap_build_writes_test_to_files_index() {
         .success();
 
     let bytes = std::fs::read(&output).unwrap();
-    let map = covy_core::cache::deserialize_testmap(&bytes).unwrap();
+    let map = suite_foundation_core::cache::deserialize_testmap(&bytes).unwrap();
     assert!(map.test_to_files.contains_key("com.foo.BarTest"));
     assert!(!map.test_to_files["com.foo.BarTest"].is_empty());
     let covered_file = map.test_to_files["com.foo.BarTest"]
@@ -569,10 +569,10 @@ fn test_impact_record_builds_v2_testmap() {
     assert!(summary.exists());
 
     let bytes = std::fs::read(&testmap).unwrap();
-    let map = covy_core::cache::deserialize_testmap(&bytes).unwrap();
+    let map = suite_foundation_core::cache::deserialize_testmap(&bytes).unwrap();
     assert_eq!(
         map.metadata.schema_version,
-        covy_core::cache::TESTMAP_SCHEMA_VERSION
+        suite_foundation_core::cache::TESTMAP_SCHEMA_VERSION
     );
     assert!(!map.tests.is_empty());
     assert!(!map.file_index.is_empty());
@@ -1032,7 +1032,7 @@ fn test_testmap_build_supports_python_language_metadata() {
         .success();
 
     let bytes = std::fs::read(&output).unwrap();
-    let map = covy_core::cache::deserialize_testmap(&bytes).unwrap();
+    let map = suite_foundation_core::cache::deserialize_testmap(&bytes).unwrap();
     assert_eq!(
         map.test_language["tests/test_mod.py::test_case"],
         "python".to_string()
@@ -1067,7 +1067,7 @@ fn test_testmap_build_writes_timings_output() {
         .success();
 
     let bytes = std::fs::read(&timings_output).unwrap();
-    let timings = covy_core::cache::deserialize_test_timings(&bytes).unwrap();
+    let timings = suite_foundation_core::cache::deserialize_test_timings(&bytes).unwrap();
     assert_eq!(timings.duration_ms.get("com.foo.BarTest"), Some(&1234));
     assert_eq!(timings.sample_count.get("com.foo.BarTest"), Some(&1));
 }
@@ -1289,7 +1289,7 @@ fn test_shard_update_ingests_jsonl_timings() {
         .stdout(predicate::str::contains("\"tests_updated\": 2"));
 
     let bytes = std::fs::read(&timings_bin).unwrap();
-    let timings = covy_core::cache::deserialize_test_timings(&bytes).unwrap();
+    let timings = suite_foundation_core::cache::deserialize_test_timings(&bytes).unwrap();
     assert_eq!(timings.duration_ms.get("com.foo.BarTest"), Some(&1200));
     assert_eq!(
         timings.duration_ms.get("tests/test_mod.py::test_one"),
@@ -1555,7 +1555,7 @@ fn test_shard_update_ingests_junit_xml_timings() {
         .stdout(predicate::str::contains("\"tests_updated\": 1"));
 
     let bytes = std::fs::read(&timings_bin).unwrap();
-    let timings = covy_core::cache::deserialize_test_timings(&bytes).unwrap();
+    let timings = suite_foundation_core::cache::deserialize_test_timings(&bytes).unwrap();
     assert_eq!(
         timings.duration_ms.get("com.foo.BarTest.testOne"),
         Some(&250)
@@ -1593,7 +1593,7 @@ fn test_shard_update_ingests_junit_xml_timings_by_class() {
         .stdout(predicate::str::contains("\"tests_updated\": 1"));
 
     let bytes = std::fs::read(&timings_bin).unwrap();
-    let timings = covy_core::cache::deserialize_test_timings(&bytes).unwrap();
+    let timings = suite_foundation_core::cache::deserialize_test_timings(&bytes).unwrap();
     assert_eq!(timings.duration_ms.get("com.foo.BarTest"), Some(&400));
     assert!(timings.duration_ms.get("com.foo.BarTest.testOne").is_none());
 }

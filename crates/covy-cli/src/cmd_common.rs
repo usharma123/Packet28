@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::{collections::BTreeSet, ffi::OsString};
 
 use anyhow::{Context, Result};
-use covy_core::config::GateConfig;
-use covy_core::diagnostics::DiagnosticsData;
-use covy_core::{CoverageData, CoverageFormat, CovyConfig, FileDiff};
 use roaring::RoaringBitmap;
+use suite_foundation_core::config::GateConfig;
+use suite_foundation_core::CovyConfig;
+use suite_packet_core::diagnostics::DiagnosticsData;
+use suite_packet_core::{CoverageData, CoverageFormat, FileDiff};
 
 /// Resolve the report output format: use the explicit value if provided,
 /// otherwise default to "json" when stdout is piped (non-TTY) and "terminal"
@@ -96,8 +97,8 @@ pub fn deserialize_json_with_example<T: serde::de::DeserializeOwned>(
     })
 }
 
-pub fn default_pipeline_ingest_adapters() -> covy_core::pipeline::PipelineIngestAdapters {
-    covy_core::pipeline::PipelineIngestAdapters {
+pub fn default_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineIngestAdapters {
+    diffy_core::pipeline::PipelineIngestAdapters {
         ingest_coverage_auto: ingest_coverage_auto,
         ingest_coverage_with_format: ingest_coverage_with_format,
         ingest_coverage_stdin: ingest_coverage_stdin,
@@ -105,16 +106,16 @@ pub fn default_pipeline_ingest_adapters() -> covy_core::pipeline::PipelineIngest
     }
 }
 
-pub fn default_impact_adapters() -> covy_core::impact_pipeline::ImpactAdapters {
-    covy_core::impact_pipeline::ImpactAdapters {
+pub fn default_impact_adapters() -> testy_core::pipeline::ImpactAdapters {
+    testy_core::pipeline::ImpactAdapters {
         ingest_coverage_auto: ingest_coverage_auto,
         ingest_coverage_with_format: ingest_coverage_with_format,
         git_diff: impact_git_diff,
     }
 }
 
-pub fn default_testmap_adapters() -> covy_core::testmap_pipeline::TestMapAdapters {
-    covy_core::testmap_pipeline::TestMapAdapters {
+pub fn default_testmap_adapters() -> testy_core::pipeline_testmap::TestMapAdapters {
+    testy_core::pipeline_testmap::TestMapAdapters {
         ingest_coverage: ingest_coverage_auto,
     }
 }
@@ -136,13 +137,13 @@ fn ingest_diagnostics(path: &Path) -> Result<DiagnosticsData> {
 }
 
 fn impact_git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>> {
-    covy_core::diff::git_diff(base, head).map_err(Into::into)
+    diffy_core::diff::git_diff(base, head).map_err(Into::into)
 }
 
 pub fn load_coverage_state(path: &str) -> Result<CoverageData> {
     let bytes =
         std::fs::read(path).with_context(|| format!("Failed to read coverage state at {path}"))?;
-    covy_core::cache::deserialize_coverage(&bytes).map_err(Into::into)
+    suite_foundation_core::cache::deserialize_coverage(&bytes).map_err(Into::into)
 }
 
 pub fn load_diagnostics_if_present(path: &str) -> Result<Option<DiagnosticsData>> {
@@ -150,8 +151,8 @@ pub fn load_diagnostics_if_present(path: &str) -> Result<Option<DiagnosticsData>
         return Ok(None);
     }
     let bytes = std::fs::read(path)?;
-    let mut data = covy_core::cache::deserialize_diagnostics(&bytes)?;
-    covy_core::pathmap::auto_normalize_issue_paths(&mut data, None);
+    let mut data = suite_foundation_core::cache::deserialize_diagnostics(&bytes)?;
+    suite_foundation_core::pathmap::auto_normalize_issue_paths(&mut data, None);
     Ok(Some(data))
 }
 
@@ -201,7 +202,7 @@ pub struct PrSharedState {
     pub coverage: CoverageData,
     pub diagnostics: Option<DiagnosticsData>,
     pub diffs: Vec<FileDiff>,
-    pub gate: covy_core::model::QualityGateResult,
+    pub gate: suite_packet_core::QualityGateResult,
 }
 
 pub fn compute_pr_shared_state(
@@ -216,12 +217,12 @@ pub fn compute_pr_shared_state(
     let head = head_ref.unwrap_or(&config.diff.head);
 
     let mut coverage = load_coverage_state(coverage_state_path)?;
-    covy_core::pathmap::auto_normalize_paths(&mut coverage, None);
+    suite_foundation_core::pathmap::auto_normalize_paths(&mut coverage, None);
 
-    let diffs = covy_core::diff::git_diff(base, head)?;
+    let diffs = diffy_core::diff::git_diff(base, head)?;
     let diagnostics = load_diagnostics_if_present(diagnostics_state_path)?;
 
-    let gate = covy_core::gate::evaluate_full_gate(
+    let gate = diffy_core::gate::evaluate_full_gate(
         &GateConfig {
             fail_under_total: config.gate.fail_under_total,
             fail_under_changed: config.gate.fail_under_changed,

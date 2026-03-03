@@ -2,7 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::Args;
-use covy_core::{CoverageData, CovyConfig, FileDiff};
+use suite_foundation_core::CovyConfig;
+use suite_packet_core::{CoverageData, FileDiff};
 
 use crate::cmd_common::{compute_pr_shared_state, compute_uncovered_blocks_generic, PrSharedState};
 
@@ -120,12 +121,12 @@ fn suggested_tests(diffs: &[FileDiff], config: &CovyConfig) -> Result<Vec<String
     }
 
     let bytes = std::fs::read(path)?;
-    let map = covy_core::cache::deserialize_testmap(&bytes)?;
+    let map = suite_foundation_core::cache::deserialize_testmap(&bytes)?;
     if map.coverage.is_empty() || map.tests.is_empty() {
         return Ok(Vec::new());
     }
 
-    let plan = covy_core::impact::plan_impacted_tests(
+    let plan = testy_core::impact::plan_impacted_tests(
         &map,
         diffs,
         config.impact.max_tests,
@@ -144,7 +145,7 @@ fn compute_uncovered_blocks(coverage: &CoverageData, diffs: &[FileDiff]) -> Vec<
 }
 
 fn render_comment_markdown(
-    gate: &covy_core::model::QualityGateResult,
+    gate: &suite_packet_core::QualityGateResult,
     mut uncovered: Vec<LineBlock>,
     max_uncovered: usize,
     suggested_tests: &[String],
@@ -207,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_render_comment_markdown_basic_snapshot_shape() {
-        let gate = covy_core::model::QualityGateResult {
+        let gate = suite_packet_core::QualityGateResult {
             passed: false,
             total_coverage_pct: Some(80.0),
             changed_coverage_pct: Some(75.0),
@@ -240,7 +241,7 @@ mod tests {
     #[test]
     fn test_compute_uncovered_blocks_compacts_ranges() {
         let mut coverage = CoverageData::new();
-        let mut fc = covy_core::FileCoverage::new();
+        let mut fc = suite_packet_core::FileCoverage::new();
         fc.lines_instrumented.insert(1);
         fc.lines_instrumented.insert(2);
         fc.lines_instrumented.insert(3);
@@ -258,7 +259,7 @@ mod tests {
         let diffs = vec![FileDiff {
             path: "src/a.rs".to_string(),
             old_path: None,
-            status: covy_core::DiffStatus::Modified,
+            status: suite_packet_core::DiffStatus::Modified,
             changed_lines: changed,
         }];
 

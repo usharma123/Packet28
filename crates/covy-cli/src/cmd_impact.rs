@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use covy_core::CovyConfig;
 use std::path::Path;
 use std::process::Command;
+use suite_foundation_core::CovyConfig;
 
 #[derive(Args)]
 pub struct ImpactArgs {
@@ -149,10 +149,10 @@ fn run_record(args: ImpactRecordArgs) -> Result<i32> {
     }
 
     let adapters = crate::cmd_common::default_impact_adapters();
-    let response = covy_core::impact_pipeline::run_impact(
-        covy_core::impact_pipeline::ImpactRequest {
-            mode: covy_core::impact_pipeline::ImpactMode::Record(
-                covy_core::impact_pipeline::ImpactRecordRequest {
+    let response = testy_core::pipeline::run_impact(
+        testy_core::pipeline::ImpactRequest {
+            mode: testy_core::pipeline::ImpactMode::Record(
+                testy_core::pipeline::ImpactRecordRequest {
                     base_ref: args.base_ref,
                     output: args.output,
                     per_test_lcov_dir: args.per_test_lcov_dir,
@@ -191,17 +191,15 @@ fn run_plan(args: ImpactPlanArgs, config_path: &str) -> Result<i32> {
         .unwrap_or(config.impact.target_coverage);
 
     let adapters = crate::cmd_common::default_impact_adapters();
-    let response = covy_core::impact_pipeline::run_impact(
-        covy_core::impact_pipeline::ImpactRequest {
-            mode: covy_core::impact_pipeline::ImpactMode::Plan(
-                covy_core::impact_pipeline::ImpactPlanRequest {
-                    base_ref: args.base_ref,
-                    head_ref: args.head_ref,
-                    testmap: args.testmap,
-                    max_tests,
-                    target_coverage,
-                },
-            ),
+    let response = testy_core::pipeline::run_impact(
+        testy_core::pipeline::ImpactRequest {
+            mode: testy_core::pipeline::ImpactMode::Plan(testy_core::pipeline::ImpactPlanRequest {
+                base_ref: args.base_ref,
+                head_ref: args.head_ref,
+                testmap: args.testmap,
+                max_tests,
+                target_coverage,
+            }),
         },
         &adapters,
     )?;
@@ -256,10 +254,10 @@ fn run_legacy(args: LegacyImpactArgs, config_path: &str) -> Result<i32> {
     };
 
     let adapters = crate::cmd_common::default_impact_adapters();
-    let response = covy_core::impact_pipeline::run_impact(
-        covy_core::impact_pipeline::ImpactRequest {
-            mode: covy_core::impact_pipeline::ImpactMode::LegacySelect(
-                covy_core::impact_pipeline::ImpactLegacyRequest {
+    let response = testy_core::pipeline::run_impact(
+        testy_core::pipeline::ImpactRequest {
+            mode: testy_core::pipeline::ImpactMode::LegacySelect(
+                testy_core::pipeline::ImpactLegacyRequest {
                     base_ref: base,
                     head_ref: head,
                     testmap,
@@ -328,7 +326,7 @@ fn run_impact_run(args: ImpactRunArgs) -> Result<i32> {
 
     let content = std::fs::read_to_string(plan_path)
         .with_context(|| format!("Failed to read plan at {plan_path}"))?;
-    let plan: covy_core::impact::ImpactPlan = crate::cmd_common::deserialize_json_with_example(
+    let plan: testy_core::impact::ImpactPlan = crate::cmd_common::deserialize_json_with_example(
         &content,
         "ImpactPlan",
         IMPACT_PLAN_EXAMPLE,
@@ -427,7 +425,7 @@ mod tests {
     fn test_run_impact_run_skips_execution_for_empty_plan() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan_path = dir.path().join("plan.json");
-        let plan = covy_core::impact::ImpactPlan::default();
+        let plan = testy_core::impact::ImpactPlan::default();
         std::fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
 
         let result = run_impact_run(ImpactRunArgs {
@@ -443,8 +441,8 @@ mod tests {
     fn test_run_impact_run_executes_command() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan_path = dir.path().join("plan.json");
-        let plan = covy_core::impact::ImpactPlan {
-            tests: vec![covy_core::impact::PlannedTest {
+        let plan = testy_core::impact::ImpactPlan {
+            tests: vec![testy_core::impact::PlannedTest {
                 id: "com.foo.BarTest".to_string(),
                 name: "com.foo.BarTest".to_string(),
                 estimated_overlap_lines: 1,

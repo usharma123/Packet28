@@ -3,8 +3,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use covy_core::path_diagnose::{diagnose_paths, load_repo_paths, PathDiagnosisRequest};
-use covy_core::CovyConfig;
+use suite_foundation_core::path_diagnose::{diagnose_paths, load_repo_paths, PathDiagnosisRequest};
+use suite_foundation_core::CovyConfig;
 
 #[derive(Args)]
 pub struct DoctorArgs {

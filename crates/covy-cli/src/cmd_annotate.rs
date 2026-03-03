@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::Args;
-use covy_core::diagnostics::Severity;
-use covy_core::{CoverageData, DiffStatus, FileDiff};
+use suite_packet_core::diagnostics::Severity;
+use suite_packet_core::{CoverageData, DiffStatus, FileDiff};
 
 use crate::cmd_common::{compute_pr_shared_state, compute_uncovered_blocks_generic, PrSharedState};
 
@@ -109,7 +109,7 @@ fn uncovered_blocks(coverage: &CoverageData, diffs: &[FileDiff]) -> Vec<BlockFin
 
 fn build_sarif(
     blocks: &[BlockFinding],
-    diagnostics: Option<&covy_core::diagnostics::DiagnosticsData>,
+    diagnostics: Option<&suite_packet_core::diagnostics::DiagnosticsData>,
     diffs: &[FileDiff],
     violations: &[String],
     max_findings: usize,
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn test_uncovered_blocks_generates_exact_locations() {
         let mut coverage = CoverageData::new();
-        let mut fc = covy_core::FileCoverage::new();
+        let mut fc = suite_packet_core::FileCoverage::new();
         fc.lines_instrumented.insert(1);
         fc.lines_instrumented.insert(2);
         fc.lines_instrumented.insert(3);

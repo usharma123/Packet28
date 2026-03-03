@@ -156,7 +156,7 @@ fn display_error(err: &anyhow::Error) {
     use colored::Colorize;
 
     // Check if it's a CovyError with a hint
-    if let Some(covy_err) = err.downcast_ref::<covy_core::CovyError>() {
+    if let Some(covy_err) = err.downcast_ref::<suite_packet_core::CovyError>() {
         eprintln!("{} {covy_err}", "error:".red().bold());
         if let Some(hint) = covy_err.hint() {
             eprintln!("  {} {hint}", "hint:".cyan().bold());

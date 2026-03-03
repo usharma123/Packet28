@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::Args;
-use covy_core::config::GateConfig;
-use covy_core::CovyConfig;
+use suite_foundation_core::config::GateConfig;
+use suite_foundation_core::CovyConfig;
 
 #[derive(Args)]
 pub struct DiffArgs {
@@ -76,11 +76,11 @@ pub fn run(args: DiffArgs, config_path: &str) -> Result<i32> {
         issues: config.gate.issues.clone(),
     };
 
-    let request = covy_core::pipeline::PipelineRequest {
+    let request = diffy_core::pipeline::PipelineRequest {
         base: base.to_string(),
         head: head.to_string(),
         source_root: None,
-        coverage: covy_core::pipeline::PipelineCoverageInput {
+        coverage: diffy_core::pipeline::PipelineCoverageInput {
             paths: args.coverage,
             format: None,
             stdin: false,
@@ -91,7 +91,7 @@ pub fn run(args: DiffArgs, config_path: &str) -> Result<i32> {
             no_inputs_error: "No coverage data found. Run `covy ingest` first or use --coverage."
                 .to_string(),
         },
-        diagnostics: covy_core::pipeline::PipelineDiagnosticsInput {
+        diagnostics: diffy_core::pipeline::PipelineDiagnosticsInput {
             issue_patterns: args.issues,
             issues_state_path: args.issues_state,
             no_issues_state: args.no_issues_state,
@@ -101,17 +101,17 @@ pub fn run(args: DiffArgs, config_path: &str) -> Result<i32> {
     };
 
     let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
-    let output = covy_core::pipeline::run_analysis(request, &adapters)?;
+    let output = diffy_core::pipeline::run_analysis(request, &adapters)?;
 
     match report.as_str() {
         "json" => {
-            let json = covy_core::report::render_gate_json(&output.gate_result);
+            let json = diffy_core::report::render_gate_json(&output.gate_result);
             println!("{json}");
         }
         _ => {
-            covy_core::report::render_gate_result(&output.gate_result);
+            diffy_core::report::render_gate_result(&output.gate_result);
             if let Some(diag) = output.diagnostics.as_ref() {
-                covy_core::report::render_issues_terminal(
+                diffy_core::report::render_issues_terminal(
                     diag,
                     Some(&output.changed_line_context.diffs),
                 );

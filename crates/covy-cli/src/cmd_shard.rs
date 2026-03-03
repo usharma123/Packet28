@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use covy_core::CovyConfig;
+use suite_foundation_core::CovyConfig;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum PlannerAlgorithmArg {
@@ -20,11 +20,11 @@ pub enum JunitIdGranularityArg {
     Class,
 }
 
-impl From<JunitIdGranularityArg> for covy_core::shard_timing::JunitIdGranularity {
+impl From<JunitIdGranularityArg> for testy_core::shard_timing::JunitIdGranularity {
     fn from(value: JunitIdGranularityArg) -> Self {
         match value {
-            JunitIdGranularityArg::Method => covy_core::shard_timing::JunitIdGranularity::Method,
-            JunitIdGranularityArg::Class => covy_core::shard_timing::JunitIdGranularity::Class,
+            JunitIdGranularityArg::Method => testy_core::shard_timing::JunitIdGranularity::Method,
+            JunitIdGranularityArg::Class => testy_core::shard_timing::JunitIdGranularity::Class,
         }
     }
 }
@@ -165,9 +165,9 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
             let algorithm = resolve_plan_algorithm(&plan, &config)?;
 
             let response =
-                covy_core::shard_pipeline::run_shard(covy_core::shard_pipeline::ShardRequest {
-                    mode: covy_core::shard_pipeline::ShardMode::Plan(
-                        covy_core::shard_pipeline::ShardPlanRequest {
+                testy_core::pipeline_shard::run_shard(testy_core::pipeline_shard::ShardRequest {
+                    mode: testy_core::pipeline_shard::ShardMode::Plan(
+                        testy_core::pipeline_shard::ShardPlanRequest {
                             shard_count,
                             tasks_json: plan.tasks_json,
                             tests_file: plan.tests_file,
@@ -205,9 +205,9 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
                 .to_string();
 
             let response =
-                covy_core::shard_pipeline::run_shard(covy_core::shard_pipeline::ShardRequest {
-                    mode: covy_core::shard_pipeline::ShardMode::Update(
-                        covy_core::shard_pipeline::ShardUpdateRequest {
+                testy_core::pipeline_shard::run_shard(testy_core::pipeline_shard::ShardRequest {
+                    mode: testy_core::pipeline_shard::ShardMode::Update(
+                        testy_core::pipeline_shard::ShardUpdateRequest {
                             junit_xml: update.junit_xml,
                             timings_jsonl: update.timings_jsonl,
                             timings_path,
@@ -238,10 +238,12 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
 
 fn to_core_algorithm(
     value: PlannerAlgorithmArg,
-) -> covy_core::shard_pipeline::ShardPlannerAlgorithm {
+) -> testy_core::pipeline_shard::ShardPlannerAlgorithm {
     match value {
-        PlannerAlgorithmArg::Lpt => covy_core::shard_pipeline::ShardPlannerAlgorithm::Lpt,
-        PlannerAlgorithmArg::WhaleLpt => covy_core::shard_pipeline::ShardPlannerAlgorithm::WhaleLpt,
+        PlannerAlgorithmArg::Lpt => testy_core::pipeline_shard::ShardPlannerAlgorithm::Lpt,
+        PlannerAlgorithmArg::WhaleLpt => {
+            testy_core::pipeline_shard::ShardPlannerAlgorithm::WhaleLpt
+        }
     }
 }
 
@@ -268,7 +270,7 @@ fn resolve_plan_algorithm(
     }
 }
 
-fn render_text(plan: &covy_core::shard::ShardPlan) {
+fn render_text(plan: &testy_core::shard::ShardPlan) {
     println!(
         "shards={} total_ms={} makespan_ms={} imbalance_ratio={:.3} parallel_efficiency={:.3} whale_count={} top_10_share={:.3}",
         plan.shards.len(),

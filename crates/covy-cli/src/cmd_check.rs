@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::Args;
-use covy_core::config::{GateConfig, IssueGateConfig};
-use covy_core::model::CoverageFormat;
-use covy_core::CovyConfig;
+use suite_foundation_core::config::{GateConfig, IssueGateConfig};
+use suite_foundation_core::CovyConfig;
+use suite_packet_core::CoverageFormat;
 
 #[derive(Args)]
 pub struct CheckArgs {
@@ -122,11 +122,11 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
         .chain(config.ingest.strip_prefixes.iter().cloned())
         .collect();
 
-    let request = covy_core::pipeline::PipelineRequest {
+    let request = diffy_core::pipeline::PipelineRequest {
         base: base.to_string(),
         head: head.to_string(),
         source_root,
-        coverage: covy_core::pipeline::PipelineCoverageInput {
+        coverage: diffy_core::pipeline::PipelineCoverageInput {
             paths: args.paths,
             format: coverage_format,
             stdin: args.stdin,
@@ -138,7 +138,7 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
                 "No coverage files specified. Provide file paths, use --stdin, or run `covy ingest` first."
                     .to_string(),
         },
-        diagnostics: covy_core::pipeline::PipelineDiagnosticsInput {
+        diagnostics: diffy_core::pipeline::PipelineDiagnosticsInput {
             issue_patterns: args.issues,
             issues_state_path: args.issues_state,
             no_issues_state: args.no_issues_state,
@@ -148,15 +148,15 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     };
 
     let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
-    let output = covy_core::pipeline::run_analysis(request, &adapters)?;
+    let output = diffy_core::pipeline::run_analysis(request, &adapters)?;
 
     match report.as_str() {
         "json" => {
-            let json = covy_core::report::render_gate_json(&output.gate_result);
+            let json = diffy_core::report::render_gate_json(&output.gate_result);
             println!("{json}");
         }
         "markdown" => {
-            let md = covy_core::report::render_markdown(
+            let md = diffy_core::report::render_markdown(
                 &output.coverage,
                 &output.gate_result,
                 &output.changed_line_context.diffs,
@@ -166,7 +166,7 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
             print!("{md}");
         }
         "github" => {
-            covy_core::report::render_github_annotations(
+            diffy_core::report::render_github_annotations(
                 &output.coverage,
                 &output.changed_line_context.diffs,
                 &output.gate_result,
@@ -174,7 +174,7 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
             );
         }
         _ => {
-            covy_core::report::render_terminal(
+            diffy_core::report::render_terminal(
                 &output.coverage,
                 args.show_missing,
                 "name",
@@ -182,12 +182,12 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
                 false,
             );
             if let Some(diag) = output.diagnostics.as_ref() {
-                covy_core::report::render_issues_terminal(
+                diffy_core::report::render_issues_terminal(
                     diag,
                     Some(&output.changed_line_context.diffs),
                 );
             }
-            covy_core::report::render_gate_result(&output.gate_result);
+            diffy_core::report::render_gate_result(&output.gate_result);
         }
     }
 

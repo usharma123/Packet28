@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use covy_core::config::GateConfig;
-use covy_core::model::CoverageFormat;
-use covy_core::CovyConfig;
+use suite_foundation_core::config::GateConfig;
+use suite_foundation_core::CovyConfig;
+use suite_packet_core::CoverageFormat;
 
 #[derive(Args)]
 pub struct GithubCommentArgs {
@@ -94,11 +94,11 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
         .chain(config.ingest.strip_prefixes.iter().cloned())
         .collect();
 
-    let request = covy_core::pipeline::PipelineRequest {
+    let request = diffy_core::pipeline::PipelineRequest {
         base: base.to_string(),
         head: head.to_string(),
         source_root,
-        coverage: covy_core::pipeline::PipelineCoverageInput {
+        coverage: diffy_core::pipeline::PipelineCoverageInput {
             paths: args.paths,
             format: coverage_format,
             stdin: args.stdin,
@@ -109,7 +109,7 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
             no_inputs_error: "No coverage files specified. Provide file paths or use --stdin."
                 .to_string(),
         },
-        diagnostics: covy_core::pipeline::PipelineDiagnosticsInput {
+        diagnostics: diffy_core::pipeline::PipelineDiagnosticsInput {
             issue_patterns: args.issues,
             issues_state_path: args.issues_state,
             no_issues_state: args.no_issues_state,
@@ -119,9 +119,9 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
     };
 
     let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
-    let output = covy_core::pipeline::run_analysis(request, &adapters)?;
+    let output = diffy_core::pipeline::run_analysis(request, &adapters)?;
 
-    let markdown = covy_core::report::render_markdown(
+    let markdown = diffy_core::report::render_markdown(
         &output.coverage,
         &output.gate_result,
         &output.changed_line_context.diffs,

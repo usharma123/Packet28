@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::Args;
-use covy_core::CovyConfig;
+use suite_foundation_core::CovyConfig;
 
 #[derive(Args)]
 pub struct ReportArgs {
@@ -63,15 +63,15 @@ pub fn run(args: ReportArgs, config_path: &str) -> Result<i32> {
         }
 
         let bytes = std::fs::read(issue_path)?;
-        let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
+        let diagnostics = suite_foundation_core::cache::deserialize_diagnostics(&bytes)?;
 
         match format {
             "json" => {
-                let json = covy_core::report::render_issues_json(&diagnostics);
+                let json = diffy_core::report::render_issues_json(&diagnostics);
                 println!("{json}");
             }
             _ => {
-                covy_core::report::render_issues_terminal(&diagnostics, None);
+                diffy_core::report::render_issues_terminal(&diagnostics, None);
             }
         }
 
@@ -89,17 +89,17 @@ pub fn run(args: ReportArgs, config_path: &str) -> Result<i32> {
     }
 
     let bytes = std::fs::read(input_path)?;
-    let coverage = covy_core::cache::deserialize_coverage(&bytes)?;
+    let coverage = suite_foundation_core::cache::deserialize_coverage(&bytes)?;
 
     let show_missing = args.show_missing || config.report.show_missing;
 
     match format {
         "json" => {
-            let json = covy_core::report::render_json(&coverage, args.below, args.summary_only);
+            let json = diffy_core::report::render_json(&coverage, args.below, args.summary_only);
             println!("{json}");
         }
         _ => {
-            covy_core::report::render_terminal(
+            diffy_core::report::render_terminal(
                 &coverage,
                 show_missing,
                 &args.sort,
