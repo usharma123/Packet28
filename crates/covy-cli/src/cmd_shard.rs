@@ -1,7 +1,6 @@
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 use covy_core::CovyConfig;
 
@@ -21,11 +20,11 @@ pub enum JunitIdGranularityArg {
     Class,
 }
 
-impl From<JunitIdGranularityArg> for crate::shard_timing::JunitIdGranularity {
+impl From<JunitIdGranularityArg> for covy_core::shard_timing::JunitIdGranularity {
     fn from(value: JunitIdGranularityArg) -> Self {
         match value {
-            JunitIdGranularityArg::Method => crate::shard_timing::JunitIdGranularity::Method,
-            JunitIdGranularityArg::Class => crate::shard_timing::JunitIdGranularity::Class,
+            JunitIdGranularityArg::Method => covy_core::shard_timing::JunitIdGranularity::Method,
+            JunitIdGranularityArg::Class => covy_core::shard_timing::JunitIdGranularity::Class,
         }
     }
 }
@@ -126,14 +125,6 @@ pub struct ShardUpdateArgs {
     pub json: bool,
 }
 
-#[derive(Debug, serde::Serialize)]
-struct ShardUpdateSummary {
-    observations_ingested: usize,
-    tests_updated: usize,
-    timings_path: String,
-    exported_json: Option<String>,
-}
-
 const SHARD_PLAN_SCHEMA_EXAMPLES: &str = r#"{
   "type": "shard-plan-input-schemas",
   "tasks_json": {
@@ -163,37 +154,40 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
             let shard_count = plan
                 .shards
                 .ok_or_else(|| anyhow::anyhow!("--shards is required"))?;
-            let tasks = load_tasks(&plan)?;
-            if tasks.is_empty() {
-                anyhow::bail!("No tasks provided for shard planning");
-            }
-            let tasks = apply_tag_filters(tasks, &plan, &config)?;
-            if tasks.is_empty() {
-                anyhow::bail!("No tasks remained after applying tier/tag filters");
-            }
-            let tests: Vec<String> = tasks.into_iter().map(|task| task.id).collect();
             let timings_path = plan
                 .timings
                 .as_deref()
                 .unwrap_or(&config.shard.timings_path)
                 .to_string();
-            let timings = load_timings(Path::new(&timings_path))?;
             let unknown_seconds = plan
                 .unknown_test_seconds
                 .unwrap_or(config.shard.unknown_test_seconds);
-            let unknown_ms = (unknown_seconds * 1000.0) as u64;
-            let jobs = covy_core::shard::build_timed_jobs(&tests, &timings, unknown_ms);
             let algorithm = resolve_plan_algorithm(&plan, &config)?;
-            let shard_plan = match algorithm {
-                PlannerAlgorithmArg::Lpt => covy_core::shard::plan_shards_lpt(&jobs, shard_count),
-                PlannerAlgorithmArg::WhaleLpt => {
-                    covy_core::shard::plan_shards_whale_lpt(&jobs, shard_count)
-                }
-            };
 
-            if let Some(dir) = plan.write_files.as_deref() {
-                write_shard_files(dir, &shard_plan)?;
-            }
+            let response =
+                covy_core::shard_pipeline::run_shard(covy_core::shard_pipeline::ShardRequest {
+                    mode: covy_core::shard_pipeline::ShardMode::Plan(
+                        covy_core::shard_pipeline::ShardPlanRequest {
+                            shard_count,
+                            tasks_json: plan.tasks_json,
+                            tests_file: plan.tests_file,
+                            impact_json: plan.impact_json,
+                            tier: plan.tier,
+                            include_tag: plan.include_tag,
+                            exclude_tag: plan.exclude_tag,
+                            tier_exclude_tags_pr: config.shard.tiers.pr.exclude_tags,
+                            tier_exclude_tags_nightly: config.shard.tiers.nightly.exclude_tags,
+                            timings_path,
+                            unknown_test_seconds: unknown_seconds,
+                            algorithm: to_core_algorithm(algorithm),
+                            write_files: plan.write_files,
+                        },
+                    ),
+                })?;
+
+            let shard_plan = response
+                .shard_plan
+                .ok_or_else(|| anyhow::anyhow!("shard plan response missing shard plan"))?;
 
             if plan.json {
                 println!("{}", serde_json::to_string_pretty(&shard_plan)?);
@@ -209,41 +203,23 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
                 .as_deref()
                 .unwrap_or(&config.shard.timings_path)
                 .to_string();
-            let mut timings = load_timings(Path::new(&timings_path))?;
 
-            let junit_files = resolve_globs(&update.junit_xml)?;
-            let jsonl_files = resolve_globs(&update.timings_jsonl)?;
-            if junit_files.is_empty() && jsonl_files.is_empty() {
-                anyhow::bail!(
-                    "No timing inputs found. Provide --junit-xml and/or --timings-jsonl."
-                );
-            }
+            let response =
+                covy_core::shard_pipeline::run_shard(covy_core::shard_pipeline::ShardRequest {
+                    mode: covy_core::shard_pipeline::ShardMode::Update(
+                        covy_core::shard_pipeline::ShardUpdateRequest {
+                            junit_xml: update.junit_xml,
+                            timings_jsonl: update.timings_jsonl,
+                            timings_path,
+                            export_json: update.export_json,
+                            junit_id_granularity: update.junit_id_granularity.into(),
+                        },
+                    ),
+                })?;
 
-            let observations = load_timing_observations(
-                &junit_files,
-                &jsonl_files,
-                update.junit_id_granularity.into(),
-            )?;
-            if observations.is_empty() {
-                anyhow::bail!("No timing observations found in provided inputs.");
-            }
-
-            let updated = apply_timing_observations(&mut timings, &observations);
-            write_timings(Path::new(&timings_path), &timings)?;
-
-            let exported_json = if let Some(path) = update.export_json.as_deref() {
-                write_timings_json(Path::new(path), &timings)?;
-                Some(path.to_string())
-            } else {
-                None
-            };
-
-            let summary = ShardUpdateSummary {
-                observations_ingested: observations.len(),
-                tests_updated: updated,
-                timings_path,
-                exported_json,
-            };
+            let summary = response
+                .timing_summary
+                .ok_or_else(|| anyhow::anyhow!("shard update response missing timing summary"))?;
             if update.json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
@@ -260,149 +236,13 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PlanningTask {
-    id: String,
-    tags: Vec<String>,
-}
-
-fn load_tasks(args: &ShardPlanArgs) -> Result<Vec<PlanningTask>> {
-    let provided = [
-        args.tasks_json.is_some(),
-        args.tests_file.is_some(),
-        args.impact_json.is_some(),
-    ]
-    .into_iter()
-    .filter(|v| *v)
-    .count();
-
-    if provided != 1 {
-        anyhow::bail!("Provide exactly one of --tasks-json, --tests-file, or --impact-json");
+fn to_core_algorithm(
+    value: PlannerAlgorithmArg,
+) -> covy_core::shard_pipeline::ShardPlannerAlgorithm {
+    match value {
+        PlannerAlgorithmArg::Lpt => covy_core::shard_pipeline::ShardPlannerAlgorithm::Lpt,
+        PlannerAlgorithmArg::WhaleLpt => covy_core::shard_pipeline::ShardPlannerAlgorithm::WhaleLpt,
     }
-
-    if let Some(path) = &args.tasks_json {
-        return load_tasks_from_tasks_json(Path::new(path));
-    }
-    if let Some(path) = &args.tests_file {
-        return load_tasks_from_file(Path::new(path));
-    }
-    load_tasks_from_impact_json(Path::new(args.impact_json.as_deref().unwrap_or_default()))
-}
-
-fn load_tasks_from_file(path: &Path) -> Result<Vec<PlanningTask>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read tests file {}", path.display()))?;
-    let tests = content
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|id| PlanningTask {
-            id: id.to_string(),
-            tags: Vec::new(),
-        })
-        .collect();
-    Ok(tests)
-}
-
-const IMPACT_RESULT_EXAMPLE: &str = r#"{
-  "selected_tests": ["com.foo.BarTest", "tests/test_x.py::test_a"],
-  "smoke_tests": [],
-  "missing_mappings": [],
-  "stale": false,
-  "confidence": 1.0,
-  "escalate_full_suite": false
-}"#;
-
-fn load_tasks_from_impact_json(path: &Path) -> Result<Vec<PlanningTask>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read impact JSON {}", path.display()))?;
-    let impact: covy_core::impact::ImpactResult = crate::cmd_common::deserialize_json_with_example(
-        &content,
-        "ImpactResult",
-        IMPACT_RESULT_EXAMPLE,
-    )?;
-    Ok(impact
-        .selected_tests
-        .into_iter()
-        .map(|id| PlanningTask {
-            id,
-            tags: Vec::new(),
-        })
-        .collect())
-}
-
-const TASKSET_EXAMPLE: &str = r#"{
-  "schema_version": 1,
-  "tasks": [
-    {"id": "com.foo.BarTest", "selector": "com.foo.BarTest", "est_ms": 1200, "tags": ["unit"]},
-    {"id": "tests/test_mod.py::test_one", "selector": "tests/test_mod.py::test_one", "est_ms": 900}
-  ]
-}"#;
-
-fn load_tasks_from_tasks_json(path: &Path) -> Result<Vec<PlanningTask>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read tasks JSON {}", path.display()))?;
-    let tasks: covy_core::shard::TaskSet =
-        crate::cmd_common::deserialize_json_with_example(&content, "TaskSet", TASKSET_EXAMPLE)?;
-    let ids = tasks
-        .tasks
-        .into_iter()
-        .map(|task| PlanningTask {
-            id: task.id.trim().to_string(),
-            tags: task.tags,
-        })
-        .filter(|task| !task.id.is_empty())
-        .collect();
-    Ok(ids)
-}
-
-fn apply_tag_filters(
-    tasks: Vec<PlanningTask>,
-    args: &ShardPlanArgs,
-    config: &CovyConfig,
-) -> Result<Vec<PlanningTask>> {
-    let tier = args.tier.trim().to_ascii_lowercase();
-    let mut exclude: std::collections::BTreeSet<String> = match tier.as_str() {
-        "pr" => config
-            .shard
-            .tiers
-            .pr
-            .exclude_tags
-            .iter()
-            .map(normalize_tag)
-            .collect(),
-        "nightly" => config
-            .shard
-            .tiers
-            .nightly
-            .exclude_tags
-            .iter()
-            .map(normalize_tag)
-            .collect(),
-        _ => anyhow::bail!(
-            "Unsupported tier '{}'. Expected 'pr' or 'nightly'",
-            args.tier
-        ),
-    };
-    exclude.extend(args.exclude_tag.iter().map(normalize_tag));
-    let include: std::collections::BTreeSet<String> =
-        args.include_tag.iter().map(normalize_tag).collect();
-
-    let filtered = tasks
-        .into_iter()
-        .filter(|task| {
-            let task_tags: Vec<String> = task.tags.iter().map(normalize_tag).collect();
-            let include_ok =
-                include.is_empty() || task_tags.iter().any(|tag| include.contains(tag));
-            let excluded = task_tags.iter().any(|tag| exclude.contains(tag));
-            include_ok && !excluded
-        })
-        .collect();
-    Ok(filtered)
-}
-
-fn normalize_tag(tag: impl AsRef<str>) -> String {
-    tag.as_ref().trim().to_ascii_lowercase()
 }
 
 fn resolve_plan_algorithm(
@@ -426,138 +266,6 @@ fn resolve_plan_algorithm(
             configured
         ),
     }
-}
-
-fn load_timings(path: &Path) -> Result<covy_core::testmap::TestTimingHistory> {
-    if !path.exists() {
-        return Ok(covy_core::testmap::TestTimingHistory::default());
-    }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Failed to read timings file {}", path.display()))?;
-    covy_core::cache::deserialize_test_timings(&bytes).map_err(Into::into)
-}
-
-fn write_timings(path: &Path, timings: &covy_core::testmap::TestTimingHistory) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let bytes = covy_core::cache::serialize_test_timings(timings)?;
-    std::fs::write(path, bytes)
-        .with_context(|| format!("Failed to write timings file {}", path.display()))?;
-    Ok(())
-}
-
-fn write_timings_json(path: &Path, timings: &covy_core::testmap::TestTimingHistory) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(timings)?;
-    std::fs::write(path, json)
-        .with_context(|| format!("Failed to write timings JSON {}", path.display()))?;
-    Ok(())
-}
-
-fn resolve_globs(patterns: &[String]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for pattern in patterns {
-        let matches: Vec<_> = glob::glob(pattern)
-            .with_context(|| format!("Invalid glob pattern: {pattern}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        if matches.is_empty() {
-            tracing::warn!("No files matched pattern: {pattern}");
-        }
-        files.extend(matches);
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-fn load_timing_observations(
-    junit_files: &[PathBuf],
-    jsonl_files: &[PathBuf],
-    junit_id_granularity: crate::shard_timing::JunitIdGranularity,
-) -> Result<Vec<crate::shard_timing::TimingObservation>> {
-    let mut observations = Vec::new();
-    for path in junit_files {
-        observations.extend(crate::shard_timing::parse_junit_xml_file(
-            path,
-            junit_id_granularity,
-        )?);
-    }
-    for path in jsonl_files {
-        observations.extend(crate::shard_timing::parse_timing_jsonl_file(path)?);
-    }
-    Ok(observations)
-}
-
-fn apply_timing_observations(
-    timings: &mut covy_core::testmap::TestTimingHistory,
-    observations: &[crate::shard_timing::TimingObservation],
-) -> usize {
-    use std::collections::BTreeMap;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut grouped: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
-    for observation in observations {
-        grouped
-            .entry(observation.test_id.as_str())
-            .or_default()
-            .push(observation.duration_ms);
-    }
-
-    for (test_id, durations) in &grouped {
-        if durations.is_empty() {
-            continue;
-        }
-        let new_count = durations.len() as u32;
-        let new_total: u64 = durations.iter().sum();
-        let new_avg = new_total / durations.len() as u64;
-
-        let prev_count = timings.sample_count.get(*test_id).copied().unwrap_or(0);
-        let prev_duration = timings
-            .duration_ms
-            .get(*test_id)
-            .copied()
-            .unwrap_or(new_avg);
-        let merged_count = prev_count.saturating_add(new_count);
-        let merged_duration = if merged_count == 0 {
-            new_avg
-        } else {
-            (((prev_duration as u128 * prev_count as u128) + (new_avg as u128 * new_count as u128))
-                / (merged_count as u128)) as u64
-        };
-
-        timings
-            .duration_ms
-            .insert((*test_id).to_string(), merged_duration);
-        timings
-            .sample_count
-            .insert((*test_id).to_string(), merged_count);
-        timings.last_seen.insert((*test_id).to_string(), now);
-    }
-
-    timings.generated_at = now;
-    grouped.len()
-}
-
-fn write_shard_files(dir: &str, plan: &covy_core::shard::ShardPlan) -> Result<()> {
-    let dir = PathBuf::from(dir);
-    std::fs::create_dir_all(&dir)?;
-    for shard in &plan.shards {
-        let path = dir.join(format!("shard-{}.txt", shard.id + 1));
-        let content = if shard.tests.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", shard.tests.join("\n"))
-        };
-        std::fs::write(path, content)?;
-    }
-    Ok(())
 }
 
 fn render_text(plan: &covy_core::shard::ShardPlan) {
@@ -587,152 +295,6 @@ fn render_text(plan: &covy_core::shard::ShardPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_load_tests_from_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("tests.txt");
-        std::fs::write(&path, "a\n\nb\n").unwrap();
-        let tests = load_tasks_from_file(&path).unwrap();
-        assert_eq!(
-            tests,
-            vec![
-                PlanningTask {
-                    id: "a".to_string(),
-                    tags: Vec::new()
-                },
-                PlanningTask {
-                    id: "b".to_string(),
-                    tags: Vec::new()
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn test_load_tests_from_impact_json_with_python_nodeids() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("impact.json");
-        let payload = serde_json::json!({
-            "selected_tests": ["tests/test_x.py::test_a", "tests/test_y.py::test_b"],
-            "smoke_tests": [],
-            "missing_mappings": [],
-            "stale": false,
-            "confidence": 1.0,
-            "escalate_full_suite": false
-        });
-        std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
-        let tests = load_tasks_from_impact_json(&path).unwrap();
-        assert_eq!(
-            tests,
-            vec![
-                PlanningTask {
-                    id: "tests/test_x.py::test_a".to_string(),
-                    tags: Vec::new()
-                },
-                PlanningTask {
-                    id: "tests/test_y.py::test_b".to_string(),
-                    tags: Vec::new()
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn test_load_tests_from_tasks_json() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("tasks.json");
-        let payload = serde_json::json!({
-            "schema_version": 1,
-            "tasks": [
-                {"id": "com.foo.BarTest", "selector": "com.foo.BarTest", "est_ms": 1200},
-                {"id": "tests/test_mod.py::test_one", "selector": "tests/test_mod.py::test_one", "est_ms": 900}
-            ]
-        });
-        std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
-        let tests = load_tasks_from_tasks_json(&path).unwrap();
-        assert_eq!(
-            tests,
-            vec![
-                PlanningTask {
-                    id: "com.foo.BarTest".to_string(),
-                    tags: Vec::new()
-                },
-                PlanningTask {
-                    id: "tests/test_mod.py::test_one".to_string(),
-                    tags: Vec::new()
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn test_apply_tag_filters_pr_excludes_slow() {
-        let tasks = vec![
-            PlanningTask {
-                id: "fast-test".to_string(),
-                tags: vec!["unit".to_string()],
-            },
-            PlanningTask {
-                id: "slow-test".to_string(),
-                tags: vec!["slow".to_string()],
-            },
-        ];
-        let args = ShardPlanArgs {
-            shards: Some(2),
-            tasks_json: None,
-            tier: "pr".to_string(),
-            include_tag: Vec::new(),
-            exclude_tag: Vec::new(),
-            tests_file: None,
-            impact_json: None,
-            timings: None,
-            unknown_test_seconds: None,
-            algorithm: None,
-            json: true,
-            write_files: None,
-            schema: false,
-        };
-        let filtered = apply_tag_filters(tasks, &args, &CovyConfig::default()).unwrap();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].id, "fast-test");
-    }
-
-    #[test]
-    fn test_apply_timing_observations_updates_history() {
-        let mut timings = covy_core::testmap::TestTimingHistory::default();
-        timings.duration_ms.insert("t1".to_string(), 1000);
-        timings.sample_count.insert("t1".to_string(), 2);
-        let obs = vec![
-            crate::shard_timing::TimingObservation {
-                test_id: "t1".to_string(),
-                duration_ms: 2000,
-            },
-            crate::shard_timing::TimingObservation {
-                test_id: "t2".to_string(),
-                duration_ms: 800,
-            },
-        ];
-        let updated = apply_timing_observations(&mut timings, &obs);
-        assert_eq!(updated, 2);
-        assert!(timings.duration_ms.contains_key("t1"));
-        assert!(timings.duration_ms.contains_key("t2"));
-        assert_eq!(timings.sample_count["t1"], 3);
-        assert_eq!(timings.sample_count["t2"], 1);
-    }
-
-    #[test]
-    fn test_write_and_load_timings_round_trip() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("timings.bin");
-        let mut timings = covy_core::testmap::TestTimingHistory::default();
-        timings.duration_ms.insert("t".to_string(), 123);
-        timings.sample_count.insert("t".to_string(), 1);
-        write_timings(&path, &timings).unwrap();
-        let loaded = load_timings(&path).unwrap();
-        assert_eq!(loaded.duration_ms.get("t"), Some(&123));
-        assert_eq!(loaded.sample_count.get("t"), Some(&1));
-    }
 
     #[test]
     fn test_resolve_plan_algorithm_prefers_cli_flag() {

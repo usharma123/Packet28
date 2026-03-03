@@ -65,3 +65,11 @@ pub mod merge {
 pub mod shard {
     pub use testy_core::shard::*;
 }
+
+pub mod shard_pipeline {
+    pub use testy_core::pipeline_shard::*;
+}
+
+pub mod shard_timing {
+    pub use testy_core::shard_timing::*;
+}
