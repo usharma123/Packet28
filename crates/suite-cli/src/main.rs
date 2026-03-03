@@ -1,5 +1,6 @@
 mod cmd_common;
 mod cmd_diff;
+mod cmd_guard;
 mod cmd_impact;
 mod cmd_map;
 mod cmd_shard;
@@ -27,6 +28,8 @@ enum Commands {
     Diff(DiffArgs),
     /// Test domain commands
     Test(TestArgs),
+    /// Guard/policy domain commands
+    Guard(GuardArgs),
 }
 
 #[derive(Args)]
@@ -57,6 +60,20 @@ enum TestCommands {
     Map(cmd_map::MapArgs),
 }
 
+#[derive(Args)]
+struct GuardArgs {
+    #[command(subcommand)]
+    command: GuardCommands,
+}
+
+#[derive(Subcommand)]
+enum GuardCommands {
+    /// Validate guard policy config (context.yaml) shape and rule syntax
+    Validate(cmd_guard::ValidateArgs),
+    /// Evaluate one packet against guard policy config
+    Check(cmd_guard::CheckArgs),
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -68,6 +85,10 @@ fn main() {
             TestCommands::Impact(args) => cmd_impact::run(args, &cli.config),
             TestCommands::Shard(args) => cmd_shard::run(args, &cli.config),
             TestCommands::Map(args) => cmd_map::run(args),
+        },
+        Commands::Guard(guard) => match guard.command {
+            GuardCommands::Validate(args) => cmd_guard::run_validate(args, &cli.config),
+            GuardCommands::Check(args) => cmd_guard::run_check(args, &cli.config),
         },
     };
 

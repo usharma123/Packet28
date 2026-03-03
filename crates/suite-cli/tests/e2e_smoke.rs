@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -28,6 +29,42 @@ fn write_manifest(path: &Path) {
         fixture("lcov/basic.info")
     );
     std::fs::write(path, line).unwrap();
+}
+
+fn write_guard_context(path: &Path) {
+    fs::write(
+        path,
+        r#"
+version: 1
+policy:
+  allowed_tools: ["covy"]
+  allowed_reducers: ["merge"]
+  paths:
+    include: ["src/**"]
+    exclude: ["src/private/**"]
+  budgets:
+    token_cap: 200
+    runtime_ms_cap: 1000
+  redaction:
+    forbidden_patterns: ["(?i)password"]
+"#,
+    )
+    .unwrap();
+}
+
+fn write_guard_packet(path: &Path) {
+    fs::write(
+        path,
+        r#"{
+  "tool": "covy",
+  "reducer": "merge",
+  "paths": ["src/lib.rs"],
+  "token_usage": 50,
+  "runtime_ms": 300,
+  "payload": {"message": "all clear"}
+}"#,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -84,4 +121,39 @@ fn test_suite_test_impact_smoke() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"selected_tests\""));
+}
+
+#[test]
+fn test_suite_guard_validate_smoke() {
+    let dir = TempDir::new().unwrap();
+    let context = dir.path().join("context.yaml");
+    write_guard_context(&context);
+
+    suite_cmd()
+        .args(["guard", "validate", "--config", context.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"valid\": true"));
+}
+
+#[test]
+fn test_suite_guard_check_smoke() {
+    let dir = TempDir::new().unwrap();
+    let context = dir.path().join("context.yaml");
+    let packet = dir.path().join("packet.json");
+    write_guard_context(&context);
+    write_guard_packet(&packet);
+
+    suite_cmd()
+        .args([
+            "guard",
+            "check",
+            "--packet",
+            packet.to_str().unwrap(),
+            "--config",
+            context.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"passed\": true"));
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/covy-core", "crates/covy-ingest", "crates/covy-cli", "crates/diffy-cli", "crates/testy-cli", "crates/suite-packet-core", "crates/suite-foundation-core", "crates/diffy-core", "crates/testy-core", "crates/suite-cli", "crates/testy-cli-common"]
+members = ["crates/covy-core", "crates/covy-ingest", "crates/covy-cli", "crates/diffy-cli", "crates/testy-cli", "crates/suite-packet-core", "crates/suite-foundation-core", "crates/diffy-core", "crates/testy-core", "crates/suite-cli", "crates/testy-cli-common", "crates/guardy-core"]
 resolver = "2"
 
 [workspace.package]
@@ -19,6 +19,7 @@ thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = "0.9"
 toml = "0.8"
 toml_edit = "0.22"
 bincode = "1"
