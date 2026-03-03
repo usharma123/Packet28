@@ -42,6 +42,10 @@ pub mod report {
     pub use diffy_core::report::*;
 }
 
+pub mod pipeline {
+    pub use diffy_core::pipeline::*;
+}
+
 pub mod impact {
     pub use testy_core::impact::*;
 }

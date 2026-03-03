@@ -95,8 +95,7 @@ pub fn run(args: ReportArgs, config_path: &str) -> Result<i32> {
 
     match format {
         "json" => {
-            let json =
-                covy_core::report::render_json(&coverage, args.below, args.summary_only);
+            let json = covy_core::report::render_json(&coverage, args.below, args.summary_only);
             println!("{json}");
         }
         _ => {

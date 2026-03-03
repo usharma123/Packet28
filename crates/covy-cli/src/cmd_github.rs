@@ -1,11 +1,9 @@
-use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
 use covy_core::config::GateConfig;
-use covy_core::diagnostics::DiagnosticsData;
-use covy_core::model::CoverageData;
+use covy_core::model::CoverageFormat;
 use covy_core::CovyConfig;
 
 #[derive(Args)]
@@ -73,41 +71,13 @@ pub struct GithubCommentArgs {
 
 pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
     crate::cmd_common::maybe_warn_deprecated(
-        "warning: `covy github-comment` is deprecated; use `covy comment` + `covy annotate` (or `covy pr`)."
+        "warning: `covy github-comment` is deprecated; use `covy comment` + `covy annotate` (or `covy pr`).",
     );
 
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
-
-    // Build a CheckArgs-compatible ingest
-    let mut coverage = ingest_coverage(&args, &config)?;
-
-    // Normalize
-    let source_root = args.source_root.as_deref().map(Path::new);
-    covy_core::pathmap::auto_normalize_paths(&mut coverage, source_root);
-
-    // Diff first so cached diagnostics can be loaded selectively.
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
 
-    tracing::info!("Computing diff {base}..{head}");
-    let diffs = covy_core::diff::git_diff(base, head)?;
-    let changed_paths: HashSet<String> = diffs.iter().map(|d| d.path.clone()).collect();
-
-    let mut loaded = resolve_diagnostics(
-        &args.issues,
-        args.issues_state.as_deref(),
-        args.no_issues_state,
-        &changed_paths,
-        source_root,
-    )?;
-
-    if let Some(diag) = loaded.data.as_mut() {
-        if loaded.needs_normalization {
-            covy_core::pathmap::auto_normalize_issue_paths(diag, source_root);
-        }
-    }
-
-    // Gate
     let gate_config = GateConfig {
         fail_under_total: args.fail_under_total.or(config.gate.fail_under_total),
         fail_under_changed: args.fail_under_changed.or(config.gate.fail_under_changed),
@@ -115,24 +85,55 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
         issues: config.gate.issues.clone(),
     };
 
-    let gate_result =
-        covy_core::gate::evaluate_full_gate(&gate_config, &coverage, loaded.data.as_ref(), &diffs);
+    let coverage_format = parse_format(&args.format)?;
+    let source_root = args.source_root.as_ref().map(PathBuf::from);
+    let strip_prefixes: Vec<String> = args
+        .strip_prefix
+        .iter()
+        .cloned()
+        .chain(config.ingest.strip_prefixes.iter().cloned())
+        .collect();
 
-    // Render markdown
+    let request = covy_core::pipeline::PipelineRequest {
+        base: base.to_string(),
+        head: head.to_string(),
+        source_root,
+        coverage: covy_core::pipeline::PipelineCoverageInput {
+            paths: args.paths,
+            format: coverage_format,
+            stdin: args.stdin,
+            input_state_path: None,
+            default_input_state_path: None,
+            strip_prefixes,
+            reject_paths_with_input: true,
+            no_inputs_error: "No coverage files specified. Provide file paths or use --stdin."
+                .to_string(),
+        },
+        diagnostics: covy_core::pipeline::PipelineDiagnosticsInput {
+            issue_patterns: args.issues,
+            issues_state_path: args.issues_state,
+            no_issues_state: args.no_issues_state,
+            default_issues_state_path: ".covy/state/issues.bin".to_string(),
+        },
+        gate: gate_config,
+    };
+
+    let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
+    let output = covy_core::pipeline::run_pipeline(request, &adapters)?;
+
     let markdown = covy_core::report::render_markdown(
-        &coverage,
-        &gate_result,
-        &diffs,
+        &output.coverage,
+        &output.gate_result,
+        &output.changed_line_context.diffs,
         args.show_missing,
-        loaded.data.as_ref(),
+        output.diagnostics.as_ref(),
     );
 
     if args.dry_run {
         print!("{markdown}");
-        return Ok(if gate_result.passed { 0 } else { 1 });
+        return Ok(if output.gate_result.passed { 0 } else { 1 });
     }
 
-    // Post to GitHub
     let token =
         std::env::var("GITHUB_TOKEN").context("GITHUB_TOKEN environment variable is required")?;
     let repo = std::env::var("GITHUB_REPOSITORY")
@@ -143,13 +144,10 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
     let api_base =
         std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into());
 
-    // Find existing covy comment
     let comments_url = format!("{api_base}/repos/{repo}/issues/{pr_number}/comments");
-
     let existing_id = find_existing_comment(&comments_url, &token)?;
 
     if let Some(comment_id) = existing_id {
-        // Update existing comment
         let url = format!("{api_base}/repos/{repo}/issues/comments/{comment_id}");
         let body = serde_json::json!({ "body": markdown });
         ureq::patch(&url)
@@ -159,7 +157,6 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
             .context("Failed to update GitHub comment")?;
         tracing::info!("Updated existing comment #{comment_id}");
     } else {
-        // Create new comment
         let body = serde_json::json!({ "body": markdown });
         ureq::post(&comments_url)
             .header("Authorization", &format!("Bearer {token}"))
@@ -169,7 +166,19 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
         tracing::info!("Created new PR comment");
     }
 
-    Ok(if gate_result.passed { 0 } else { 1 })
+    Ok(if output.gate_result.passed { 0 } else { 1 })
+}
+
+fn parse_format(s: &str) -> Result<Option<CoverageFormat>> {
+    match s {
+        "lcov" => Ok(Some(CoverageFormat::Lcov)),
+        "cobertura" => Ok(Some(CoverageFormat::Cobertura)),
+        "jacoco" => Ok(Some(CoverageFormat::JaCoCo)),
+        "gocov" => Ok(Some(CoverageFormat::GoCov)),
+        "llvm-cov" => Ok(Some(CoverageFormat::LlvmCov)),
+        "auto" => Ok(None),
+        other => anyhow::bail!("Unknown format: {other}"),
+    }
 }
 
 fn detect_pr_number() -> Option<u64> {
@@ -206,191 +215,4 @@ fn find_existing_comment(url: &str, token: &str) -> Result<Option<u64>> {
     }
 
     Ok(None)
-}
-
-fn ingest_coverage(args: &GithubCommentArgs, config: &CovyConfig) -> Result<CoverageData> {
-    let format = match args.format.as_str() {
-        "lcov" => Some(covy_core::CoverageFormat::Lcov),
-        "cobertura" => Some(covy_core::CoverageFormat::Cobertura),
-        "jacoco" => Some(covy_core::CoverageFormat::JaCoCo),
-        "gocov" => Some(covy_core::CoverageFormat::GoCov),
-        "llvm-cov" => Some(covy_core::CoverageFormat::LlvmCov),
-        "auto" => None,
-        other => anyhow::bail!("Unknown format: {other}"),
-    };
-
-    if args.stdin {
-        let fmt = format
-            .ok_or_else(|| anyhow::anyhow!("--format is required when reading from --stdin"))?;
-        return Ok(covy_ingest::ingest_reader(std::io::stdin().lock(), fmt)?);
-    }
-
-    if args.paths.is_empty() {
-        anyhow::bail!("No coverage files specified. Provide file paths or use --stdin.");
-    }
-
-    let mut files = Vec::new();
-    for pattern in &args.paths {
-        let matches: Vec<_> = glob::glob(pattern)
-            .context(format!("Invalid glob pattern: {pattern}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        files.extend(matches);
-    }
-
-    if files.is_empty() {
-        anyhow::bail!("No coverage files found");
-    }
-
-    let strip_prefixes: Vec<&str> = args
-        .strip_prefix
-        .iter()
-        .chain(config.ingest.strip_prefixes.iter())
-        .map(|s| s.as_str())
-        .collect();
-
-    let mut combined = CoverageData::new();
-    for file in &files {
-        let data = if let Some(fmt) = format {
-            covy_ingest::ingest_path_with_format(file, fmt)?
-        } else {
-            covy_ingest::ingest_path(file)?
-        };
-
-        let data = if strip_prefixes.is_empty() {
-            data
-        } else {
-            let mut result = CoverageData {
-                files: std::collections::BTreeMap::new(),
-                format: data.format,
-                timestamp: data.timestamp,
-            };
-            for (path, fc) in data.files {
-                let mut stripped = path.as_str();
-                for prefix in &strip_prefixes {
-                    if let Some(rest) = stripped.strip_prefix(prefix) {
-                        stripped = rest;
-                        break;
-                    }
-                }
-                result.files.insert(stripped.to_string(), fc);
-            }
-            result
-        };
-
-        combined.merge(&data);
-    }
-
-    Ok(combined)
-}
-
-fn ingest_issues(patterns: &[String]) -> Result<DiagnosticsData> {
-    let mut files = Vec::new();
-    for pattern in patterns {
-        let matches: Vec<_> = glob::glob(pattern)
-            .context(format!("Invalid glob pattern: {pattern}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        files.extend(matches);
-    }
-
-    if files.is_empty() {
-        anyhow::bail!("No diagnostics files found");
-    }
-
-    let mut combined = DiagnosticsData::new();
-    for file in &files {
-        let data = load_diagnostics_input(file)?;
-        combined.merge(&data);
-    }
-
-    Ok(combined)
-}
-
-fn resolve_diagnostics(
-    issues_patterns: &[String],
-    issues_state_path: Option<&str>,
-    no_issues_state: bool,
-    selected_paths: &HashSet<String>,
-    source_root: Option<&Path>,
-) -> Result<LoadedDiagnostics> {
-    if !issues_patterns.is_empty() {
-        return Ok(LoadedDiagnostics {
-            data: Some(ingest_issues(issues_patterns)?),
-            needs_normalization: true,
-        });
-    }
-
-    if no_issues_state {
-        return Ok(LoadedDiagnostics::none());
-    }
-
-    let state_path = issues_state_path.unwrap_or(".covy/state/issues.bin");
-    let state_path = Path::new(state_path);
-    if !state_path.exists() {
-        return Ok(LoadedDiagnostics::none());
-    }
-
-    tracing::info!(
-        "Loading diagnostics from cached state {}",
-        state_path.display()
-    );
-    let (diagnostics, meta) =
-        covy_core::cache::deserialize_diagnostics_for_paths_from_file(state_path, selected_paths)?;
-
-    let needs_normalization = !state_metadata_compatible(meta.as_ref(), source_root);
-    Ok(LoadedDiagnostics {
-        data: Some(diagnostics),
-        needs_normalization,
-    })
-}
-
-fn load_diagnostics_input(path: &Path) -> Result<DiagnosticsData> {
-    if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
-    {
-        let bytes = std::fs::read(path)?;
-        let diagnostics = covy_core::cache::deserialize_diagnostics(&bytes)?;
-        return Ok(diagnostics);
-    }
-
-    covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
-}
-
-#[derive(Default)]
-struct LoadedDiagnostics {
-    data: Option<DiagnosticsData>,
-    needs_normalization: bool,
-}
-
-impl LoadedDiagnostics {
-    fn none() -> Self {
-        Self {
-            data: None,
-            needs_normalization: false,
-        }
-    }
-}
-
-fn state_metadata_compatible(
-    meta: Option<&covy_core::cache::DiagnosticsStateMetadata>,
-    source_root: Option<&Path>,
-) -> bool {
-    let Some(meta) = meta else {
-        return false;
-    };
-
-    if meta.schema_version != covy_core::cache::DIAGNOSTICS_STATE_SCHEMA_VERSION {
-        return false;
-    }
-    if meta.path_norm_version != covy_core::cache::DIAGNOSTICS_PATH_NORM_VERSION {
-        return false;
-    }
-    if !meta.normalized_paths {
-        return false;
-    }
-
-    meta.repo_root_id == covy_core::cache::current_repo_root_id(source_root)
 }

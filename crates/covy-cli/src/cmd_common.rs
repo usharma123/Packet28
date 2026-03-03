@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, ffi::OsString};
 use anyhow::{Context, Result};
 use covy_core::config::GateConfig;
 use covy_core::diagnostics::DiagnosticsData;
-use covy_core::{CoverageData, CovyConfig, FileDiff};
+use covy_core::{CoverageData, CoverageFormat, CovyConfig, FileDiff};
 use roaring::RoaringBitmap;
 
 /// Resolve the report output format: use the explicit value if provided,
@@ -94,6 +94,31 @@ pub fn deserialize_json_with_example<T: serde::de::DeserializeOwned>(
     serde_json::from_str(input).map_err(|e| {
         anyhow::anyhow!("Failed to parse {type_name}: {e}\n\nExpected JSON shape:\n{example}")
     })
+}
+
+pub fn default_pipeline_ingest_adapters() -> covy_core::pipeline::PipelineIngestAdapters {
+    covy_core::pipeline::PipelineIngestAdapters {
+        ingest_coverage_auto: ingest_coverage_auto,
+        ingest_coverage_with_format: ingest_coverage_with_format,
+        ingest_coverage_stdin: ingest_coverage_stdin,
+        ingest_diagnostics: ingest_diagnostics,
+    }
+}
+
+fn ingest_coverage_auto(path: &Path) -> Result<CoverageData> {
+    covy_ingest::ingest_path(path).map_err(Into::into)
+}
+
+fn ingest_coverage_with_format(path: &Path, format: CoverageFormat) -> Result<CoverageData> {
+    covy_ingest::ingest_path_with_format(path, format).map_err(Into::into)
+}
+
+fn ingest_coverage_stdin(format: CoverageFormat) -> Result<CoverageData> {
+    covy_ingest::ingest_reader(std::io::stdin().lock(), format).map_err(Into::into)
+}
+
+fn ingest_diagnostics(path: &Path) -> Result<DiagnosticsData> {
+    covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
 }
 
 pub fn load_coverage_state(path: &str) -> Result<CoverageData> {

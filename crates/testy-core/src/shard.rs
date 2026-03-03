@@ -378,7 +378,10 @@ mod tests {
         ];
         let plan = plan_shards_whale_lpt(&input, 2);
         assert_eq!(plan.shards.len(), 2);
-        assert!(plan.shards.iter().any(|s| s.tests.iter().any(|t| t == "whale")));
+        assert!(plan
+            .shards
+            .iter()
+            .any(|s| s.tests.iter().any(|t| t == "whale")));
     }
 
     #[test]

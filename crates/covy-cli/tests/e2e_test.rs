@@ -399,6 +399,27 @@ fn test_check_loads_coverage_from_state_by_default() {
 }
 
 #[test]
+fn test_check_still_returns_failure_exit_code_when_gate_fails() {
+    covy_cmd()
+        .args([
+            "check",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--fail-under-total",
+            "101",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--report",
+            "json",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("\"passed\": false"));
+}
+
+#[test]
 fn test_check_without_coverage_and_state_fails() {
     let dir = TempDir::new().unwrap();
 
@@ -412,6 +433,28 @@ fn test_check_without_coverage_and_state_fails() {
         .stderr(predicate::str::contains(
             "No coverage files specified and no cached coverage state found",
         ));
+}
+
+#[test]
+fn test_diff_returns_zero_even_when_gate_fails() {
+    covy_cmd()
+        .args([
+            "diff",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--fail-under-total",
+            "101",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--report",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"passed\": false"));
 }
 
 #[test]
@@ -830,6 +873,7 @@ fn test_github_comment_still_works_without_warning_noise() {
         ])
         .assert()
         .success()
+        .stdout(predicate::str::contains("## Coverage Report"))
         .stderr(predicate::str::contains("deprecated").not());
 }
 

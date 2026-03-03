@@ -243,10 +243,10 @@ impl PathMapper {
 
         Arc::clone(
             &self
-            .cached_known_index
-            .as_ref()
-            .expect("known index cache must be initialized")
-            .1,
+                .cached_known_index
+                .as_ref()
+                .expect("known index cache must be initialized")
+                .1,
         )
     }
 

@@ -1101,10 +1101,7 @@ mod tests {
 
         let bytes = serialize_testmap(&index).unwrap();
         let restored = deserialize_testmap(&bytes).unwrap();
-        assert_eq!(
-            restored.metadata.schema_version,
-            TESTMAP_SCHEMA_VERSION
-        );
+        assert_eq!(restored.metadata.schema_version, TESTMAP_SCHEMA_VERSION);
         assert_eq!(restored.test_to_files.len(), 1);
         assert_eq!(restored.file_to_tests.len(), 1);
     }
@@ -1177,7 +1174,9 @@ mod tests {
             .or_default()
             .insert("com.foo.BarTest".to_string());
         index.tests.push("com.foo.BarTest".to_string());
-        index.file_index.push("src/main/java/com/foo/Bar.java".to_string());
+        index
+            .file_index
+            .push("src/main/java/com/foo/Bar.java".to_string());
         index.coverage = vec![vec![vec![10]]];
 
         let bytes = bincode::serialize(&index).unwrap();
