@@ -1,13 +1,37 @@
-covy_pr:
+coverage_suite_pr:
   image: rust:1.76
   stage: test
   rules:
     - if: '$CI_MERGE_REQUEST_IID'
   script:
     - apt-get update && apt-get install -y git curl
-    - cargo build --release -p covy-cli
-    - ./target/release/covy ingest coverage/lcov.info --issues reports/sarif.sarif
-    - ./target/release/covy pr --base-ref origin/$CI_DEFAULT_BRANCH --head-ref HEAD --out-comment comment.md --out-sarif covy.sarif
+    - cargo build --release -p covy-cli -p diffy-cli -p testy-cli -p suite-cli
+    - cargo test --workspace
+    - ./target/release/covy --help > /dev/null
+    - ./target/release/covy ingest --help > /dev/null
+    - ./target/release/diffy analyze --help > /dev/null
+    - ./target/release/testy impact --help > /dev/null
+    - ./target/release/testy shard plan --help > /dev/null
+    - ./target/release/testy testmap build --help > /dev/null
+    - ./target/release/suite diff analyze --help > /dev/null
+    - ./target/release/suite test impact --help > /dev/null
+    - |
+      if [ -f coverage/lcov.info ] && [ -f reports/sarif.sarif ]; then
+        ./target/release/covy ingest coverage/lcov.info --issues reports/sarif.sarif
+      else
+        echo "Skipping ingest example: customize report paths for your repository."
+      fi
+    - |
+      if [ -f .covy/state/latest.bin ]; then
+        ./target/release/covy pr --base-ref origin/$CI_DEFAULT_BRANCH --head-ref HEAD --output-comment comment.md --output-sarif covy.sarif
+      else
+        cat <<'EOF' > comment.md
+        ## covy
+
+        Skipped PR artifacts: no coverage state found. Customize the ingest step for your repository.
+        EOF
+        printf '{"version":"2.1.0","runs":[]}\n' > covy.sarif
+      fi
     - |
       curl --fail --request POST \
         --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \

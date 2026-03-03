@@ -18,3 +18,8 @@ suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
 clap.workspace = true
 anyhow.workspace = true
 colored.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true

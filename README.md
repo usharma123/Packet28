@@ -1,24 +1,53 @@
-# covy
+# Coverage CLI Suite
 
-`covy` is a fast Rust CLI for coverage and diagnostics gating.
+This workspace ships four first-class binaries:
 
-## Why covy
+- `covy`: all-in-one coverage + diagnostics workflow (ingest, check, report, PR artifacts, path tooling).
+- `diffy`: diff-focused coverage/diagnostics gate analysis.
+- `testy`: test impact analysis, sharding, and testmap generation.
+- `suite`: umbrella CLI with domain routing (`suite diff ...`, `suite test ...`).
 
-- Parse coverage from multiple formats (`lcov`, `cobertura`, `jacoco`, `gocov`, `llvm-cov`).
-- Ingest diagnostics from SARIF.
-- Gate PRs on both signals: coverage thresholds + no new issues (errors/warnings/combined) on changed lines.
-- Render terminal, JSON, markdown, and GitHub annotations.
+## When To Use Each
 
-## Quick Start
+- Use `covy` when you want one CLI handling end-to-end coverage and diagnostics workflows.
+- Use `diffy` when you only need diff gate analysis and issue-aware pass/fail output.
+- Use `testy` when you are working specifically on impact planning, sharding, and map artifacts.
+- Use `suite` when you want a single umbrella command namespace split by domain.
+
+## Quickstart (All Binaries)
 
 ```bash
-# Build once
-cargo build --release -p covy-cli
+# Build all binaries
+cargo build --release -p covy-cli -p diffy-cli -p testy-cli -p suite-cli
+```
 
-# Use the built binary for real runs
+`covy` examples:
+
+```bash
 ./target/release/covy ingest tests/fixtures/lcov/basic.info --issues tests/fixtures/sarif/basic.sarif
 ./target/release/covy check tests/fixtures/lcov/basic.info --issues tests/fixtures/sarif/basic.sarif --max-new-errors 0 --json
 ./target/release/covy report --issues
+```
+
+`diffy` examples:
+
+```bash
+./target/release/diffy analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --no-issues-state --json
+```
+
+`testy` examples:
+
+```bash
+./target/release/testy testmap build --manifest artifacts/testmap-manifest.jsonl --output .covy/state/testmap.bin
+./target/release/testy impact --base HEAD --head HEAD --testmap .covy/state/testmap.bin --json
+./target/release/testy shard plan --shards 4 --tasks-json artifacts/tasks.json --json
+```
+
+`suite` examples:
+
+```bash
+./target/release/suite diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --no-issues-state --json
+./target/release/suite test impact --base HEAD --head HEAD --testmap .covy/state/testmap.bin --json
 ```
 
 ## Recent Changes (v0.2.0)

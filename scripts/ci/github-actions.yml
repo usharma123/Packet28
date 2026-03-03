@@ -1,10 +1,10 @@
-name: covy-pr
+name: coverage-suite-pr
 
 on:
   pull_request:
 
 jobs:
-  covy:
+  coverage-suite:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -17,8 +17,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build covy
-        run: cargo build --release -p covy-cli
+      - name: Build all CLI binaries
+        run: cargo build --release -p covy-cli -p diffy-cli -p testy-cli -p suite-cli
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Smoke all CLI command surfaces
+        run: |
+          ./target/release/covy --help > /dev/null
+          ./target/release/covy ingest --help > /dev/null
+          ./target/release/diffy analyze --help > /dev/null
+          ./target/release/testy impact --help > /dev/null
+          ./target/release/testy shard plan --help > /dev/null
+          ./target/release/testy testmap build --help > /dev/null
+          ./target/release/suite diff analyze --help > /dev/null
+          ./target/release/suite test impact --help > /dev/null
 
       - name: Ingest coverage (example)
         run: |
@@ -30,11 +44,21 @@ jobs:
 
       - name: Generate PR artifacts
         run: |
-          ./target/release/covy pr \
-            --base-ref origin/${{ github.base_ref }} \
-            --head-ref HEAD \
-            --out-comment comment.md \
-            --out-sarif covy.sarif
+          if [ -f .covy/state/latest.bin ]; then
+            ./target/release/covy pr \
+              --base-ref origin/${{ github.base_ref }} \
+              --head-ref HEAD \
+              --output-comment comment.md \
+              --output-sarif covy.sarif
+          else
+            echo "Skipping PR artifacts: no coverage state found. Run covy ingest with repo coverage inputs."
+            cat <<'EOF' > comment.md
+            ## covy
+
+            Skipped PR artifacts: no coverage state found. Customize the ingest step for your repository.
+            EOF
+            printf '{"version":"2.1.0","runs":[]}\n' > covy.sarif
+          fi
 
       - name: Upload SARIF
         uses: github/codeql-action/upload-sarif@v3
