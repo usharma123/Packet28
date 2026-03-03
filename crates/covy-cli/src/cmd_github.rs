@@ -119,7 +119,7 @@ pub fn run(args: GithubCommentArgs, config_path: &str) -> Result<i32> {
     };
 
     let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
-    let output = covy_core::pipeline::run_pipeline(request, &adapters)?;
+    let output = covy_core::pipeline::run_analysis(request, &adapters)?;
 
     let markdown = covy_core::report::render_markdown(
         &output.coverage,

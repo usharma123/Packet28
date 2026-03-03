@@ -82,7 +82,7 @@ pub struct PipelineOutput {
 }
 
 /// Canonical orchestration entrypoint for diff analysis.
-pub fn run_pipeline(
+pub fn run_analysis(
     request: PipelineRequest,
     adapters: &PipelineIngestAdapters,
 ) -> Result<PipelineOutput> {

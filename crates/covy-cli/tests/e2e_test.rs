@@ -436,7 +436,7 @@ fn test_check_without_coverage_and_state_fails() {
 }
 
 #[test]
-fn test_diff_returns_zero_even_when_gate_fails() {
+fn test_diff_returns_failure_exit_code_when_gate_fails() {
     covy_cmd()
         .args([
             "diff",
@@ -453,7 +453,7 @@ fn test_diff_returns_zero_even_when_gate_fails() {
             "json",
         ])
         .assert()
-        .success()
+        .code(1)
         .stdout(predicate::str::contains("\"passed\": false"));
 }
 

@@ -101,7 +101,7 @@ pub fn run(args: DiffArgs, config_path: &str) -> Result<i32> {
     };
 
     let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
-    let output = covy_core::pipeline::run_pipeline(request, &adapters)?;
+    let output = covy_core::pipeline::run_analysis(request, &adapters)?;
 
     match report.as_str() {
         "json" => {
@@ -119,6 +119,5 @@ pub fn run(args: DiffArgs, config_path: &str) -> Result<i32> {
         }
     }
 
-    // Render-only command: always success unless command execution errors.
-    Ok(0)
+    Ok(if output.gate_result.passed { 0 } else { 1 })
 }
