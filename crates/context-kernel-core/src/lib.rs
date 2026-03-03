@@ -145,6 +145,17 @@ pub struct KernelAudit {
     pub input_usage: BudgetUsage,
     pub output_usage: BudgetUsage,
     pub total_usage: BudgetUsage,
+    #[serde(default)]
+    pub governance: GovernanceAudit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GovernanceAudit {
+    pub enabled: bool,
+    pub config_path: Option<String>,
+    pub input_audits: Vec<guardy_core::AuditResult>,
+    pub output_audits: Vec<guardy_core::AuditResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -213,6 +224,9 @@ pub enum KernelError {
 
     #[error("cache lock failed: {detail}")]
     CacheLock { detail: String },
+
+    #[error("policy violation for target '{target}': {detail}")]
+    PolicyViolation { target: String, detail: String },
 }
 
 impl KernelError {
@@ -263,8 +277,19 @@ impl KernelError {
                 message: self.to_string(),
                 target: None,
             },
+            KernelError::PolicyViolation { target, .. } => KernelFailure {
+                code: "policy_violation".to_string(),
+                message: self.to_string(),
+                target: Some(target.clone()),
+            },
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct PolicyGuard {
+    config: guardy_core::ContextConfig,
+    config_path: String,
 }
 
 pub struct ExecutionContext {
@@ -362,75 +387,97 @@ impl Kernel {
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let input_usage = usage_for_packets(&req.input_packets);
+        let policy_guard = load_policy_guard(&req.policy_context)?;
+        let mut governance = GovernanceAudit {
+            enabled: policy_guard.is_some(),
+            config_path: policy_guard.as_ref().map(|p| p.config_path.clone()),
+            ..GovernanceAudit::default()
+        };
+
+        if let Some(policy_guard) = &policy_guard {
+            if should_enforce_policy_for_target(&target) {
+                let input_audits =
+                    audit_packets_against_policy(&policy_guard.config, &req.input_packets)?;
+                ensure_policy_audits_pass(&target, "input", &input_audits)?;
+                governance.input_audits = input_audits;
+            }
+        }
 
         enforce_budget(&target, BudgetStage::Input, req.budget, input_usage)?;
 
-        let cache_input = cache_input_for_request(&req, &target);
-        let cache_lookup = {
-            let cache = self
-                .memory
-                .lock()
-                .map_err(|source| KernelError::CacheLock {
-                    detail: source.to_string(),
-                })?;
-            cache.lookup_with_hooks(&target, &cache_input, hooks)
-        };
-
-        if let Some(entry) = cache_lookup.entry {
-            let output_packets = entry
-                .packets
-                .into_iter()
-                .map(|packet| KernelPacket {
-                    packet_id: packet.packet_id,
-                    format: default_packet_format(),
-                    body: packet.body,
-                    token_usage: packet.token_usage,
-                    runtime_ms: packet.runtime_ms,
-                    metadata: packet.metadata,
-                })
-                .collect::<Vec<_>>();
-            let output_packet_count = output_packets.len();
-
-            let output_usage = usage_for_packets(&output_packets);
-            let total_usage = BudgetUsage {
-                tokens: input_usage.tokens.saturating_add(output_usage.tokens),
-                bytes: input_usage.bytes.saturating_add(output_usage.bytes),
-                runtime_ms: input_usage
-                    .runtime_ms
-                    .saturating_add(output_usage.runtime_ms),
+        let cache_lookup = if policy_guard.is_none() {
+            let cache_input = cache_input_for_request(&req, &target);
+            let cache_lookup = {
+                let cache = self
+                    .memory
+                    .lock()
+                    .map_err(|source| KernelError::CacheLock {
+                        detail: source.to_string(),
+                    })?;
+                cache.lookup_with_hooks(&target, &cache_input, hooks)
             };
-            enforce_budget(&target, BudgetStage::Total, req.budget, total_usage)?;
 
-            return Ok(KernelResponse {
-                request_id,
-                target: target.clone(),
-                output_packets,
-                audit: KernelAudit {
-                    reducer: target,
-                    input_packets: req.input_packets.len(),
-                    output_packets: output_packet_count,
-                    budget: req.budget,
-                    input_usage,
-                    output_usage,
-                    total_usage,
-                },
-                metadata: merge_json(
-                    entry.metadata,
-                    json!({
-                        "cache": {
-                            "hit": true,
-                            "key": cache_lookup.cache_key,
-                        }
-                    }),
-                ),
-            });
-        }
+            if let Some(entry) = cache_lookup.entry {
+                let output_packets = entry
+                    .packets
+                    .into_iter()
+                    .map(|packet| KernelPacket {
+                        packet_id: packet.packet_id,
+                        format: default_packet_format(),
+                        body: packet.body,
+                        token_usage: packet.token_usage,
+                        runtime_ms: packet.runtime_ms,
+                        metadata: packet.metadata,
+                    })
+                    .collect::<Vec<_>>();
+                let output_packet_count = output_packets.len();
+
+                let output_usage = usage_for_packets(&output_packets);
+                let total_usage = BudgetUsage {
+                    tokens: input_usage.tokens.saturating_add(output_usage.tokens),
+                    bytes: input_usage.bytes.saturating_add(output_usage.bytes),
+                    runtime_ms: input_usage
+                        .runtime_ms
+                        .saturating_add(output_usage.runtime_ms),
+                };
+                enforce_budget(&target, BudgetStage::Total, req.budget, total_usage)?;
+
+                return Ok(KernelResponse {
+                    request_id,
+                    target: target.clone(),
+                    output_packets,
+                    audit: KernelAudit {
+                        reducer: target,
+                        input_packets: req.input_packets.len(),
+                        output_packets: output_packet_count,
+                        budget: req.budget,
+                        input_usage,
+                        output_usage,
+                        total_usage,
+                        governance,
+                    },
+                    metadata: merge_json(
+                        entry.metadata,
+                        json!({
+                            "cache": {
+                                "hit": true,
+                                "key": cache_lookup.cache_key,
+                            }
+                        }),
+                    ),
+                });
+            }
+
+            Some(cache_lookup)
+        } else {
+            None
+        };
 
         let mut ctx = ExecutionContext {
             request_id,
             target: target.clone(),
             budget: req.budget,
-            policy_context: req.policy_context,
+            policy_context: req.policy_context.clone(),
             reducer_input: req.reducer_input,
             shared: Map::new(),
         };
@@ -438,6 +485,16 @@ impl Kernel {
         let started_at = Instant::now();
         let reducer_result = reducer(&mut ctx, &req.input_packets)?;
         let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        if let Some(policy_guard) = &policy_guard {
+            if should_enforce_policy_for_target(&target) {
+                let output_audits = audit_packets_against_policy(
+                    &policy_guard.config,
+                    &reducer_result.output_packets,
+                )?;
+                ensure_policy_audits_pass(&target, "output", &output_audits)?;
+                governance.output_audits = output_audits;
+            }
+        }
         let output_packet_count = reducer_result.output_packets.len();
 
         let output_usage = usage_for_packets(&reducer_result.output_packets);
@@ -462,19 +519,23 @@ impl Kernel {
                 input_usage,
                 output_usage,
                 total_usage,
+                governance,
             },
             metadata: merge_json(
                 merge_json(ctx.shared_json(), reducer_result.metadata),
                 json!({
                     "cache": {
                         "hit": false,
-                        "key": cache_lookup.cache_key,
+                        "key": cache_lookup
+                            .as_ref()
+                            .map(|lookup| lookup.cache_key.clone())
+                            .unwrap_or_else(|| "governed-no-cache".to_string()),
                     }
                 }),
             ),
         };
 
-        {
+        if let Some(cache_lookup) = cache_lookup {
             let mut cache = self
                 .memory
                 .lock()
@@ -671,7 +732,38 @@ pub fn load_packet_file(path: &Path) -> Result<KernelPacket, KernelError> {
 
 pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("contextq.assemble", run_contextq_assemble);
+    kernel.register_reducer("governed.assemble", run_governed_assemble);
     kernel.register_reducer("guardy.check", run_guardy_check);
+}
+
+fn run_governed_assemble(
+    ctx: &mut ExecutionContext,
+    input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let config_path = ctx
+        .policy_context
+        .get("config_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| KernelError::InvalidRequest {
+            detail: "governed.assemble requires policy_context.config_path".to_string(),
+        })?
+        .to_string();
+
+    let reducer = run_contextq_assemble(ctx, input_packets)?;
+    ctx.set_shared("governed", Value::Bool(true));
+    ctx.set_shared("policy_config_path", Value::String(config_path.clone()));
+    Ok(ReducerResult {
+        output_packets: reducer.output_packets,
+        metadata: merge_json(
+            reducer.metadata,
+            json!({
+                "reducer": "governed.assemble",
+                "governed": true,
+                "config_path": config_path,
+            }),
+        ),
+    })
 }
 
 fn run_contextq_assemble(
@@ -798,6 +890,112 @@ fn run_guardy_check(
             "reducer": "guardy.check",
             "passed": audit.passed,
         }),
+    })
+}
+
+fn load_policy_guard(policy_context: &Value) -> Result<Option<PolicyGuard>, KernelError> {
+    let Some(config_path) = policy_context
+        .get("config_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let config = guardy_core::ContextConfig::load(Path::new(config_path)).map_err(|source| {
+        KernelError::InvalidRequest {
+            detail: format!("invalid policy_context.config_path: {source}"),
+        }
+    })?;
+
+    Ok(Some(PolicyGuard {
+        config,
+        config_path: config_path.to_string(),
+    }))
+}
+
+fn should_enforce_policy_for_target(target: &str) -> bool {
+    target != "guardy.check"
+}
+
+fn audit_packets_against_policy(
+    config: &guardy_core::ContextConfig,
+    packets: &[KernelPacket],
+) -> Result<Vec<guardy_core::AuditResult>, KernelError> {
+    let mut audits = Vec::with_capacity(packets.len());
+    for packet in packets {
+        let guard_packet = kernel_packet_to_guard_packet(packet)?;
+        audits.push(guardy_core::check_packet(config, &guard_packet));
+    }
+    Ok(audits)
+}
+
+fn kernel_packet_to_guard_packet(
+    packet: &KernelPacket,
+) -> Result<guardy_core::GuardPacket, KernelError> {
+    let mut guard_packet = if packet.body.is_object() {
+        serde_json::from_value::<guardy_core::GuardPacket>(packet.body.clone()).map_err(
+            |source| KernelError::InvalidRequest {
+                detail: format!("packet is not guard-compatible JSON: {source}"),
+            },
+        )?
+    } else {
+        guardy_core::GuardPacket {
+            payload: packet.body.clone(),
+            ..guardy_core::GuardPacket::default()
+        }
+    };
+
+    if guard_packet.packet_id.is_none() {
+        guard_packet.packet_id = packet.packet_id.clone();
+    }
+    if guard_packet.token_usage.is_none() {
+        guard_packet.token_usage = packet.token_usage;
+    }
+    if guard_packet.runtime_ms.is_none() {
+        guard_packet.runtime_ms = packet.runtime_ms;
+    }
+    if guard_packet.payload.is_null() {
+        guard_packet.payload = packet.body.clone();
+    }
+
+    Ok(guard_packet)
+}
+
+fn ensure_policy_audits_pass(
+    target: &str,
+    stage: &str,
+    audits: &[guardy_core::AuditResult],
+) -> Result<(), KernelError> {
+    let mut violations = Vec::new();
+
+    for (idx, audit) in audits.iter().enumerate() {
+        if audit.passed {
+            continue;
+        }
+
+        let finding_summary = audit
+            .findings
+            .iter()
+            .take(3)
+            .map(|f| format!("{}:{} ({})", f.rule, f.subject, f.message))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        violations.push(format!("packet#{} [{}]", idx + 1, finding_summary));
+    }
+
+    if violations.is_empty() {
+        return Ok(());
+    }
+
+    Err(KernelError::PolicyViolation {
+        target: target.to_string(),
+        detail: format!(
+            "policy audit failed during {stage}: {}",
+            violations.join("; ")
+        ),
     })
 }
 
@@ -928,6 +1126,54 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    fn write_policy_file(path: &Path, tools: &[&str], reducers: &[&str]) {
+        let tools_yaml = if tools.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[{}]",
+                tools
+                    .iter()
+                    .map(|tool| format!("\"{tool}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let reducers_yaml = if reducers.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[{}]",
+                reducers
+                    .iter()
+                    .map(|reducer| format!("\"{reducer}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        std::fs::write(
+            path,
+            format!(
+                r#"
+version: 1
+policy:
+  allowed_tools: {tools_yaml}
+  allowed_reducers: {reducers_yaml}
+  paths:
+    include: ["src/**"]
+    exclude: []
+  budgets:
+    token_cap: 2000
+    runtime_ms_cap: 2000
+  redaction:
+    forbidden_patterns: []
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn errors_for_unknown_target() {
         let kernel = Kernel::new();
@@ -1032,6 +1278,89 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert_eq!(reducer, "assemble");
+    }
+
+    #[test]
+    fn policy_enforcement_rejects_disallowed_packet_before_contextq() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("context.yaml");
+        write_policy_file(&config_path, &["contextq"], &["assemble"]);
+
+        let kernel = Kernel::with_v1_reducers();
+        let packet = KernelPacket::from_value(
+            json!({
+                "tool": "diffy",
+                "reducer": "analyze",
+                "paths": ["src/lib.rs"],
+                "payload": {"gate_result": {"passed": true}}
+            }),
+            None,
+        );
+
+        let err = kernel
+            .execute(KernelRequest {
+                target: "contextq.assemble".to_string(),
+                input_packets: vec![packet],
+                policy_context: json!({
+                    "config_path": config_path.to_string_lossy().to_string()
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, KernelError::PolicyViolation { .. }));
+    }
+
+    #[test]
+    fn governed_assemble_surfaces_governance_audit() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("context.yaml");
+        write_policy_file(
+            &config_path,
+            &["diffy", "contextq"],
+            &["analyze", "assemble", "contextq.assemble"],
+        );
+
+        let kernel = Kernel::with_v1_reducers();
+        let packet = KernelPacket::from_value(
+            json!({
+                "packet_id": "diffy-analyze-v1",
+                "tool": "diffy",
+                "reducer": "analyze",
+                "paths": ["src/lib.rs"],
+                "payload": {"summary": "ok"},
+                "sections": [{
+                    "title": "Diff Gate Summary",
+                    "body": "passed: true",
+                    "refs": [{"kind":"file","value":"src/lib.rs"}],
+                    "relevance": 1.0
+                }]
+            }),
+            None,
+        );
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "governed.assemble".to_string(),
+                input_packets: vec![packet],
+                policy_context: json!({
+                    "config_path": config_path.to_string_lossy().to_string()
+                }),
+                budget: ExecutionBudget {
+                    token_cap: Some(1200),
+                    byte_cap: Some(24_000),
+                    runtime_ms_cap: Some(1_000),
+                },
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        assert_eq!(response.output_packets.len(), 1);
+        assert!(response.audit.governance.enabled);
+        assert_eq!(response.audit.governance.input_audits.len(), 1);
+        assert_eq!(response.audit.governance.output_audits.len(), 1);
+        assert!(response.audit.governance.input_audits[0].passed);
+        assert!(response.audit.governance.output_audits[0].passed);
     }
 
     #[test]

@@ -18,11 +18,18 @@ pub struct ContextConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
+    #[serde(alias = "tool_allowlist")]
     pub allowed_tools: Vec<String>,
+    #[serde(alias = "reducer_allowlist")]
     pub allowed_reducers: Vec<String>,
+    #[serde(alias = "path_rules")]
     pub paths: PathPolicy,
+    #[serde(alias = "budget_rules")]
     pub budgets: BudgetPolicy,
+    #[serde(alias = "redaction_rules")]
     pub redaction: RedactionPolicy,
+    #[serde(alias = "human_review_flags")]
+    pub human_review: HumanReviewPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -43,6 +50,15 @@ pub struct BudgetPolicy {
 #[serde(default, deny_unknown_fields)]
 pub struct RedactionPolicy {
     pub forbidden_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct HumanReviewPolicy {
+    pub required: bool,
+    pub on_policy_violation: bool,
+    pub on_budget_violation: bool,
+    pub on_redaction_violation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -653,6 +669,40 @@ policy:
         assert!(result.errors.iter().any(|e| e.contains("token_cap")));
         assert!(result.errors.iter().any(|e| e.contains("runtime_ms_cap")));
         assert!(result.errors.iter().any(|e| e.contains("invalid regex")));
+    }
+
+    #[test]
+    fn validate_config_accepts_canonical_policy_aliases() {
+        let yaml = r#"
+version: 1
+policy:
+  tool_allowlist: ["diffy"]
+  reducer_allowlist: ["analyze"]
+  path_rules:
+    include: ["src/**"]
+    exclude: []
+  budget_rules:
+    token_cap: 300
+    runtime_ms_cap: 2000
+  redaction_rules:
+    forbidden_patterns: ["(?i)secret"]
+  human_review:
+    required: true
+    on_policy_violation: true
+    on_budget_violation: false
+    on_redaction_violation: true
+"#;
+
+        let result = validate_config_str(yaml);
+        assert!(result.valid);
+
+        let config = parse_context_strict(yaml).unwrap();
+        assert_eq!(config.policy.allowed_tools, vec!["diffy".to_string()]);
+        assert_eq!(config.policy.allowed_reducers, vec!["analyze".to_string()]);
+        assert!(config.policy.human_review.required);
+        assert!(config.policy.human_review.on_policy_violation);
+        assert!(!config.policy.human_review.on_budget_violation);
+        assert!(config.policy.human_review.on_redaction_violation);
     }
 
     #[test]

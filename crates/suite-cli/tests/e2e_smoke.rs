@@ -52,6 +52,27 @@ policy:
     .unwrap();
 }
 
+fn write_governed_context(path: &Path) {
+    fs::write(
+        path,
+        r#"
+version: 1
+policy:
+  allowed_tools: ["diffy", "contextq"]
+  allowed_reducers: ["analyze", "assemble", "contextq.assemble"]
+  paths:
+    include: ["**"]
+    exclude: []
+  budgets:
+    token_cap: 5000
+    runtime_ms_cap: 5000
+  redaction:
+    forbidden_patterns: []
+"#,
+    )
+    .unwrap();
+}
+
 fn write_guard_packet(path: &Path) {
     fs::write(
         path,
@@ -108,6 +129,33 @@ fn test_suite_diff_analyze_smoke() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"passed\""));
+}
+
+#[test]
+fn test_suite_diff_analyze_governed_smoke() {
+    let dir = TempDir::new().unwrap();
+    let context = dir.path().join("context.yaml");
+    write_governed_context(&context);
+
+    suite_cmd()
+        .args([
+            "diff",
+            "analyze",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--json",
+            "--context-config",
+            context.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"final_packet\""))
+        .stdout(predicate::str::contains("\"tool\": \"contextq\""));
 }
 
 #[test]

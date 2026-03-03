@@ -58,6 +58,18 @@ pub struct AnalyzeArgs {
     /// Path to coverage state file
     #[arg(long)]
     input: Option<String>,
+
+    /// Run governed packet path using this context policy config (context.yaml).
+    #[arg(long)]
+    context_config: Option<String>,
+
+    /// Context assembly token budget for governed mode.
+    #[arg(long, default_value_t = contextq_core::DEFAULT_BUDGET_TOKENS)]
+    context_budget_tokens: u64,
+
+    /// Context assembly byte budget for governed mode.
+    #[arg(long, default_value_t = contextq_core::DEFAULT_BUDGET_BYTES)]
+    context_budget_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +94,15 @@ struct DiffAnalyzeKernelOutput {
     gate_result: suite_packet_core::QualityGateResult,
     diagnostics: Option<suite_packet_core::DiagnosticsData>,
     diffs: Vec<SerializableFileDiff>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiffAnalyzeKernelPacket {
+    packet_id: Option<String>,
+    tool: Option<String>,
+    reducer: Option<String>,
+    paths: Vec<String>,
+    payload: DiffAnalyzeKernelOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,7 +138,25 @@ impl SerializableFileDiff {
     }
 }
 
+fn parse_diff_output(body: &serde_json::Value) -> Result<DiffAnalyzeKernelOutput> {
+    if let Ok(packet) = serde_json::from_value::<DiffAnalyzeKernelPacket>(body.clone()) {
+        return Ok(packet.payload);
+    }
+
+    serde_json::from_value(body.clone())
+        .map_err(|source| anyhow!("invalid diff analyze output packet: {source}"))
+}
+
+fn format_pct(value: Option<f64>) -> String {
+    value
+        .map(|pct| format!("{pct:.2}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
 pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
+    let governed_context_config = args.context_config.clone();
+    let governed_budget_tokens = args.context_budget_tokens;
+    let governed_budget_bytes = args.context_budget_bytes;
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let report =
         if crate::cmd_common::resolve_json_output(args.json, args.report.as_deref(), "--report")? {
@@ -157,12 +196,47 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let output: DiffAnalyzeKernelOutput = serde_json::from_value(output_packet.body.clone())?;
+    let output = parse_diff_output(&output_packet.body)?;
+    let gate_passed = output.gate_result.passed;
+
+    let governed_response = if let Some(context_config) = governed_context_config {
+        Some(kernel.execute(context_kernel_core::KernelRequest {
+            target: "governed.assemble".to_string(),
+            input_packets: vec![output_packet.clone()],
+            budget: context_kernel_core::ExecutionBudget {
+                token_cap: Some(governed_budget_tokens),
+                byte_cap: Some(governed_budget_bytes),
+                runtime_ms_cap: None,
+            },
+            policy_context: json!({
+                "config_path": context_config,
+            }),
+            ..context_kernel_core::KernelRequest::default()
+        })?)
+    } else {
+        None
+    };
 
     match report.as_str() {
         "json" => {
-            let json = diffy_core::report::render_gate_json(&output.gate_result);
-            println!("{json}");
+            if let Some(governed) = governed_response {
+                let final_packet = governed.output_packets.first().ok_or_else(|| {
+                    anyhow!("kernel returned no output packets for governed flow")
+                })?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "gate_result": output.gate_result,
+                        "diagnostics": output.diagnostics,
+                        "diffs": output.diffs,
+                        "final_packet": final_packet.body,
+                        "kernel_audit": governed.audit,
+                    }))?
+                );
+            } else {
+                let json = diffy_core::report::render_gate_json(&output.gate_result);
+                println!("{json}");
+            }
         }
         _ => {
             diffy_core::report::render_gate_result(&output.gate_result);
@@ -175,10 +249,26 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                     .collect::<Vec<_>>();
                 diffy_core::report::render_issues_terminal(diag, Some(&diffs));
             }
+
+            if let Some(governed) = governed_response {
+                let final_packet = governed.output_packets.first().ok_or_else(|| {
+                    anyhow!("kernel returned no output packets for governed flow")
+                })?;
+                let sections = final_packet
+                    .body
+                    .get("assembly")
+                    .and_then(|assembly| assembly.get("sections_kept"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                println!(
+                    "governed packet assembled: packet_id={} sections_kept={sections}",
+                    final_packet.packet_id.as_deref().unwrap_or("unknown")
+                );
+            }
         }
     }
 
-    Ok(if output.gate_result.passed { 0 } else { 1 })
+    Ok(if gate_passed { 0 } else { 1 })
 }
 
 fn run_diff_analyze_reducer(
@@ -234,7 +324,7 @@ fn run_diff_analyze_reducer(
         }
     })?;
 
-    let packet_body = serde_json::to_value(DiffAnalyzeKernelOutput {
+    let kernel_output = DiffAnalyzeKernelOutput {
         gate_result: output.gate_result.clone(),
         diagnostics: output.diagnostics.clone(),
         diffs: output
@@ -243,7 +333,74 @@ fn run_diff_analyze_reducer(
             .iter()
             .map(SerializableFileDiff::from_file_diff)
             .collect(),
-    })
+    };
+
+    let mut changed_paths = output
+        .changed_line_context
+        .changed_paths
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    changed_paths.sort();
+
+    let refs = changed_paths
+        .iter()
+        .map(|path| {
+            json!({
+                "kind": "file",
+                "value": path,
+                "source": "diffy-analyze-v1",
+                "relevance": 0.75
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let gate_summary = format!(
+        "passed: {}\nchanged_coverage_pct: {}\ntotal_coverage_pct: {}\nnew_file_coverage_pct: {}\nviolations: {}",
+        kernel_output.gate_result.passed,
+        format_pct(kernel_output.gate_result.changed_coverage_pct),
+        format_pct(kernel_output.gate_result.total_coverage_pct),
+        format_pct(kernel_output.gate_result.new_file_coverage_pct),
+        if kernel_output.gate_result.violations.is_empty() {
+            "none".to_string()
+        } else {
+            kernel_output.gate_result.violations.join("; ")
+        }
+    );
+
+    let changed_file_body = if changed_paths.is_empty() {
+        "No changed files".to_string()
+    } else {
+        changed_paths.join("\n")
+    };
+
+    let packet_body = serde_json::to_value(json!({
+        "packet_id": "diffy-analyze-v1",
+        "tool": "diffy",
+        "tools": ["diffy"],
+        "reducer": "analyze",
+        "reducers": ["analyze"],
+        "paths": changed_paths,
+        "payload": kernel_output,
+        "sections": [
+            {
+                "id": "diff-gate-summary",
+                "title": "Diff Gate Summary",
+                "body": gate_summary,
+                "refs": refs.clone(),
+                "relevance": if output.gate_result.passed { 0.8 } else { 1.4 },
+            },
+            {
+                "id": "changed-files",
+                "title": "Changed Files",
+                "body": changed_file_body,
+                "refs": refs.clone(),
+                "relevance": 0.9,
+            }
+        ],
+        "refs": refs,
+        "text_blobs": [gate_summary],
+    }))
     .map_err(|source| context_kernel_core::KernelError::ReducerFailed {
         target: ctx.target.clone(),
         detail: source.to_string(),
