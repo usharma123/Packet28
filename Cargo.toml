@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/covy-core", "crates/covy-ingest", "crates/covy-cli", "crates/diffy-cli", "crates/suite-packet-core", "crates/suite-foundation-core", "crates/diffy-core", "crates/testy-core"]
+members = ["crates/covy-core", "crates/covy-ingest", "crates/covy-cli", "crates/diffy-cli", "crates/testy-cli", "crates/suite-packet-core", "crates/suite-foundation-core", "crates/diffy-core", "crates/testy-core"]
 resolver = "2"
 
 [workspace.package]

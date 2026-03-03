@@ -1,0 +1,28 @@
+[package]
+name = "testy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "testy"
+path = "src/main.rs"
+
+[dependencies]
+testy-core = { version = "0.2.0", path = "../testy-core" }
+suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
+suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
+covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
+diffy-core = { version = "0.2.0", path = "../diffy-core" }
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+colored.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
