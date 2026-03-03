@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use suite_packet_core::gate::{ImpactPlan, ImpactResult};
 
 pub type ImpactError = anyhow::Error;
 
@@ -70,11 +71,11 @@ pub struct ImpactBudgetUsage {
 #[derive(Debug, Clone)]
 pub struct ImpactResponse {
     pub selected_tests: Vec<String>,
-    pub plan: Option<crate::impact::ImpactPlan>,
+    pub plan: Option<ImpactPlan>,
     pub confidence: Option<f64>,
     pub budget_usage: Option<ImpactBudgetUsage>,
     pub record_summary: Option<ImpactRecordSummary>,
-    pub impact_result: Option<crate::impact::ImpactResult>,
+    pub impact_result: Option<ImpactResult>,
     pub print_command: Option<String>,
     pub known_tests: Option<usize>,
 }
@@ -530,7 +531,7 @@ fn is_stale(generated_at: u64, fresh_hours: u32) -> bool {
 }
 
 fn apply_policy(
-    result: &mut crate::impact::ImpactResult,
+    result: &mut ImpactResult,
     diffs: &[crate::model::FileDiff],
     stale: bool,
     known_tests: usize,

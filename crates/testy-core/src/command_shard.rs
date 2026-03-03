@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use suite_foundation_core::CovyConfig;
+use suite_packet_core::shard::ShardPlan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlannerAlgorithmArg {
@@ -51,10 +52,7 @@ pub const SHARD_PLAN_SCHEMA_EXAMPLES: &str = r#"{
   }
 }"#;
 
-pub fn run_shard_plan_command(
-    args: ShardPlanArgs,
-    config_path: &str,
-) -> Result<crate::shard::ShardPlan> {
+pub fn run_shard_plan_command(args: ShardPlanArgs, config_path: &str) -> Result<ShardPlan> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let shard_count = args
         .shards
@@ -141,7 +139,7 @@ pub fn resolve_plan_algorithm(
     }
 }
 
-pub fn render_text(plan: &crate::shard::ShardPlan) -> String {
+pub fn render_text(plan: &ShardPlan) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "shards={} total_ms={} makespan_ms={} imbalance_ratio={:.3} parallel_efficiency={:.3} whale_count={} top_10_share={:.3}\n",

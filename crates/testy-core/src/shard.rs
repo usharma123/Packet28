@@ -1,6 +1,7 @@
-pub use suite_packet_core::shard::{
-    PlannedShard, PlannedTask, Shard, ShardPlan, Task, TaskSet, UniversalShardPlan,
-    SHARD_PLAN_SCHEMA_VERSION, TASK_SCHEMA_VERSION,
+use suite_packet_core::shard::{Shard, ShardPlan};
+#[cfg(test)]
+use suite_packet_core::shard::{
+    Task, TaskSet, UniversalShardPlan, SHARD_PLAN_SCHEMA_VERSION, TASK_SCHEMA_VERSION,
 };
 
 pub fn build_timed_jobs(

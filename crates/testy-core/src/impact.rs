@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use roaring::RoaringBitmap;
+use suite_packet_core::gate::{ImpactPlan, ImpactResult, PlannedTest, UncoveredBlock};
 
 use crate::model::FileDiff;
 use crate::testmap::TestMapIndex;
-
-pub use suite_packet_core::gate::{ImpactPlan, ImpactResult, PlannedTest, UncoveredBlock};
 
 pub fn select_impacted_tests(index: &TestMapIndex, diffs: &[FileDiff]) -> ImpactResult {
     let mut tests: BTreeSet<String> = BTreeSet::new();

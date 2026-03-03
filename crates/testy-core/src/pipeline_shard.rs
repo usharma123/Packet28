@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use suite_packet_core::gate::ImpactResult;
+use suite_packet_core::shard::{ShardPlan, TaskSet};
 
 pub type ShardError = anyhow::Error;
 
@@ -78,7 +80,7 @@ pub struct ShardTimingSummary {
 
 #[derive(Debug, Clone)]
 pub struct ShardResponse {
-    pub shard_plan: Option<crate::shard::ShardPlan>,
+    pub shard_plan: Option<ShardPlan>,
     pub plan_summary: Option<ShardPlanSummary>,
     pub timing_summary: Option<ShardTimingSummary>,
     pub filtered_out: Vec<String>,
@@ -231,7 +233,7 @@ const IMPACT_RESULT_EXAMPLE: &str = r#"{
 fn load_tasks_from_impact_json(path: &Path) -> Result<Vec<PlanningTask>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read impact JSON {}", path.display()))?;
-    let impact: crate::impact::ImpactResult =
+    let impact: ImpactResult =
         deserialize_json_with_example(&content, "ImpactResult", IMPACT_RESULT_EXAMPLE)?;
     Ok(impact
         .selected_tests
@@ -254,8 +256,7 @@ const TASKSET_EXAMPLE: &str = r#"{
 fn load_tasks_from_tasks_json(path: &Path) -> Result<Vec<PlanningTask>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read tasks JSON {}", path.display()))?;
-    let tasks: crate::shard::TaskSet =
-        deserialize_json_with_example(&content, "TaskSet", TASKSET_EXAMPLE)?;
+    let tasks: TaskSet = deserialize_json_with_example(&content, "TaskSet", TASKSET_EXAMPLE)?;
     let ids = tasks
         .tasks
         .into_iter()
@@ -428,7 +429,7 @@ fn apply_timing_observations(
     grouped.len()
 }
 
-fn write_shard_files(dir: &str, plan: &crate::shard::ShardPlan) -> Result<()> {
+fn write_shard_files(dir: &str, plan: &ShardPlan) -> Result<()> {
     let dir = PathBuf::from(dir);
     std::fs::create_dir_all(&dir)?;
     for shard in &plan.shards {

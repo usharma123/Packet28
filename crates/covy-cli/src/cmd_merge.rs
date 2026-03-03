@@ -79,7 +79,7 @@ pub fn run(args: MergeArgs, config_path: &str) -> Result<i32> {
         )?;
     }
 
-    let summary = testy_core::merge::MergeSummary {
+    let summary = suite_packet_core::merge::MergeSummary {
         coverage_inputs: coverage_inputs.len(),
         diagnostics_inputs: diagnostics_inputs.len(),
         skipped_inputs: skipped_cov + skipped_diag,

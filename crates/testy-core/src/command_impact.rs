@@ -3,6 +3,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use suite_foundation_core::CovyConfig;
+#[cfg(test)]
+use suite_packet_core::gate::PlannedTest;
+use suite_packet_core::gate::{ImpactPlan, ImpactResult};
 
 #[derive(Debug, Clone)]
 pub struct LegacyImpactArgs {
@@ -41,7 +44,7 @@ pub struct ImpactRunArgs {
 
 #[derive(Debug, Clone)]
 pub struct ImpactLegacyOutput {
-    pub result: crate::impact::ImpactResult,
+    pub result: ImpactResult,
     pub known_tests: usize,
     pub print_command: Option<String>,
 }
@@ -128,7 +131,7 @@ pub fn run_plan(
     args: ImpactPlanArgs,
     config_path: &str,
     adapters: &crate::pipeline::ImpactAdapters,
-) -> Result<crate::impact::ImpactPlan> {
+) -> Result<ImpactPlan> {
     if !args.format.eq_ignore_ascii_case("json") {
         anyhow::bail!(
             "Unsupported --format '{}'; only 'json' is supported",
@@ -169,7 +172,7 @@ pub fn run_impact_run(args: ImpactRunArgs, binary_name: &str) -> Result<ImpactRu
 
     let content = std::fs::read_to_string(&args.plan_path)
         .with_context(|| format!("Failed to read plan at {}", args.plan_path))?;
-    let plan: crate::impact::ImpactPlan =
+    let plan: ImpactPlan =
         deserialize_json_with_example(&content, "ImpactPlan", &impact_plan_example(binary_name))?;
 
     let tests: Vec<String> = plan.tests.iter().map(|t| t.id.clone()).collect();
@@ -302,7 +305,7 @@ mod tests {
     fn test_run_impact_run_skips_execution_for_empty_plan() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan_path = dir.path().join("plan.json");
-        let plan = crate::impact::ImpactPlan::default();
+        let plan = ImpactPlan::default();
         std::fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
 
         let result = run_impact_run(
@@ -320,8 +323,8 @@ mod tests {
     fn test_run_impact_run_executes_command() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan_path = dir.path().join("plan.json");
-        let plan = crate::impact::ImpactPlan {
-            tests: vec![crate::impact::PlannedTest {
+        let plan = ImpactPlan {
+            tests: vec![PlannedTest {
                 id: "com.foo.BarTest".to_string(),
                 name: "com.foo.BarTest".to_string(),
                 estimated_overlap_lines: 1,

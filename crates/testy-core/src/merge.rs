@@ -4,8 +4,6 @@ use crate::diagnostics::DiagnosticsData;
 use crate::error::CovyError;
 use crate::model::CoverageData;
 
-pub use suite_packet_core::merge::MergeSummary;
-
 pub fn merge_coverage_inputs(
     paths: &[PathBuf],
     strict: bool,
