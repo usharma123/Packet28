@@ -113,6 +113,12 @@ pub fn default_impact_adapters() -> covy_core::impact_pipeline::ImpactAdapters {
     }
 }
 
+pub fn default_testmap_adapters() -> covy_core::testmap_pipeline::TestMapAdapters {
+    covy_core::testmap_pipeline::TestMapAdapters {
+        ingest_coverage: ingest_coverage_auto,
+    }
+}
+
 fn ingest_coverage_auto(path: &Path) -> Result<CoverageData> {
     covy_ingest::ingest_path(path).map_err(Into::into)
 }

@@ -25,5 +25,6 @@ pub mod impact;
 pub mod merge;
 pub mod pipeline;
 pub mod pipeline_shard;
+pub mod pipeline_testmap;
 pub mod shard;
 pub mod shard_timing;

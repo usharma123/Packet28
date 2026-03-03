@@ -58,6 +58,10 @@ pub mod testmap {
     pub use suite_packet_core::testmap::*;
 }
 
+pub mod testmap_pipeline {
+    pub use testy_core::pipeline_testmap::*;
+}
+
 pub mod merge {
     pub use testy_core::merge::*;
 }
