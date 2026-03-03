@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn suite_cmd() -> Command {
-    assert_cmd::cargo::cargo_bin_cmd!("suite")
+    assert_cmd::cargo::cargo_bin_cmd!("Packet28")
 }
 
 fn fixture(rel: &str) -> String {

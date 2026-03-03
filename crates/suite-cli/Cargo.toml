@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [[bin]]
-name = "suite"
+name = "Packet28"
 path = "src/main.rs"
 
 [dependencies]

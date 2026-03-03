@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "suite",
+    name = "Packet28",
     version,
     about = "Umbrella platform CLI for suite domains"
 )]

@@ -31,8 +31,8 @@ jobs:
           ./target/release/testy impact --help > /dev/null
           ./target/release/testy shard plan --help > /dev/null
           ./target/release/testy testmap build --help > /dev/null
-          ./target/release/suite diff analyze --help > /dev/null
-          ./target/release/suite test impact --help > /dev/null
+          ./target/release/Packet28 diff analyze --help > /dev/null
+          ./target/release/Packet28 test impact --help > /dev/null
 
       - name: Ingest coverage (example)
         run: |

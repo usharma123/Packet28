@@ -5,14 +5,14 @@ This workspace ships four first-class binaries:
 - `covy`: all-in-one coverage + diagnostics workflow (ingest, check, report, PR artifacts, path tooling).
 - `diffy`: diff-focused coverage/diagnostics gate analysis.
 - `testy`: test impact analysis, sharding, and testmap generation.
-- `suite`: umbrella CLI with domain routing (`suite diff ...`, `suite test ...`).
+- `Packet28`: umbrella CLI with domain routing (`Packet28 diff ...`, `Packet28 test ...`).
 
 ## When To Use Each
 
 - Use `covy` when you want one CLI handling end-to-end coverage and diagnostics workflows.
 - Use `diffy` when you only need diff gate analysis and issue-aware pass/fail output.
 - Use `testy` when you are working specifically on impact planning, sharding, and map artifacts.
-- Use `suite` when you want a single umbrella command namespace split by domain.
+- Use `Packet28` when you want a single umbrella command namespace split by domain.
 
 ## Quickstart (All Binaries)
 
@@ -43,15 +43,15 @@ cargo build --release -p covy-cli -p diffy-cli -p testy-cli -p suite-cli
 ./target/release/testy shard plan --shards 4 --tasks-json artifacts/tasks.json --json
 ```
 
-`suite` examples:
+`Packet28` examples:
 
 ```bash
-./target/release/suite diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --no-issues-state --json
-./target/release/suite test impact --base HEAD --head HEAD --testmap .covy/state/testmap.bin --json
-./target/release/suite guard validate --config context.yaml
-./target/release/suite guard check --packet packet.json --config context.yaml
-./target/release/suite stack slice --input artifacts/stack.log --json
-./target/release/suite build reduce --input artifacts/build.log --json
+./target/release/Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --no-issues-state --json
+./target/release/Packet28 test impact --base HEAD --head HEAD --testmap .covy/state/testmap.bin --json
+./target/release/Packet28 guard validate --config context.yaml
+./target/release/Packet28 guard check --packet packet.json --config context.yaml
+./target/release/Packet28 stack slice --input artifacts/stack.log --json
+./target/release/Packet28 build reduce --input artifacts/build.log --json
 ```
 
 Guard policy `context.yaml` canonical V1 shape:
@@ -79,13 +79,13 @@ policy:
 1. Validate policy config:
 
 ```bash
-./target/release/suite guard validate --config context.yaml
+./target/release/Packet28 guard validate --config context.yaml
 ```
 
 2. Run diff analysis through the governed kernel path:
 
 ```bash
-./target/release/suite diff analyze \
+./target/release/Packet28 diff analyze \
   --coverage tests/fixtures/lcov/basic.info \
   --base HEAD \
   --head HEAD \
@@ -98,7 +98,7 @@ policy:
 3. Run impact analysis through the same governed kernel path:
 
 ```bash
-./target/release/suite test impact \
+./target/release/Packet28 test impact \
   --base HEAD \
   --head HEAD \
   --testmap .covy/state/testmap.bin \
@@ -110,35 +110,35 @@ policy:
 4. Validate a packet directly against policy:
 
 ```bash
-./target/release/suite guard check --packet packet.json --config context.yaml
+./target/release/Packet28 guard check --packet packet.json --config context.yaml
 ```
 
 5. Assemble one or more packet files with a hard budget:
 
 ```bash
-./target/release/suite context assemble \
+./target/release/Packet28 context assemble \
   --packet a.json \
   --packet b.json \
   --budget-tokens 1200 \
   --budget-bytes 24000
 
 # Optional governed assembly with policy enforcement + audit metadata
-./target/release/suite context assemble \
+./target/release/Packet28 context assemble \
   --packet a.json \
   --packet b.json \
   --context-config context.yaml
 ```
 
-`suite diff analyze` and `suite test impact` now both route reducers through `context-kernel-core`, and when `--context-config` is set they continue into governed `contextq` assembly with kernel governance audit metadata.
+`Packet28 diff analyze` and `Packet28 test impact` now both route reducers through `context-kernel-core`, and when `--context-config` is set they continue into governed `contextq` assembly with kernel governance audit metadata.
 
 Machine-mode shape and exits for repeatable local demos:
 
-- `suite diff analyze --json --context-config ...` emits `schema_version: "suite.diff.analyze.v1"` with `kernel_audit` and `kernel_metadata`.
-- `suite test impact --json` emits `schema_version: "suite.test.impact.v1"` with `kernel_audit` and `kernel_metadata`.
-- `suite stack slice --json` emits `schema_version: "suite.stack.slice.v1"`.
-- `suite build reduce --json` emits `schema_version: "suite.build.reduce.v1"`.
-- `suite context assemble` emits `schema_version: "suite.context.assemble.v1"` with `packet` + kernel audit metadata.
-- `suite context assemble --context-config ...` emits the same schema version with governed `final_packet` + governed kernel audit metadata.
+- `Packet28 diff analyze --json --context-config ...` emits `schema_version: "suite.diff.analyze.v1"` with `kernel_audit` and `kernel_metadata`.
+- `Packet28 test impact --json` emits `schema_version: "suite.test.impact.v1"` with `kernel_audit` and `kernel_metadata`.
+- `Packet28 stack slice --json` emits `schema_version: "suite.stack.slice.v1"`.
+- `Packet28 build reduce --json` emits `schema_version: "suite.build.reduce.v1"`.
+- `Packet28 context assemble` emits `schema_version: "suite.context.assemble.v1"` with `packet` + kernel audit metadata.
+- `Packet28 context assemble --context-config ...` emits the same schema version with governed `final_packet` + governed kernel audit metadata.
 - `contextq` budget trim metadata is emitted under `budget_trim` (truncated/dropped/estimated/cap fields).
 - Exit codes are stable: `0` success, `1` policy/gate denial, `2` usage/runtime errors.
 
@@ -147,12 +147,12 @@ Machine-mode shape and exits for repeatable local demos:
 These reducers now run through the same governed kernel path as `diff` and `test`:
 
 ```bash
-./target/release/suite stack slice \
+./target/release/Packet28 stack slice \
   --input artifacts/stack.log \
   --json \
   --context-config context.yaml
 
-./target/release/suite build reduce \
+./target/release/Packet28 build reduce \
   --input artifacts/build.log \
   --json \
   --context-config context.yaml
