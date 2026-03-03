@@ -50,6 +50,10 @@ pub mod impact {
     pub use testy_core::impact::*;
 }
 
+pub mod impact_pipeline {
+    pub use testy_core::pipeline::*;
+}
+
 pub mod testmap {
     pub use suite_packet_core::testmap::*;
 }

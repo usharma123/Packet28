@@ -105,6 +105,14 @@ pub fn default_pipeline_ingest_adapters() -> covy_core::pipeline::PipelineIngest
     }
 }
 
+pub fn default_impact_adapters() -> covy_core::impact_pipeline::ImpactAdapters {
+    covy_core::impact_pipeline::ImpactAdapters {
+        ingest_coverage_auto: ingest_coverage_auto,
+        ingest_coverage_with_format: ingest_coverage_with_format,
+        git_diff: impact_git_diff,
+    }
+}
+
 fn ingest_coverage_auto(path: &Path) -> Result<CoverageData> {
     covy_ingest::ingest_path(path).map_err(Into::into)
 }
@@ -119,6 +127,10 @@ fn ingest_coverage_stdin(format: CoverageFormat) -> Result<CoverageData> {
 
 fn ingest_diagnostics(path: &Path) -> Result<DiagnosticsData> {
     covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
+}
+
+fn impact_git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>> {
+    covy_core::diff::git_diff(base, head).map_err(Into::into)
 }
 
 pub fn load_coverage_state(path: &str) -> Result<CoverageData> {

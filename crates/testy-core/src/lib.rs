@@ -23,4 +23,5 @@ pub mod cache {
 
 pub mod impact;
 pub mod merge;
+pub mod pipeline;
 pub mod shard;
