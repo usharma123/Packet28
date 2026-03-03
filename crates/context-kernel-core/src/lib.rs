@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+use context_memory_core::{CachePacket, DeltaReuseHooks, NoopDeltaReuseHooks, PacketCache};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ExecutionBudget {
     pub token_cap: Option<u64>,
     pub byte_cap: Option<usize>,
@@ -85,6 +87,44 @@ impl Default for KernelRequest {
             reducer_input: Value::Null,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct KernelStepRequest {
+    pub id: String,
+    pub target: String,
+    pub depends_on: Vec<String>,
+    pub input_packets: Vec<KernelPacket>,
+    pub policy_context: Value,
+    pub reducer_input: Value,
+    pub budget: ExecutionBudget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct KernelSequenceRequest {
+    pub budget: ExecutionBudget,
+    pub steps: Vec<KernelStepRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelStepResponse {
+    pub id: String,
+    pub target: String,
+    pub status: String,
+    pub response: Option<KernelResponse>,
+    pub failure: Option<KernelFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelSequenceResponse {
+    pub request_id: u64,
+    pub scheduled: Vec<String>,
+    pub skipped: Vec<String>,
+    pub budget_exhausted: bool,
+    pub step_results: Vec<KernelStepResponse>,
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +207,12 @@ pub enum KernelError {
 
     #[error("reducer '{target}' failed: {detail}")]
     ReducerFailed { target: String, detail: String },
+
+    #[error("scheduler error: {detail}")]
+    SchedulerFailed { detail: String },
+
+    #[error("cache lock failed: {detail}")]
+    CacheLock { detail: String },
 }
 
 impl KernelError {
@@ -207,6 +253,16 @@ impl KernelError {
                 message: self.to_string(),
                 target: Some(target.clone()),
             },
+            KernelError::SchedulerFailed { .. } => KernelFailure {
+                code: "scheduler_failed".to_string(),
+                message: self.to_string(),
+                target: None,
+            },
+            KernelError::CacheLock { .. } => KernelFailure {
+                code: "cache_lock_failed".to_string(),
+                message: self.to_string(),
+                target: None,
+            },
         }
     }
 }
@@ -241,6 +297,7 @@ type ReducerFn = dyn Fn(&mut ExecutionContext, &[KernelPacket]) -> Result<Reduce
 pub struct Kernel {
     reducers: HashMap<String, Arc<ReducerFn>>,
     next_request_id: AtomicU64,
+    memory: Mutex<PacketCache>,
 }
 
 impl Default for Kernel {
@@ -254,6 +311,7 @@ impl Kernel {
         Self {
             reducers: HashMap::new(),
             next_request_id: AtomicU64::new(1),
+            memory: Mutex::new(PacketCache::new()),
         }
     }
 
@@ -280,6 +338,15 @@ impl Kernel {
     }
 
     pub fn execute(&self, req: KernelRequest) -> Result<KernelResponse, KernelError> {
+        let mut hooks = NoopDeltaReuseHooks;
+        self.execute_with_hooks(req, &mut hooks)
+    }
+
+    pub fn execute_with_hooks(
+        &self,
+        req: KernelRequest,
+        hooks: &mut dyn DeltaReuseHooks,
+    ) -> Result<KernelResponse, KernelError> {
         let target = req.target.trim().to_string();
         if target.is_empty() {
             return Err(KernelError::EmptyTarget);
@@ -297,6 +364,67 @@ impl Kernel {
         let input_usage = usage_for_packets(&req.input_packets);
 
         enforce_budget(&target, BudgetStage::Input, req.budget, input_usage)?;
+
+        let cache_input = cache_input_for_request(&req, &target);
+        let cache_lookup = {
+            let cache = self
+                .memory
+                .lock()
+                .map_err(|source| KernelError::CacheLock {
+                    detail: source.to_string(),
+                })?;
+            cache.lookup_with_hooks(&target, &cache_input, hooks)
+        };
+
+        if let Some(entry) = cache_lookup.entry {
+            let output_packets = entry
+                .packets
+                .into_iter()
+                .map(|packet| KernelPacket {
+                    packet_id: packet.packet_id,
+                    format: default_packet_format(),
+                    body: packet.body,
+                    token_usage: packet.token_usage,
+                    runtime_ms: packet.runtime_ms,
+                    metadata: packet.metadata,
+                })
+                .collect::<Vec<_>>();
+            let output_packet_count = output_packets.len();
+
+            let output_usage = usage_for_packets(&output_packets);
+            let total_usage = BudgetUsage {
+                tokens: input_usage.tokens.saturating_add(output_usage.tokens),
+                bytes: input_usage.bytes.saturating_add(output_usage.bytes),
+                runtime_ms: input_usage
+                    .runtime_ms
+                    .saturating_add(output_usage.runtime_ms),
+            };
+            enforce_budget(&target, BudgetStage::Total, req.budget, total_usage)?;
+
+            return Ok(KernelResponse {
+                request_id,
+                target: target.clone(),
+                output_packets,
+                audit: KernelAudit {
+                    reducer: target,
+                    input_packets: req.input_packets.len(),
+                    output_packets: output_packet_count,
+                    budget: req.budget,
+                    input_usage,
+                    output_usage,
+                    total_usage,
+                },
+                metadata: merge_json(
+                    entry.metadata,
+                    json!({
+                        "cache": {
+                            "hit": true,
+                            "key": cache_lookup.cache_key,
+                        }
+                    }),
+                ),
+            });
+        }
 
         let mut ctx = ExecutionContext {
             request_id,
@@ -321,12 +449,13 @@ impl Kernel {
 
         enforce_budget(&target, BudgetStage::Total, req.budget, total_usage)?;
 
-        Ok(KernelResponse {
+        let output_packets = reducer_result.output_packets;
+        let response = KernelResponse {
             request_id,
             target: target.clone(),
-            output_packets: reducer_result.output_packets,
+            output_packets: output_packets.clone(),
             audit: KernelAudit {
-                reducer: target,
+                reducer: target.clone(),
                 input_packets: req.input_packets.len(),
                 output_packets: output_packet_count,
                 budget: req.budget,
@@ -334,13 +463,193 @@ impl Kernel {
                 output_usage,
                 total_usage,
             },
-            metadata: merge_json(ctx.shared_json(), reducer_result.metadata),
+            metadata: merge_json(
+                merge_json(ctx.shared_json(), reducer_result.metadata),
+                json!({
+                    "cache": {
+                        "hit": false,
+                        "key": cache_lookup.cache_key,
+                    }
+                }),
+            ),
+        };
+
+        {
+            let mut cache = self
+                .memory
+                .lock()
+                .map_err(|source| KernelError::CacheLock {
+                    detail: source.to_string(),
+                })?;
+            let packets = output_packets
+                .iter()
+                .map(|packet| CachePacket {
+                    packet_id: packet.packet_id.clone(),
+                    body: packet.body.clone(),
+                    token_usage: packet.token_usage,
+                    runtime_ms: packet.runtime_ms,
+                    metadata: packet.metadata.clone(),
+                })
+                .collect();
+
+            let metadata = response.metadata.clone();
+            cache.put_with_hooks(&target, &cache_lookup, packets, metadata, hooks);
+        }
+
+        Ok(response)
+    }
+
+    pub fn execute_sequence(
+        &self,
+        req: KernelSequenceRequest,
+    ) -> Result<KernelSequenceResponse, KernelError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let mut scheduler_steps = Vec::with_capacity(req.steps.len());
+        let mut by_id = HashMap::new();
+
+        for step in req.steps {
+            let id = step.id.trim().to_string();
+            if id.is_empty() {
+                return Err(KernelError::InvalidRequest {
+                    detail: "sequence step id cannot be empty".to_string(),
+                });
+            }
+
+            let estimate = usage_for_packets(&step.input_packets);
+            scheduler_steps.push(context_scheduler_core::ScheduleStep {
+                id: id.clone(),
+                target: step.target.clone(),
+                depends_on: step.depends_on.clone(),
+                estimate: context_scheduler_core::StepEstimate {
+                    tokens: estimate.tokens,
+                    bytes: estimate.bytes,
+                    runtime_ms: estimate.runtime_ms,
+                },
+            });
+            by_id.insert(id, step);
+        }
+
+        let schedule = context_scheduler_core::schedule(context_scheduler_core::ScheduleRequest {
+            steps: scheduler_steps,
+            budget: context_scheduler_core::ScheduleBudget {
+                token_cap: req.budget.token_cap,
+                byte_cap: req.budget.byte_cap,
+                runtime_ms_cap: req.budget.runtime_ms_cap,
+            },
+        })
+        .map_err(|source| KernelError::SchedulerFailed {
+            detail: source.to_string(),
+        })?;
+
+        let mut step_results = Vec::new();
+        let mut scheduled = Vec::new();
+        let mut completed = HashMap::<String, bool>::new();
+        for scheduled_step in &schedule.ordered_steps {
+            let Some(original) = by_id.get(&scheduled_step.id) else {
+                continue;
+            };
+
+            if original
+                .depends_on
+                .iter()
+                .any(|dep| !completed.get(dep).copied().unwrap_or(false))
+            {
+                completed.insert(scheduled_step.id.clone(), false);
+                step_results.push(KernelStepResponse {
+                    id: scheduled_step.id.clone(),
+                    target: original.target.clone(),
+                    status: "skipped".to_string(),
+                    response: None,
+                    failure: Some(KernelFailure {
+                        code: "dependency_failed".to_string(),
+                        message: "step skipped due to failed dependency".to_string(),
+                        target: Some(original.target.clone()),
+                    }),
+                });
+                continue;
+            }
+
+            let response = self.execute(KernelRequest {
+                target: original.target.clone(),
+                input_packets: original.input_packets.clone(),
+                budget: if original.budget == ExecutionBudget::default() {
+                    req.budget
+                } else {
+                    original.budget
+                },
+                policy_context: original.policy_context.clone(),
+                reducer_input: original.reducer_input.clone(),
+            });
+
+            match response {
+                Ok(response) => {
+                    scheduled.push(scheduled_step.id.clone());
+                    completed.insert(scheduled_step.id.clone(), true);
+                    step_results.push(KernelStepResponse {
+                        id: scheduled_step.id.clone(),
+                        target: original.target.clone(),
+                        status: "ok".to_string(),
+                        response: Some(response),
+                        failure: None,
+                    });
+                }
+                Err(err) => {
+                    completed.insert(scheduled_step.id.clone(), false);
+                    step_results.push(KernelStepResponse {
+                        id: scheduled_step.id.clone(),
+                        target: original.target.clone(),
+                        status: "failed".to_string(),
+                        response: None,
+                        failure: Some(err.structured()),
+                    });
+                }
+            }
+        }
+
+        let skipped = schedule
+            .skipped_steps
+            .iter()
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>();
+        for skipped_step in &schedule.skipped_steps {
+            if let Some(step) = by_id.get(&skipped_step.id) {
+                step_results.push(KernelStepResponse {
+                    id: step.id.clone(),
+                    target: step.target.clone(),
+                    status: "skipped".to_string(),
+                    response: None,
+                    failure: Some(KernelFailure {
+                        code: skipped_step.reason.clone(),
+                        message: format!("step skipped: {}", skipped_step.reason),
+                        target: Some(step.target.clone()),
+                    }),
+                });
+            }
+        }
+
+        Ok(KernelSequenceResponse {
+            request_id,
+            scheduled,
+            skipped,
+            budget_exhausted: schedule.budget_exhausted,
+            step_results,
+            metadata: json!({
+                "estimated_usage": {
+                    "tokens": schedule.estimated_usage.tokens,
+                    "bytes": schedule.estimated_usage.bytes,
+                    "runtime_ms": schedule.estimated_usage.runtime_ms,
+                }
+            }),
         })
     }
 }
 
 pub fn execute(req: KernelRequest) -> Result<KernelResponse, KernelError> {
     Kernel::with_v1_reducers().execute(req)
+}
+
+pub fn execute_sequence(req: KernelSequenceRequest) -> Result<KernelSequenceResponse, KernelError> {
+    Kernel::with_v1_reducers().execute_sequence(req)
 }
 
 pub fn load_packet_file(path: &Path) -> Result<KernelPacket, KernelError> {
@@ -560,6 +869,35 @@ fn default_packet_format() -> String {
     "packet-json".to_string()
 }
 
+fn cache_input_for_request(req: &KernelRequest, target: &str) -> Value {
+    let inputs = req
+        .input_packets
+        .iter()
+        .map(|packet| {
+            json!({
+                "packet_id": packet.packet_id.clone(),
+                "format": packet.format.clone(),
+                "body": packet.body.clone(),
+                "token_usage": packet.token_usage,
+                "runtime_ms": packet.runtime_ms,
+                "metadata": packet.metadata.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "target": target,
+        "input_packets": inputs,
+        "budget": {
+            "token_cap": req.budget.token_cap,
+            "byte_cap": req.budget.byte_cap,
+            "runtime_ms_cap": req.budget.runtime_ms_cap,
+        },
+        "policy_context": req.policy_context.clone(),
+        "reducer_input": req.reducer_input.clone(),
+    })
+}
+
 fn estimate_json_bytes(value: &Value) -> usize {
     serde_json::to_string(value)
         .map(|text| text.len())
@@ -586,6 +924,8 @@ fn merge_json(left: Value, right: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -747,6 +1087,164 @@ policy:
             .and_then(Value::as_bool)
             .unwrap();
         assert!(passed);
+    }
+
+    #[test]
+    fn caches_reducer_packets_by_request_hash() {
+        let mut kernel = Kernel::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = calls.clone();
+        kernel.register_reducer("count.reducer", move |_ctx, _packets| {
+            calls_ref.fetch_add(1, Ordering::Relaxed);
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(json!({"ok": true}), None)],
+                metadata: json!({"source":"reducer"}),
+            })
+        });
+
+        let request = KernelRequest {
+            target: "count.reducer".to_string(),
+            reducer_input: json!({"task":"same"}),
+            ..KernelRequest::default()
+        };
+
+        let first = kernel.execute(request.clone()).unwrap();
+        let second = kernel.execute(request).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first.output_packets.len(), 1);
+        assert_eq!(second.output_packets.len(), 1);
+        assert_eq!(
+            second
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn executes_sequence_in_dependency_order() {
+        let mut kernel = Kernel::new();
+        kernel.register_reducer("step.a", |_ctx, _packets| {
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(json!({"step":"a"}), None)],
+                metadata: Value::Null,
+            })
+        });
+        kernel.register_reducer("step.b", |_ctx, _packets| {
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(json!({"step":"b"}), None)],
+                metadata: Value::Null,
+            })
+        });
+
+        let response = kernel
+            .execute_sequence(KernelSequenceRequest {
+                budget: ExecutionBudget {
+                    token_cap: Some(100),
+                    byte_cap: None,
+                    runtime_ms_cap: None,
+                },
+                steps: vec![
+                    KernelStepRequest {
+                        id: "b".to_string(),
+                        target: "step.b".to_string(),
+                        depends_on: vec!["a".to_string()],
+                        input_packets: vec![],
+                        ..KernelStepRequest::default()
+                    },
+                    KernelStepRequest {
+                        id: "a".to_string(),
+                        target: "step.a".to_string(),
+                        depends_on: vec![],
+                        input_packets: vec![],
+                        ..KernelStepRequest::default()
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(response.scheduled, vec!["a".to_string(), "b".to_string()]);
+        assert!(response.skipped.is_empty());
+    }
+
+    #[test]
+    fn sequence_respects_scheduler_budget_cutoff() {
+        let mut kernel = Kernel::new();
+        kernel.register_reducer("step.a", |_ctx, _packets| Ok(ReducerResult::default()));
+        kernel.register_reducer("step.b", |_ctx, _packets| Ok(ReducerResult::default()));
+
+        let packet = KernelPacket {
+            body: json!({"size":"large"}),
+            token_usage: Some(90),
+            ..KernelPacket::default()
+        };
+        let response = kernel
+            .execute_sequence(KernelSequenceRequest {
+                budget: ExecutionBudget {
+                    token_cap: Some(100),
+                    byte_cap: None,
+                    runtime_ms_cap: None,
+                },
+                steps: vec![
+                    KernelStepRequest {
+                        id: "a".to_string(),
+                        target: "step.a".to_string(),
+                        input_packets: vec![packet.clone()],
+                        ..KernelStepRequest::default()
+                    },
+                    KernelStepRequest {
+                        id: "b".to_string(),
+                        target: "step.b".to_string(),
+                        input_packets: vec![packet],
+                        ..KernelStepRequest::default()
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert!(response.budget_exhausted);
+        assert_eq!(response.scheduled, vec!["a".to_string()]);
+        assert_eq!(response.skipped, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn sequence_skips_dependent_step_after_failure() {
+        let mut kernel = Kernel::new();
+        kernel.register_reducer("step.fail", |_ctx, _packets| {
+            Err(KernelError::ReducerFailed {
+                target: "step.fail".to_string(),
+                detail: "boom".to_string(),
+            })
+        });
+        kernel.register_reducer("step.after", |_ctx, _packets| Ok(ReducerResult::default()));
+
+        let response = kernel
+            .execute_sequence(KernelSequenceRequest {
+                budget: ExecutionBudget::default(),
+                steps: vec![
+                    KernelStepRequest {
+                        id: "fail".to_string(),
+                        target: "step.fail".to_string(),
+                        ..KernelStepRequest::default()
+                    },
+                    KernelStepRequest {
+                        id: "after".to_string(),
+                        target: "step.after".to_string(),
+                        depends_on: vec!["fail".to_string()],
+                        ..KernelStepRequest::default()
+                    },
+                ],
+            })
+            .unwrap();
+
+        let after = response
+            .step_results
+            .iter()
+            .find(|step| step.id == "after")
+            .unwrap();
+        assert_eq!(after.status, "skipped");
     }
 
     #[test]

@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 testy-cli-common = { version = "0.2.0", path = "../testy-cli-common" }
 diffy-core = { version = "0.2.0", path = "../diffy-core" }
+testy-core = { version = "0.2.0", path = "../testy-core" }
 guardy-core = { version = "0.2.0", path = "../guardy-core" }
 contextq-core = { version = "0.2.0", path = "../contextq-core" }
 context-kernel-core = { version = "0.2.0", path = "../context-kernel-core" }
@@ -24,6 +25,8 @@ covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
 clap.workspace = true
 anyhow.workspace = true
 colored.workspace = true
+roaring.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

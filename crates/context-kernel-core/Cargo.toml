@@ -13,6 +13,8 @@ suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
 suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
 guardy-core = { version = "0.2.0", path = "../guardy-core" }
 contextq-core = { version = "0.2.0", path = "../contextq-core" }
+context-memory-core = { version = "0.2.0", path = "../context-memory-core" }
+context-scheduler-core = { version = "0.2.0", path = "../context-scheduler-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
