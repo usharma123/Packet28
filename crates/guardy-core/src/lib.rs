@@ -18,18 +18,28 @@ pub struct ContextConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
+    pub tools: AllowlistPolicy,
+    pub reducers: AllowlistPolicy,
     #[serde(alias = "tool_allowlist")]
     pub allowed_tools: Vec<String>,
     #[serde(alias = "reducer_allowlist")]
     pub allowed_reducers: Vec<String>,
     #[serde(alias = "path_rules")]
     pub paths: PathPolicy,
+    pub token_budget: TokenBudgetPolicy,
+    pub runtime_budget: RuntimeBudgetPolicy,
     #[serde(alias = "budget_rules")]
     pub budgets: BudgetPolicy,
     #[serde(alias = "redaction_rules")]
     pub redaction: RedactionPolicy,
     #[serde(alias = "human_review_flags")]
     pub human_review: HumanReviewPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AllowlistPolicy {
+    pub allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -44,6 +54,20 @@ pub struct PathPolicy {
 pub struct BudgetPolicy {
     pub token_cap: Option<u64>,
     pub runtime_ms_cap: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenBudgetPolicy {
+    #[serde(alias = "token_cap")]
+    pub cap: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeBudgetPolicy {
+    #[serde(alias = "runtime_ms_cap")]
+    pub cap_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -154,9 +178,39 @@ impl ContextConfig {
             ));
         }
 
+        if let Some(message) = validate_allowlist_conflict(
+            &self.policy.tools.allowlist,
+            &self.policy.allowed_tools,
+            "policy.tools.allowlist",
+            "policy.allowed_tools",
+        ) {
+            errors.push(message);
+        }
+
+        if let Some(message) = validate_allowlist_conflict(
+            &self.policy.reducers.allowlist,
+            &self.policy.allowed_reducers,
+            "policy.reducers.allowlist",
+            "policy.allowed_reducers",
+        ) {
+            errors.push(message);
+        }
+
+        for (idx, tool) in self.policy.tools.allowlist.iter().enumerate() {
+            if tool.trim().is_empty() {
+                errors.push(format!("policy.tools.allowlist[{idx}] cannot be empty"));
+            }
+        }
+
         for (idx, tool) in self.policy.allowed_tools.iter().enumerate() {
             if tool.trim().is_empty() {
                 errors.push(format!("policy.allowed_tools[{idx}] cannot be empty"));
+            }
+        }
+
+        for (idx, reducer) in self.policy.reducers.allowlist.iter().enumerate() {
+            if reducer.trim().is_empty() {
+                errors.push(format!("policy.reducers.allowlist[{idx}] cannot be empty"));
             }
         }
 
@@ -166,8 +220,34 @@ impl ContextConfig {
             }
         }
 
+        if let Some(message) = validate_cap_conflict(
+            self.policy.token_budget.cap,
+            self.policy.budgets.token_cap,
+            "policy.token_budget.cap",
+            "policy.budgets.token_cap",
+        ) {
+            errors.push(message);
+        }
+
+        if let Some(message) = validate_cap_conflict(
+            self.policy.runtime_budget.cap_ms,
+            self.policy.budgets.runtime_ms_cap,
+            "policy.runtime_budget.cap_ms",
+            "policy.budgets.runtime_ms_cap",
+        ) {
+            errors.push(message);
+        }
+
+        if self.policy.token_budget.cap == Some(0) {
+            errors.push("policy.token_budget.cap must be greater than 0".to_string());
+        }
+
         if self.policy.budgets.token_cap == Some(0) {
             errors.push("policy.budgets.token_cap must be greater than 0".to_string());
+        }
+
+        if self.policy.runtime_budget.cap_ms == Some(0) {
+            errors.push("policy.runtime_budget.cap_ms must be greater than 0".to_string());
         }
 
         if self.policy.budgets.runtime_ms_cap == Some(0) {
@@ -195,6 +275,32 @@ impl ContextConfig {
         }
 
         errors
+    }
+}
+
+impl PolicyConfig {
+    pub fn effective_allowed_tools(&self) -> Vec<String> {
+        let canonical = normalize_non_empty_list(&self.tools.allowlist);
+        if !canonical.is_empty() {
+            return canonical;
+        }
+        normalize_non_empty_list(&self.allowed_tools)
+    }
+
+    pub fn effective_allowed_reducers(&self) -> Vec<String> {
+        let canonical = normalize_non_empty_list(&self.reducers.allowlist);
+        if !canonical.is_empty() {
+            return canonical;
+        }
+        normalize_non_empty_list(&self.allowed_reducers)
+    }
+
+    pub fn effective_token_cap(&self) -> Option<u64> {
+        self.token_budget.cap.or(self.budgets.token_cap)
+    }
+
+    pub fn effective_runtime_ms_cap(&self) -> Option<u64> {
+        self.runtime_budget.cap_ms.or(self.budgets.runtime_ms_cap)
     }
 }
 
@@ -381,10 +487,8 @@ pub fn check_packet(config: &ContextConfig, packet: &GuardPacket) -> AuditResult
 
     let allowed_tools: BTreeSet<_> = config
         .policy
-        .allowed_tools
-        .iter()
-        .map(|item| item.trim())
-        .filter(|item| !item.is_empty())
+        .effective_allowed_tools()
+        .into_iter()
         .collect();
 
     if !allowed_tools.is_empty() {
@@ -401,10 +505,8 @@ pub fn check_packet(config: &ContextConfig, packet: &GuardPacket) -> AuditResult
 
     let allowed_reducers: BTreeSet<_> = config
         .policy
-        .allowed_reducers
-        .iter()
-        .map(|item| item.trim())
-        .filter(|item| !item.is_empty())
+        .effective_allowed_reducers()
+        .into_iter()
         .collect();
 
     if !allowed_reducers.is_empty() {
@@ -442,7 +544,7 @@ pub fn check_packet(config: &ContextConfig, packet: &GuardPacket) -> AuditResult
         }
     }
 
-    if let Some(token_cap) = config.policy.budgets.token_cap {
+    if let Some(token_cap) = config.policy.effective_token_cap() {
         if total_token_usage > token_cap {
             findings.push(AuditFinding {
                 rule: "token_cap".to_string(),
@@ -455,7 +557,7 @@ pub fn check_packet(config: &ContextConfig, packet: &GuardPacket) -> AuditResult
         }
     }
 
-    if let Some(runtime_cap) = config.policy.budgets.runtime_ms_cap {
+    if let Some(runtime_cap) = config.policy.effective_runtime_ms_cap() {
         if total_runtime_ms > runtime_cap {
             findings.push(AuditFinding {
                 rule: "runtime_ms_cap".to_string(),
@@ -531,6 +633,49 @@ fn non_empty(input: Option<&str>) -> Option<&str> {
         None
     } else {
         Some(trimmed)
+    }
+}
+
+fn normalize_non_empty_list(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| non_empty(Some(item.as_str())).map(ToOwned::to_owned))
+        .collect()
+}
+
+fn validate_allowlist_conflict(
+    canonical: &[String],
+    legacy: &[String],
+    canonical_label: &str,
+    legacy_label: &str,
+) -> Option<String> {
+    let canonical = normalize_non_empty_list(canonical)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let legacy = normalize_non_empty_list(legacy)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    if canonical.is_empty() || legacy.is_empty() || canonical == legacy {
+        return None;
+    }
+
+    Some(format!(
+        "{canonical_label} conflicts with {legacy_label}; set only one or keep both identical"
+    ))
+}
+
+fn validate_cap_conflict(
+    canonical: Option<u64>,
+    legacy: Option<u64>,
+    canonical_label: &str,
+    legacy_label: &str,
+) -> Option<String> {
+    match (canonical, legacy) {
+        (Some(canonical), Some(legacy)) if canonical != legacy => Some(format!(
+            "{canonical_label} conflicts with {legacy_label}; set only one or keep both identical"
+        )),
+        _ => None,
     }
 }
 
@@ -645,12 +790,18 @@ mod tests {
         let yaml = r#"
 version: 2
 policy:
+  tools:
+    allowlist: [""]
   allowed_tools: [""]
   paths:
     include: ["[broken"]
+  token_budget:
+    cap: 0
   budgets:
     token_cap: 0
     runtime_ms_cap: 0
+  runtime_budget:
+    cap_ms: 0
   redaction:
     forbidden_patterns: ["("]
 "#;
@@ -666,13 +817,63 @@ policy:
             .iter()
             .any(|e| e.contains("allowed_tools[0] cannot be empty")));
         assert!(result.errors.iter().any(|e| e.contains("invalid glob")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("policy.token_budget.cap")));
         assert!(result.errors.iter().any(|e| e.contains("token_cap")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("policy.runtime_budget.cap_ms")));
         assert!(result.errors.iter().any(|e| e.contains("runtime_ms_cap")));
         assert!(result.errors.iter().any(|e| e.contains("invalid regex")));
     }
 
     #[test]
-    fn validate_config_accepts_canonical_policy_aliases() {
+    fn validate_config_accepts_canonical_policy_shape() {
+        let yaml = r#"
+version: 1
+policy:
+  tools:
+    allowlist: ["diffy"]
+  reducers:
+    allowlist: ["analyze"]
+  paths:
+    include: ["src/**"]
+    exclude: []
+  token_budget:
+    cap: 300
+  runtime_budget:
+    cap_ms: 2000
+  redaction:
+    forbidden_patterns: ["(?i)secret"]
+  human_review:
+    required: true
+    on_policy_violation: true
+    on_budget_violation: false
+    on_redaction_violation: true
+"#;
+
+        let result = validate_config_str(yaml);
+        assert!(result.valid);
+
+        let config = parse_context_strict(yaml).unwrap();
+        assert_eq!(
+            config.policy.effective_allowed_tools(),
+            vec!["diffy".to_string()]
+        );
+        assert_eq!(
+            config.policy.effective_allowed_reducers(),
+            vec!["analyze".to_string()]
+        );
+        assert_eq!(config.policy.effective_token_cap(), Some(300));
+        assert_eq!(config.policy.effective_runtime_ms_cap(), Some(2000));
+        assert!(config.policy.human_review.required);
+    }
+
+    #[test]
+    fn validate_config_accepts_legacy_policy_aliases() {
         let yaml = r#"
 version: 1
 policy:
@@ -697,12 +898,66 @@ policy:
         assert!(result.valid);
 
         let config = parse_context_strict(yaml).unwrap();
-        assert_eq!(config.policy.allowed_tools, vec!["diffy".to_string()]);
-        assert_eq!(config.policy.allowed_reducers, vec!["analyze".to_string()]);
+        assert_eq!(
+            config.policy.effective_allowed_tools(),
+            vec!["diffy".to_string()]
+        );
+        assert_eq!(
+            config.policy.effective_allowed_reducers(),
+            vec!["analyze".to_string()]
+        );
+        assert_eq!(config.policy.effective_token_cap(), Some(300));
+        assert_eq!(config.policy.effective_runtime_ms_cap(), Some(2000));
         assert!(config.policy.human_review.required);
         assert!(config.policy.human_review.on_policy_violation);
         assert!(!config.policy.human_review.on_budget_violation);
         assert!(config.policy.human_review.on_redaction_violation);
+    }
+
+    #[test]
+    fn validate_config_rejects_conflicting_canonical_and_legacy_fields() {
+        let yaml = r#"
+version: 1
+policy:
+  tools:
+    allowlist: ["diffy"]
+  allowed_tools: ["covy"]
+  reducers:
+    allowlist: ["analyze"]
+  allowed_reducers: ["merge"]
+  paths:
+    include: ["src/**"]
+    exclude: []
+  token_budget:
+    cap: 200
+  budgets:
+    token_cap: 300
+    runtime_ms_cap: 1200
+  runtime_budget:
+    cap_ms: 1000
+  redaction:
+    forbidden_patterns: []
+"#;
+
+        let result = validate_config_str(yaml);
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("policy.tools.allowlist conflicts with policy.allowed_tools")));
+        assert!(result.errors.iter().any(|e| {
+            e.contains("policy.reducers.allowlist conflicts with policy.allowed_reducers")
+        }));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e
+                    .contains("policy.token_budget.cap conflicts with policy.budgets.token_cap"))
+        );
+        assert!(result.errors.iter().any(|e| {
+            e.contains("policy.runtime_budget.cap_ms conflicts with policy.budgets.runtime_ms_cap")
+        }));
     }
 
     #[test]

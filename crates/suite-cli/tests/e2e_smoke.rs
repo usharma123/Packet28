@@ -37,14 +37,17 @@ fn write_guard_context(path: &Path) {
         r#"
 version: 1
 policy:
-  allowed_tools: ["covy"]
-  allowed_reducers: ["merge"]
+  tools:
+    allowlist: ["covy"]
+  reducers:
+    allowlist: ["merge"]
   paths:
     include: ["src/**"]
     exclude: ["src/private/**"]
-  budgets:
-    token_cap: 200
-    runtime_ms_cap: 1000
+  token_budget:
+    cap: 200
+  runtime_budget:
+    cap_ms: 1000
   redaction:
     forbidden_patterns: ["(?i)password"]
 "#,
@@ -58,14 +61,17 @@ fn write_governed_context(path: &Path) {
         r#"
 version: 1
 policy:
-  allowed_tools: ["diffy", "contextq"]
-  allowed_reducers: ["analyze", "assemble", "contextq.assemble"]
+  tools:
+    allowlist: ["diffy", "contextq"]
+  reducers:
+    allowlist: ["analyze", "assemble", "contextq.assemble"]
   paths:
     include: ["**"]
     exclude: []
-  budgets:
-    token_cap: 5000
-    runtime_ms_cap: 5000
+  token_budget:
+    cap: 5000
+  runtime_budget:
+    cap_ms: 5000
   redaction:
     forbidden_patterns: []
 "#,

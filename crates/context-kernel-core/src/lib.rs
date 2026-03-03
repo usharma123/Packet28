@@ -154,8 +154,17 @@ pub struct KernelAudit {
 pub struct GovernanceAudit {
     pub enabled: bool,
     pub config_path: Option<String>,
+    pub reducer_execution: Option<ReducerExecutionAudit>,
     pub input_audits: Vec<guardy_core::AuditResult>,
     pub output_audits: Vec<guardy_core::AuditResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ReducerExecutionAudit {
+    pub reducer: String,
+    pub allowed: bool,
+    pub matched_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -396,6 +405,10 @@ impl Kernel {
 
         if let Some(policy_guard) = &policy_guard {
             if should_enforce_policy_for_target(&target) {
+                governance.reducer_execution = Some(enforce_reducer_execution_policy(
+                    &target,
+                    &policy_guard.config,
+                )?);
                 let input_audits =
                     audit_packets_against_policy(&policy_guard.config, &req.input_packets)?;
                 ensure_policy_audits_pass(&target, "input", &input_audits)?;
@@ -919,6 +932,65 @@ fn should_enforce_policy_for_target(target: &str) -> bool {
     target != "guardy.check"
 }
 
+fn enforce_reducer_execution_policy(
+    target: &str,
+    config: &guardy_core::ContextConfig,
+) -> Result<ReducerExecutionAudit, KernelError> {
+    let allowlist = config.policy.effective_allowed_reducers();
+    if allowlist.is_empty() {
+        return Ok(ReducerExecutionAudit {
+            reducer: target.to_string(),
+            allowed: true,
+            matched_by: None,
+        });
+    }
+
+    if let Some(matched_by) = match_reducer_allowlist(target, &allowlist) {
+        return Ok(ReducerExecutionAudit {
+            reducer: target.to_string(),
+            allowed: true,
+            matched_by: Some(matched_by),
+        });
+    }
+
+    Err(KernelError::PolicyViolation {
+        target: target.to_string(),
+        detail: format!(
+            "reducer execution '{target}' is not allowed by policy; allowed reducers: {}",
+            allowlist.join(", ")
+        ),
+    })
+}
+
+fn match_reducer_allowlist(target: &str, allowlist: &[String]) -> Option<String> {
+    let candidates = reducer_candidates(target);
+    allowlist
+        .iter()
+        .find(|allowed| {
+            candidates
+                .iter()
+                .any(|candidate| allowed.as_str() == candidate.as_str())
+        })
+        .cloned()
+}
+
+fn reducer_candidates(target: &str) -> Vec<String> {
+    let mut candidates = vec![target.to_string()];
+    if let Some(leaf) = target.rsplit('.').next() {
+        if !leaf.is_empty() && leaf != target {
+            candidates.push(leaf.to_string());
+        }
+    }
+
+    if target == "governed.assemble" {
+        candidates.push("contextq.assemble".to_string());
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
 fn audit_packets_against_policy(
     config: &guardy_core::ContextConfig,
     packets: &[KernelPacket],
@@ -1357,10 +1429,43 @@ policy:
 
         assert_eq!(response.output_packets.len(), 1);
         assert!(response.audit.governance.enabled);
+        assert!(response
+            .audit
+            .governance
+            .reducer_execution
+            .as_ref()
+            .is_some_and(|audit| audit.allowed));
         assert_eq!(response.audit.governance.input_audits.len(), 1);
         assert_eq!(response.audit.governance.output_audits.len(), 1);
         assert!(response.audit.governance.input_audits[0].passed);
         assert!(response.audit.governance.output_audits[0].passed);
+    }
+
+    #[test]
+    fn policy_enforcement_rejects_disallowed_reducer_execution() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("context.yaml");
+        write_policy_file(&config_path, &[], &["assemble"]);
+
+        let mut kernel = Kernel::new();
+        kernel.register_reducer("custom.run", |_ctx, _packets| Ok(ReducerResult::default()));
+
+        let err = kernel
+            .execute(KernelRequest {
+                target: "custom.run".to_string(),
+                policy_context: json!({
+                    "config_path": config_path.to_string_lossy().to_string()
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap_err();
+
+        match err {
+            KernelError::PolicyViolation { detail, .. } => {
+                assert!(detail.contains("reducer execution 'custom.run'"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

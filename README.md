@@ -48,6 +48,28 @@ cargo build --release -p covy-cli -p diffy-cli -p testy-cli -p suite-cli
 ```bash
 ./target/release/suite diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --no-issues-state --json
 ./target/release/suite test impact --base HEAD --head HEAD --testmap .covy/state/testmap.bin --json
+./target/release/suite guard validate --config context.yaml
+./target/release/suite guard check --packet packet.json --config context.yaml
+```
+
+Guard policy `context.yaml` canonical V1 shape:
+
+```yaml
+version: 1
+policy:
+  tools:
+    allowlist: ["diffy", "contextq"]
+  reducers:
+    allowlist: ["analyze", "assemble", "contextq.assemble"]
+  paths:
+    include: ["src/**"]
+    exclude: ["src/private/**"]
+  token_budget:
+    cap: 5000
+  runtime_budget:
+    cap_ms: 5000
+  redaction:
+    forbidden_patterns: ["(?i)password", "(?i)secret"]
 ```
 
 ## Recent Changes (v0.2.0)
