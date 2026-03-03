@@ -12,6 +12,7 @@ use suite_foundation_core::error::CovyError;
 
 pub const DEFAULT_BUDGET_TOKENS: u64 = 1200;
 pub const DEFAULT_BUDGET_BYTES: usize = 24_000;
+pub const CONTEXTQ_SCHEMA_VERSION: &str = "contextq.assemble.v1";
 
 #[derive(Debug, Clone, Copy)]
 pub struct AssembleOptions {
@@ -116,6 +117,7 @@ pub struct AssembledPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AssembledPacket {
+    pub schema_version: String,
     pub packet_id: Option<String>,
     pub tool: Option<String>,
     pub tools: Vec<String>,
@@ -350,6 +352,7 @@ pub fn assemble_packets(
     reducers.insert("assemble".to_string());
 
     AssembledPacket {
+        schema_version: CONTEXTQ_SCHEMA_VERSION.to_string(),
         packet_id: Some("contextq-assembled-v1".to_string()),
         tool: Some("contextq".to_string()),
         tools: tools.into_iter().collect(),
@@ -733,6 +736,7 @@ mod tests {
             },
         );
 
+        assert_eq!(assembled.schema_version, CONTEXTQ_SCHEMA_VERSION);
         assert_eq!(assembled.assembly.input_packets, 2);
         let payload: AssembledPayload = serde_json::from_value(assembled.payload).unwrap();
         assert_eq!(payload.refs.len(), 1);
@@ -761,6 +765,7 @@ mod tests {
             },
         );
 
+        assert_eq!(assembled.schema_version, CONTEXTQ_SCHEMA_VERSION);
         assert!(assembled.assembly.truncated);
         assert!(assembled.token_usage.unwrap_or(0) <= 60);
         assert!(assembled.assembly.estimated_bytes <= 500);

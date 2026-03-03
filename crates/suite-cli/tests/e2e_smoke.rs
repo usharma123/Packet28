@@ -493,7 +493,7 @@ fn test_suite_context_assemble_smoke() {
     );
     write_context_packet(
         &packet_b,
-        "impact",
+        "testy",
         "Impact plan",
         "selected tests for src/lib.rs",
         "src/lib.rs",
@@ -512,9 +512,57 @@ fn test_suite_context_assemble_smoke() {
         ])
         .assert()
         .success()
+        .stdout(predicate::str::contains(
+            "\"schema_version\": \"suite.context.assemble.v1\"",
+        ))
+        .stdout(predicate::str::contains("\"packet\""))
         .stdout(predicate::str::contains("\"tool\": \"contextq\""))
         .stdout(predicate::str::contains("\"reducer\": \"assemble\""))
         .stdout(predicate::str::contains("\"sections\""));
+}
+
+#[test]
+fn test_suite_context_assemble_governed_smoke() {
+    let dir = TempDir::new().unwrap();
+    let context = dir.path().join("context.yaml");
+    let packet_a = dir.path().join("a.json");
+    let packet_b = dir.path().join("b.json");
+    write_governed_context(&context);
+    write_context_packet(
+        &packet_a,
+        "diffy",
+        "Diff gate",
+        "critical regression in coverage",
+        "src/lib.rs",
+    );
+    write_context_packet(
+        &packet_b,
+        "testy",
+        "Impact plan",
+        "selected tests for src/lib.rs",
+        "src/lib.rs",
+    );
+
+    suite_cmd()
+        .args([
+            "context",
+            "assemble",
+            "--packet",
+            packet_a.to_str().unwrap(),
+            "--packet",
+            packet_b.to_str().unwrap(),
+            "--budget-tokens",
+            "1200",
+            "--context-config",
+            context.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"schema_version\": \"suite.context.assemble.v1\"",
+        ))
+        .stdout(predicate::str::contains("\"final_packet\""))
+        .stdout(predicate::str::contains("\"tool\": \"contextq\""));
 }
 
 #[test]

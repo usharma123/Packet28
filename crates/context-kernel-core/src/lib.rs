@@ -835,7 +835,7 @@ fn run_contextq_assemble(
             "tool": assembled.tool,
             "reducer": assembled.reducer,
             "truncated": assembled.assembly.truncated,
-            "schema_version": "contextq.assemble.v1",
+            "schema_version": contextq_core::CONTEXTQ_SCHEMA_VERSION,
             "budget_trim": {
                 "truncated": assembled.assembly.truncated,
                 "sections_dropped": assembled.assembly.sections_dropped,
@@ -852,7 +852,7 @@ fn run_contextq_assemble(
         output_packets: vec![packet],
         metadata: json!({
             "reducer": "contextq.assemble",
-            "schema_version": "contextq.assemble.v1",
+            "schema_version": contextq_core::CONTEXTQ_SCHEMA_VERSION,
             "budget_trim": {
                 "truncated": assembled.assembly.truncated,
                 "sections_dropped": assembled.assembly.sections_dropped,

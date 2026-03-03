@@ -121,6 +121,12 @@ policy:
   --packet b.json \
   --budget-tokens 1200 \
   --budget-bytes 24000
+
+# Optional governed assembly with policy enforcement + audit metadata
+./target/release/suite context assemble \
+  --packet a.json \
+  --packet b.json \
+  --context-config context.yaml
 ```
 
 `suite diff analyze` and `suite test impact` now both route reducers through `context-kernel-core`, and when `--context-config` is set they continue into governed `contextq` assembly with kernel governance audit metadata.
@@ -131,6 +137,8 @@ Machine-mode shape and exits for repeatable local demos:
 - `suite test impact --json` emits `schema_version: "suite.test.impact.v1"` with `kernel_audit` and `kernel_metadata`.
 - `suite stack slice --json` emits `schema_version: "suite.stack.slice.v1"`.
 - `suite build reduce --json` emits `schema_version: "suite.build.reduce.v1"`.
+- `suite context assemble` emits `schema_version: "suite.context.assemble.v1"` with `packet` + kernel audit metadata.
+- `suite context assemble --context-config ...` emits the same schema version with governed `final_packet` + governed kernel audit metadata.
 - `contextq` budget trim metadata is emitted under `budget_trim` (truncated/dropped/estimated/cap fields).
 - Exit codes are stable: `0` success, `1` policy/gate denial, `2` usage/runtime errors.
 
