@@ -16,6 +16,7 @@ path = "src/main.rs"
 testy-cli-common = { version = "0.2.0", path = "../testy-cli-common" }
 diffy-core = { version = "0.2.0", path = "../diffy-core" }
 guardy-core = { version = "0.2.0", path = "../guardy-core" }
+contextq-core = { version = "0.2.0", path = "../contextq-core" }
 suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
 suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
 covy-ingest = { version = "0.2.0", path = "../covy-ingest" }

@@ -67,6 +67,29 @@ fn write_guard_packet(path: &Path) {
     .unwrap();
 }
 
+fn write_context_packet(path: &Path, packet_id: &str, title: &str, body: &str, path_ref: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"{{
+  "packet_id": "{packet_id}",
+  "tool": "{packet_id}",
+  "reducer": "reduce",
+  "paths": ["{path_ref}"],
+  "sections": [
+    {{
+      "title": "{title}",
+      "body": "{body}",
+      "refs": [{{ "kind": "file", "value": "{path_ref}" }}],
+      "relevance": 0.9
+    }}
+  ]
+}}"#
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn test_suite_diff_analyze_smoke() {
     suite_cmd()
@@ -156,4 +179,42 @@ fn test_suite_guard_check_smoke() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"passed\": true"));
+}
+
+#[test]
+fn test_suite_context_assemble_smoke() {
+    let dir = TempDir::new().unwrap();
+    let packet_a = dir.path().join("a.json");
+    let packet_b = dir.path().join("b.json");
+    write_context_packet(
+        &packet_a,
+        "diffy",
+        "Diff gate",
+        "critical regression in coverage",
+        "src/lib.rs",
+    );
+    write_context_packet(
+        &packet_b,
+        "impact",
+        "Impact plan",
+        "selected tests for src/lib.rs",
+        "src/lib.rs",
+    );
+
+    suite_cmd()
+        .args([
+            "context",
+            "assemble",
+            "--packet",
+            packet_a.to_str().unwrap(),
+            "--input",
+            packet_b.to_str().unwrap(),
+            "--budget-tokens",
+            "1200",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tool\": \"contextq\""))
+        .stdout(predicate::str::contains("\"reducer\": \"assemble\""))
+        .stdout(predicate::str::contains("\"sections\""));
 }

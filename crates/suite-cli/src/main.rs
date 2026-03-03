@@ -1,4 +1,5 @@
 mod cmd_common;
+mod cmd_context;
 mod cmd_diff;
 mod cmd_guard;
 mod cmd_impact;
@@ -30,6 +31,8 @@ enum Commands {
     Test(TestArgs),
     /// Guard/policy domain commands
     Guard(GuardArgs),
+    /// Context assembly domain commands
+    Context(ContextArgs),
 }
 
 #[derive(Args)]
@@ -74,6 +77,18 @@ enum GuardCommands {
     Check(cmd_guard::CheckArgs),
 }
 
+#[derive(Args)]
+struct ContextArgs {
+    #[command(subcommand)]
+    command: ContextCommands,
+}
+
+#[derive(Subcommand)]
+enum ContextCommands {
+    /// Merge multiple reducer packets into a bounded final packet
+    Assemble(cmd_context::AssembleArgs),
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -89,6 +104,9 @@ fn main() {
         Commands::Guard(guard) => match guard.command {
             GuardCommands::Validate(args) => cmd_guard::run_validate(args, &cli.config),
             GuardCommands::Check(args) => cmd_guard::run_check(args, &cli.config),
+        },
+        Commands::Context(context) => match context.command {
+            ContextCommands::Assemble(args) => cmd_context::run_assemble(args),
         },
     };
 
