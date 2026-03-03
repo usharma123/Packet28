@@ -1,4 +1,3 @@
-mod cmd_common;
 mod cmd_impact;
 mod cmd_shard;
 mod cmd_testmap;

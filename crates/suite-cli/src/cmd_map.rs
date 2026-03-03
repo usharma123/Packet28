@@ -24,55 +24,15 @@ pub struct MapArgs {
     pub schema: bool,
 }
 
-#[derive(serde::Serialize)]
-struct MapSummary {
-    manifest_files: usize,
-    records: usize,
-    tests: usize,
-    files: usize,
-    output_testmap_path: String,
-    output_timings_path: String,
-}
-
 pub fn run(args: MapArgs) -> Result<i32> {
-    if args.schema {
-        println!(
-            "{}",
-            testy_core::pipeline_testmap::TESTMAP_MANIFEST_SCHEMA_EXAMPLE
-        );
-        return Ok(0);
-    }
-
-    let adapters = crate::cmd_common::default_testmap_adapters();
-    let response = testy_core::pipeline_testmap::run_testmap(
-        testy_core::pipeline_testmap::TestMapRequest {
-            manifest_globs: args.manifest,
-            output_testmap_path: args.output,
-            output_timings_path: args.timings_output,
+    testy_cli_common::testmap::run_testmap_build(
+        testy_cli_common::testmap::TestmapBuildArgs {
+            manifest: args.manifest,
+            output: args.output,
+            timings_output: args.timings_output,
+            json: args.json,
+            schema: args.schema,
         },
-        &adapters,
-    )?;
-
-    for warning in &response.warnings {
-        eprintln!("warning: {warning}");
-    }
-
-    if args.json {
-        let summary = MapSummary {
-            manifest_files: response.stats.manifest_files,
-            records: response.stats.records,
-            tests: response.stats.tests,
-            files: response.stats.files,
-            output_testmap_path: response.output_testmap_path,
-            output_timings_path: response.output_timings_path,
-        };
-        println!("{}", serde_json::to_string_pretty(&summary)?);
-    } else {
-        println!(
-            "Built testmap from {} manifest records across {} file(s)",
-            response.stats.records, response.stats.manifest_files
-        );
-    }
-
-    Ok(0)
+        &testy_cli_common::testmap::TestmapRunnerOptions::default(),
+    )
 }

@@ -85,38 +85,12 @@ pub fn maybe_warn_deprecated(message: &str) {
     }
 }
 
-/// Deserialize JSON with a helpful error message that includes an example of
-/// the expected JSON shape.
-pub fn deserialize_json_with_example<T: serde::de::DeserializeOwned>(
-    input: &str,
-    type_name: &str,
-    example: &str,
-) -> anyhow::Result<T> {
-    serde_json::from_str(input).map_err(|e| {
-        anyhow::anyhow!("Failed to parse {type_name}: {e}\n\nExpected JSON shape:\n{example}")
-    })
-}
-
 pub fn default_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineIngestAdapters {
     diffy_core::pipeline::PipelineIngestAdapters {
         ingest_coverage_auto: ingest_coverage_auto,
         ingest_coverage_with_format: ingest_coverage_with_format,
         ingest_coverage_stdin: ingest_coverage_stdin,
         ingest_diagnostics: ingest_diagnostics,
-    }
-}
-
-pub fn default_impact_adapters() -> testy_core::pipeline::ImpactAdapters {
-    testy_core::pipeline::ImpactAdapters {
-        ingest_coverage_auto: ingest_coverage_auto,
-        ingest_coverage_with_format: ingest_coverage_with_format,
-        git_diff: impact_git_diff,
-    }
-}
-
-pub fn default_testmap_adapters() -> testy_core::pipeline_testmap::TestMapAdapters {
-    testy_core::pipeline_testmap::TestMapAdapters {
-        ingest_coverage: ingest_coverage_auto,
     }
 }
 
@@ -134,10 +108,6 @@ fn ingest_coverage_stdin(format: CoverageFormat) -> Result<CoverageData> {
 
 fn ingest_diagnostics(path: &Path) -> Result<DiagnosticsData> {
     covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
-}
-
-fn impact_git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>> {
-    diffy_core::diff::git_diff(base, head).map_err(Into::into)
 }
 
 pub fn load_coverage_state(path: &str) -> Result<CoverageData> {

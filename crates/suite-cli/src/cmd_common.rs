@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::Result;
-use suite_packet_core::{CoverageData, CoverageFormat, FileDiff};
+use suite_packet_core::{CoverageData, CoverageFormat};
 
 pub fn resolve_report_format(explicit: Option<&str>) -> String {
     match explicit {
@@ -42,20 +42,6 @@ pub fn default_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineInges
     }
 }
 
-pub fn default_impact_adapters() -> testy_core::pipeline::ImpactAdapters {
-    testy_core::pipeline::ImpactAdapters {
-        ingest_coverage_auto,
-        ingest_coverage_with_format,
-        git_diff: impact_git_diff,
-    }
-}
-
-pub fn default_testmap_adapters() -> testy_core::pipeline_testmap::TestMapAdapters {
-    testy_core::pipeline_testmap::TestMapAdapters {
-        ingest_coverage: ingest_coverage_auto,
-    }
-}
-
 fn ingest_coverage_auto(path: &Path) -> Result<CoverageData> {
     covy_ingest::ingest_path(path).map_err(Into::into)
 }
@@ -70,8 +56,4 @@ fn ingest_coverage_stdin(format: CoverageFormat) -> Result<CoverageData> {
 
 fn ingest_diagnostics(path: &Path) -> Result<suite_packet_core::diagnostics::DiagnosticsData> {
     covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
-}
-
-fn impact_git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>> {
-    diffy_core::diff::git_diff(base, head).map_err(Into::into)
 }

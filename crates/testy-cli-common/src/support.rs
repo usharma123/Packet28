@@ -1,8 +1,3 @@
-use std::path::Path;
-
-use anyhow::Result;
-use suite_packet_core::{CoverageData, CoverageFormat, FileDiff};
-
 pub fn warn_if_legacy_flag_used(alias: &str, canonical: &str) {
     if !deprecation_warnings_enabled() || global_quiet_enabled() || global_json_enabled() {
         return;
@@ -47,30 +42,4 @@ pub fn deserialize_json_with_example<T: serde::de::DeserializeOwned>(
     serde_json::from_str(input).map_err(|e| {
         anyhow::anyhow!("Failed to parse {type_name}: {e}\n\nExpected JSON shape:\n{example}")
     })
-}
-
-pub fn default_impact_adapters() -> testy_core::pipeline::ImpactAdapters {
-    testy_core::pipeline::ImpactAdapters {
-        ingest_coverage_auto,
-        ingest_coverage_with_format,
-        git_diff: impact_git_diff,
-    }
-}
-
-pub fn default_testmap_adapters() -> testy_core::pipeline_testmap::TestMapAdapters {
-    testy_core::pipeline_testmap::TestMapAdapters {
-        ingest_coverage: ingest_coverage_auto,
-    }
-}
-
-fn ingest_coverage_auto(path: &Path) -> Result<CoverageData> {
-    covy_ingest::ingest_path(path).map_err(Into::into)
-}
-
-fn ingest_coverage_with_format(path: &Path, format: CoverageFormat) -> Result<CoverageData> {
-    covy_ingest::ingest_path_with_format(path, format).map_err(Into::into)
-}
-
-fn impact_git_diff(base: &str, head: &str) -> Result<Vec<FileDiff>> {
-    diffy_core::diff::git_diff(base, head).map_err(Into::into)
 }
