@@ -1,3 +1,4 @@
+mod cmd_build;
 mod cmd_common;
 mod cmd_context;
 mod cmd_diff;
@@ -5,6 +6,7 @@ mod cmd_guard;
 mod cmd_impact;
 mod cmd_map;
 mod cmd_shard;
+mod cmd_stack;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -33,6 +35,10 @@ enum Commands {
     Guard(GuardArgs),
     /// Context assembly domain commands
     Context(ContextArgs),
+    /// Stack trace / failure log reduction commands
+    Stack(StackArgs),
+    /// Build diagnostics reduction commands
+    Build(BuildArgs),
 }
 
 #[derive(Args)]
@@ -89,6 +95,30 @@ enum ContextCommands {
     Assemble(cmd_context::AssembleArgs),
 }
 
+#[derive(Args)]
+struct StackArgs {
+    #[command(subcommand)]
+    command: StackCommands,
+}
+
+#[derive(Subcommand)]
+enum StackCommands {
+    /// Parse stack traces/failing logs into deduped failure packets
+    Slice(cmd_stack::SliceArgs),
+}
+
+#[derive(Args)]
+struct BuildArgs {
+    #[command(subcommand)]
+    command: BuildCommands,
+}
+
+#[derive(Subcommand)]
+enum BuildCommands {
+    /// Parse compiler/linter output into deduped build diagnostic packets
+    Reduce(cmd_build::ReduceArgs),
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -107,6 +137,12 @@ fn main() {
         },
         Commands::Context(context) => match context.command {
             ContextCommands::Assemble(args) => cmd_context::run_assemble(args),
+        },
+        Commands::Stack(stack) => match stack.command {
+            StackCommands::Slice(args) => cmd_stack::run(args),
+        },
+        Commands::Build(build) => match build.command {
+            BuildCommands::Reduce(args) => cmd_build::run(args),
         },
     };
 

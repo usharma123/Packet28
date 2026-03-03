@@ -131,6 +131,7 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
+                    "schema_version": "suite.test.impact.v1",
                     "impact_result": output.result,
                     "known_tests": output.known_tests,
                     "print_command": output.print_command,
@@ -139,17 +140,25 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
                         "impact": response.audit,
                         "governed": governed.audit,
                     },
+                    "kernel_metadata": {
+                        "impact": response.metadata,
+                        "governed": governed.metadata,
+                    },
                 }))?
             );
         } else {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
+                    "schema_version": "suite.test.impact.v1",
                     "impact_result": output.result,
                     "known_tests": output.known_tests,
                     "print_command": output.print_command,
                     "kernel_audit": {
                         "impact": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "impact": response.metadata,
                     },
                 }))?
             );

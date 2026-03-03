@@ -747,6 +747,8 @@ pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("contextq.assemble", run_contextq_assemble);
     kernel.register_reducer("governed.assemble", run_governed_assemble);
     kernel.register_reducer("guardy.check", run_guardy_check);
+    kernel.register_reducer("stacky.slice", run_stacky_slice);
+    kernel.register_reducer("buildy.reduce", run_buildy_reduce);
 }
 
 fn run_governed_assemble(
@@ -833,6 +835,16 @@ fn run_contextq_assemble(
             "tool": assembled.tool,
             "reducer": assembled.reducer,
             "truncated": assembled.assembly.truncated,
+            "schema_version": "contextq.assemble.v1",
+            "budget_trim": {
+                "truncated": assembled.assembly.truncated,
+                "sections_dropped": assembled.assembly.sections_dropped,
+                "refs_dropped": assembled.assembly.refs_dropped,
+                "estimated_tokens": assembled.assembly.estimated_tokens,
+                "estimated_bytes": assembled.assembly.estimated_bytes,
+                "budget_tokens": assembled.assembly.budget_tokens,
+                "budget_bytes": assembled.assembly.budget_bytes,
+            },
         }),
     };
 
@@ -840,6 +852,16 @@ fn run_contextq_assemble(
         output_packets: vec![packet],
         metadata: json!({
             "reducer": "contextq.assemble",
+            "schema_version": "contextq.assemble.v1",
+            "budget_trim": {
+                "truncated": assembled.assembly.truncated,
+                "sections_dropped": assembled.assembly.sections_dropped,
+                "refs_dropped": assembled.assembly.refs_dropped,
+                "estimated_tokens": assembled.assembly.estimated_tokens,
+                "estimated_bytes": assembled.assembly.estimated_bytes,
+                "budget_tokens": assembled.assembly.budget_tokens,
+                "budget_bytes": assembled.assembly.budget_bytes,
+            },
         }),
     })
 }
@@ -902,6 +924,98 @@ fn run_guardy_check(
         metadata: json!({
             "reducer": "guardy.check",
             "passed": audit.passed,
+        }),
+    })
+}
+
+fn run_stacky_slice(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let input: stacky_core::StackSliceRequest = serde_json::from_value(ctx.reducer_input.clone())
+        .map_err(|source| KernelError::ReducerFailed {
+        target: ctx.target.clone(),
+        detail: format!("invalid reducer input: {source}"),
+    })?;
+
+    let packet = stacky_core::slice_to_packet(input);
+    let payload: stacky_core::StackSliceOutput = serde_json::from_value(packet.payload.clone())
+        .map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: format!("invalid stacky payload: {source}"),
+        })?;
+
+    let kernel_packet = KernelPacket {
+        packet_id: packet.packet_id.clone(),
+        format: default_packet_format(),
+        body: serde_json::to_value(&packet).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?,
+        token_usage: None,
+        runtime_ms: None,
+        metadata: json!({
+            "tool": "stacky",
+            "reducer": "slice",
+            "schema_version": payload.schema_version,
+            "unique_failures": payload.unique_failures,
+            "duplicates_removed": payload.duplicates_removed,
+        }),
+    };
+
+    Ok(ReducerResult {
+        output_packets: vec![kernel_packet],
+        metadata: json!({
+            "reducer": "stacky.slice",
+            "schema_version": stacky_core::STACKY_SCHEMA_VERSION,
+            "unique_failures": payload.unique_failures,
+            "duplicates_removed": payload.duplicates_removed,
+        }),
+    })
+}
+
+fn run_buildy_reduce(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let input: buildy_core::BuildReduceRequest = serde_json::from_value(ctx.reducer_input.clone())
+        .map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: format!("invalid reducer input: {source}"),
+        })?;
+
+    let packet = buildy_core::reduce_to_packet(input);
+    let payload: buildy_core::BuildReduceOutput = serde_json::from_value(packet.payload.clone())
+        .map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: format!("invalid buildy payload: {source}"),
+        })?;
+
+    let kernel_packet = KernelPacket {
+        packet_id: packet.packet_id.clone(),
+        format: default_packet_format(),
+        body: serde_json::to_value(&packet).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?,
+        token_usage: None,
+        runtime_ms: None,
+        metadata: json!({
+            "tool": "buildy",
+            "reducer": "reduce",
+            "schema_version": payload.schema_version,
+            "unique_diagnostics": payload.unique_diagnostics,
+            "duplicates_removed": payload.duplicates_removed,
+        }),
+    };
+
+    Ok(ReducerResult {
+        output_packets: vec![kernel_packet],
+        metadata: json!({
+            "reducer": "buildy.reduce",
+            "schema_version": buildy_core::BUILDY_SCHEMA_VERSION,
+            "unique_diagnostics": payload.unique_diagnostics,
+            "duplicates_removed": payload.duplicates_removed,
         }),
     })
 }
@@ -1439,6 +1553,60 @@ policy:
         assert_eq!(response.audit.governance.output_audits.len(), 1);
         assert!(response.audit.governance.input_audits[0].passed);
         assert!(response.audit.governance.output_audits[0].passed);
+    }
+
+    #[test]
+    fn contextq_assemble_exposes_budget_trim_metadata() {
+        let kernel = Kernel::with_v1_reducers();
+        let packet = KernelPacket::from_value(
+            json!({
+                "packet_id": "large-packet",
+                "tool": "diffy",
+                "reducer": "analyze",
+                "sections": [{
+                    "title": "Large section",
+                    "body": "X".repeat(8_000),
+                    "refs": [{"kind":"file","value":"src/lib.rs"}],
+                    "relevance": 1.0
+                }]
+            }),
+            None,
+        );
+        let mut packet = packet;
+        packet.token_usage = Some(1);
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "contextq.assemble".to_string(),
+                input_packets: vec![packet],
+                budget: ExecutionBudget {
+                    token_cap: Some(1300),
+                    byte_cap: Some(200_000),
+                    runtime_ms_cap: None,
+                },
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        let truncated = response
+            .metadata
+            .get("budget_trim")
+            .and_then(|trim| trim.get("truncated"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        assert!(truncated);
+        assert!(response
+            .metadata
+            .get("budget_trim")
+            .and_then(|trim| trim.get("sections_dropped"))
+            .and_then(Value::as_u64)
+            .is_some());
+        assert!(response
+            .metadata
+            .get("budget_trim")
+            .and_then(|trim| trim.get("refs_dropped"))
+            .and_then(Value::as_u64)
+            .is_some());
     }
 
     #[test]

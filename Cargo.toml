@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/covy-core", "crates/covy-ingest", "crates/covy-cli", "crates/diffy-cli", "crates/testy-cli", "crates/suite-packet-core", "crates/suite-foundation-core", "crates/diffy-core", "crates/testy-core", "crates/suite-cli", "crates/testy-cli-common", "crates/guardy-core", "crates/contextq-core", "crates/context-kernel-core", "crates/context-memory-core", "crates/context-scheduler-core"]
+members = ["crates/covy-core", "crates/covy-ingest", "crates/covy-cli", "crates/diffy-cli", "crates/testy-cli", "crates/suite-packet-core", "crates/suite-foundation-core", "crates/diffy-core", "crates/testy-core", "crates/suite-cli", "crates/testy-cli-common", "crates/guardy-core", "crates/contextq-core", "crates/context-kernel-core", "crates/context-memory-core", "crates/context-scheduler-core", "crates/stacky-core", "crates/buildy-core"]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,5 @@
+src/lib.rs:10:5: error: cannot find value `x` in this scope [E0425]
+src/lib.rs:10:5: error: cannot find value `x` in this scope [E0425]
+main.c(40,2): warning C4996: use of deprecated function
+error[E0308]: mismatched types
+  --> src/main.rs:22:13

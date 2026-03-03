@@ -235,11 +235,16 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
+                        "schema_version": "suite.diff.analyze.v1",
                         "gate_result": output.gate_result,
                         "diagnostics": output.diagnostics,
                         "diffs": output.diffs,
                         "final_packet": final_packet.body,
                         "kernel_audit": governed.audit,
+                        "kernel_metadata": {
+                            "diff": response.metadata,
+                            "governed": governed.metadata,
+                        },
                     }))?
                 );
             } else {

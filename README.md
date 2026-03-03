@@ -50,6 +50,8 @@ cargo build --release -p covy-cli -p diffy-cli -p testy-cli -p suite-cli
 ./target/release/suite test impact --base HEAD --head HEAD --testmap .covy/state/testmap.bin --json
 ./target/release/suite guard validate --config context.yaml
 ./target/release/suite guard check --packet packet.json --config context.yaml
+./target/release/suite stack slice --input artifacts/stack.log --json
+./target/release/suite build reduce --input artifacts/build.log --json
 ```
 
 Guard policy `context.yaml` canonical V1 shape:
@@ -72,7 +74,7 @@ policy:
     forbidden_patterns: ["(?i)password", "(?i)secret"]
 ```
 
-## Governed Local Workflow (V1)
+## Governed Local Workflow (Usable V1)
 
 1. Validate policy config:
 
@@ -122,6 +124,34 @@ policy:
 ```
 
 `suite diff analyze` and `suite test impact` now both route reducers through `context-kernel-core`, and when `--context-config` is set they continue into governed `contextq` assembly with kernel governance audit metadata.
+
+Machine-mode shape and exits for repeatable local demos:
+
+- `suite diff analyze --json --context-config ...` emits `schema_version: "suite.diff.analyze.v1"` with `kernel_audit` and `kernel_metadata`.
+- `suite test impact --json` emits `schema_version: "suite.test.impact.v1"` with `kernel_audit` and `kernel_metadata`.
+- `suite stack slice --json` emits `schema_version: "suite.stack.slice.v1"`.
+- `suite build reduce --json` emits `schema_version: "suite.build.reduce.v1"`.
+- `contextq` budget trim metadata is emitted under `budget_trim` (truncated/dropped/estimated/cap fields).
+- Exit codes are stable: `0` success, `1` policy/gate denial, `2` usage/runtime errors.
+
+## Next Reducer Wave (V1)
+
+These reducers now run through the same governed kernel path as `diff` and `test`:
+
+```bash
+./target/release/suite stack slice \
+  --input artifacts/stack.log \
+  --json \
+  --context-config context.yaml
+
+./target/release/suite build reduce \
+  --input artifacts/build.log \
+  --json \
+  --context-config context.yaml
+```
+
+- `stacky` parses stack traces/failing logs, normalizes frames, dedupes repeated failures, fingerprints similar failures, and surfaces first actionable frames.
+- `buildy` parses compiler/linter output, dedupes repeated diagnostics, groups root causes, and ranks fix order.
 
 ## Recent Changes (v0.2.0)
 

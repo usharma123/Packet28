@@ -1,0 +1,11 @@
+java.lang.IllegalStateException: boom
+  at com.example.Service.run(src/service.rs:42)
+  at com.example.Main.main(src/main.rs:10)
+
+java.lang.IllegalStateException: boom
+  at com.example.Service.run(src/service.rs:42)
+  at com.example.Main.main(src/main.rs:10)
+
+thread 'main' panicked at src/lib.rs:11:2
+  0: app::core::run at src/lib.rs:11:2
+  1: std::rt::lang_start_internal at /rustc/abc/std/src/rt.rs:95:18

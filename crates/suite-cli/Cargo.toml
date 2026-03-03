@@ -19,6 +19,8 @@ testy-core = { version = "0.2.0", path = "../testy-core" }
 guardy-core = { version = "0.2.0", path = "../guardy-core" }
 contextq-core = { version = "0.2.0", path = "../contextq-core" }
 context-kernel-core = { version = "0.2.0", path = "../context-kernel-core" }
+stacky-core = { version = "0.2.0", path = "../stacky-core" }
+buildy-core = { version = "0.2.0", path = "../buildy-core" }
 suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
 suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
 covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
