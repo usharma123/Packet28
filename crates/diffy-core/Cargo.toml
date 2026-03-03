@@ -1,5 +1,5 @@
 [package]
-name = "covy-core"
+name = "diffy-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,9 +11,15 @@ homepage.workspace = true
 [dependencies]
 suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
 suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
-diffy-core = { version = "0.2.0", path = "../diffy-core" }
-testy-core = { version = "0.2.0", path = "../testy-core" }
+roaring.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+colored.workspace = true
+comfy-table.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-roaring.workspace = true
 tempfile.workspace = true

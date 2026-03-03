@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
-use crate::model::FileDiff;
+use crate::diff::FileDiff;
 
 /// Severity of a diagnostic issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -192,10 +192,10 @@ mod tests {
         let mut changed = RoaringBitmap::new();
         changed.insert(5);
         changed.insert(10);
-        let diffs = vec![crate::model::FileDiff {
+        let diffs = vec![crate::diff::FileDiff {
             path: "src/main.rs".to_string(),
             old_path: None,
-            status: crate::model::DiffStatus::Modified,
+            status: crate::diff::DiffStatus::Modified,
             changed_lines: changed,
         }];
 
