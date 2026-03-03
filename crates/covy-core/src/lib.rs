@@ -22,6 +22,10 @@ pub mod pathmap {
     pub use suite_foundation_core::pathmap::*;
 }
 
+pub mod path_diagnose {
+    pub use suite_foundation_core::path_diagnose::*;
+}
+
 pub mod snapshot {
     pub use suite_foundation_core::snapshot::*;
 }
