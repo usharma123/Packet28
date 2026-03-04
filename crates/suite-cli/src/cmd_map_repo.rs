@@ -1,6 +1,14 @@
 use anyhow::{anyhow, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+pub enum PacketDetailArg {
+    #[default]
+    Compact,
+    Rich,
+}
 
 #[derive(Args)]
 pub struct RepoArgs {
@@ -17,11 +25,11 @@ pub struct RepoArgs {
     pub focus_symbols: Vec<String>,
 
     /// Maximum files in map output
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, default_value_t = 40)]
     pub max_files: usize,
 
     /// Maximum symbols in map output
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 120)]
     pub max_symbols: usize,
 
     /// Include test files
@@ -31,6 +39,22 @@ pub struct RepoArgs {
     /// Emit JSON output
     #[arg(long)]
     pub json: bool,
+
+    /// Packet detail level in JSON mode
+    #[arg(long, value_enum, default_value_t = PacketDetailArg::Compact)]
+    pub packet_detail: PacketDetailArg,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pub pretty: bool,
+
+    /// Include kernel metadata/audit in JSON output
+    #[arg(long)]
+    pub debug: bool,
+
+    /// Persist kernel cache on disk under <repo-root>/.packet28
+    #[arg(long)]
+    pub cache: bool,
 
     /// Run governed packet path using this context policy config (context.yaml)
     #[arg(long)]
@@ -46,18 +70,39 @@ pub struct RepoArgs {
 }
 
 pub fn run(args: RepoArgs) -> Result<i32> {
-    let kernel = context_kernel_core::Kernel::with_v1_reducers();
+    let repo_root = args.repo_root.clone();
+    let input = mapy_core::RepoMapRequest {
+        repo_root,
+        focus_paths: args.focus_paths,
+        focus_symbols: args.focus_symbols,
+        max_files: args.max_files,
+        max_symbols: args.max_symbols,
+        include_tests: args.include_tests,
+    };
 
+    let use_kernel = args.cache || args.context_config.is_some();
+    if !use_kernel {
+        let envelope = mapy_core::build_repo_map(input)?;
+        if args.json {
+            let packet = packet_value(&envelope, args.packet_detail)?;
+            emit_json(
+                &json!({
+                    "schema_version": "suite.map.repo.v1",
+                    "packet": packet,
+                }),
+                args.pretty,
+            )?;
+            return Ok(0);
+        }
+
+        print_text_summary(&envelope);
+        return Ok(0);
+    }
+
+    let kernel = build_kernel(args.cache, PathBuf::from(&input.repo_root));
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "mapy.repo".to_string(),
-        reducer_input: serde_json::to_value(mapy_core::RepoMapRequest {
-            repo_root: args.repo_root,
-            focus_paths: args.focus_paths,
-            focus_symbols: args.focus_symbols,
-            max_files: args.max_files,
-            max_symbols: args.max_symbols,
-            include_tests: args.include_tests,
-        })?,
+        reducer_input: serde_json::to_value(input)?,
         policy_context: args
             .context_config
             .as_ref()
@@ -74,11 +119,18 @@ pub fn run(args: RepoArgs) -> Result<i32> {
     let envelope: suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload> =
         serde_json::from_value(output_packet.body.clone())
             .map_err(|source| anyhow!("invalid mapy output packet: {source}"))?;
+    let governed_input_packet = if args.packet_detail == PacketDetailArg::Rich {
+        let mut packet = output_packet.clone();
+        packet.body = packet_value(&envelope, PacketDetailArg::Rich)?;
+        packet
+    } else {
+        output_packet.clone()
+    };
 
     let governed_response = if let Some(context_config) = args.context_config {
         Some(kernel.execute(context_kernel_core::KernelRequest {
             target: "governed.assemble".to_string(),
-            input_packets: vec![output_packet.clone()],
+            input_packets: vec![governed_input_packet],
             budget: context_kernel_core::ExecutionBudget {
                 token_cap: Some(args.context_budget_tokens),
                 byte_cap: Some(args.context_budget_bytes),
@@ -86,6 +138,11 @@ pub fn run(args: RepoArgs) -> Result<i32> {
             },
             policy_context: json!({
                 "config_path": context_config,
+                "detail_mode": match args.packet_detail {
+                    PacketDetailArg::Rich => "rich",
+                    PacketDetailArg::Compact => "compact",
+                },
+                "compact_assembly": args.packet_detail == PacketDetailArg::Compact,
             }),
             ..context_kernel_core::KernelRequest::default()
         })?)
@@ -94,55 +151,53 @@ pub fn run(args: RepoArgs) -> Result<i32> {
     };
 
     if args.json {
+        let packet = packet_value(&envelope, args.packet_detail)?;
         if let Some(governed) = governed_response {
             let final_packet = governed
                 .output_packets
                 .first()
                 .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "schema_version": "suite.map.repo.v1",
-                    "packet": envelope,
-                    "final_packet": final_packet.body,
-                    "kernel_audit": {
-                        "map": response.audit,
-                        "governed": governed.audit,
-                    },
-                    "kernel_metadata": {
-                        "map": response.metadata,
-                        "governed": governed.metadata,
-                    },
-                }))?
-            );
+            if args.debug {
+                emit_json(
+                    &json!({
+                        "schema_version": "suite.map.repo.v1",
+                        "packet": packet,
+                        "final_packet": final_packet.body,
+                        "kernel_audit": {
+                            "map": response.audit,
+                            "governed": governed.audit,
+                        },
+                        "kernel_metadata": {
+                            "map": response.metadata,
+                            "governed": governed.metadata,
+                        },
+                    }),
+                    args.pretty,
+                )?;
+            } else {
+                emit_json(
+                    &json!({
+                        "schema_version": "suite.map.repo.v1",
+                        "packet": packet,
+                        "final_packet": final_packet.body,
+                    }),
+                    args.pretty,
+                )?;
+            }
         } else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
+            emit_json(
+                &json!({
                     "schema_version": "suite.map.repo.v1",
-                    "packet": envelope,
-                    "kernel_audit": {
-                        "map": response.audit,
-                    },
-                    "kernel_metadata": {
-                        "map": response.metadata,
-                    },
-                }))?
-            );
+                    "packet": packet,
+                }),
+                args.pretty,
+            )?;
         }
 
         return Ok(0);
     }
 
-    println!("{}", envelope.summary);
-    println!("top files:");
-    for file in envelope.payload.files_ranked.iter().take(10) {
-        println!("- {} ({:.3})", file.path, file.score);
-    }
-    println!("top symbols:");
-    for symbol in envelope.payload.symbols_ranked.iter().take(10) {
-        println!("- {} :: {} ({:.3})", symbol.file, symbol.name, symbol.score);
-    }
+    print_text_summary(&envelope);
 
     if let Some(governed) = governed_response {
         let final_packet = governed
@@ -162,4 +217,56 @@ pub fn run(args: RepoArgs) -> Result<i32> {
     }
 
     Ok(0)
+}
+
+fn packet_value(
+    envelope: &suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>,
+    detail: PacketDetailArg,
+) -> Result<Value> {
+    if detail == PacketDetailArg::Rich {
+        let mut value = serde_json::to_value(envelope)?;
+        value["payload"] = serde_json::to_value(mapy_core::expand_repo_map_payload(envelope))?;
+        return Ok(value);
+    }
+    serde_json::to_value(envelope).map_err(Into::into)
+}
+
+fn emit_json(value: &Value, pretty: bool) -> Result<()> {
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        println!("{}", serde_json::to_string(value)?);
+    }
+    Ok(())
+}
+
+fn print_text_summary(envelope: &suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>) {
+    println!("{}", envelope.summary);
+    println!("top files:");
+    for file in envelope.payload.files_ranked.iter().take(10) {
+        if let Some(file_ref) = envelope.files.get(file.file_idx) {
+            println!("- {} ({:.3})", file_ref.path, file.score);
+        }
+    }
+    println!("top symbols:");
+    for symbol in envelope.payload.symbols_ranked.iter().take(10) {
+        if let Some(symbol_ref) = envelope.symbols.get(symbol.symbol_idx) {
+            let file = envelope
+                .files
+                .get(symbol.file_idx)
+                .map(|f| f.path.as_str())
+                .unwrap_or("unknown");
+            println!("- {} :: {} ({:.3})", file, symbol_ref.name, symbol.score);
+        }
+    }
+}
+
+fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
+    if cache {
+        return context_kernel_core::Kernel::with_v1_reducers_and_persistence(
+            context_kernel_core::PersistConfig::new(root_dir),
+        );
+    }
+
+    context_kernel_core::Kernel::with_v1_reducers()
 }

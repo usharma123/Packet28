@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::Result;
@@ -7,8 +6,7 @@ use suite_packet_core::{CoverageData, CoverageFormat};
 pub fn resolve_report_format(explicit: Option<&str>) -> String {
     match explicit {
         Some(fmt) => fmt.to_string(),
-        None if std::io::stdout().is_terminal() => "terminal".to_string(),
-        None => "json".to_string(),
+        None => "terminal".to_string(),
     }
 }
 

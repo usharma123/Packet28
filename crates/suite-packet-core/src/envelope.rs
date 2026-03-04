@@ -16,7 +16,9 @@ pub enum RiskLevel {
 #[serde(default)]
 pub struct FileRef {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub relevance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
 
@@ -24,8 +26,13 @@ pub struct FileRef {
 #[serde(default)]
 pub struct SymbolRef {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub relevance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
 
@@ -36,13 +43,19 @@ pub struct BudgetCost {
     pub est_bytes: usize,
     pub runtime_ms: u64,
     pub tool_calls: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_est_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_est_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct Provenance {
     pub inputs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub git_base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub git_head: Option<String>,
     pub generated_at_unix: u64,
 }
@@ -55,9 +68,13 @@ pub struct EnvelopeV1<T> {
     pub kind: String,
     pub hash: String,
     pub summary: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub symbols: Vec<SymbolRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub risk: Option<RiskLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
     pub budget_cost: BudgetCost,
     pub provenance: Provenance,
@@ -90,6 +107,10 @@ impl<T: Serialize> EnvelopeV1<T> {
             obj.insert("hash".to_string(), Value::String(String::new()));
             if let Some(budget_cost) = obj.get_mut("budget_cost").and_then(Value::as_object_mut) {
                 budget_cost.insert("runtime_ms".to_string(), Value::from(0));
+                budget_cost.insert("est_bytes".to_string(), Value::from(0));
+                budget_cost.insert("est_tokens".to_string(), Value::from(0));
+                budget_cost.insert("payload_est_bytes".to_string(), Value::Null);
+                budget_cost.insert("payload_est_tokens".to_string(), Value::Null);
             }
             if let Some(provenance) = obj.get_mut("provenance").and_then(Value::as_object_mut) {
                 provenance.insert("generated_at_unix".to_string(), Value::from(0));
@@ -99,17 +120,52 @@ impl<T: Serialize> EnvelopeV1<T> {
     }
 
     pub fn with_canonical_hash(mut self) -> Self {
-        self.files
-            .sort_by(|a, b| a.path.cmp(&b.path).then_with(|| cmp_opt_f64(a.relevance, b.relevance)));
+        self.sort_refs();
+        self.hash = self.canonical_hash();
+        self
+    }
+
+    pub fn with_canonical_hash_and_real_budget(mut self) -> Self {
+        self.hash = self.canonical_hash();
+
+        let mut prev = (usize::MAX, u64::MAX);
+        for _ in 0..5 {
+            let bytes = envelope_json_bytes(&self);
+            let tokens = estimate_tokens_from_bytes(bytes);
+            if (bytes, tokens) == prev {
+                break;
+            }
+            self.budget_cost.est_bytes = bytes;
+            self.budget_cost.est_tokens = tokens;
+            prev = (bytes, tokens);
+        }
+
+        self.hash = self.canonical_hash();
+        self
+    }
+
+    fn sort_refs(&mut self) {
+        self.files.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then_with(|| cmp_opt_f64(a.relevance, b.relevance))
+        });
         self.symbols.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
                 .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.kind.cmp(&b.kind))
                 .then_with(|| cmp_opt_f64(a.relevance, b.relevance))
         });
-        self.hash = self.canonical_hash();
-        self
     }
+}
+
+pub fn envelope_json_bytes<T: Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value).map(|buf| buf.len()).unwrap_or(0)
+}
+
+pub fn estimate_tokens_from_bytes(bytes: usize) -> u64 {
+    (bytes / 4) as u64
 }
 
 pub fn canonical_hash_json<T: Serialize>(value: &T) -> String {
@@ -195,12 +251,14 @@ mod tests {
                 SymbolRef {
                     name: "b".to_string(),
                     file: None,
+                    kind: None,
                     relevance: None,
                     source: None,
                 },
                 SymbolRef {
                     name: "a".to_string(),
                     file: None,
+                    kind: None,
                     relevance: None,
                     source: None,
                 },
@@ -216,5 +274,42 @@ mod tests {
         assert!(!env.hash.is_empty());
         assert_eq!(env.files[0].path, "a");
         assert_eq!(env.symbols[0].name, "a");
+    }
+
+    #[test]
+    fn envelope_real_budget_matches_serialized_bytes() {
+        let env = EnvelopeV1 {
+            version: "1".to_string(),
+            tool: "demo".to_string(),
+            kind: "demo.kind".to_string(),
+            hash: String::new(),
+            summary: "demo".to_string(),
+            files: vec![],
+            symbols: vec![],
+            risk: None,
+            confidence: Some(1.0),
+            budget_cost: BudgetCost {
+                est_tokens: 0,
+                est_bytes: 0,
+                runtime_ms: 12,
+                tool_calls: 1,
+                payload_est_tokens: Some(10),
+                payload_est_bytes: Some(40),
+            },
+            provenance: Provenance {
+                inputs: vec!["a".to_string()],
+                git_base: None,
+                git_head: None,
+                generated_at_unix: 123,
+            },
+            payload: json!({"ok": true, "n": 1}),
+        }
+        .with_canonical_hash_and_real_budget();
+
+        assert_eq!(env.budget_cost.est_bytes, envelope_json_bytes(&env));
+        assert_eq!(
+            env.budget_cost.est_tokens,
+            estimate_tokens_from_bytes(env.budget_cost.est_bytes)
+        );
     }
 }

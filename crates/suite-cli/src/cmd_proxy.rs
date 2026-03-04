@@ -1,6 +1,23 @@
 use anyhow::{anyhow, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+pub enum PacketDetailArg {
+    #[default]
+    Compact,
+    Rich,
+}
+
+impl From<PacketDetailArg> for suite_proxy_core::PacketDetail {
+    fn from(value: PacketDetailArg) -> Self {
+        match value {
+            PacketDetailArg::Compact => suite_proxy_core::PacketDetail::Compact,
+            PacketDetailArg::Rich => suite_proxy_core::PacketDetail::Rich,
+        }
+    }
+}
 
 #[derive(Args)]
 pub struct ProxyArgs {
@@ -20,6 +37,22 @@ pub struct RunArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Packet detail level in JSON mode
+    #[arg(long, value_enum, default_value_t = PacketDetailArg::Compact)]
+    pub packet_detail: PacketDetailArg,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pub pretty: bool,
+
+    /// Include kernel metadata/audit in JSON output
+    #[arg(long)]
+    pub debug: bool,
+
+    /// Persist kernel cache on disk under <cwd>/.packet28
+    #[arg(long)]
+    pub cache: bool,
+
     /// Working directory for command execution
     #[arg(long)]
     pub cwd: Option<String>,
@@ -35,6 +68,10 @@ pub struct RunArgs {
     /// Maximum reduced output lines
     #[arg(long)]
     pub max_lines: Option<usize>,
+
+    /// Maximum serialized packet bytes
+    #[arg(long)]
+    pub packet_byte_cap: Option<usize>,
 
     /// Run governed packet path using this context policy config (context.yaml)
     #[arg(long)]
@@ -54,17 +91,42 @@ pub struct RunArgs {
 }
 
 pub fn run(args: RunArgs) -> Result<i32> {
-    let kernel = context_kernel_core::Kernel::with_v1_reducers();
+    let persist_root = persistence_root(&args)?;
+    let input = suite_proxy_core::ProxyRunRequest {
+        argv: args.command_argv,
+        cwd: args.cwd,
+        env_allowlist: args.env_allowlist,
+        max_output_bytes: args.max_output_bytes,
+        max_lines: args.max_lines,
+        packet_byte_cap: args.packet_byte_cap,
+        detail: args.packet_detail.into(),
+    };
 
+    let use_kernel = args.cache || args.context_config.is_some();
+    if !use_kernel {
+        let envelope = suite_proxy_core::run_and_reduce(input)?;
+        if args.json {
+            emit_json(
+                &json!({
+                    "schema_version": "suite.proxy.run.v1",
+                    "packet": envelope,
+                }),
+                args.pretty,
+            )?;
+        } else {
+            print_text_summary(&envelope);
+        }
+        return Ok(if envelope.payload.exit_code == 0 {
+            0
+        } else {
+            1
+        });
+    }
+
+    let kernel = build_kernel(args.cache, persist_root);
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "proxy.run".to_string(),
-        reducer_input: serde_json::to_value(suite_proxy_core::ProxyRunRequest {
-            argv: args.command_argv,
-            cwd: args.cwd,
-            env_allowlist: args.env_allowlist,
-            max_output_bytes: args.max_output_bytes,
-            max_lines: args.max_lines,
-        })?,
+        reducer_input: serde_json::to_value(input)?,
         policy_context: args
             .context_config
             .as_ref()
@@ -93,6 +155,11 @@ pub fn run(args: RunArgs) -> Result<i32> {
             },
             policy_context: json!({
                 "config_path": context_config,
+                "detail_mode": match args.packet_detail {
+                    PacketDetailArg::Rich => "rich",
+                    PacketDetailArg::Compact => "compact",
+                },
+                "compact_assembly": args.packet_detail == PacketDetailArg::Compact,
             }),
             ..context_kernel_core::KernelRequest::default()
         })?)
@@ -106,46 +173,51 @@ pub fn run(args: RunArgs) -> Result<i32> {
                 .output_packets
                 .first()
                 .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "schema_version": "suite.proxy.run.v1",
-                    "packet": envelope,
-                    "final_packet": final_packet.body,
-                    "kernel_audit": {
-                        "proxy": response.audit,
-                        "governed": governed.audit,
-                    },
-                    "kernel_metadata": {
-                        "proxy": response.metadata,
-                        "governed": governed.metadata,
-                    },
-                }))?
-            );
+            if args.debug {
+                emit_json(
+                    &json!({
+                        "schema_version": "suite.proxy.run.v1",
+                        "packet": envelope,
+                        "final_packet": final_packet.body,
+                        "kernel_audit": {
+                            "proxy": response.audit,
+                            "governed": governed.audit,
+                        },
+                        "kernel_metadata": {
+                            "proxy": response.metadata,
+                            "governed": governed.metadata,
+                        },
+                    }),
+                    args.pretty,
+                )?;
+            } else {
+                emit_json(
+                    &json!({
+                        "schema_version": "suite.proxy.run.v1",
+                        "packet": envelope,
+                        "final_packet": final_packet.body,
+                    }),
+                    args.pretty,
+                )?;
+            }
         } else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
+            emit_json(
+                &json!({
                     "schema_version": "suite.proxy.run.v1",
                     "packet": envelope,
-                    "kernel_audit": {
-                        "proxy": response.audit,
-                    },
-                    "kernel_metadata": {
-                        "proxy": response.metadata,
-                    },
-                }))?
-            );
+                }),
+                args.pretty,
+            )?;
         }
 
-        return Ok(if envelope.payload.exit_code == 0 { 0 } else { 1 });
+        return Ok(if envelope.payload.exit_code == 0 {
+            0
+        } else {
+            1
+        });
     }
 
-    println!("{}", envelope.summary);
-    for line in &envelope.payload.output_lines {
-        println!("{line}");
-    }
+    print_text_summary(&envelope);
 
     if let Some(governed) = governed_response {
         let final_packet = governed
@@ -164,5 +236,52 @@ pub fn run(args: RunArgs) -> Result<i32> {
         );
     }
 
-    Ok(if envelope.payload.exit_code == 0 { 0 } else { 1 })
+    Ok(if envelope.payload.exit_code == 0 {
+        0
+    } else {
+        1
+    })
+}
+
+fn emit_json(value: &Value, pretty: bool) -> Result<()> {
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        println!("{}", serde_json::to_string(value)?);
+    }
+    Ok(())
+}
+
+fn print_text_summary(
+    envelope: &suite_packet_core::EnvelopeV1<suite_proxy_core::CommandSummaryPayload>,
+) {
+    println!("{}", envelope.summary);
+    let lines = if envelope.payload.output_lines.is_empty() {
+        &envelope.payload.highlights
+    } else {
+        &envelope.payload.output_lines
+    };
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+fn persistence_root(args: &RunArgs) -> Result<PathBuf> {
+    let root = if let Some(cwd) = args.cwd.as_deref() {
+        PathBuf::from(cwd)
+    } else {
+        std::env::current_dir()?
+    };
+
+    Ok(root)
+}
+
+fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
+    if cache {
+        return context_kernel_core::Kernel::with_v1_reducers_and_persistence(
+            context_kernel_core::PersistConfig::new(root_dir),
+        );
+    }
+
+    context_kernel_core::Kernel::with_v1_reducers()
 }

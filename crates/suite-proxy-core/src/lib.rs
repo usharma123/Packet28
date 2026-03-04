@@ -9,6 +9,16 @@ use suite_packet_core::{BudgetCost, CovyError, EnvelopeV1, FileRef, Provenance};
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 24_000;
 const DEFAULT_MAX_LINES: usize = 160;
+const DEFAULT_PACKET_BYTE_CAP: usize = 2_500;
+const HIGHLIGHT_CAP: usize = 6;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketDetail {
+    #[default]
+    Compact,
+    Rich,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -18,6 +28,8 @@ pub struct ProxyRunRequest {
     pub env_allowlist: Vec<String>,
     pub max_output_bytes: Option<usize>,
     pub max_lines: Option<usize>,
+    pub packet_byte_cap: Option<usize>,
+    pub detail: PacketDetail,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -25,7 +37,7 @@ pub struct ProxyRunRequest {
 pub struct SummaryGroup {
     pub name: String,
     pub count: usize,
-    pub examples: Vec<String>,
+    pub example_line_indexes: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -48,6 +60,7 @@ pub struct CommandSummaryPayload {
     pub token_saved_est: u64,
     pub groups: Vec<SummaryGroup>,
     pub dropped: Vec<DroppedSummary>,
+    pub highlights: Vec<String>,
     pub output_lines: Vec<String>,
 }
 
@@ -58,9 +71,13 @@ struct ScoredLine {
     score: i32,
 }
 
-pub fn run_and_reduce(req: ProxyRunRequest) -> Result<EnvelopeV1<CommandSummaryPayload>, CovyError> {
+pub fn run_and_reduce(
+    req: ProxyRunRequest,
+) -> Result<EnvelopeV1<CommandSummaryPayload>, CovyError> {
     if req.argv.is_empty() {
-        return Err(CovyError::Other("proxy.run requires at least one command arg".to_string()));
+        return Err(CovyError::Other(
+            "proxy.run requires at least one command arg".to_string(),
+        ));
     }
     validate_safe_command(&req.argv)?;
 
@@ -135,23 +152,60 @@ pub fn run_and_reduce(req: ProxyRunRequest) -> Result<EnvelopeV1<CommandSummaryP
         selected.push(item);
     }
 
+    let selected_lines = selected
+        .iter()
+        .map(|item| item.line.clone())
+        .collect::<Vec<_>>();
+    let lines_out = selected_lines.len();
+    let bytes_out = selected_lines
+        .iter()
+        .map(|v| v.len().saturating_add(1))
+        .sum::<usize>();
+    let bytes_saved = bytes_in.saturating_sub(bytes_out);
+
+    let highlights = selected
+        .iter()
+        .take(HIGHLIGHT_CAP)
+        .map(|item| item.line.clone())
+        .collect::<Vec<_>>();
+
+    let highlight_index_by_line = highlights
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| (line.clone(), idx))
+        .collect::<BTreeMap<_, _>>();
+
     let mut groups = BTreeMap::<String, SummaryGroup>::new();
     for item in &selected {
-        let entry = groups.entry(item.group.clone()).or_insert_with(|| SummaryGroup {
-            name: item.group.clone(),
-            count: 0,
-            examples: Vec::new(),
-        });
+        let entry = groups
+            .entry(item.group.clone())
+            .or_insert_with(|| SummaryGroup {
+                name: item.group.clone(),
+                count: 0,
+                example_line_indexes: Vec::new(),
+            });
         entry.count = entry.count.saturating_add(1);
-        if entry.examples.len() < 3 {
-            entry.examples.push(item.line.clone());
+        if let Some(line_idx) = highlight_index_by_line.get(&item.line).copied() {
+            if entry.example_line_indexes.len() < 3
+                && !entry.example_line_indexes.contains(&line_idx)
+            {
+                entry.example_line_indexes.push(line_idx);
+            }
         }
     }
 
-    let output_lines = selected.iter().map(|item| item.line.clone()).collect::<Vec<_>>();
-    let lines_out = output_lines.len();
-    let bytes_out = output_lines.iter().map(|v| v.len().saturating_add(1)).sum::<usize>();
-    let bytes_saved = bytes_in.saturating_sub(bytes_out);
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|a, b| {
+        score_group(&b.name)
+            .cmp(&score_group(&a.name))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let output_lines = if req.detail == PacketDetail::Rich {
+        selected_lines.clone()
+    } else {
+        Vec::new()
+    };
 
     let payload = CommandSummaryPayload {
         command: command.clone(),
@@ -162,7 +216,7 @@ pub fn run_and_reduce(req: ProxyRunRequest) -> Result<EnvelopeV1<CommandSummaryP
         bytes_out,
         bytes_saved,
         token_saved_est: (bytes_saved / 4) as u64,
-        groups: groups.into_values().collect(),
+        groups,
         dropped: vec![
             DroppedSummary {
                 reason: "deduplicated".to_string(),
@@ -173,29 +227,37 @@ pub fn run_and_reduce(req: ProxyRunRequest) -> Result<EnvelopeV1<CommandSummaryP
                 count: dropped_by_budget,
             },
         ],
+        highlights,
         output_lines,
     };
 
-    let files = extract_file_refs(&payload.output_lines);
+    let files = extract_file_refs(&selected_lines);
+    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default().len();
 
-    let envelope = EnvelopeV1 {
+    let mut envelope = EnvelopeV1 {
         version: "1".to_string(),
         tool: "proxy".to_string(),
         kind: "command_summary".to_string(),
         hash: String::new(),
         summary: format!(
             "command='{}' exit_code={} lines={} -> {} bytes_saved={}",
-            payload.command, payload.exit_code, payload.lines_in, payload.lines_out, payload.bytes_saved
+            payload.command,
+            payload.exit_code,
+            payload.lines_in,
+            payload.lines_out,
+            payload.bytes_saved
         ),
         files,
         symbols: Vec::new(),
         risk: None,
         confidence: Some(1.0),
         budget_cost: BudgetCost {
-            est_tokens: (bytes_out / 4) as u64,
-            est_bytes: bytes_out,
+            est_tokens: 0,
+            est_bytes: 0,
             runtime_ms,
             tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
         },
         provenance: Provenance {
             inputs: vec![command],
@@ -204,8 +266,12 @@ pub fn run_and_reduce(req: ProxyRunRequest) -> Result<EnvelopeV1<CommandSummaryP
             generated_at_unix: now_unix(),
         },
         payload,
-    }
-    .with_canonical_hash();
+    };
+    envelope = envelope.with_canonical_hash_and_real_budget();
+    enforce_packet_budget(
+        &mut envelope,
+        req.packet_byte_cap.unwrap_or(DEFAULT_PACKET_BYTE_CAP),
+    );
 
     Ok(envelope)
 }
@@ -282,25 +348,109 @@ fn score_group(group: &str) -> i32 {
 }
 
 fn extract_file_refs(lines: &[String]) -> Vec<FileRef> {
-    let mut out = BTreeSet::<String>::new();
+    let mut counts = BTreeMap::<String, usize>::new();
     for line in lines {
         for cap in path_capture_re().captures_iter(line) {
             if let Some(m) = cap.get(1) {
                 let path = normalize_path(m.as_str());
                 if !path.is_empty() {
-                    out.insert(path);
+                    *counts.entry(path).or_insert(0) += 1;
                 }
             }
         }
     }
 
-    out.into_iter()
-        .map(|path| FileRef {
+    let max_count = counts.values().copied().max().unwrap_or(1) as f64;
+    let mut out = counts
+        .into_iter()
+        .map(|(path, count)| FileRef {
             path,
-            relevance: Some(0.7),
+            relevance: Some((count as f64 / max_count).clamp(0.0, 1.0)),
             source: Some("proxy.command_summary".to_string()),
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    out.sort_by(|a, b| {
+        b.relevance
+            .unwrap_or(0.0)
+            .total_cmp(&a.relevance.unwrap_or(0.0))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out
+}
+
+fn enforce_packet_budget(envelope: &mut EnvelopeV1<CommandSummaryPayload>, cap: usize) {
+    for _ in 0..64 {
+        let current_bytes = serde_json::to_vec(envelope).map(|v| v.len()).unwrap_or(0);
+        if current_bytes <= cap {
+            *envelope = envelope.clone().with_canonical_hash_and_real_budget();
+            return;
+        }
+
+        if trim_group_examples(&mut envelope.payload.groups) {
+            *envelope = envelope.clone().with_canonical_hash_and_real_budget();
+            continue;
+        }
+        if trim_highlights(
+            &mut envelope.payload.highlights,
+            &mut envelope.payload.groups,
+        ) {
+            *envelope = envelope.clone().with_canonical_hash_and_real_budget();
+            continue;
+        }
+        if trim_low_priority_group(&mut envelope.payload.groups) {
+            *envelope = envelope.clone().with_canonical_hash_and_real_budget();
+            continue;
+        }
+        if trim_low_relevance_file(&mut envelope.files) {
+            *envelope = envelope.clone().with_canonical_hash_and_real_budget();
+            continue;
+        }
+        if !envelope.payload.output_lines.is_empty() {
+            envelope.payload.output_lines.pop();
+            *envelope = envelope.clone().with_canonical_hash_and_real_budget();
+            continue;
+        }
+        break;
+    }
+}
+
+fn trim_group_examples(groups: &mut [SummaryGroup]) -> bool {
+    for group in groups.iter_mut().rev() {
+        if !group.example_line_indexes.is_empty() {
+            group.example_line_indexes.pop();
+            return true;
+        }
+    }
+    false
+}
+
+fn trim_highlights(highlights: &mut Vec<String>, groups: &mut [SummaryGroup]) -> bool {
+    if highlights.is_empty() {
+        return false;
+    }
+    highlights.pop();
+    let cap = highlights.len();
+    for group in groups {
+        group.example_line_indexes.retain(|idx| *idx < cap);
+    }
+    true
+}
+
+fn trim_low_priority_group(groups: &mut Vec<SummaryGroup>) -> bool {
+    if groups.is_empty() {
+        return false;
+    }
+    groups.pop();
+    true
+}
+
+fn trim_low_relevance_file(files: &mut Vec<FileRef>) -> bool {
+    if files.is_empty() {
+        return false;
+    }
+    files.pop();
+    true
 }
 
 fn normalize_path(input: &str) -> String {

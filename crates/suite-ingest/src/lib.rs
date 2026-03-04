@@ -3,14 +3,20 @@ use std::path::Path;
 
 use suite_packet_core::{CoverageData, CoverageFormat, CovyError, DiagnosticsData};
 
-pub fn ingest_coverage_path(path: &Path, format: Option<CoverageFormat>) -> Result<CoverageData, CovyError> {
+pub fn ingest_coverage_path(
+    path: &Path,
+    format: Option<CoverageFormat>,
+) -> Result<CoverageData, CovyError> {
     match format {
         Some(format) => covy_ingest::ingest_path_with_format(path, format),
         None => covy_ingest::ingest_path(path),
     }
 }
 
-pub fn ingest_coverage_paths(paths: &[String], format: Option<CoverageFormat>) -> Result<CoverageData, CovyError> {
+pub fn ingest_coverage_paths(
+    paths: &[String],
+    format: Option<CoverageFormat>,
+) -> Result<CoverageData, CovyError> {
     let mut merged = CoverageData::new();
     for path in paths {
         let data = ingest_coverage_path(Path::new(path), format)?;

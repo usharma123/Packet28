@@ -1,10 +1,17 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use suite_foundation_core::config::{GateConfig, IssueGateConfig};
 use suite_foundation_core::CovyConfig;
 use suite_packet_core::{BudgetCost, CoverageFormat, EnvelopeV1, FileRef, Provenance};
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+pub enum PacketDetailArg {
+    #[default]
+    Compact,
+    Rich,
+}
 
 #[derive(Args)]
 pub struct CheckArgs {
@@ -64,14 +71,21 @@ pub struct CheckArgs {
     #[arg(long)]
     max_new_warnings: Option<u32>,
 
-    /// Output format (terminal/json/markdown/github). Defaults to "terminal" in interactive
-    /// mode and "json" when stdout is piped.
+    /// Output format (terminal/json/markdown/github). Defaults to "terminal".
     #[arg(long)]
     report: Option<String>,
 
     /// Emit JSON output
     #[arg(long)]
     json: bool,
+
+    /// Packet detail level in JSON mode
+    #[arg(long, value_enum, default_value_t = PacketDetailArg::Compact)]
+    packet_detail: PacketDetailArg,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pretty: bool,
 
     /// Prefixes to strip from file paths in coverage data
     #[arg(long)]
@@ -194,10 +208,12 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
                 risk: None,
                 confidence: Some(if output.gate_result.passed { 1.0 } else { 0.8 }),
                 budget_cost: BudgetCost {
-                    est_tokens: (json.len() / 4) as u64,
-                    est_bytes: json.len(),
+                    est_tokens: 0,
+                    est_bytes: 0,
                     runtime_ms: 0,
                     tool_calls: 1,
+                    payload_est_tokens: Some((json.len() / 4) as u64),
+                    payload_est_bytes: Some(json.len()),
                 },
                 provenance: Provenance {
                     inputs: changed_paths,
@@ -207,16 +223,25 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
                 },
                 payload: gate_json,
             }
-            .with_canonical_hash();
+            .with_canonical_hash_and_real_budget();
 
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+            let value = if args.packet_detail == PacketDetailArg::Rich {
+                serde_json::json!({
                     "schema_version": "suite.cover.check.v1",
                     "gate_result": output.gate_result,
                     "envelope_v1": envelope,
-                }))?
-            );
+                })
+            } else {
+                serde_json::json!({
+                    "schema_version": "suite.cover.check.v1",
+                    "packet": envelope,
+                })
+            };
+            if args.pretty {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", serde_json::to_string(&value)?);
+            }
         }
         "markdown" => {
             let md = diffy_core::report::render_markdown(
