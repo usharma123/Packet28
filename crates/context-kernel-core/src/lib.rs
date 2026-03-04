@@ -1893,12 +1893,12 @@ policy:
             .unwrap();
 
         assert_eq!(response.output_packets.len(), 1);
-        let reducer = response.output_packets[0]
+        let kind = response.output_packets[0]
             .body
-            .get("reducer")
+            .get("kind")
             .and_then(Value::as_str)
             .unwrap();
-        assert_eq!(reducer, "assemble");
+        assert_eq!(kind, "context_assemble");
     }
 
     #[test]
@@ -2120,7 +2120,8 @@ policy:
 
         let passed = response.output_packets[0]
             .body
-            .get("passed")
+            .get("payload")
+            .and_then(|payload| payload.get("passed"))
             .and_then(Value::as_bool)
             .unwrap();
         assert!(passed);
@@ -2147,7 +2148,8 @@ policy:
         let kernel = Kernel::with_v1_reducers();
         let packet = KernelPacket::from_value(
             json!({
-                "schema_version": "suite.proxy.run.v1",
+                "schema_version": "suite.packet.v1",
+                "packet_type": "suite.proxy.run.v1",
                 "packet": {
                     "tool": "proxy",
                     "payload": {
@@ -2171,7 +2173,8 @@ policy:
 
         let passed = response.output_packets[0]
             .body
-            .get("passed")
+            .get("payload")
+            .and_then(|payload| payload.get("passed"))
             .and_then(Value::as_bool)
             .unwrap();
         assert!(!passed);

@@ -100,11 +100,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
     let machine_profile = args
         .json
         .map(|profile| suite_packet_core::JsonProfile::from(profile));
-    let detail_mode = if matches!(
-        machine_profile,
-        Some(suite_packet_core::JsonProfile::Full | suite_packet_core::JsonProfile::Handle)
-    ) || args.packet_detail == PacketDetailArg::Rich
-    {
+    let detail_mode = if args.packet_detail == PacketDetailArg::Rich {
         PacketDetailArg::Rich
     } else {
         PacketDetailArg::Compact
