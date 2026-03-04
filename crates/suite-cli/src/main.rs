@@ -1,10 +1,13 @@
 mod cmd_build;
+mod cmd_cover;
 mod cmd_common;
 mod cmd_context;
 mod cmd_diff;
 mod cmd_guard;
 mod cmd_impact;
 mod cmd_map;
+mod cmd_map_repo;
+mod cmd_proxy;
 mod cmd_shard;
 mod cmd_stack;
 
@@ -27,6 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Coverage domain commands
+    Cover(CoverArgs),
     /// Diff domain commands
     Diff(DiffArgs),
     /// Test domain commands
@@ -39,6 +44,22 @@ enum Commands {
     Stack(StackArgs),
     /// Build diagnostics reduction commands
     Build(BuildArgs),
+    /// Repo mapping commands
+    Map(MapArgs),
+    /// Safe command proxy/reduction commands
+    Proxy(cmd_proxy::ProxyArgs),
+}
+
+#[derive(Args)]
+struct CoverArgs {
+    #[command(subcommand)]
+    command: CoverCommands,
+}
+
+#[derive(Subcommand)]
+enum CoverCommands {
+    /// Analyze coverage quality gate
+    Check(cmd_cover::CheckArgs),
 }
 
 #[derive(Args)]
@@ -119,10 +140,25 @@ enum BuildCommands {
     Reduce(cmd_build::ReduceArgs),
 }
 
+#[derive(Args)]
+struct MapArgs {
+    #[command(subcommand)]
+    command: MapCommands,
+}
+
+#[derive(Subcommand)]
+enum MapCommands {
+    /// Build deterministic repo map packet
+    Repo(cmd_map_repo::RepoArgs),
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Commands::Cover(cover) => match cover.command {
+            CoverCommands::Check(args) => cmd_cover::run(args, &cli.config),
+        },
         Commands::Diff(diff) => match diff.command {
             DiffCommands::Analyze(args) => cmd_diff::run(args, &cli.config),
         },
@@ -143,6 +179,12 @@ fn main() {
         },
         Commands::Build(build) => match build.command {
             BuildCommands::Reduce(args) => cmd_build::run(args),
+        },
+        Commands::Map(map) => match map.command {
+            MapCommands::Repo(args) => cmd_map_repo::run(args),
+        },
+        Commands::Proxy(proxy) => match proxy.command {
+            cmd_proxy::ProxyCommands::Run(args) => cmd_proxy::run(args),
         },
     };
 

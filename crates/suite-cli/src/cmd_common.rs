@@ -43,17 +43,17 @@ pub fn default_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineInges
 }
 
 fn ingest_coverage_auto(path: &Path) -> Result<CoverageData> {
-    covy_ingest::ingest_path(path).map_err(Into::into)
+    suite_ingest::ingest_coverage_path(path, None).map_err(Into::into)
 }
 
 fn ingest_coverage_with_format(path: &Path, format: CoverageFormat) -> Result<CoverageData> {
-    covy_ingest::ingest_path_with_format(path, format).map_err(Into::into)
+    suite_ingest::ingest_coverage_path(path, Some(format)).map_err(Into::into)
 }
 
 fn ingest_coverage_stdin(format: CoverageFormat) -> Result<CoverageData> {
-    covy_ingest::ingest_reader(std::io::stdin().lock(), format).map_err(Into::into)
+    suite_ingest::ingest_coverage_stdin(format).map_err(Into::into)
 }
 
 fn ingest_diagnostics(path: &Path) -> Result<suite_packet_core::diagnostics::DiagnosticsData> {
-    covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
+    suite_ingest::ingest_diagnostics_path(path).map_err(Into::into)
 }
