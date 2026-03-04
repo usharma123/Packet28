@@ -15,6 +15,7 @@ homepage = "https://github.com/usharma123/Covy"
 # Core
 roaring = "0.10"
 blake3 = "1"
+sha2 = "0.10"
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

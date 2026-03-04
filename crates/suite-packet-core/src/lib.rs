@@ -4,7 +4,9 @@ pub mod diff;
 pub mod envelope;
 pub mod error;
 pub mod gate;
+pub mod machine;
 pub mod merge;
+pub mod registry;
 pub mod shard;
 pub mod testmap;
 
@@ -13,6 +15,8 @@ pub use diagnostics::*;
 pub use envelope::*;
 pub use error::CovyError;
 pub use gate::*;
+pub use machine::*;
 pub use merge::MergeSummary;
+pub use registry::*;
 pub use shard::*;
 pub use testmap::*;

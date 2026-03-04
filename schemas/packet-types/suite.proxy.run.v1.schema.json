@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.proxy.run.v1.schema.json",
+  "title": "Packet Type Contract: suite.proxy.run.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.proxy.run.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["command","exit_code","highlights"],
+          "properties": {
+            "debug": {},
+            "truncated": {},
+            "returned_count": {},
+            "total_count": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["command","exit_code","highlights"],
+  "x-optional_payload_fields": ["output_lines","groups","dropped","debug","artifact_handle"],
+  "x-boundedness_rules": ["line and byte caps enforced before packet emission"],
+  "x-compatibility_notes": ["legacy packet-detail rich path supported for one release"]
+}

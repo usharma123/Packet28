@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.packet.v1.schema.json",
+  "title": "Suite Packet Wrapper V1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "type": "string",
+      "pattern": "^suite\\.[a-z0-9]+\\.[a-z0-9]+\\.v1$"
+    },
+    "packet": {
+      "type": "object",
+      "required": [
+        "version",
+        "tool",
+        "kind",
+        "hash",
+        "summary",
+        "budget_cost",
+        "provenance",
+        "payload"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "hash": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "budget_cost": {
+          "type": "object"
+        },
+        "provenance": {
+          "type": "object"
+        },
+        "payload": {}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

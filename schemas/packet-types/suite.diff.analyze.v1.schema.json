@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.diff.analyze.v1.schema.json",
+  "title": "Packet Type Contract: suite.diff.analyze.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.diff.analyze.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["gate_result"],
+          "properties": {
+            "debug": {},
+            "truncated": {},
+            "returned_count": {},
+            "total_count": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["gate_result"],
+  "x-optional_payload_fields": ["diagnostics","diffs","debug","truncated","returned_count","total_count","artifact_handle"],
+  "x-boundedness_rules": ["diff arrays truncated in compact profile","handle profile for full diffs"],
+  "x-compatibility_notes": ["legacy gate-json shape supported for one release"]
+}

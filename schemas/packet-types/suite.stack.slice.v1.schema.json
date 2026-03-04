@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.stack.slice.v1.schema.json",
+  "title": "Packet Type Contract: suite.stack.slice.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.stack.slice.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["unique_failures","total_failures"],
+          "properties": {
+            "debug": {},
+            "truncated": {},
+            "returned_count": {},
+            "total_count": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["unique_failures","total_failures"],
+  "x-optional_payload_fields": ["failures","debug","truncated","returned_count","total_count","artifact_handle"],
+  "x-boundedness_rules": ["failure list truncated in compact profile"],
+  "x-compatibility_notes": ["legacy stack packet shape supported for one release"]
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.map.repo.v1",
+  "packet": {
+    "version": "1",
+    "tool": "suite",
+    "kind": "suite.map.repo.v1",
+    "hash": "hash-compact-example",
+    "summary": "suite.map.repo.v1 compact snapshot",
+    "budget_cost": {
+      "est_tokens": 100,
+      "est_bytes": 400,
+      "runtime_ms": 12,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["input-a"],
+      "git_base": "HEAD~1",
+      "git_head": "HEAD",
+      "generated_at_unix": 1700000000
+    },
+    "payload": {"passed":true,"violations":[],"gate_result":{"passed":true},"result":{"selected_tests":["t1"],"confidence":0.9},"known_tests":1,"unique_failures":1,"total_failures":1,"unique_diagnostics":1,"total_diagnostics":1,"files_ranked":[{"file_idx":0,"score":0.9}],"symbols_ranked":[{"symbol_idx":0,"file_idx":0,"score":0.8}],"truncation":{"files":false,"symbols":false},"command":"echo ok","exit_code":0,"highlights":["ok"],"sections":[{"title":"S","body":"B"}],"refs":[{"kind":"file","value":"src/lib.rs"}],"findings":[],"truncated":true,"returned_count":1,"total_count":2}
+  }
+}

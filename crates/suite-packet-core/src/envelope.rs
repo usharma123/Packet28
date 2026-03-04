@@ -312,4 +312,50 @@ mod tests {
             estimate_tokens_from_bytes(env.budget_cost.est_bytes)
         );
     }
+
+    #[test]
+    fn canonical_hash_ignores_volatile_fields() {
+        let mut left = EnvelopeV1 {
+            version: "1".to_string(),
+            tool: "demo".to_string(),
+            kind: "demo.kind".to_string(),
+            hash: "left".to_string(),
+            summary: "demo".to_string(),
+            files: vec![],
+            symbols: vec![],
+            risk: None,
+            confidence: Some(1.0),
+            budget_cost: BudgetCost {
+                est_tokens: 111,
+                est_bytes: 222,
+                runtime_ms: 333,
+                tool_calls: 1,
+                payload_est_tokens: Some(444),
+                payload_est_bytes: Some(555),
+            },
+            provenance: Provenance {
+                inputs: vec!["input.json".to_string()],
+                git_base: Some("base".to_string()),
+                git_head: Some("head".to_string()),
+                generated_at_unix: 100,
+            },
+            payload: json!({
+                "status": "ok",
+                "items": [1, 2, 3],
+            }),
+        };
+        let mut right = left.clone();
+        right.hash = "right".to_string();
+        right.budget_cost.est_tokens = 9000;
+        right.budget_cost.est_bytes = 9001;
+        right.budget_cost.runtime_ms = 9002;
+        right.budget_cost.payload_est_tokens = Some(9003);
+        right.budget_cost.payload_est_bytes = Some(9004);
+        right.provenance.generated_at_unix = 9999;
+
+        assert_eq!(left.canonical_hash(), right.canonical_hash());
+
+        left.summary = "different".to_string();
+        assert_ne!(left.canonical_hash(), right.canonical_hash());
+    }
 }

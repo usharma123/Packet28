@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.test.impact.v1.schema.json",
+  "title": "Packet Type Contract: suite.test.impact.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.test.impact.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["result","known_tests"],
+          "properties": {
+            "debug": {},
+            "truncated": {},
+            "returned_count": {},
+            "total_count": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["result","known_tests"],
+  "x-optional_payload_fields": ["print_command","debug","truncated","returned_count","total_count","artifact_handle"],
+  "x-boundedness_rules": ["test arrays truncated in compact profile"],
+  "x-compatibility_notes": ["legacy impact_result top-level fields supported for one release"]
+}

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.map.repo.v1.schema.json",
+  "title": "Packet Type Contract: suite.map.repo.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.map.repo.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["files_ranked","symbols_ranked","truncation"],
+          "properties": {
+            "debug": {},
+            "truncated": {},
+            "returned_count": {},
+            "total_count": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["files_ranked","symbols_ranked","truncation"],
+  "x-optional_payload_fields": ["edges","focus_hits","debug","artifact_handle"],
+  "x-boundedness_rules": ["rank arrays bounded by request limits","compact mode keeps bounded payload"],
+  "x-compatibility_notes": ["legacy packet-detail rich path supported for one release"]
+}

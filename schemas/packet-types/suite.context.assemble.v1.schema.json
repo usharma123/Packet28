@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.context.assemble.v1.schema.json",
+  "title": "Packet Type Contract: suite.context.assemble.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.context.assemble.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["sections","refs","truncated"],
+          "properties": {
+            "debug": {},
+            "truncated": {},
+            "returned_count": {},
+            "total_count": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["sections","refs","truncated"],
+  "x-optional_payload_fields": ["sources","debug","artifact_handle"],
+  "x-boundedness_rules": ["budget bounded by tokens and bytes"],
+  "x-compatibility_notes": ["legacy final_packet envelope shim supported for one release"]
+}
