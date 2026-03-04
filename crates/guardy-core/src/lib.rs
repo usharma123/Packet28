@@ -97,6 +97,14 @@ pub struct HumanReviewPolicy {
 #[serde(default)]
 pub struct GuardPacket {
     pub packet_id: Option<String>,
+    pub summary: Option<String>,
+    pub kind: Option<String>,
+    pub version: Option<String>,
+    pub hash: Option<String>,
+    pub provenance: Option<GuardProvenance>,
+    pub risk: Option<String>,
+    pub confidence: Option<f64>,
+    pub budget_cost: Option<Value>,
     pub tool: Option<String>,
     pub tools: Vec<String>,
     pub reducer: Option<String>,
@@ -106,6 +114,8 @@ pub struct GuardPacket {
     pub runtime_ms: Option<u64>,
     pub tool_call_count: Option<u64>,
     pub payload: Value,
+    pub files: Vec<PacketFileRef>,
+    pub symbols: Vec<PacketSymbolRef>,
     pub tool_invocations: Vec<ToolInvocation>,
     pub reducer_invocations: Vec<ReducerInvocation>,
     pub text_blobs: Vec<String>,
@@ -117,6 +127,33 @@ pub struct GuardPacket {
     pub shard_plan: Option<suite_packet_core::ShardPlan>,
     #[serde(default)]
     pub merge_summary: Option<suite_packet_core::MergeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GuardProvenance {
+    pub inputs: Vec<String>,
+    pub git_base: Option<String>,
+    pub git_head: Option<String>,
+    pub generated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PacketFileRef {
+    pub path: String,
+    pub relevance: Option<f64>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PacketSymbolRef {
+    pub name: String,
+    pub file: Option<String>,
+    pub kind: Option<String>,
+    pub relevance: Option<f64>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -282,7 +319,9 @@ impl ContextConfig {
 
         for (idx, pattern) in self.policy.human_review.paths.iter().enumerate() {
             if let Err(err) = Pattern::new(pattern) {
-                errors.push(format!("policy.human_review.paths[{idx}] invalid glob: {err}"));
+                errors.push(format!(
+                    "policy.human_review.paths[{idx}] invalid glob: {err}"
+                ));
             }
         }
 
@@ -385,6 +424,16 @@ impl GuardPacket {
                 paths.insert(normalize_path(path));
             }
         }
+        for file in &self.files {
+            if let Some(path) = non_empty(Some(file.path.as_str())) {
+                paths.insert(normalize_path(path));
+            }
+        }
+        for symbol in &self.symbols {
+            if let Some(file) = symbol.file.as_deref().and_then(|v| non_empty(Some(v))) {
+                paths.insert(normalize_path(file));
+            }
+        }
         for invocation in &self.tool_invocations {
             for path in &invocation.paths {
                 if let Some(path) = non_empty(Some(path.as_str())) {
@@ -433,7 +482,48 @@ impl GuardPacket {
         let mut out = Vec::new();
 
         collect_texts_from_value(&self.payload, "packet.payload", &mut out);
+        for (idx, path) in self.paths.iter().enumerate() {
+            push_text_candidate(&mut out, format!("packet.paths[{idx}]"), path);
+        }
+        for (idx, file) in self.files.iter().enumerate() {
+            push_text_candidate(&mut out, format!("packet.files[{idx}].path"), &file.path);
+            if let Some(source) = file.source.as_deref() {
+                push_text_candidate(&mut out, format!("packet.files[{idx}].source"), source);
+            }
+        }
+        for (idx, symbol) in self.symbols.iter().enumerate() {
+            push_text_candidate(
+                &mut out,
+                format!("packet.symbols[{idx}].name"),
+                &symbol.name,
+            );
+            if let Some(file) = symbol.file.as_deref() {
+                push_text_candidate(&mut out, format!("packet.symbols[{idx}].file"), file);
+            }
+            if let Some(source) = symbol.source.as_deref() {
+                push_text_candidate(&mut out, format!("packet.symbols[{idx}].source"), source);
+            }
+        }
         for (idx, call) in self.tool_invocations.iter().enumerate() {
+            push_text_candidate(
+                &mut out,
+                format!("packet.tool_invocations[{idx}].name"),
+                &call.name,
+            );
+            if let Some(reducer) = call.reducer.as_deref() {
+                push_text_candidate(
+                    &mut out,
+                    format!("packet.tool_invocations[{idx}].reducer"),
+                    reducer,
+                );
+            }
+            for (path_idx, path) in call.paths.iter().enumerate() {
+                push_text_candidate(
+                    &mut out,
+                    format!("packet.tool_invocations[{idx}].paths[{path_idx}]"),
+                    path,
+                );
+            }
             collect_texts_from_value(
                 &call.input,
                 &format!("packet.tool_invocations[{idx}].input"),
@@ -446,6 +536,11 @@ impl GuardPacket {
             );
         }
         for (idx, call) in self.reducer_invocations.iter().enumerate() {
+            push_text_candidate(
+                &mut out,
+                format!("packet.reducer_invocations[{idx}].name"),
+                &call.name,
+            );
             collect_texts_from_value(
                 &call.output,
                 &format!("packet.reducer_invocations[{idx}].output"),
@@ -473,6 +568,20 @@ impl GuardPacket {
         }
         if let Some(value) = &self.merge_summary {
             collect_serialized_texts(value, "packet.merge_summary", &mut out);
+        }
+        if let Some(summary) = self.summary.as_deref() {
+            push_text_candidate(&mut out, "packet.summary".to_string(), summary);
+        }
+        if let Some(provenance) = &self.provenance {
+            for (idx, input) in provenance.inputs.iter().enumerate() {
+                push_text_candidate(&mut out, format!("packet.provenance.inputs[{idx}]"), input);
+            }
+            if let Some(git_base) = provenance.git_base.as_deref() {
+                push_text_candidate(&mut out, "packet.provenance.git_base".to_string(), git_base);
+            }
+            if let Some(git_head) = provenance.git_head.as_deref() {
+                push_text_candidate(&mut out, "packet.provenance.git_head".to_string(), git_head);
+            }
         }
 
         out
@@ -614,8 +723,11 @@ pub fn check_packet(config: &ContextConfig, packet: &GuardPacket) -> AuditResult
         }
     }
 
-    let human_review_paths =
-        compile_globs(&config.policy.human_review.paths, "human_review.paths", &mut findings);
+    let human_review_paths = compile_globs(
+        &config.policy.human_review.paths,
+        "human_review.paths",
+        &mut findings,
+    );
     if !human_review_paths.is_empty() {
         for path in &paths {
             if matches_any(&human_review_paths, path) {
@@ -812,6 +924,15 @@ struct TextCandidate {
 fn collect_serialized_texts<T: Serialize>(value: &T, root: &str, out: &mut Vec<TextCandidate>) {
     if let Ok(serialized) = serde_json::to_value(value) {
         collect_texts_from_value(&serialized, root, out);
+    }
+}
+
+fn push_text_candidate(out: &mut Vec<TextCandidate>, source: String, value: &str) {
+    if !value.is_empty() {
+        out.push(TextCandidate {
+            source,
+            value: value.to_string(),
+        });
     }
 }
 
@@ -1140,5 +1261,131 @@ policy:
 
         let audit = check_packet_file(&packet_path, &config_path).unwrap();
         assert!(audit.passed);
+    }
+
+    #[test]
+    fn check_packet_paths_from_top_level_refs() {
+        let yaml = r#"
+version: 1
+policy:
+  allowed_tools: ["mapy"]
+  allowed_reducers: []
+  paths:
+    include: ["src/**"]
+    exclude: ["src/private/**"]
+  budgets:
+    token_cap: 1000
+    runtime_ms_cap: 2000
+  redaction:
+    forbidden_patterns: []
+"#;
+        let config = parse_context_strict(yaml).unwrap();
+
+        let packet: GuardPacket = serde_json::from_str(
+            r#"{
+  "tool": "mapy",
+  "files": [
+    {"path": "src/lib.rs"},
+    {"path": "src/private/secret.rs"}
+  ],
+  "payload": {}
+}"#,
+        )
+        .unwrap();
+
+        let result = check_packet(&config, &packet);
+        assert!(!result.passed);
+        assert!(result.findings.iter().any(|f| f.rule == "path_exclude"));
+    }
+
+    #[test]
+    fn check_packet_scans_files_and_symbols_for_redaction() {
+        let yaml = r#"
+version: 1
+policy:
+  paths:
+    include: ["**"]
+    exclude: []
+  redaction:
+    forbidden_patterns: ["secret123"]
+"#;
+        let config = parse_context_strict(yaml).unwrap();
+
+        let packet: GuardPacket = serde_json::from_str(
+            r#"{
+  "files": [{"path": "src/secret123.txt"}],
+  "symbols": [{"name": "ok", "file": "src/main.rs"}],
+  "payload": {}
+}"#,
+        )
+        .unwrap();
+
+        let result = check_packet(&config, &packet);
+        assert!(!result.passed);
+        assert!(result
+            .findings
+            .iter()
+            .any(|f| f.rule == "redaction" && f.subject == "packet.files[0].path"));
+    }
+
+    #[test]
+    fn check_packet_scans_summary_for_redaction() {
+        let yaml = r#"
+version: 1
+policy:
+  paths:
+    include: ["**"]
+    exclude: []
+  redaction:
+    forbidden_patterns: ["secret123"]
+"#;
+        let config = parse_context_strict(yaml).unwrap();
+
+        let packet: GuardPacket = serde_json::from_str(
+            r#"{
+  "summary": "contains secret123",
+  "payload": {}
+}"#,
+        )
+        .unwrap();
+
+        let result = check_packet(&config, &packet);
+        assert!(!result.passed);
+        assert!(result
+            .findings
+            .iter()
+            .any(|f| f.rule == "redaction" && f.subject == "packet.summary"));
+    }
+
+    #[test]
+    fn check_packet_scans_provenance_for_redaction() {
+        let yaml = r#"
+version: 1
+policy:
+  paths:
+    include: ["**"]
+    exclude: []
+  redaction:
+    forbidden_patterns: ["secret123"]
+"#;
+        let config = parse_context_strict(yaml).unwrap();
+
+        let packet: GuardPacket = serde_json::from_str(
+            r#"{
+  "provenance": {
+    "inputs": ["my_secret123_input"],
+    "generated_at_unix": 1
+  },
+  "payload": {}
+}"#,
+        )
+        .unwrap();
+
+        let result = check_packet(&config, &packet);
+        assert!(!result.passed);
+        assert!(result
+            .findings
+            .iter()
+            .any(|f| f.rule == "redaction" && f.subject == "packet.provenance.inputs[0]"));
     }
 }

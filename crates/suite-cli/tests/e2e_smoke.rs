@@ -142,6 +142,54 @@ fn write_denied_guard_packet(path: &Path) {
     .unwrap();
 }
 
+fn write_wrapped_guard_packet(path: &Path) {
+    fs::write(
+        path,
+        r#"{
+  "schema_version": "suite.proxy.run.v1",
+  "packet": {
+    "tool": "proxy",
+    "payload": {
+      "highlights": ["my_password_is_secret123"]
+    }
+  }
+}"#,
+    )
+    .unwrap();
+}
+
+fn write_redaction_only_context(path: &Path) {
+    fs::write(
+        path,
+        r#"
+version: 1
+policy:
+  paths:
+    include: ["**"]
+    exclude: []
+  redaction:
+    forbidden_patterns: ["secret123", "(?i)password"]
+"#,
+    )
+    .unwrap();
+}
+
+fn write_permissive_context(path: &Path) {
+    fs::write(
+        path,
+        r#"
+version: 1
+policy:
+  paths:
+    include: ["**"]
+    exclude: []
+  redaction:
+    forbidden_patterns: []
+"#,
+    )
+    .unwrap();
+}
+
 fn write_context_packet(path: &Path, packet_id: &str, title: &str, body: &str, path_ref: &str) {
     fs::write(
         path,
@@ -218,9 +266,13 @@ enum Beta {
     .unwrap();
 }
 
+fn kernel_cache_file(root: &Path) -> PathBuf {
+    root.join(".packet28").join("packet-cache-v1.bin")
+}
+
 #[test]
 fn test_suite_cover_check_smoke() {
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "cover",
             "check",
@@ -235,8 +287,49 @@ fn test_suite_cover_check_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"schema_version\": \"suite.cover.check.v1\""))
-        .stdout(predicate::str::contains("\"envelope_v1\""));
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.cover.check.v1")
+    );
+    assert!(value.get("packet").is_some());
+    assert!(value.get("envelope_v1").is_none());
+}
+
+#[test]
+fn test_suite_cover_check_rich_json_smoke() {
+    let output = suite_cmd()
+        .args([
+            "cover",
+            "check",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--json",
+            "--packet-detail",
+            "rich",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.cover.check.v1")
+    );
+    assert!(value.get("envelope_v1").is_some());
+    assert!(value.get("gate_result").is_some());
 }
 
 #[test]
@@ -477,6 +570,24 @@ fn test_suite_guard_validate_smoke() {
 }
 
 #[test]
+fn test_suite_guard_validate_with_context_config_flag() {
+    let dir = TempDir::new().unwrap();
+    let context = dir.path().join("context.yaml");
+    write_guard_context(&context);
+
+    suite_cmd()
+        .args([
+            "guard",
+            "validate",
+            "--context-config",
+            context.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"valid\": true"));
+}
+
+#[test]
 fn test_suite_guard_check_smoke() {
     let dir = TempDir::new().unwrap();
     let context = dir.path().join("context.yaml");
@@ -531,6 +642,48 @@ fn test_suite_guard_check_exit_code_stable_for_denied_packet() {
         .assert()
         .code(1)
         .stdout(predicate::str::contains("\"passed\": false"));
+}
+
+#[test]
+fn test_suite_guard_check_detects_wrapped_packet_redaction() {
+    let dir = TempDir::new().unwrap();
+    let context = dir.path().join("context.yaml");
+    let packet = dir.path().join("wrapped-packet.json");
+    write_redaction_only_context(&context);
+    write_wrapped_guard_packet(&packet);
+
+    suite_cmd()
+        .args([
+            "guard",
+            "check",
+            "--packet",
+            packet.to_str().unwrap(),
+            "--context-config",
+            context.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("\"rule\": \"redaction\""));
+}
+
+#[test]
+fn test_suite_cover_check_terminal_default() {
+    suite_cmd()
+        .args([
+            "cover",
+            "check",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Quality Gate: PASSED"))
+        .stdout(predicate::str::contains("\"schema_version\"").not());
 }
 
 #[test]
@@ -816,6 +969,13 @@ fn test_suite_proxy_run_json_smoke() {
             .and_then(Value::as_str),
         Some("command_summary")
     );
+    assert!(value
+        .get("packet")
+        .and_then(|p| p.get("payload"))
+        .and_then(|p| p.get("output_lines"))
+        .and_then(Value::as_array)
+        .map(|v| v.is_empty())
+        .unwrap_or(false));
 }
 
 #[test]
@@ -850,4 +1010,289 @@ fn test_suite_map_repo_json_smoke() {
             .and_then(Value::as_str),
         Some("repo_map")
     );
+    assert!(value
+        .get("packet")
+        .and_then(|p| p.get("payload"))
+        .and_then(|p| p.get("files_ranked"))
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("file_idx"))
+        .is_some());
+}
+
+#[test]
+fn test_suite_map_repo_cache_flag_writes_kernel_cache_file() {
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+    let cache_file = kernel_cache_file(dir.path());
+    assert!(!cache_file.exists());
+
+    suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--cache",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    assert!(cache_file.exists());
+    assert!(fs::metadata(cache_file).unwrap().len() > 0);
+}
+
+#[test]
+fn test_suite_proxy_run_rich_json_smoke() {
+    let output = suite_cmd()
+        .args([
+            "proxy",
+            "run",
+            "--json",
+            "--packet-detail",
+            "rich",
+            "--",
+            "ls",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert!(value
+        .get("packet")
+        .and_then(|p| p.get("payload"))
+        .and_then(|p| p.get("output_lines"))
+        .and_then(Value::as_array)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false));
+}
+
+#[test]
+fn test_suite_proxy_run_cache_flag_writes_kernel_cache_file() {
+    let dir = TempDir::new().unwrap();
+    let cache_file = kernel_cache_file(dir.path());
+    assert!(!cache_file.exists());
+
+    suite_cmd()
+        .args([
+            "proxy",
+            "run",
+            "--cache",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--",
+            "ls",
+        ])
+        .assert()
+        .success();
+
+    assert!(cache_file.exists());
+    assert!(fs::metadata(cache_file).unwrap().len() > 0);
+}
+
+#[test]
+fn test_suite_map_repo_rich_json_smoke() {
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+
+    let output = suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--packet-detail",
+            "rich",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert!(value
+        .get("packet")
+        .and_then(|p| p.get("payload"))
+        .and_then(|p| p.get("files_ranked"))
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("path"))
+        .is_some());
+}
+
+#[test]
+fn test_suite_output_flag_writes_to_file() {
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+    let out = dir.path().join("map-output.json");
+
+    suite_cmd()
+        .args([
+            "--output",
+            out.to_str().unwrap(),
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let written = fs::read_to_string(&out).unwrap();
+    let value: Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.map.repo.v1")
+    );
+}
+
+#[test]
+fn test_suite_map_repo_rich_governed_section_body_uses_rich_payload() {
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+    let context = dir.path().join("context.yaml");
+    write_permissive_context(&context);
+
+    let output = suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--packet-detail",
+            "rich",
+            "--context-config",
+            context.to_str().unwrap(),
+            "--context-budget-tokens",
+            "5000",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    let body = value
+        .get("final_packet")
+        .and_then(|v| v.get("payload"))
+        .and_then(|v| v.get("sections"))
+        .and_then(Value::as_array)
+        .and_then(|sections| sections.first())
+        .and_then(|section| section.get("body"))
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(body.contains("\"path\""));
+    assert!(!body.contains("file_idx"));
+}
+
+#[test]
+fn test_suite_proxy_run_rich_governed_section_body_uses_rich_payload() {
+    let dir = TempDir::new().unwrap();
+    let context = dir.path().join("context.yaml");
+    write_permissive_context(&context);
+
+    let output = suite_cmd()
+        .args([
+            "proxy",
+            "run",
+            "--json",
+            "--packet-detail",
+            "rich",
+            "--context-config",
+            context.to_str().unwrap(),
+            "--context-budget-tokens",
+            "5000",
+            "--",
+            "ls",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    let body = value
+        .get("final_packet")
+        .and_then(|v| v.get("payload"))
+        .and_then(|v| v.get("sections"))
+        .and_then(Value::as_array)
+        .and_then(|sections| sections.first())
+        .and_then(|section| section.get("body"))
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(body.contains("\"output_lines\""));
+}
+
+#[test]
+fn test_compact_packets_respect_byte_slo_and_estimate() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let java_test = workspace.join("JavaTest");
+    assert!(java_test.exists(), "JavaTest fixture folder missing");
+
+    let map_output = suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            java_test.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        map_output.len() <= 2_500,
+        "map output exceeded SLO: {}",
+        map_output.len()
+    );
+    let map_value: Value = serde_json::from_slice(&map_output).unwrap();
+    let map_packet = map_value.get("packet").unwrap();
+    let map_packet_bytes = serde_json::to_vec(map_packet).unwrap().len();
+    let map_est_bytes = map_packet
+        .get("budget_cost")
+        .and_then(|v| v.get("est_bytes"))
+        .and_then(Value::as_u64)
+        .unwrap() as usize;
+    assert_eq!(map_est_bytes, map_packet_bytes);
+
+    let proxy_output = suite_cmd()
+        .args(["proxy", "run", "--json", "--", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        proxy_output.len() <= 2_500,
+        "proxy output exceeded SLO: {}",
+        proxy_output.len()
+    );
+    let proxy_value: Value = serde_json::from_slice(&proxy_output).unwrap();
+    let proxy_packet = proxy_value.get("packet").unwrap();
+    let proxy_packet_bytes = serde_json::to_vec(proxy_packet).unwrap().len();
+    let proxy_est_bytes = proxy_packet
+        .get("budget_cost")
+        .and_then(|v| v.get("est_bytes"))
+        .and_then(Value::as_u64)
+        .unwrap() as usize;
+    assert_eq!(proxy_est_bytes, proxy_packet_bytes);
 }

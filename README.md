@@ -51,10 +51,15 @@ cargo build --release -p covy-cli -p diffy-cli -p testy-cli -p suite-cli
 ./target/release/Packet28 test impact --base HEAD --head HEAD --testmap .covy/state/testmap.bin --json
 ./target/release/Packet28 map repo --repo-root . --json
 ./target/release/Packet28 proxy run --json -- git status
-./target/release/Packet28 guard validate --config context.yaml
-./target/release/Packet28 guard check --packet packet.json --config context.yaml
+./target/release/Packet28 map repo --repo-root . --cache --json
+./target/release/Packet28 proxy run --cache --json -- git status
+./target/release/Packet28 map repo --repo-root . --json --packet-detail rich --pretty
+./target/release/Packet28 proxy run --json --packet-detail rich --pretty -- git status
+./target/release/Packet28 guard validate --context-config context.yaml
+./target/release/Packet28 guard check --packet packet.json --context-config context.yaml
 ./target/release/Packet28 stack slice --input artifacts/stack.log --json
 ./target/release/Packet28 build reduce --input artifacts/build.log --json
+./target/release/Packet28 --output artifacts/map.json map repo --repo-root . --json
 ```
 
 Guard policy `context.yaml` canonical V1 shape:
@@ -90,7 +95,7 @@ policy:
 1. Validate policy config:
 
 ```bash
-./target/release/Packet28 guard validate --config context.yaml
+./target/release/Packet28 guard validate --context-config context.yaml
 ```
 
 2. Run diff analysis through the governed kernel path:
@@ -103,7 +108,7 @@ policy:
   --no-issues-state \
   --json \
   --context-config context.yaml \
-  --context-budget-tokens 1200
+  --context-budget-tokens 5000
 ```
 
 3. Run impact analysis through the same governed kernel path:
@@ -115,13 +120,13 @@ policy:
   --testmap .covy/state/testmap.bin \
   --json \
   --context-config context.yaml \
-  --context-budget-tokens 1200
+  --context-budget-tokens 5000
 ```
 
 4. Validate a packet directly against policy:
 
 ```bash
-./target/release/Packet28 guard check --packet packet.json --config context.yaml
+./target/release/Packet28 guard check --packet packet.json --context-config context.yaml
 ```
 
 5. Assemble one or more packet files with a hard budget:
@@ -130,8 +135,8 @@ policy:
 ./target/release/Packet28 context assemble \
   --packet a.json \
   --packet b.json \
-  --budget-tokens 1200 \
-  --budget-bytes 24000
+  --budget-tokens 5000 \
+  --budget-bytes 32000
 
 # Optional governed assembly with policy enforcement + audit metadata
 ./target/release/Packet28 context assemble \
@@ -150,6 +155,12 @@ Machine-mode shape and exits for repeatable local demos:
 - `Packet28 build reduce --json` emits `schema_version: "suite.build.reduce.v1"`.
 - `Packet28 context assemble` emits `schema_version: "suite.context.assemble.v1"` with `packet` + kernel audit metadata.
 - `Packet28 context assemble --context-config ...` emits the same schema version with governed `final_packet` + governed kernel audit metadata.
+- `Packet28 cover check --json`, `Packet28 map repo --json`, and `Packet28 proxy run --json` default to compact packets (`schema_version` + `packet`) and minified JSON.
+- Add `--packet-detail rich` for one-release compatibility output, and `--pretty` for human-readable JSON formatting.
+- `Packet28 cover check` and `Packet28 diff analyze` default to terminal output unless `--json` or `--report json` is set.
+- `Packet28 --output <path> ...` redirects stdout to a file sink for scripting and multi-step pipelines.
+- `Packet28 map repo --cache` and `Packet28 proxy run --cache` enable disk-backed kernel cache reuse under `.packet28/packet-cache-v1.bin`.
+- `guard` commands support `--context-config`; legacy `--config` remains supported for compatibility.
 - `contextq` budget trim metadata is emitted under `budget_trim` (truncated/dropped/estimated/cap fields).
 - Exit codes are stable: `0` success, `1` policy/gate denial, `2` usage/runtime errors.
 

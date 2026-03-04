@@ -1,7 +1,7 @@
 mod cmd_build;
-mod cmd_cover;
 mod cmd_common;
 mod cmd_context;
+mod cmd_cover;
 mod cmd_diff;
 mod cmd_guard;
 mod cmd_impact;
@@ -10,6 +10,8 @@ mod cmd_map_repo;
 mod cmd_proxy;
 mod cmd_shard;
 mod cmd_stack;
+
+use std::path::Path;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -23,6 +25,10 @@ struct Cli {
     /// Path to config file
     #[arg(long, global = true, default_value = "covy.toml")]
     config: String,
+
+    /// Write stdout output to a file instead of the terminal
+    #[arg(long)]
+    output: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -154,6 +160,10 @@ enum MapCommands {
 
 fn main() {
     let cli = Cli::parse();
+    if let Err(e) = configure_stdout_output(cli.output.as_deref()) {
+        display_error(&e);
+        std::process::exit(2);
+    }
 
     let result = match cli.command {
         Commands::Cover(cover) => match cover.command {
@@ -211,4 +221,36 @@ fn display_error(err: &anyhow::Error) {
             eprintln!("  {} {cause}", "caused by:".dimmed());
         }
     }
+}
+
+#[cfg(unix)]
+fn configure_stdout_output(path: Option<&str>) -> anyhow::Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+
+    let Some(path) = path else {
+        return Ok(());
+    };
+
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(Path::new(path))?;
+
+    // Redirect process stdout to the requested output file.
+    let ret = unsafe { libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_stdout_output(path: Option<&str>) -> anyhow::Result<()> {
+    if path.is_some() {
+        anyhow::bail!("--output is currently supported only on Unix targets");
+    }
+    Ok(())
 }

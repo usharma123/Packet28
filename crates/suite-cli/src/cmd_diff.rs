@@ -42,8 +42,7 @@ pub struct AnalyzeArgs {
     #[arg(long)]
     no_issues_state: bool,
 
-    /// Output format (terminal/json). Defaults to "terminal" in interactive
-    /// mode and "json" when stdout is piped.
+    /// Output format (terminal/json). Defaults to "terminal".
     #[arg(long)]
     report: Option<String>,
 

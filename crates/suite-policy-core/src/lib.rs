@@ -206,7 +206,9 @@ impl ContextConfig {
 
         for (idx, pattern) in self.policy.human_review.paths.iter().enumerate() {
             if let Err(err) = Pattern::new(pattern) {
-                errors.push(format!("policy.human_review.paths[{idx}] invalid glob: {err}"));
+                errors.push(format!(
+                    "policy.human_review.paths[{idx}] invalid glob: {err}"
+                ));
             }
         }
 
