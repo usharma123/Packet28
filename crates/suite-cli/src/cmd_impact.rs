@@ -19,8 +19,16 @@ pub struct ImpactArgs {
     pub testmap: String,
 
     /// Emit JSON output
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    pub json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Emit one-release compatibility JSON shape
     #[arg(long)]
-    pub json: bool,
+    pub legacy_json: bool,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pub pretty: bool,
 
     /// Emit runnable test command
     #[arg(long)]
@@ -52,29 +60,11 @@ struct ImpactKernelInput {
     config_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ImpactKernelOutput {
     result: suite_packet_core::ImpactResult,
     known_tests: usize,
     print_command: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ImpactKernelPacket {
-    packet_id: Option<String>,
-    tool: Option<String>,
-    reducer: Option<String>,
-    paths: Vec<String>,
-    payload: ImpactKernelOutput,
-}
-
-fn parse_impact_output(body: &Value) -> Result<ImpactKernelOutput> {
-    if let Ok(packet) = serde_json::from_value::<ImpactKernelPacket>(body.clone()) {
-        return Ok(packet.payload);
-    }
-
-    serde_json::from_value(body.clone())
-        .map_err(|source| anyhow!("invalid impact output packet: {source}"))
 }
 
 pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
@@ -109,7 +99,10 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let output = parse_impact_output(&output_packet.body)?;
+    let envelope: suite_packet_core::EnvelopeV1<ImpactKernelOutput> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid impact output packet: {source}"))?;
+    let output = envelope.payload.clone();
 
     let governed_response = if governed_context_config.is_some() {
         Some(kernel.execute(context_kernel_core::KernelRequest {
@@ -127,7 +120,8 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         None
     };
 
-    if args.json {
+    if let Some(profile_arg) = args.json {
+        let profile: suite_packet_core::JsonProfile = profile_arg.into();
         if let Some(governed) = governed_response {
             let budget_hint = crate::cmd_common::budget_retry_hint(
                 &governed.metadata,
@@ -139,50 +133,99 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
                 .output_packets
                 .first()
                 .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "schema_version": "suite.test.impact.v1",
-                    "impact_result": output.result,
-                    "known_tests": output.known_tests,
-                    "print_command": output.print_command,
-                    "final_packet": final_packet.body,
-                    "kernel_audit": {
-                        "impact": response.audit,
-                        "governed": governed.audit,
-                    },
-                    "kernel_metadata": {
-                        "impact": response.metadata,
-                        "governed": governed.metadata,
-                    },
-                    "cache": {
-                        "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                    },
-                    "hints": {
-                        "budget_retry": budget_hint,
-                    },
-                }))?
-            );
+            if args.legacy_json {
+                crate::cmd_common::emit_json(
+                    &json!({
+                        "schema_version": "suite.test.impact.v1",
+                        "impact_result": output.result,
+                        "known_tests": output.known_tests,
+                        "print_command": output.print_command,
+                        "final_packet": final_packet.body,
+                        "kernel_audit": {
+                            "impact": response.audit,
+                            "governed": governed.audit,
+                        },
+                        "kernel_metadata": {
+                            "impact": response.metadata,
+                            "governed": governed.metadata,
+                        },
+                        "cache": {
+                            "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                        "hints": {
+                            "budget_retry": budget_hint,
+                        },
+                    }),
+                    args.pretty,
+                )?;
+            } else {
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_TEST_IMPACT,
+                    &envelope,
+                    profile,
+                    args.pretty,
+                    &crate::cmd_common::resolve_artifact_root(None),
+                    Some(json!({
+                        "kernel_audit": {
+                            "impact": response.audit,
+                            "governed": governed.audit,
+                        },
+                        "kernel_metadata": {
+                            "impact": response.metadata,
+                            "governed": governed.metadata,
+                        },
+                        "cache": {
+                            "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                        "hints": {
+                            "budget_retry": budget_hint,
+                        },
+                        "governed_packet": final_packet.body,
+                    })),
+                )?;
+            }
         } else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "schema_version": "suite.test.impact.v1",
-                    "impact_result": output.result,
-                    "known_tests": output.known_tests,
-                    "print_command": output.print_command,
-                    "kernel_audit": {
-                        "impact": response.audit,
-                    },
-                    "kernel_metadata": {
-                        "impact": response.metadata,
-                    },
-                    "cache": {
-                        "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                    },
-                }))?
-            );
+            if args.legacy_json {
+                crate::cmd_common::emit_json(
+                    &json!({
+                        "schema_version": "suite.test.impact.v1",
+                        "impact_result": output.result,
+                        "known_tests": output.known_tests,
+                        "print_command": output.print_command,
+                        "kernel_audit": {
+                            "impact": response.audit,
+                        },
+                        "kernel_metadata": {
+                            "impact": response.metadata,
+                        },
+                        "cache": {
+                            "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                    }),
+                    args.pretty,
+                )?;
+            } else {
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_TEST_IMPACT,
+                    &envelope,
+                    profile,
+                    args.pretty,
+                    &crate::cmd_common::resolve_artifact_root(None),
+                    Some(json!({
+                        "kernel_audit": {
+                            "impact": response.audit,
+                        },
+                        "kernel_metadata": {
+                            "impact": response.metadata,
+                        },
+                        "cache": {
+                            "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                    })),
+                )?;
+            }
         }
         return Ok(0);
     }
@@ -233,8 +276,15 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
             .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
         let sections = final_packet
             .body
-            .get("assembly")
+            .get("payload")
+            .and_then(|payload| payload.get("assembly"))
             .and_then(|assembly| assembly.get("sections_kept"))
+            .or_else(|| {
+                final_packet
+                    .body
+                    .get("assembly")
+                    .and_then(|assembly| assembly.get("sections_kept"))
+            })
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         println!(
@@ -257,6 +307,13 @@ fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
     context_kernel_core::Kernel::with_v1_reducers()
 }
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn run_test_impact_reducer(
     ctx: &mut context_kernel_core::ExecutionContext,
     _input_packets: &[context_kernel_core::KernelPacket],
@@ -269,12 +326,15 @@ fn run_test_impact_reducer(
             }
         })?;
 
+    let testmap_path = input.testmap.clone();
+    let git_base = input.base.clone();
+    let git_head = input.head.clone();
     let adapters = testy_cli_common::adapters::default_impact_adapters();
     let output = testy_core::command_impact::run_legacy_impact(
         testy_core::command_impact::LegacyImpactArgs {
-            base: input.base,
-            head: input.head,
-            testmap: input.testmap,
+            base: input.base.clone(),
+            head: input.head.clone(),
+            testmap: input.testmap.clone(),
             print_command: input.print_command,
         },
         &input.config_path,
@@ -300,56 +360,6 @@ fn run_test_impact_reducer(
     symbol_refs.sort();
     symbol_refs.dedup();
 
-    let file_refs = paths
-        .iter()
-        .map(|path| {
-            json!({
-                "kind": "file",
-                "value": path,
-                "source": "testy-impact-v1",
-                "relevance": 0.8
-            })
-        })
-        .collect::<Vec<_>>();
-    let selected_refs = output
-        .result
-        .selected_tests
-        .iter()
-        .map(|test| {
-            json!({
-                "kind": "symbol",
-                "value": test,
-                "source": "testy-impact-v1",
-                "relevance": 0.9
-            })
-        })
-        .collect::<Vec<_>>();
-    let symbol_refs_payload = symbol_refs
-        .iter()
-        .map(|symbol| {
-            json!({
-                "kind": "symbol",
-                "value": symbol,
-                "source": "testy-impact-v1",
-                "relevance": 0.7
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let mut refs = file_refs.clone();
-    refs.extend(symbol_refs_payload.clone());
-
-    let selected_tests_body = if output.result.selected_tests.is_empty() {
-        "(no impacted tests)".to_string()
-    } else {
-        output.result.selected_tests.join("\n")
-    };
-    let smoke_tests_body = if output.result.smoke_tests.is_empty() {
-        "(none)".to_string()
-    } else {
-        output.result.smoke_tests.join("\n")
-    };
-
     let summary = format!(
         "selected: {}\nknown: {}\nmissing: {}\nconfidence: {:.2}\nstale: {}\nescalate_full_suite: {}",
         output.result.selected_tests.len(),
@@ -360,60 +370,79 @@ fn run_test_impact_reducer(
         output.result.escalate_full_suite,
     );
 
-    let mut sections = vec![
-        json!({
-            "id": "impact-summary",
-            "title": "Impact Summary",
-            "body": summary,
-            "refs": refs.clone(),
-            "relevance": if output.result.escalate_full_suite { 1.2 } else { 0.85 },
-        }),
-        json!({
-            "id": "selected-tests",
-            "title": "Selected Tests",
-            "body": selected_tests_body,
-            "refs": selected_refs,
-            "relevance": 1.0,
-        }),
-    ];
+    let files = paths
+        .iter()
+        .map(|path| suite_packet_core::FileRef {
+            path: path.clone(),
+            relevance: Some(0.8),
+            source: Some("testy.impact".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let symbols = symbol_refs
+        .iter()
+        .map(|symbol| suite_packet_core::SymbolRef {
+            name: symbol.clone(),
+            file: None,
+            kind: Some("test_id".to_string()),
+            relevance: Some(0.8),
+            source: Some("testy.impact".to_string()),
+        })
+        .collect::<Vec<_>>();
 
-    if !output.result.smoke_tests.is_empty() {
-        sections.push(json!({
-            "id": "smoke-tests",
-            "title": "Smoke Tests",
-            "body": smoke_tests_body,
-            "refs": symbol_refs_payload,
-            "relevance": 0.8,
-        }));
+    let payload_bytes = serde_json::to_vec(&impact_output).unwrap_or_default().len();
+    let envelope = suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "testy".to_string(),
+        kind: "test_impact".to_string(),
+        hash: String::new(),
+        summary,
+        files,
+        symbols,
+        risk: None,
+        confidence: Some(output.result.confidence.clamp(0.0, 1.0)),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: vec![testmap_path],
+            git_base,
+            git_head,
+            generated_at_unix: now_unix(),
+        },
+        payload: impact_output,
     }
-
-    let packet_body = json!({
-        "packet_id": "testy-impact-v1",
-        "tool": "testy",
-        "tools": ["testy"],
-        "reducer": "impact",
-        "reducers": ["impact"],
-        "paths": paths,
-        "payload": impact_output,
-        "sections": sections,
-        "refs": refs,
-        "text_blobs": [summary],
-    });
+    .with_canonical_hash_and_real_budget();
 
     Ok(context_kernel_core::ReducerResult {
         output_packets: vec![context_kernel_core::KernelPacket {
-            packet_id: Some("testy-impact-v1".to_string()),
+            packet_id: Some(format!(
+                "testy-{}",
+                envelope.hash.chars().take(12).collect::<String>()
+            )),
             format: "packet-json".to_string(),
-            body: packet_body,
-            token_usage: None,
-            runtime_ms: None,
+            body: serde_json::to_value(&envelope).map_err(|source| {
+                context_kernel_core::KernelError::ReducerFailed {
+                    target: ctx.target.clone(),
+                    detail: source.to_string(),
+                }
+            })?,
+            token_usage: Some(envelope.budget_cost.est_tokens),
+            runtime_ms: Some(envelope.budget_cost.runtime_ms),
             metadata: json!({
                 "reducer": "testy.impact",
+                "kind": "test_impact",
+                "hash": envelope.hash,
                 "selected_tests": output.result.selected_tests.len(),
             }),
         }],
         metadata: json!({
             "reducer": "testy.impact",
+            "kind": "test_impact",
             "selected_tests": output.result.selected_tests.len(),
         }),
     })

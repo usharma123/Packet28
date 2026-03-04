@@ -35,8 +35,12 @@ pub enum ProxyCommands {
 #[derive(Args)]
 pub struct RunArgs {
     /// Emit JSON output
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    pub json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Emit one-release compatibility JSON shape
     #[arg(long)]
-    pub json: bool,
+    pub legacy_json: bool,
 
     /// Packet detail level in JSON mode
     #[arg(long, value_enum, default_value_t = PacketDetailArg::Compact)]
@@ -93,6 +97,18 @@ pub struct RunArgs {
 
 pub fn run(args: RunArgs) -> Result<i32> {
     let persist_root = persistence_root(&args)?;
+    let machine_profile = args
+        .json
+        .map(|profile| suite_packet_core::JsonProfile::from(profile));
+    let detail_mode = if matches!(
+        machine_profile,
+        Some(suite_packet_core::JsonProfile::Full | suite_packet_core::JsonProfile::Handle)
+    ) || args.packet_detail == PacketDetailArg::Rich
+    {
+        PacketDetailArg::Rich
+    } else {
+        PacketDetailArg::Compact
+    };
     let input = suite_proxy_core::ProxyRunRequest {
         argv: args.command_argv,
         cwd: args.cwd,
@@ -100,20 +116,31 @@ pub fn run(args: RunArgs) -> Result<i32> {
         max_output_bytes: args.max_output_bytes,
         max_lines: args.max_lines,
         packet_byte_cap: args.packet_byte_cap,
-        detail: args.packet_detail.into(),
+        detail: detail_mode.into(),
     };
 
     let use_kernel = args.cache || args.context_config.is_some();
     if !use_kernel {
         let envelope = suite_proxy_core::run_and_reduce(input)?;
-        if args.json {
-            emit_json(
-                &json!({
-                    "schema_version": "suite.proxy.run.v1",
-                    "packet": envelope,
-                }),
-                args.pretty,
-            )?;
+        if let Some(profile) = machine_profile {
+            if args.legacy_json {
+                crate::cmd_common::emit_json(
+                    &json!({
+                        "schema_version": "suite.proxy.run.v1",
+                        "packet": envelope,
+                    }),
+                    args.pretty,
+                )?;
+            } else {
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_PROXY_RUN,
+                    &envelope,
+                    profile,
+                    args.pretty,
+                    &persist_root,
+                    None,
+                )?;
+            }
         } else {
             print_text_summary(&envelope);
         }
@@ -124,7 +151,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         });
     }
 
-    let kernel = build_kernel(args.cache, persist_root);
+    let kernel = build_kernel(args.cache, persist_root.clone());
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "proxy.run".to_string(),
         reducer_input: serde_json::to_value(input)?,
@@ -156,11 +183,11 @@ pub fn run(args: RunArgs) -> Result<i32> {
             },
             policy_context: json!({
                 "config_path": context_config,
-                "detail_mode": match args.packet_detail {
+                "detail_mode": match detail_mode {
                     PacketDetailArg::Rich => "rich",
                     PacketDetailArg::Compact => "compact",
                 },
-                "compact_assembly": args.packet_detail == PacketDetailArg::Compact,
+                "compact_assembly": detail_mode == PacketDetailArg::Compact,
             }),
             ..context_kernel_core::KernelRequest::default()
         })?)
@@ -168,7 +195,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         None
     };
 
-    if args.json {
+    if let Some(profile) = machine_profile {
         if let Some(governed) = governed_response {
             let budget_hint = crate::cmd_common::budget_retry_hint(
                 &governed.metadata,
@@ -180,12 +207,49 @@ pub fn run(args: RunArgs) -> Result<i32> {
                 .output_packets
                 .first()
                 .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-            if args.debug {
-                emit_json(
-                    &json!({
-                        "schema_version": "suite.proxy.run.v1",
-                        "packet": envelope,
-                        "final_packet": final_packet.body,
+            if args.legacy_json {
+                if args.debug {
+                    crate::cmd_common::emit_json(
+                        &json!({
+                            "schema_version": "suite.proxy.run.v1",
+                            "packet": envelope,
+                            "final_packet": final_packet.body,
+                            "kernel_audit": {
+                                "proxy": response.audit,
+                                "governed": governed.audit,
+                            },
+                            "kernel_metadata": {
+                                "proxy": response.metadata,
+                                "governed": governed.metadata,
+                            },
+                            "cache": {
+                                "proxy": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                                "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            },
+                            "hints": {
+                                "budget_retry": budget_hint,
+                            },
+                        }),
+                        args.pretty,
+                    )?;
+                } else {
+                    crate::cmd_common::emit_json(
+                        &json!({
+                            "schema_version": "suite.proxy.run.v1",
+                            "packet": envelope,
+                            "final_packet": final_packet.body,
+                        }),
+                        args.pretty,
+                    )?;
+                }
+            } else {
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_PROXY_RUN,
+                    &envelope,
+                    profile,
+                    args.pretty,
+                    &persist_root,
+                    Some(json!({
                         "kernel_audit": {
                             "proxy": response.audit,
                             "governed": governed.audit,
@@ -201,30 +265,36 @@ pub fn run(args: RunArgs) -> Result<i32> {
                         "hints": {
                             "budget_retry": budget_hint,
                         },
+                        "governed_packet": final_packet.body,
+                    })),
+                )?;
+            }
+        } else {
+            if args.legacy_json {
+                crate::cmd_common::emit_json(
+                    &json!({
+                        "schema_version": "suite.proxy.run.v1",
+                        "packet": envelope,
+                        "cache": {
+                            "proxy": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
                     }),
                     args.pretty,
                 )?;
             } else {
-                emit_json(
-                    &json!({
-                        "schema_version": "suite.proxy.run.v1",
-                        "packet": envelope,
-                        "final_packet": final_packet.body,
-                    }),
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_PROXY_RUN,
+                    &envelope,
+                    profile,
                     args.pretty,
+                    &persist_root,
+                    Some(json!({
+                        "cache": {
+                            "proxy": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                    })),
                 )?;
             }
-        } else {
-            emit_json(
-                &json!({
-                    "schema_version": "suite.proxy.run.v1",
-                    "packet": envelope,
-                    "cache": {
-                        "proxy": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                    },
-                }),
-                args.pretty,
-            )?;
         }
 
         return Ok(if envelope.payload.exit_code == 0 {
@@ -259,8 +329,15 @@ pub fn run(args: RunArgs) -> Result<i32> {
             .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
         let sections = final_packet
             .body
-            .get("assembly")
+            .get("payload")
+            .and_then(|payload| payload.get("assembly"))
             .and_then(|assembly| assembly.get("sections_kept"))
+            .or_else(|| {
+                final_packet
+                    .body
+                    .get("assembly")
+                    .and_then(|assembly| assembly.get("sections_kept"))
+            })
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         println!(
@@ -274,15 +351,6 @@ pub fn run(args: RunArgs) -> Result<i32> {
     } else {
         1
     })
-}
-
-fn emit_json(value: &Value, pretty: bool) -> Result<()> {
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    } else {
-        println!("{}", serde_json::to_string(value)?);
-    }
-    Ok(())
 }
 
 fn print_text_summary(

@@ -89,7 +89,7 @@ policy:
   tools:
     allowlist: ["diffy", "testy", "stacky", "buildy", "contextq"]
   reducers:
-    allowlist: ["analyze", "impact", "slice", "reduce", "assemble", "contextq.assemble"]
+    allowlist: ["analyze", "impact", "slice", "reduce", "assemble", "contextq.assemble", "diffy.analyze", "testy.impact", "stacky.slice", "buildy.reduce", "governed.assemble"]
   paths:
     include: ["**"]
     exclude: []
@@ -146,7 +146,8 @@ fn write_wrapped_guard_packet(path: &Path) {
     fs::write(
         path,
         r#"{
-  "schema_version": "suite.proxy.run.v1",
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.proxy.run.v1",
   "packet": {
     "tool": "proxy",
     "payload": {
@@ -270,6 +271,31 @@ fn kernel_cache_file(root: &Path) -> PathBuf {
     root.join(".packet28").join("packet-cache-v1.bin")
 }
 
+fn parse_packet_wrapper(output: &[u8], packet_type: &str) -> Value {
+    let value: Value = serde_json::from_slice(output).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.packet.v1")
+    );
+    assert_eq!(
+        value.get("packet_type").and_then(Value::as_str),
+        Some(packet_type)
+    );
+    assert!(value.get("packet").is_some());
+    value
+}
+
+fn packet_payload<'a>(wrapper: &'a Value) -> &'a Value {
+    wrapper
+        .get("packet")
+        .and_then(|packet| packet.get("payload"))
+        .expect("packet.payload should exist")
+}
+
+fn packet_debug(wrapper: &Value) -> Option<&Value> {
+    packet_payload(wrapper).get("debug")
+}
+
 #[test]
 fn test_suite_cover_check_smoke() {
     let output = suite_cmd()
@@ -291,13 +317,8 @@ fn test_suite_cover_check_smoke() {
         .stdout
         .clone();
 
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.cover.check.v1")
-    );
-    assert!(value.get("packet").is_some());
-    assert!(value.get("envelope_v1").is_none());
+    let value = parse_packet_wrapper(&output, "suite.cover.check.v1");
+    assert!(packet_payload(&value).get("passed").is_some());
 }
 
 #[test]
@@ -323,13 +344,8 @@ fn test_suite_cover_check_rich_json_smoke() {
         .stdout
         .clone();
 
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.cover.check.v1")
-    );
-    assert!(value.get("envelope_v1").is_some());
-    assert!(value.get("gate_result").is_some());
+    let value = parse_packet_wrapper(&output, "suite.cover.check.v1");
+    assert!(packet_payload(&value).get("violations").is_some());
 }
 
 #[test]
@@ -358,7 +374,7 @@ fn test_suite_diff_analyze_governed_smoke() {
     let context = dir.path().join("context.yaml");
     write_governed_context(&context);
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "diff",
             "analyze",
@@ -375,8 +391,16 @@ fn test_suite_diff_analyze_governed_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"final_packet\""))
-        .stdout(predicate::str::contains("\"tool\": \"contextq\""));
+        .get_output()
+        .stdout
+        .clone();
+
+    let value = parse_packet_wrapper(&output, "suite.diff.analyze.v1");
+    assert!(packet_debug(&value)
+        .and_then(|v| v.get("governed_packet"))
+        .and_then(|v| v.get("tool"))
+        .and_then(Value::as_str)
+        .is_some());
 }
 
 #[test]
@@ -398,7 +422,7 @@ fn test_suite_test_impact_smoke() {
         .assert()
         .success();
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "test",
             "impact",
@@ -412,7 +436,14 @@ fn test_suite_test_impact_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"selected_tests\""));
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.test.impact.v1");
+    assert!(packet_payload(&value)
+        .get("result")
+        .and_then(|v| v.get("selected_tests"))
+        .is_some());
 }
 
 #[test]
@@ -436,7 +467,7 @@ fn test_suite_test_impact_governed_smoke() {
         .assert()
         .success();
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "test",
             "impact",
@@ -452,8 +483,15 @@ fn test_suite_test_impact_governed_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"final_packet\""))
-        .stdout(predicate::str::contains("\"tool\": \"contextq\""));
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.test.impact.v1");
+    assert!(packet_debug(&value)
+        .and_then(|v| v.get("governed_packet"))
+        .and_then(|v| v.get("tool"))
+        .and_then(Value::as_str)
+        .is_some());
 }
 
 #[test]
@@ -483,17 +521,13 @@ fn test_suite_diff_analyze_governed_json_metadata_shape() {
         .stdout
         .clone();
 
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.diff.analyze.v1")
-    );
-    assert!(value
-        .get("kernel_metadata")
+    let value = parse_packet_wrapper(&output, "suite.diff.analyze.v1");
+    assert!(packet_debug(&value)
+        .and_then(|v| v.get("kernel_metadata"))
         .and_then(|meta| meta.get("diff"))
         .is_some());
-    assert!(value
-        .get("kernel_metadata")
+    assert!(packet_debug(&value)
+        .and_then(|v| v.get("kernel_metadata"))
         .and_then(|meta| meta.get("governed"))
         .and_then(|governed| governed.get("budget_trim"))
         .is_some());
@@ -540,17 +574,13 @@ fn test_suite_test_impact_governed_json_metadata_shape() {
         .stdout
         .clone();
 
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.test.impact.v1")
-    );
-    assert!(value
-        .get("kernel_metadata")
+    let value = parse_packet_wrapper(&output, "suite.test.impact.v1");
+    assert!(packet_debug(&value)
+        .and_then(|v| v.get("kernel_metadata"))
         .and_then(|meta| meta.get("impact"))
         .is_some());
-    assert!(value
-        .get("kernel_metadata")
+    assert!(packet_debug(&value)
+        .and_then(|v| v.get("kernel_metadata"))
         .and_then(|meta| meta.get("governed"))
         .and_then(|governed| governed.get("budget_trim"))
         .is_some());
@@ -595,7 +625,7 @@ fn test_suite_guard_check_smoke() {
     write_guard_context(&context);
     write_guard_packet(&packet);
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "guard",
             "check",
@@ -606,7 +636,16 @@ fn test_suite_guard_check_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"passed\": true"));
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.guard.check.v1");
+    assert_eq!(
+        packet_payload(&value)
+            .get("passed")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 }
 
 #[test]
@@ -630,7 +669,7 @@ fn test_suite_guard_check_exit_code_stable_for_denied_packet() {
     write_guard_context(&context);
     write_denied_guard_packet(&packet);
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "guard",
             "check",
@@ -641,7 +680,16 @@ fn test_suite_guard_check_exit_code_stable_for_denied_packet() {
         ])
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("\"passed\": false"));
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.guard.check.v1");
+    assert_eq!(
+        packet_payload(&value)
+            .get("passed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
 }
 
 #[test]
@@ -652,7 +700,7 @@ fn test_suite_guard_check_detects_wrapped_packet_redaction() {
     write_redaction_only_context(&context);
     write_wrapped_guard_packet(&packet);
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "guard",
             "check",
@@ -663,7 +711,17 @@ fn test_suite_guard_check_detects_wrapped_packet_redaction() {
         ])
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("\"rule\": \"redaction\""));
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.guard.check.v1");
+    assert!(packet_payload(&value)
+        .get("findings")
+        .and_then(Value::as_array)
+        .and_then(|findings| findings.first())
+        .and_then(|finding| finding.get("rule"))
+        .and_then(Value::as_str)
+        .is_some_and(|rule| rule == "redaction"));
 }
 
 #[test]
@@ -706,7 +764,7 @@ fn test_suite_context_assemble_smoke() {
         "src/lib.rs",
     );
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "context",
             "assemble",
@@ -719,13 +777,18 @@ fn test_suite_context_assemble_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "\"schema_version\": \"suite.context.assemble.v1\"",
-        ))
-        .stdout(predicate::str::contains("\"packet\""))
-        .stdout(predicate::str::contains("\"tool\": \"contextq\""))
-        .stdout(predicate::str::contains("\"reducer\": \"assemble\""))
-        .stdout(predicate::str::contains("\"sections\""));
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.context.assemble.v1");
+    assert_eq!(
+        value
+            .get("packet")
+            .and_then(|packet| packet.get("tool"))
+            .and_then(Value::as_str),
+        Some("contextq")
+    );
+    assert!(packet_payload(&value).get("sections").is_some());
 }
 
 #[test]
@@ -750,7 +813,7 @@ fn test_suite_context_assemble_governed_smoke() {
         "src/lib.rs",
     );
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "context",
             "assemble",
@@ -765,11 +828,14 @@ fn test_suite_context_assemble_governed_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "\"schema_version\": \"suite.context.assemble.v1\"",
-        ))
-        .stdout(predicate::str::contains("\"final_packet\""))
-        .stdout(predicate::str::contains("\"tool\": \"contextq\""));
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.context.assemble.v1");
+    assert!(packet_debug(&value)
+        .and_then(|debug| debug.get("kernel_metadata"))
+        .and_then(|meta| meta.get("governed"))
+        .is_some());
 }
 
 #[test]
@@ -821,7 +887,7 @@ fn test_suite_governed_local_workflow_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"final_packet\""))
+        .stdout(predicate::str::contains("\"governed_packet\""))
         .stdout(predicate::str::contains("\"kernel_audit\""));
 
     suite_cmd()
@@ -852,10 +918,10 @@ fn test_suite_governed_local_workflow_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"final_packet\""))
+        .stdout(predicate::str::contains("\"governed_packet\""))
         .stdout(predicate::str::contains("\"kernel_audit\""));
 
-    suite_cmd()
+    let output = suite_cmd()
         .args([
             "context",
             "assemble",
@@ -868,8 +934,18 @@ fn test_suite_governed_local_workflow_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"tool\": \"contextq\""))
-        .stdout(predicate::str::contains("\"assembly\""));
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.context.assemble.v1");
+    assert_eq!(
+        value
+            .get("packet")
+            .and_then(|packet| packet.get("tool"))
+            .and_then(Value::as_str),
+        Some("contextq")
+    );
+    assert!(packet_payload(&value).get("assembly").is_some());
 }
 
 #[test]
@@ -896,16 +972,14 @@ fn test_suite_stack_slice_governed_smoke() {
         .stdout
         .clone();
 
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.stack.slice.v1")
-    );
-    assert!(value.get("packet").is_some());
-    assert!(value.get("final_packet").is_some());
-    assert!(value
-        .get("kernel_audit")
+    let value = parse_packet_wrapper(&output, "suite.stack.slice.v1");
+    assert!(packet_debug(&value)
+        .and_then(|debug| debug.get("kernel_audit"))
         .and_then(|v| v.get("stack"))
+        .is_some());
+    assert!(packet_debug(&value)
+        .and_then(|debug| debug.get("kernel_audit"))
+        .and_then(|v| v.get("governed"))
         .is_some());
 }
 
@@ -933,16 +1007,14 @@ fn test_suite_build_reduce_governed_smoke() {
         .stdout
         .clone();
 
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.build.reduce.v1")
-    );
-    assert!(value.get("packet").is_some());
-    assert!(value.get("final_packet").is_some());
-    assert!(value
-        .get("kernel_audit")
+    let value = parse_packet_wrapper(&output, "suite.build.reduce.v1");
+    assert!(packet_debug(&value)
+        .and_then(|debug| debug.get("kernel_audit"))
         .and_then(|v| v.get("build"))
+        .is_some());
+    assert!(packet_debug(&value)
+        .and_then(|debug| debug.get("kernel_audit"))
+        .and_then(|v| v.get("governed"))
         .is_some());
 }
 
@@ -956,12 +1028,7 @@ fn test_suite_proxy_run_json_smoke() {
         .stdout
         .clone();
 
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.proxy.run.v1")
-    );
-    assert!(value.get("packet").is_some());
+    let value = parse_packet_wrapper(&output, "suite.proxy.run.v1");
     assert_eq!(
         value
             .get("packet")
@@ -997,12 +1064,7 @@ fn test_suite_map_repo_json_smoke() {
         .stdout
         .clone();
 
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.map.repo.v1")
-    );
-    assert!(value.get("packet").is_some());
+    let value = parse_packet_wrapper(&output, "suite.map.repo.v1");
     assert_eq!(
         value
             .get("packet")
@@ -1123,7 +1185,7 @@ fn test_suite_map_repo_rich_json_smoke() {
         .and_then(|p| p.get("files_ranked"))
         .and_then(Value::as_array)
         .and_then(|arr| arr.first())
-        .and_then(|v| v.get("path"))
+        .and_then(|v| v.get("file_idx"))
         .is_some());
 }
 
@@ -1151,7 +1213,7 @@ fn test_suite_output_flag_writes_to_file() {
     let value: Value = serde_json::from_str(&written).unwrap();
     assert_eq!(
         value.get("schema_version").and_then(Value::as_str),
-        Some("suite.map.repo.v1")
+        Some("suite.packet.v1")
     );
 }
 
@@ -1184,7 +1246,10 @@ fn test_suite_map_repo_rich_governed_section_body_uses_rich_payload() {
 
     let value: Value = serde_json::from_slice(&output).unwrap();
     let body = value
-        .get("final_packet")
+        .get("packet")
+        .and_then(|v| v.get("payload"))
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get("governed_packet"))
         .and_then(|v| v.get("payload"))
         .and_then(|v| v.get("sections"))
         .and_then(Value::as_array)
@@ -1224,7 +1289,10 @@ fn test_suite_proxy_run_rich_governed_section_body_uses_rich_payload() {
 
     let value: Value = serde_json::from_slice(&output).unwrap();
     let body = value
-        .get("final_packet")
+        .get("packet")
+        .and_then(|v| v.get("payload"))
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get("governed_packet"))
         .and_then(|v| v.get("payload"))
         .and_then(|v| v.get("sections"))
         .and_then(Value::as_array)
@@ -1547,9 +1615,168 @@ fn test_suite_diff_analyze_json_includes_cache_block() {
         .clone();
     let value: Value = serde_json::from_slice(&output).unwrap();
     assert!(value
-        .get("cache")
+        .get("packet")
+        .and_then(|packet| packet.get("payload"))
+        .and_then(|payload| payload.get("debug"))
+        .and_then(|debug| debug.get("cache"))
         .and_then(|v| v.get("diff"))
         .and_then(|v| v.get("hit"))
         .and_then(Value::as_bool)
         .is_some());
+}
+
+#[test]
+fn test_suite_map_repo_profiles_and_handle_fetch_share_hash() {
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+
+    let compact_output = suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--json=compact",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let compact = parse_packet_wrapper(&compact_output, "suite.map.repo.v1");
+
+    let full_output = suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--json=full",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let full = parse_packet_wrapper(&full_output, "suite.map.repo.v1");
+
+    let handle_output = suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--json=handle",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let handle = parse_packet_wrapper(&handle_output, "suite.map.repo.v1");
+
+    let compact_hash = compact
+        .get("packet")
+        .and_then(|packet| packet.get("hash"))
+        .and_then(Value::as_str)
+        .unwrap();
+    let full_hash = full
+        .get("packet")
+        .and_then(|packet| packet.get("hash"))
+        .and_then(Value::as_str)
+        .unwrap();
+    let handle_hash = handle
+        .get("packet")
+        .and_then(|packet| packet.get("hash"))
+        .and_then(Value::as_str)
+        .unwrap();
+    assert_eq!(compact_hash, full_hash);
+    assert_eq!(compact_hash, handle_hash);
+
+    let artifact_handle = packet_payload(&handle)
+        .get("artifact_handle")
+        .cloned()
+        .unwrap();
+    let handle_id = artifact_handle
+        .get("handle_id")
+        .and_then(Value::as_str)
+        .unwrap();
+    let artifact_path = artifact_handle.get("path").and_then(Value::as_str).unwrap();
+    assert!(Path::new(artifact_path).exists());
+
+    let fetch_output = suite_cmd()
+        .args([
+            "packet",
+            "fetch",
+            "--handle",
+            handle_id,
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--json=full",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let fetched = parse_packet_wrapper(&fetch_output, "suite.map.repo.v1");
+    let fetched_hash = fetched
+        .get("packet")
+        .and_then(|packet| packet.get("hash"))
+        .and_then(Value::as_str)
+        .unwrap();
+    assert_eq!(compact_hash, fetched_hash);
+}
+
+#[test]
+fn test_suite_cover_check_report_json_compat_maps_to_packet_wrapper() {
+    let output = suite_cmd()
+        .args([
+            "cover",
+            "check",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--report",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.cover.check.v1");
+    assert!(packet_payload(&value).get("passed").is_some());
+}
+
+#[test]
+fn test_suite_map_repo_legacy_json_compat_shape() {
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+
+    let output = suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--legacy-json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.map.repo.v1")
+    );
+    assert!(value.get("packet_type").is_none());
+    assert!(value.get("packet").is_some());
 }

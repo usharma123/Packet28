@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use suite_packet_core::EnvelopeV1;
 
 #[derive(Args)]
 pub struct ReduceArgs {
@@ -12,8 +13,16 @@ pub struct ReduceArgs {
     input: Option<String>,
 
     /// Emit JSON output
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Emit one-release compatibility JSON shape
     #[arg(long)]
-    json: bool,
+    legacy_json: bool,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pretty: bool,
 
     /// Optional cap on number of parsed diagnostics
     #[arg(long)]
@@ -59,8 +68,9 @@ pub fn run(args: ReduceArgs) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let packet: buildy_core::BuildPacket = serde_json::from_value(output_packet.body.clone())
-        .map_err(|source| anyhow!("invalid buildy output packet: {source}"))?;
+    let packet: EnvelopeV1<buildy_core::BuildReduceOutput> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid buildy output packet: {source}"))?;
 
     let governed_response = if let Some(context_config) = args.context_config {
         Some(kernel.execute(context_kernel_core::KernelRequest {
@@ -80,7 +90,8 @@ pub fn run(args: ReduceArgs) -> Result<i32> {
         None
     };
 
-    if args.json {
+    if let Some(profile_arg) = args.json {
+        let profile: suite_packet_core::JsonProfile = profile_arg.into();
         if let Some(governed) = governed_response {
             let budget_hint = crate::cmd_common::budget_retry_hint(
                 &governed.metadata,
@@ -92,52 +103,100 @@ pub fn run(args: ReduceArgs) -> Result<i32> {
                 .output_packets
                 .first()
                 .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "schema_version": "suite.build.reduce.v1",
-                    "packet": packet,
-                    "final_packet": final_packet.body,
-                    "kernel_audit": {
-                        "build": response.audit,
-                        "governed": governed.audit,
-                    },
-                    "kernel_metadata": {
-                        "build": response.metadata,
-                        "governed": governed.metadata,
-                    },
-                    "cache": {
-                        "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                    },
-                    "hints": {
-                        "budget_retry": budget_hint,
-                    },
-                }))?
-            );
+            if args.legacy_json {
+                crate::cmd_common::emit_json(
+                    &json!({
+                        "schema_version": "suite.build.reduce.v1",
+                        "packet": packet,
+                        "final_packet": final_packet.body,
+                        "kernel_audit": {
+                            "build": response.audit,
+                            "governed": governed.audit,
+                        },
+                        "kernel_metadata": {
+                            "build": response.metadata,
+                            "governed": governed.metadata,
+                        },
+                        "cache": {
+                            "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                        "hints": {
+                            "budget_retry": budget_hint,
+                        },
+                    }),
+                    args.pretty,
+                )?;
+            } else {
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_BUILD_REDUCE,
+                    &packet,
+                    profile,
+                    args.pretty,
+                    &crate::cmd_common::resolve_artifact_root(None),
+                    Some(json!({
+                        "kernel_audit": {
+                            "build": response.audit,
+                            "governed": governed.audit,
+                        },
+                        "kernel_metadata": {
+                            "build": response.metadata,
+                            "governed": governed.metadata,
+                        },
+                        "cache": {
+                            "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                        "hints": {
+                            "budget_retry": budget_hint,
+                        },
+                        "governed_packet": final_packet.body,
+                    })),
+                )?;
+            }
         } else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "schema_version": "suite.build.reduce.v1",
-                    "packet": packet,
-                    "kernel_audit": {
-                        "build": response.audit,
-                    },
-                    "kernel_metadata": {
-                        "build": response.metadata,
-                    },
-                    "cache": {
-                        "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                    },
-                }))?
-            );
+            if args.legacy_json {
+                crate::cmd_common::emit_json(
+                    &json!({
+                        "schema_version": "suite.build.reduce.v1",
+                        "packet": packet,
+                        "kernel_audit": {
+                            "build": response.audit,
+                        },
+                        "kernel_metadata": {
+                            "build": response.metadata,
+                        },
+                        "cache": {
+                            "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                    }),
+                    args.pretty,
+                )?;
+            } else {
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_BUILD_REDUCE,
+                    &packet,
+                    profile,
+                    args.pretty,
+                    &crate::cmd_common::resolve_artifact_root(None),
+                    Some(json!({
+                        "kernel_audit": {
+                            "build": response.audit,
+                        },
+                        "kernel_metadata": {
+                            "build": response.metadata,
+                        },
+                        "cache": {
+                            "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                    })),
+                )?;
+            }
         }
         return Ok(0);
     }
 
-    let payload: buildy_core::BuildReduceOutput = serde_json::from_value(packet.payload.clone())
-        .map_err(|source| anyhow!("invalid buildy payload: {source}"))?;
+    let payload = packet.payload.clone();
     println!(
         "summary: total={} unique={} duplicates_removed={}",
         payload.total_diagnostics, payload.unique_diagnostics, payload.duplicates_removed
@@ -169,8 +228,15 @@ pub fn run(args: ReduceArgs) -> Result<i32> {
             .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
         let sections = final_packet
             .body
-            .get("assembly")
+            .get("payload")
+            .and_then(|payload| payload.get("assembly"))
             .and_then(|assembly| assembly.get("sections_kept"))
+            .or_else(|| {
+                final_packet
+                    .body
+                    .get("assembly")
+                    .and_then(|assembly| assembly.get("sections_kept"))
+            })
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         println!(

@@ -70,7 +70,7 @@ policy:
   tools:
     allowlist: ["diffy", "contextq"]
   reducers:
-    allowlist: ["analyze", "assemble", "contextq.assemble"]
+    allowlist: ["analyze", "assemble", "contextq.assemble", "diffy.analyze"]
   paths:
     include: ["src/**"]
     exclude: ["src/private/**"]
@@ -149,20 +149,29 @@ policy:
 
 Machine-mode shape and exits for repeatable local demos:
 
-- `Packet28 diff analyze --json --context-config ...` emits `schema_version: "suite.diff.analyze.v1"` with `kernel_audit` and `kernel_metadata`.
-- `Packet28 test impact --json` emits `schema_version: "suite.test.impact.v1"` with `kernel_audit` and `kernel_metadata`.
-- `Packet28 stack slice --json` emits `schema_version: "suite.stack.slice.v1"`.
-- `Packet28 build reduce --json` emits `schema_version: "suite.build.reduce.v1"`.
-- `Packet28 context assemble` emits `schema_version: "suite.context.assemble.v1"` with `packet` + kernel audit metadata.
-- `Packet28 context assemble --context-config ...` emits the same schema version with governed `final_packet` + governed kernel audit metadata.
-- `Packet28 cover check --json`, `Packet28 map repo --json`, and `Packet28 proxy run --json` default to compact packets (`schema_version` + `packet`) and minified JSON.
-- Add `--packet-detail rich` for one-release compatibility output, and `--pretty` for human-readable JSON formatting.
+- Scoped machine commands emit one wrapper: `schema_version: "suite.packet.v1"`, `packet_type`, and `packet`.
+- Optional debug/audit/cache metadata is placed at `packet.payload.debug`.
+- `--json` and `--json=compact` are bounded compact mode defaults.
+- `--json=full` emits full payload projection.
+- `--json=handle` emits compact payload + `payload.artifact_handle` and persists full artifact under `.packet28/artifacts/`.
+- `Packet28 packet fetch --handle <id> --json=full|compact` expands handle artifacts.
+- `--packet-detail` and `--report json` are accepted one-release compatibility shims and map internally to profile behavior.
+- `--legacy-json` emits previous command-specific top-level JSON shapes for one release.
+- Add `--pretty` for human-readable JSON formatting.
 - `Packet28 cover check` and `Packet28 diff analyze` default to terminal output unless `--json` or `--report json` is set.
 - `Packet28 --output <path> ...` redirects stdout to a file sink for scripting and multi-step pipelines.
 - `Packet28 map repo --cache` and `Packet28 proxy run --cache` enable disk-backed kernel cache reuse under `.packet28/packet-cache-v1.bin`.
 - `guard` commands support `--context-config`; legacy `--config` remains supported for compatibility.
 - `contextq` budget trim metadata is emitted under `budget_trim` (truncated/dropped/estimated/cap fields).
 - Exit codes are stable: `0` success, `1` policy/gate denial, `2` usage/runtime errors.
+
+Phase 1 protocol docs:
+
+- `docs/packet-envelope-v1.md`
+- `docs/machine-output-contract.md`
+- `docs/wire-profiles.md`
+- `docs/schema-registry.md`
+- `docs/ci-agent-examples.md`
 
 ## Next Reducer Wave (V1)
 

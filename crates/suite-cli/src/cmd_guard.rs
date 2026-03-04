@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use clap::Args;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Args, Default)]
 pub struct ValidateArgs {
@@ -20,6 +20,18 @@ pub struct CheckArgs {
     /// Path to guard policy config (context.yaml)
     #[arg(long)]
     context_config: Option<String>,
+
+    /// Emit JSON output profile
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Emit one-release compatibility JSON shape
+    #[arg(long)]
+    legacy_json: bool,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pretty: bool,
 }
 
 pub fn run_validate(args: ValidateArgs, config_path: &str) -> Result<i32> {
@@ -46,8 +58,29 @@ pub fn run_check(args: CheckArgs, config_path: &str) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let audit: guardy_core::AuditResult = serde_json::from_value(audit_packet.body.clone())?;
-    println!("{}", serde_json::to_string_pretty(&audit)?);
+    let envelope: suite_packet_core::EnvelopeV1<Value> =
+        serde_json::from_value(audit_packet.body.clone())
+            .map_err(|source| anyhow!("invalid guard audit envelope: {source}"))?;
+    let audit: guardy_core::AuditResult = serde_json::from_value(envelope.payload.clone())
+        .map_err(|source| anyhow!("invalid guard audit payload: {source}"))?;
+    if args.legacy_json {
+        crate::cmd_common::emit_json(&serde_json::to_value(&audit)?, args.pretty)?;
+    } else {
+        let profile = args
+            .json
+            .map(suite_packet_core::JsonProfile::from)
+            .unwrap_or(suite_packet_core::JsonProfile::Compact);
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_GUARD_CHECK,
+            &envelope,
+            profile,
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            Some(json!({
+                "kernel_metadata": response.metadata,
+            })),
+        )?;
+    }
     Ok(if audit.passed { 0 } else { 1 })
 }
 

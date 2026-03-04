@@ -76,12 +76,16 @@ pub struct CheckArgs {
     report: Option<String>,
 
     /// Emit JSON output
-    #[arg(long)]
-    json: bool,
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    json: Option<crate::cmd_common::JsonProfileArg>,
 
     /// Packet detail level in JSON mode
     #[arg(long, value_enum, default_value_t = PacketDetailArg::Compact)]
     packet_detail: PacketDetailArg,
+
+    /// Emit one-release compatibility JSON shape
+    #[arg(long)]
+    legacy_json: bool,
 
     /// Pretty-print JSON output
     #[arg(long)]
@@ -106,12 +110,13 @@ pub struct CheckArgs {
 
 pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
-    let report =
-        if crate::cmd_common::resolve_json_output(args.json, args.report.as_deref(), "--report")? {
-            "json".to_string()
-        } else {
-            crate::cmd_common::resolve_report_format(args.report.as_deref())
-        };
+    let machine_profile =
+        crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
+    let report = if machine_profile.is_some() {
+        "json".to_string()
+    } else {
+        crate::cmd_common::resolve_report_format(args.report.as_deref())
+    };
 
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
@@ -225,23 +230,38 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
             }
             .with_canonical_hash_and_real_budget();
 
-            let value = if args.packet_detail == PacketDetailArg::Rich {
-                serde_json::json!({
-                    "schema_version": "suite.cover.check.v1",
-                    "gate_result": output.gate_result,
-                    "envelope_v1": envelope,
-                })
-            } else {
-                serde_json::json!({
-                    "schema_version": "suite.cover.check.v1",
-                    "packet": envelope,
-                })
-            };
-            if args.pretty {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
-                println!("{}", serde_json::to_string(&value)?);
+            if args.legacy_json {
+                let value = if args.packet_detail == PacketDetailArg::Rich {
+                    serde_json::json!({
+                        "schema_version": "suite.cover.check.v1",
+                        "gate_result": output.gate_result,
+                        "envelope_v1": envelope,
+                    })
+                } else {
+                    serde_json::json!({
+                        "schema_version": "suite.cover.check.v1",
+                        "packet": envelope,
+                    })
+                };
+                crate::cmd_common::emit_json(&value, args.pretty)?;
+                return Ok(if output.gate_result.passed { 0 } else { 1 });
             }
+
+            let mut effective_profile =
+                machine_profile.unwrap_or(suite_packet_core::JsonProfile::Compact);
+            if effective_profile == suite_packet_core::JsonProfile::Compact
+                && args.packet_detail == PacketDetailArg::Rich
+            {
+                effective_profile = suite_packet_core::JsonProfile::Full;
+            }
+            crate::cmd_common::emit_machine_envelope(
+                suite_packet_core::PACKET_TYPE_COVER_CHECK,
+                &envelope,
+                effective_profile,
+                args.pretty,
+                &crate::cmd_common::resolve_artifact_root(None),
+                None,
+            )?;
         }
         "markdown" => {
             let md = diffy_core::report::render_markdown(

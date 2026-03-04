@@ -7,6 +7,7 @@ mod cmd_guard;
 mod cmd_impact;
 mod cmd_map;
 mod cmd_map_repo;
+mod cmd_packet;
 mod cmd_proxy;
 mod cmd_shard;
 mod cmd_stack;
@@ -55,6 +56,8 @@ enum Commands {
     Map(MapArgs),
     /// Safe command proxy/reduction commands
     Proxy(cmd_proxy::ProxyArgs),
+    /// Packet artifact utilities
+    Packet(cmd_packet::PacketArgs),
 }
 
 #[derive(Args)]
@@ -206,6 +209,9 @@ fn main() {
         },
         Commands::Proxy(proxy) => match proxy.command {
             cmd_proxy::ProxyCommands::Run(args) => cmd_proxy::run(args),
+        },
+        Commands::Packet(packet) => match packet.command {
+            cmd_packet::PacketCommands::Fetch(args) => cmd_packet::run_fetch(args),
         },
     };
 

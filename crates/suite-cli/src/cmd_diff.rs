@@ -48,8 +48,16 @@ pub struct AnalyzeArgs {
     report: Option<String>,
 
     /// Emit JSON output
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Emit one-release compatibility JSON shape
     #[arg(long)]
-    json: bool,
+    legacy_json: bool,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pretty: bool,
 
     /// Coverage report files to ingest (instead of loading state)
     #[arg(long)]
@@ -100,13 +108,21 @@ struct DiffAnalyzeKernelOutput {
     diffs: Vec<SerializableFileDiff>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiffAnalyzeKernelPacket {
-    packet_id: Option<String>,
-    tool: Option<String>,
-    reducer: Option<String>,
-    paths: Vec<String>,
-    payload: DiffAnalyzeKernelOutput,
+impl Default for DiffAnalyzeKernelOutput {
+    fn default() -> Self {
+        Self {
+            gate_result: suite_packet_core::QualityGateResult {
+                passed: false,
+                total_coverage_pct: None,
+                changed_coverage_pct: None,
+                new_file_coverage_pct: None,
+                violations: Vec::new(),
+                issue_counts: None,
+            },
+            diagnostics: None,
+            diffs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,15 +158,6 @@ impl SerializableFileDiff {
     }
 }
 
-fn parse_diff_output(body: &serde_json::Value) -> Result<DiffAnalyzeKernelOutput> {
-    if let Ok(packet) = serde_json::from_value::<DiffAnalyzeKernelPacket>(body.clone()) {
-        return Ok(packet.payload);
-    }
-
-    serde_json::from_value(body.clone())
-        .map_err(|source| anyhow!("invalid diff analyze output packet: {source}"))
-}
-
 fn format_pct(value: Option<f64>) -> String {
     value
         .map(|pct| format!("{pct:.2}"))
@@ -170,12 +177,13 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         })
         .unwrap_or(Value::Null);
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
-    let report =
-        if crate::cmd_common::resolve_json_output(args.json, args.report.as_deref(), "--report")? {
-            "json".to_string()
-        } else {
-            crate::cmd_common::resolve_report_format(args.report.as_deref())
-        };
+    let machine_profile =
+        crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
+    let report = if machine_profile.is_some() {
+        "json".to_string()
+    } else {
+        crate::cmd_common::resolve_report_format(args.report.as_deref())
+    };
 
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
@@ -209,7 +217,10 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let output = parse_diff_output(&output_packet.body)?;
+    let envelope: suite_packet_core::EnvelopeV1<DiffAnalyzeKernelOutput> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid diff analyze output packet: {source}"))?;
+    let output = envelope.payload.clone();
     let gate_passed = output.gate_result.passed;
 
     let governed_response = if let Some(context_config) = governed_context_config {
@@ -232,6 +243,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
 
     match report.as_str() {
         "json" => {
+            let profile = machine_profile.unwrap_or(suite_packet_core::JsonProfile::Compact);
             if let Some(governed) = governed_response {
                 let budget_hint = crate::cmd_common::budget_retry_hint(
                     &governed.metadata,
@@ -242,48 +254,94 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                 let final_packet = governed.output_packets.first().ok_or_else(|| {
                     anyhow!("kernel returned no output packets for governed flow")
                 })?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "schema_version": "suite.diff.analyze.v1",
-                        "gate_result": output.gate_result,
-                        "diagnostics": output.diagnostics,
-                        "diffs": output.diffs,
-                        "final_packet": final_packet.body,
-                        "kernel_audit": governed.audit,
-                        "kernel_metadata": {
-                            "diff": response.metadata,
-                            "governed": governed.metadata,
-                        },
-                        "cache": {
-                            "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        },
-                        "hints": {
-                            "budget_retry": budget_hint,
-                        },
-                    }))?
-                );
-            } else {
-                let mut value: Value = serde_json::from_str(&diffy_core::report::render_gate_json(
-                    &output.gate_result,
-                ))
-                .map_err(|source| anyhow!("failed to parse gate json: {source}"))?;
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert(
-                        "kernel_metadata".to_string(),
-                        json!({
-                            "diff": response.metadata,
+                if args.legacy_json {
+                    crate::cmd_common::emit_json(
+                        &json!({
+                            "schema_version": "suite.diff.analyze.v1",
+                            "gate_result": output.gate_result,
+                            "diagnostics": output.diagnostics,
+                            "diffs": output.diffs,
+                            "final_packet": final_packet.body,
+                            "kernel_audit": governed.audit,
+                            "kernel_metadata": {
+                                "diff": response.metadata,
+                                "governed": governed.metadata,
+                            },
+                            "cache": {
+                                "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                                "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            },
+                            "hints": {
+                                "budget_retry": budget_hint,
+                            },
                         }),
-                    );
-                    obj.insert(
-                        "cache".to_string(),
-                        json!({
-                            "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        }),
-                    );
+                        args.pretty,
+                    )?;
+                } else {
+                    crate::cmd_common::emit_machine_envelope(
+                        suite_packet_core::PACKET_TYPE_DIFF_ANALYZE,
+                        &envelope,
+                        profile,
+                        args.pretty,
+                        &crate::cmd_common::resolve_artifact_root(None),
+                        Some(json!({
+                            "kernel_audit": {
+                                "diff": response.audit,
+                                "governed": governed.audit,
+                            },
+                            "kernel_metadata": {
+                                "diff": response.metadata,
+                                "governed": governed.metadata,
+                            },
+                            "cache": {
+                                "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                                "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            },
+                            "hints": {
+                                "budget_retry": budget_hint,
+                            },
+                            "governed_packet": final_packet.body,
+                        })),
+                    )?;
                 }
-                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                if args.legacy_json {
+                    let mut value: Value = serde_json::from_str(
+                        &diffy_core::report::render_gate_json(&output.gate_result),
+                    )
+                    .map_err(|source| anyhow!("failed to parse gate json: {source}"))?;
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "kernel_metadata".to_string(),
+                            json!({
+                                "diff": response.metadata,
+                            }),
+                        );
+                        obj.insert(
+                            "cache".to_string(),
+                            json!({
+                                "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            }),
+                        );
+                    }
+                    crate::cmd_common::emit_json(&value, args.pretty)?;
+                } else {
+                    crate::cmd_common::emit_machine_envelope(
+                        suite_packet_core::PACKET_TYPE_DIFF_ANALYZE,
+                        &envelope,
+                        profile,
+                        args.pretty,
+                        &crate::cmd_common::resolve_artifact_root(None),
+                        Some(json!({
+                            "cache": {
+                                "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            },
+                            "kernel_metadata": {
+                                "diff": response.metadata,
+                            },
+                        })),
+                    )?;
+                }
             }
         }
         _ => {
@@ -320,8 +378,15 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                 }
                 let sections = final_packet
                     .body
-                    .get("assembly")
+                    .get("payload")
+                    .and_then(|payload| payload.get("assembly"))
                     .and_then(|assembly| assembly.get("sections_kept"))
+                    .or_else(|| {
+                        final_packet
+                            .body
+                            .get("assembly")
+                            .and_then(|assembly| assembly.get("sections_kept"))
+                    })
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
                 println!(
@@ -344,6 +409,13 @@ fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
     context_kernel_core::Kernel::with_v1_reducers()
 }
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn run_diff_analyze_reducer(
     ctx: &mut context_kernel_core::ExecutionContext,
     _input_packets: &[context_kernel_core::KernelPacket],
@@ -356,9 +428,11 @@ fn run_diff_analyze_reducer(
             }
         })?;
 
+    let git_base = input.base.clone();
+    let git_head = input.head.clone();
     let request = diffy_core::pipeline::PipelineRequest {
-        base: input.base,
-        head: input.head,
+        base: input.base.clone(),
+        head: input.head.clone(),
         source_root: None,
         coverage: diffy_core::pipeline::PipelineCoverageInput {
             paths: input.coverage,
@@ -416,18 +490,6 @@ fn run_diff_analyze_reducer(
         .collect::<Vec<_>>();
     changed_paths.sort();
 
-    let refs = changed_paths
-        .iter()
-        .map(|path| {
-            json!({
-                "kind": "file",
-                "value": path,
-                "source": "diffy-analyze-v1",
-                "relevance": 0.75
-            })
-        })
-        .collect::<Vec<_>>();
-
     let gate_summary = format!(
         "passed: {}\nchanged_coverage_pct: {}\ntotal_coverage_pct: {}\nnew_file_coverage_pct: {}\nviolations: {}",
         kernel_output.gate_result.passed,
@@ -447,52 +509,68 @@ fn run_diff_analyze_reducer(
         changed_paths.join("\n")
     };
 
-    let packet_body = serde_json::to_value(json!({
-        "packet_id": "diffy-analyze-v1",
-        "tool": "diffy",
-        "tools": ["diffy"],
-        "reducer": "analyze",
-        "reducers": ["analyze"],
-        "paths": changed_paths,
-        "payload": kernel_output,
-        "sections": [
-            {
-                "id": "diff-gate-summary",
-                "title": "Diff Gate Summary",
-                "body": gate_summary,
-                "refs": refs.clone(),
-                "relevance": if output.gate_result.passed { 0.8 } else { 1.4 },
-            },
-            {
-                "id": "changed-files",
-                "title": "Changed Files",
-                "body": changed_file_body,
-                "refs": refs.clone(),
-                "relevance": 0.9,
-            }
-        ],
-        "refs": refs,
-        "text_blobs": [gate_summary],
-    }))
-    .map_err(|source| context_kernel_core::KernelError::ReducerFailed {
-        target: ctx.target.clone(),
-        detail: source.to_string(),
-    })?;
+    let files = changed_paths
+        .iter()
+        .map(|path| suite_packet_core::FileRef {
+            path: path.clone(),
+            relevance: Some(0.75),
+            source: Some("diffy.analyze".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let payload_bytes = serde_json::to_vec(&kernel_output).unwrap_or_default().len();
+    let envelope = suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "diffy".to_string(),
+        kind: "diff_analyze".to_string(),
+        hash: String::new(),
+        summary: format!("{gate_summary}\nchanged_files: {changed_file_body}"),
+        files,
+        symbols: Vec::new(),
+        risk: None,
+        confidence: Some(if output.gate_result.passed { 1.0 } else { 0.8 }),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: changed_paths,
+            git_base: Some(git_base),
+            git_head: Some(git_head),
+            generated_at_unix: now_unix(),
+        },
+        payload: kernel_output,
+    }
+    .with_canonical_hash_and_real_budget();
 
     Ok(context_kernel_core::ReducerResult {
         output_packets: vec![context_kernel_core::KernelPacket {
-            packet_id: Some("diffy-analyze-v1".to_string()),
+            packet_id: Some(format!(
+                "diffy-{}",
+                envelope.hash.chars().take(12).collect::<String>()
+            )),
             format: "packet-json".to_string(),
-            body: packet_body,
-            token_usage: None,
-            runtime_ms: None,
+            body: serde_json::to_value(&envelope).map_err(|source| {
+                context_kernel_core::KernelError::ReducerFailed {
+                    target: ctx.target.clone(),
+                    detail: source.to_string(),
+                }
+            })?,
+            token_usage: Some(envelope.budget_cost.est_tokens),
+            runtime_ms: Some(envelope.budget_cost.runtime_ms),
             metadata: json!({
                 "reducer": "diffy.analyze",
+                "kind": "diff_analyze",
+                "hash": envelope.hash,
                 "passed": output.gate_result.passed,
             }),
         }],
         metadata: json!({
             "reducer": "diffy.analyze",
+            "kind": "diff_analyze",
             "passed": output.gate_result.passed,
         }),
     })

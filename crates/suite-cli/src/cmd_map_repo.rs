@@ -37,8 +37,12 @@ pub struct RepoArgs {
     pub include_tests: bool,
 
     /// Emit JSON output
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    pub json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Emit one-release compatibility JSON shape
     #[arg(long)]
-    pub json: bool,
+    pub legacy_json: bool,
 
     /// Packet detail level in JSON mode
     #[arg(long, value_enum, default_value_t = PacketDetailArg::Compact)]
@@ -70,6 +74,18 @@ pub struct RepoArgs {
 }
 
 pub fn run(args: RepoArgs) -> Result<i32> {
+    let machine_profile = args
+        .json
+        .map(|profile| suite_packet_core::JsonProfile::from(profile));
+    let detail_mode = if matches!(
+        machine_profile,
+        Some(suite_packet_core::JsonProfile::Full | suite_packet_core::JsonProfile::Handle)
+    ) || args.packet_detail == PacketDetailArg::Rich
+    {
+        PacketDetailArg::Rich
+    } else {
+        PacketDetailArg::Compact
+    };
     let repo_root = args.repo_root.clone();
     let input = mapy_core::RepoMapRequest {
         repo_root,
@@ -83,15 +99,26 @@ pub fn run(args: RepoArgs) -> Result<i32> {
     let use_kernel = args.cache || args.context_config.is_some();
     if !use_kernel {
         let envelope = mapy_core::build_repo_map(input)?;
-        if args.json {
-            let packet = packet_value(&envelope, args.packet_detail)?;
-            emit_json(
-                &json!({
-                    "schema_version": "suite.map.repo.v1",
-                    "packet": packet,
-                }),
-                args.pretty,
-            )?;
+        if let Some(profile) = machine_profile {
+            if args.legacy_json {
+                let packet = packet_value(&envelope, detail_mode)?;
+                crate::cmd_common::emit_json(
+                    &json!({
+                        "schema_version": "suite.map.repo.v1",
+                        "packet": packet,
+                    }),
+                    args.pretty,
+                )?;
+            } else {
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_MAP_REPO,
+                    &envelope,
+                    profile,
+                    args.pretty,
+                    &PathBuf::from(&args.repo_root),
+                    None,
+                )?;
+            }
             return Ok(0);
         }
 
@@ -119,7 +146,7 @@ pub fn run(args: RepoArgs) -> Result<i32> {
     let envelope: suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload> =
         serde_json::from_value(output_packet.body.clone())
             .map_err(|source| anyhow!("invalid mapy output packet: {source}"))?;
-    let governed_input_packet = if args.packet_detail == PacketDetailArg::Rich {
+    let governed_input_packet = if detail_mode == PacketDetailArg::Rich {
         let mut packet = output_packet.clone();
         packet.body = packet_value(&envelope, PacketDetailArg::Rich)?;
         packet
@@ -138,11 +165,11 @@ pub fn run(args: RepoArgs) -> Result<i32> {
             },
             policy_context: json!({
                 "config_path": context_config,
-                "detail_mode": match args.packet_detail {
+                "detail_mode": match detail_mode {
                     PacketDetailArg::Rich => "rich",
                     PacketDetailArg::Compact => "compact",
                 },
-                "compact_assembly": args.packet_detail == PacketDetailArg::Compact,
+                "compact_assembly": detail_mode == PacketDetailArg::Compact,
             }),
             ..context_kernel_core::KernelRequest::default()
         })?)
@@ -150,8 +177,8 @@ pub fn run(args: RepoArgs) -> Result<i32> {
         None
     };
 
-    if args.json {
-        let packet = packet_value(&envelope, args.packet_detail)?;
+    if let Some(profile) = machine_profile {
+        let packet = packet_value(&envelope, detail_mode)?;
         if let Some(governed) = governed_response {
             let budget_hint = crate::cmd_common::budget_retry_hint(
                 &governed.metadata,
@@ -163,12 +190,49 @@ pub fn run(args: RepoArgs) -> Result<i32> {
                 .output_packets
                 .first()
                 .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-            if args.debug {
-                emit_json(
-                    &json!({
-                        "schema_version": "suite.map.repo.v1",
-                        "packet": packet,
-                        "final_packet": final_packet.body,
+            if args.legacy_json {
+                if args.debug {
+                    crate::cmd_common::emit_json(
+                        &json!({
+                            "schema_version": "suite.map.repo.v1",
+                            "packet": packet,
+                            "final_packet": final_packet.body,
+                            "kernel_audit": {
+                                "map": response.audit,
+                                "governed": governed.audit,
+                            },
+                            "kernel_metadata": {
+                                "map": response.metadata,
+                                "governed": governed.metadata,
+                            },
+                            "cache": {
+                                "map": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                                "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            },
+                            "hints": {
+                                "budget_retry": budget_hint,
+                            },
+                        }),
+                        args.pretty,
+                    )?;
+                } else {
+                    crate::cmd_common::emit_json(
+                        &json!({
+                            "schema_version": "suite.map.repo.v1",
+                            "packet": packet,
+                            "final_packet": final_packet.body,
+                        }),
+                        args.pretty,
+                    )?;
+                }
+            } else {
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_MAP_REPO,
+                    &envelope,
+                    profile,
+                    args.pretty,
+                    &PathBuf::from(&args.repo_root),
+                    Some(json!({
                         "kernel_audit": {
                             "map": response.audit,
                             "governed": governed.audit,
@@ -184,30 +248,36 @@ pub fn run(args: RepoArgs) -> Result<i32> {
                         "hints": {
                             "budget_retry": budget_hint,
                         },
+                        "governed_packet": final_packet.body,
+                    })),
+                )?;
+            }
+        } else {
+            if args.legacy_json {
+                crate::cmd_common::emit_json(
+                    &json!({
+                        "schema_version": "suite.map.repo.v1",
+                        "packet": packet,
+                        "cache": {
+                            "map": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
                     }),
                     args.pretty,
                 )?;
             } else {
-                emit_json(
-                    &json!({
-                        "schema_version": "suite.map.repo.v1",
-                        "packet": packet,
-                        "final_packet": final_packet.body,
-                    }),
+                crate::cmd_common::emit_machine_envelope(
+                    suite_packet_core::PACKET_TYPE_MAP_REPO,
+                    &envelope,
+                    profile,
                     args.pretty,
+                    &PathBuf::from(&args.repo_root),
+                    Some(json!({
+                        "cache": {
+                            "map": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                    })),
                 )?;
             }
-        } else {
-            emit_json(
-                &json!({
-                    "schema_version": "suite.map.repo.v1",
-                    "packet": packet,
-                    "cache": {
-                        "map": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                    },
-                }),
-                args.pretty,
-            )?;
         }
 
         return Ok(0);
@@ -238,8 +308,15 @@ pub fn run(args: RepoArgs) -> Result<i32> {
             .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
         let sections = final_packet
             .body
-            .get("assembly")
+            .get("payload")
+            .and_then(|payload| payload.get("assembly"))
             .and_then(|assembly| assembly.get("sections_kept"))
+            .or_else(|| {
+                final_packet
+                    .body
+                    .get("assembly")
+                    .and_then(|assembly| assembly.get("sections_kept"))
+            })
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         println!(
@@ -261,15 +338,6 @@ fn packet_value(
         return Ok(value);
     }
     serde_json::to_value(envelope).map_err(Into::into)
-}
-
-fn emit_json(value: &Value, pretty: bool) -> Result<()> {
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    } else {
-        println!("{}", serde_json::to_string(value)?);
-    }
-    Ok(())
 }
 
 fn print_text_summary(envelope: &suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>) {
