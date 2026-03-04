@@ -5,7 +5,7 @@ This workspace ships four first-class binaries:
 - `covy`: all-in-one coverage + diagnostics workflow (ingest, check, report, PR artifacts, path tooling).
 - `diffy`: diff-focused coverage/diagnostics gate analysis.
 - `testy`: test impact analysis, sharding, and testmap generation.
-- `Packet28`: umbrella CLI with domain routing (`Packet28 diff ...`, `Packet28 test ...`).
+- `Packet28`: umbrella CLI with domain routing (`Packet28 cover ...`, `Packet28 diff ...`, `Packet28 test ...`, `Packet28 map ...`, `Packet28 proxy ...`).
 
 ## When To Use Each
 
@@ -46,8 +46,11 @@ cargo build --release -p covy-cli -p diffy-cli -p testy-cli -p suite-cli
 `Packet28` examples:
 
 ```bash
+./target/release/Packet28 cover check --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --no-issues-state --json
 ./target/release/Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --no-issues-state --json
 ./target/release/Packet28 test impact --base HEAD --head HEAD --testmap .covy/state/testmap.bin --json
+./target/release/Packet28 map repo --repo-root . --json
+./target/release/Packet28 proxy run --json -- git status
 ./target/release/Packet28 guard validate --config context.yaml
 ./target/release/Packet28 guard check --packet packet.json --config context.yaml
 ./target/release/Packet28 stack slice --input artifacts/stack.log --json
@@ -70,8 +73,16 @@ policy:
     cap: 5000
   runtime_budget:
     cap_ms: 5000
+  tool_call_budget:
+    cap: 10
   redaction:
     forbidden_patterns: ["(?i)password", "(?i)secret"]
+  human_review:
+    required: false
+    on_policy_violation: true
+    on_budget_violation: true
+    on_redaction_violation: true
+    paths: ["src/security/**"]
 ```
 
 ## Governed Local Workflow (Usable V1)

@@ -1,0 +1,8 @@
+Third-Party Attribution Notes
+=============================
+
+This repository includes in-house implementations inspired by public tools and patterns
+(including RTK-style command compression pipelines and Aider-style repo mapping workflows).
+
+No direct source code has been copied from non-MIT licensed projects in this implementation wave.
+Any future MIT-licensed code adaptation should preserve required notices and license headers.

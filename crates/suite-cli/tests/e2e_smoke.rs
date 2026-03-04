@@ -97,8 +97,16 @@ policy:
     cap: 5000
   runtime_budget:
     cap_ms: 5000
+  tool_call_budget:
+    cap: 10
   redaction:
     forbidden_patterns: []
+  human_review:
+    required: false
+    on_policy_violation: true
+    on_budget_violation: true
+    on_redaction_violation: true
+    paths: []
 "#,
     )
     .unwrap();
@@ -183,6 +191,52 @@ main.c(40,2): warning C4996: use of deprecated function
 "#,
     )
     .unwrap();
+}
+
+fn write_repo_fixture(root: &Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("alpha.rs"),
+        r#"
+use crate::beta::Beta;
+
+fn alpha() {}
+struct Alpha;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        src.join("beta.rs"),
+        r#"
+fn beta() {}
+enum Beta {
+  A,
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_suite_cover_check_smoke() {
+    suite_cmd()
+        .args([
+            "cover",
+            "check",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"schema_version\": \"suite.cover.check.v1\""))
+        .stdout(predicate::str::contains("\"envelope_v1\""));
 }
 
 #[test]
@@ -737,4 +791,63 @@ fn test_suite_build_reduce_governed_smoke() {
         .get("kernel_audit")
         .and_then(|v| v.get("build"))
         .is_some());
+}
+
+#[test]
+fn test_suite_proxy_run_json_smoke() {
+    let output = suite_cmd()
+        .args(["proxy", "run", "--json", "--", "ls"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.proxy.run.v1")
+    );
+    assert!(value.get("packet").is_some());
+    assert_eq!(
+        value
+            .get("packet")
+            .and_then(|p| p.get("kind"))
+            .and_then(Value::as_str),
+        Some("command_summary")
+    );
+}
+
+#[test]
+fn test_suite_map_repo_json_smoke() {
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+
+    let output = suite_cmd()
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.map.repo.v1")
+    );
+    assert!(value.get("packet").is_some());
+    assert_eq!(
+        value
+            .get("packet")
+            .and_then(|p| p.get("kind"))
+            .and_then(Value::as_str),
+        Some("repo_map")
+    );
 }
