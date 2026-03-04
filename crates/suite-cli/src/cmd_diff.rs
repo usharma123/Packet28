@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::Args;
@@ -57,6 +58,10 @@ pub struct AnalyzeArgs {
     /// Path to coverage state file
     #[arg(long)]
     input: Option<String>,
+
+    /// Persist kernel cache on disk under <cwd>/.packet28
+    #[arg(long)]
+    cache: bool,
 
     /// Run governed packet path using this context policy config (context.yaml).
     #[arg(long)]
@@ -191,7 +196,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         input: args.input,
     };
 
-    let mut kernel = context_kernel_core::Kernel::with_v1_reducers();
+    let mut kernel = build_kernel(args.cache, std::env::current_dir()?);
     kernel.register_reducer("diffy.analyze", run_diff_analyze_reducer);
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "diffy.analyze".to_string(),
@@ -228,6 +233,12 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     match report.as_str() {
         "json" => {
             if let Some(governed) = governed_response {
+                let budget_hint = crate::cmd_common::budget_retry_hint(
+                    &governed.metadata,
+                    governed_budget_tokens,
+                    governed_budget_bytes,
+                    "Packet28 diff analyze --context-config <context.yaml>",
+                );
                 let final_packet = governed.output_packets.first().ok_or_else(|| {
                     anyhow!("kernel returned no output packets for governed flow")
                 })?;
@@ -244,11 +255,35 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                             "diff": response.metadata,
                             "governed": governed.metadata,
                         },
+                        "cache": {
+                            "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                        "hints": {
+                            "budget_retry": budget_hint,
+                        },
                     }))?
                 );
             } else {
-                let json = diffy_core::report::render_gate_json(&output.gate_result);
-                println!("{json}");
+                let mut value: Value = serde_json::from_str(&diffy_core::report::render_gate_json(
+                    &output.gate_result,
+                ))
+                .map_err(|source| anyhow!("failed to parse gate json: {source}"))?;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "kernel_metadata".to_string(),
+                        json!({
+                            "diff": response.metadata,
+                        }),
+                    );
+                    obj.insert(
+                        "cache".to_string(),
+                        json!({
+                            "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
             }
         }
         _ => {
@@ -262,11 +297,27 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                     .collect::<Vec<_>>();
                 diffy_core::report::render_issues_terminal(diag, Some(&diffs));
             }
+            if let Some(summary) = crate::cmd_common::cache_summary_line(&response.metadata) {
+                println!("{summary}");
+            }
 
             if let Some(governed) = governed_response {
                 let final_packet = governed.output_packets.first().ok_or_else(|| {
                     anyhow!("kernel returned no output packets for governed flow")
                 })?;
+                if let Some(summary) = crate::cmd_common::cache_summary_line(&governed.metadata) {
+                    println!("{summary}");
+                }
+                if let Some(hint) = crate::cmd_common::budget_retry_hint(
+                    &governed.metadata,
+                    governed_budget_tokens,
+                    governed_budget_bytes,
+                    "Packet28 diff analyze --context-config <context.yaml>",
+                ) {
+                    if let Some(retry) = hint.get("retry_command").and_then(Value::as_str) {
+                        println!("hint: high truncation detected; retry with: {retry}");
+                    }
+                }
                 let sections = final_packet
                     .body
                     .get("assembly")
@@ -282,6 +333,15 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     }
 
     Ok(if gate_passed { 0 } else { 1 })
+}
+
+fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
+    if cache {
+        return context_kernel_core::Kernel::with_v1_reducers_and_persistence(
+            context_kernel_core::PersistConfig::new(root_dir),
+        );
+    }
+    context_kernel_core::Kernel::with_v1_reducers()
 }
 
 fn run_diff_analyze_reducer(

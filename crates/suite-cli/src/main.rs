@@ -19,7 +19,8 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "Packet28",
     version,
-    about = "Umbrella platform CLI for suite domains"
+    about = "Umbrella platform CLI for suite domains",
+    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
 )]
 struct Cli {
     /// Path to config file
@@ -111,6 +112,9 @@ enum GuardCommands {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  Packet28 context assemble --packet a.json --packet b.json --context-config context.yaml\n  Packet28 context store list --root . --limit 20\n  Packet28 context recall --query \"what changed in parser\" --limit 5"
+)]
 struct ContextArgs {
     #[command(subcommand)]
     command: ContextCommands,
@@ -119,7 +123,12 @@ struct ContextArgs {
 #[derive(Subcommand)]
 enum ContextCommands {
     /// Merge multiple reducer packets into a bounded final packet
+    #[command(alias = "merge")]
     Assemble(cmd_context::AssembleArgs),
+    /// Query and manage persisted context store entries
+    Store(cmd_context::StoreArgs),
+    /// Recall prior context entries by semantic/lexical query
+    Recall(cmd_context::RecallArgs),
 }
 
 #[derive(Args)]
@@ -183,6 +192,8 @@ fn main() {
         },
         Commands::Context(context) => match context.command {
             ContextCommands::Assemble(args) => cmd_context::run_assemble(args),
+            ContextCommands::Store(args) => cmd_context::run_store(args),
+            ContextCommands::Recall(args) => cmd_context::run_recall(args),
         },
         Commands::Stack(stack) => match stack.command {
             StackCommands::Slice(args) => cmd_stack::run(args),

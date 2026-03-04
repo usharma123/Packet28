@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct ImpactArgs {
@@ -24,6 +25,10 @@ pub struct ImpactArgs {
     /// Emit runnable test command
     #[arg(long)]
     pub print_command: bool,
+
+    /// Persist kernel cache on disk under <cwd>/.packet28
+    #[arg(long)]
+    pub cache: bool,
 
     /// Run governed packet path using this context policy config (context.yaml).
     #[arg(long)]
@@ -85,7 +90,7 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         })
         .unwrap_or(Value::Null);
 
-    let mut kernel = context_kernel_core::Kernel::with_v1_reducers();
+    let mut kernel = build_kernel(args.cache, std::env::current_dir()?);
     kernel.register_reducer("testy.impact", run_test_impact_reducer);
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "testy.impact".to_string(),
@@ -124,6 +129,12 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
 
     if args.json {
         if let Some(governed) = governed_response {
+            let budget_hint = crate::cmd_common::budget_retry_hint(
+                &governed.metadata,
+                governed_budget_tokens,
+                governed_budget_bytes,
+                "Packet28 test impact --context-config <context.yaml>",
+            );
             let final_packet = governed
                 .output_packets
                 .first()
@@ -144,6 +155,13 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
                         "impact": response.metadata,
                         "governed": governed.metadata,
                     },
+                    "cache": {
+                        "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                    "hints": {
+                        "budget_retry": budget_hint,
+                    },
                 }))?
             );
         } else {
@@ -159,6 +177,9 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
                     },
                     "kernel_metadata": {
                         "impact": response.metadata,
+                    },
+                    "cache": {
+                        "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
                     },
                 }))?
             );
@@ -190,6 +211,22 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     }
 
     if let Some(governed) = governed_response {
+        if let Some(summary) = crate::cmd_common::cache_summary_line(&response.metadata) {
+            println!("{summary}");
+        }
+        if let Some(summary) = crate::cmd_common::cache_summary_line(&governed.metadata) {
+            println!("{summary}");
+        }
+        if let Some(hint) = crate::cmd_common::budget_retry_hint(
+            &governed.metadata,
+            governed_budget_tokens,
+            governed_budget_bytes,
+            "Packet28 test impact --context-config <context.yaml>",
+        ) {
+            if let Some(retry) = hint.get("retry_command").and_then(Value::as_str) {
+                println!("hint: high truncation detected; retry with: {retry}");
+            }
+        }
         let final_packet = governed
             .output_packets
             .first()
@@ -204,9 +241,20 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
             "governed packet assembled: packet_id={} sections_kept={sections}",
             final_packet.packet_id.as_deref().unwrap_or("unknown")
         );
+    } else if let Some(summary) = crate::cmd_common::cache_summary_line(&response.metadata) {
+        println!("{summary}");
     }
 
     Ok(0)
+}
+
+fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
+    if cache {
+        return context_kernel_core::Kernel::with_v1_reducers_and_persistence(
+            context_kernel_core::PersistConfig::new(root_dir),
+        );
+    }
+    context_kernel_core::Kernel::with_v1_reducers()
 }
 
 fn run_test_impact_reducer(

@@ -153,6 +153,12 @@ pub fn run(args: RepoArgs) -> Result<i32> {
     if args.json {
         let packet = packet_value(&envelope, args.packet_detail)?;
         if let Some(governed) = governed_response {
+            let budget_hint = crate::cmd_common::budget_retry_hint(
+                &governed.metadata,
+                args.context_budget_tokens,
+                args.context_budget_bytes,
+                "Packet28 map repo --context-config <context.yaml>",
+            );
             let final_packet = governed
                 .output_packets
                 .first()
@@ -170,6 +176,13 @@ pub fn run(args: RepoArgs) -> Result<i32> {
                         "kernel_metadata": {
                             "map": response.metadata,
                             "governed": governed.metadata,
+                        },
+                        "cache": {
+                            "map": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                        },
+                        "hints": {
+                            "budget_retry": budget_hint,
                         },
                     }),
                     args.pretty,
@@ -189,6 +202,9 @@ pub fn run(args: RepoArgs) -> Result<i32> {
                 &json!({
                     "schema_version": "suite.map.repo.v1",
                     "packet": packet,
+                    "cache": {
+                        "map": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
                 }),
                 args.pretty,
             )?;
@@ -198,8 +214,24 @@ pub fn run(args: RepoArgs) -> Result<i32> {
     }
 
     print_text_summary(&envelope);
+    if let Some(summary) = crate::cmd_common::cache_summary_line(&response.metadata) {
+        println!("{summary}");
+    }
 
     if let Some(governed) = governed_response {
+        if let Some(summary) = crate::cmd_common::cache_summary_line(&governed.metadata) {
+            println!("{summary}");
+        }
+        if let Some(hint) = crate::cmd_common::budget_retry_hint(
+            &governed.metadata,
+            args.context_budget_tokens,
+            args.context_budget_bytes,
+            "Packet28 map repo --context-config <context.yaml>",
+        ) {
+            if let Some(retry) = hint.get("retry_command").and_then(Value::as_str) {
+                println!("hint: high truncation detected; retry with: {retry}");
+            }
+        }
         let final_packet = governed
             .output_packets
             .first()
