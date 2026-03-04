@@ -12,6 +12,135 @@ const PERSIST_CACHE_VERSION: u32 = 1;
 const PERSIST_CACHE_DIR: &str = ".packet28";
 const PERSIST_CACHE_FILE: &str = "packet-cache-v1.bin";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionReason {
+    ExpiredTtl,
+    ManualPrune,
+    VersionMismatch,
+    CorruptLoadRecovery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct EvictionCounters {
+    pub expired_ttl: usize,
+    pub manual_prune: usize,
+    pub version_mismatch: usize,
+    pub corrupt_load_recovery: usize,
+}
+
+impl EvictionCounters {
+    fn add(&mut self, reason: EvictionReason, count: usize) {
+        match reason {
+            EvictionReason::ExpiredTtl => self.expired_ttl = self.expired_ttl.saturating_add(count),
+            EvictionReason::ManualPrune => {
+                self.manual_prune = self.manual_prune.saturating_add(count)
+            }
+            EvictionReason::VersionMismatch => {
+                self.version_mismatch = self.version_mismatch.saturating_add(count)
+            }
+            EvictionReason::CorruptLoadRecovery => {
+                self.corrupt_load_recovery = self.corrupt_load_recovery.saturating_add(count)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContextStoreListFilter {
+    pub target: Option<String>,
+    pub contains_query: Option<String>,
+    pub created_after_unix: Option<u64>,
+    pub created_before_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextStorePaging {
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for ContextStorePaging {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ContextStoreEntrySummary {
+    pub cache_key: String,
+    pub target: String,
+    pub input_hash: String,
+    pub created_at_unix: u64,
+    pub age_secs: u64,
+    pub packet_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextStoreEntryDetail {
+    pub entry: PacketCacheEntry,
+    pub age_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ContextStoreStats {
+    pub entries: usize,
+    pub oldest_created_at_unix: Option<u64>,
+    pub newest_created_at_unix: Option<u64>,
+    pub evictions: EvictionCounters,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContextStorePruneRequest {
+    pub all: bool,
+    pub ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ContextStorePruneReport {
+    pub removed: usize,
+    pub remaining: usize,
+    pub reasons: EvictionCounters,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecallOptions {
+    pub limit: usize,
+    pub since_unix: Option<u64>,
+    pub until_unix: Option<u64>,
+    pub target: Option<String>,
+}
+
+impl Default for RecallOptions {
+    fn default() -> Self {
+        Self {
+            limit: 8,
+            since_unix: None,
+            until_unix: None,
+            target: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RecallHit {
+    pub cache_key: String,
+    pub target: String,
+    pub created_at_unix: u64,
+    pub age_secs: u64,
+    pub score: f64,
+    pub snippet: String,
+    pub matched_tokens: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PersistConfig {
     pub root_dir: PathBuf,
@@ -174,6 +303,7 @@ impl DeltaReuseHooks for NoopDeltaReuseHooks {}
 pub struct PacketCache {
     entries_by_hash: HashMap<String, PacketCacheEntry>,
     latest_request_index: HashMap<String, String>,
+    eviction_counters: EvictionCounters,
 }
 
 impl PacketCache {
@@ -182,20 +312,26 @@ impl PacketCache {
     }
 
     pub fn load_from_disk(config: &PersistConfig) -> Self {
+        let mut cache = Self::new();
         let path = persist_cache_path(&config.root_dir);
         let Ok(raw) = fs::read(path) else {
-            return Self::new();
+            return cache;
         };
 
         let Ok(envelope) = bincode::deserialize::<PersistEnvelope>(&raw) else {
-            return Self::new();
+            cache
+                .eviction_counters
+                .add(EvictionReason::CorruptLoadRecovery, 1);
+            return cache;
         };
 
         if envelope.version != PERSIST_CACHE_VERSION {
-            return Self::new();
+            cache
+                .eviction_counters
+                .add(EvictionReason::VersionMismatch, 1);
+            return cache;
         }
 
-        let mut cache = Self::new();
         for entry in envelope.entries {
             let entry = entry.into_entry();
             if entry.cache_key.trim().is_empty() {
@@ -232,9 +368,14 @@ impl PacketCache {
 
     pub fn evict_expired(&mut self, ttl_secs: u64) {
         let now = now_unix();
+        let before = self.entries_by_hash.len();
         self.entries_by_hash
             .retain(|_, entry| !is_expired(entry.created_at_unix, ttl_secs, now));
         self.rebuild_latest_request_index();
+        let removed = before.saturating_sub(self.entries_by_hash.len());
+        if removed > 0 {
+            self.evict_reason(EvictionReason::ExpiredTtl, removed);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -339,6 +480,185 @@ impl PacketCache {
         entry
     }
 
+    pub fn list_entries(
+        &self,
+        filter: &ContextStoreListFilter,
+        paging: &ContextStorePaging,
+    ) -> Vec<ContextStoreEntrySummary> {
+        let now = now_unix();
+        let target_filter = filter.target.as_ref().map(|v| v.to_ascii_lowercase());
+        let contains_filter = filter
+            .contains_query
+            .as_ref()
+            .map(|v| v.to_ascii_lowercase());
+
+        let mut items = self
+            .entries_by_hash
+            .values()
+            .filter(|entry| {
+                if let Some(target) = target_filter.as_ref() {
+                    if !entry.target.to_ascii_lowercase().contains(target) {
+                        return false;
+                    }
+                }
+                if let Some(contains) = contains_filter.as_ref() {
+                    let haystack = format!(
+                        "{} {} {}",
+                        entry.cache_key.to_ascii_lowercase(),
+                        entry.target.to_ascii_lowercase(),
+                        entry.input_hash.to_ascii_lowercase()
+                    );
+                    if !haystack.contains(contains) {
+                        return false;
+                    }
+                }
+                if let Some(after) = filter.created_after_unix {
+                    if entry.created_at_unix < after {
+                        return false;
+                    }
+                }
+                if let Some(before) = filter.created_before_unix {
+                    if entry.created_at_unix > before {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|entry| ContextStoreEntrySummary {
+                cache_key: entry.cache_key.clone(),
+                target: entry.target.clone(),
+                input_hash: entry.input_hash.clone(),
+                created_at_unix: entry.created_at_unix,
+                age_secs: now.saturating_sub(entry.created_at_unix),
+                packet_count: entry.packets.len(),
+            })
+            .collect::<Vec<_>>();
+
+        items.sort_by(|a, b| {
+            b.created_at_unix
+                .cmp(&a.created_at_unix)
+                .then_with(|| a.cache_key.cmp(&b.cache_key))
+        });
+
+        items
+            .into_iter()
+            .skip(paging.offset)
+            .take(paging.limit.max(1))
+            .collect()
+    }
+
+    pub fn get_entry(&self, cache_key: &str) -> Option<ContextStoreEntryDetail> {
+        let now = now_unix();
+        self.entries_by_hash
+            .get(cache_key)
+            .cloned()
+            .map(|entry| ContextStoreEntryDetail {
+                age_secs: now.saturating_sub(entry.created_at_unix),
+                entry,
+            })
+    }
+
+    pub fn prune(&mut self, request: ContextStorePruneRequest) -> ContextStorePruneReport {
+        let removed = if request.all {
+            let removed = self.entries_by_hash.len();
+            self.entries_by_hash.clear();
+            self.latest_request_index.clear();
+            if removed > 0 {
+                self.evict_reason(EvictionReason::ManualPrune, removed);
+            }
+            removed
+        } else {
+            let ttl_secs = request.ttl_secs.unwrap_or(DEFAULT_PERSIST_TTL_SECS);
+            self.remove_where(
+                |entry, now| is_expired(entry.created_at_unix, ttl_secs, now),
+                EvictionReason::ManualPrune,
+            )
+        };
+
+        ContextStorePruneReport {
+            removed,
+            remaining: self.entries_by_hash.len(),
+            reasons: self.eviction_counters.clone(),
+        }
+    }
+
+    pub fn stats(&self) -> ContextStoreStats {
+        let oldest = self
+            .entries_by_hash
+            .values()
+            .map(|v| v.created_at_unix)
+            .min();
+        let newest = self
+            .entries_by_hash
+            .values()
+            .map(|v| v.created_at_unix)
+            .max();
+        ContextStoreStats {
+            entries: self.entries_by_hash.len(),
+            oldest_created_at_unix: oldest,
+            newest_created_at_unix: newest,
+            evictions: self.eviction_counters.clone(),
+        }
+    }
+
+    pub fn recall(&self, query: &str, options: &RecallOptions) -> Vec<RecallHit> {
+        let query_tokens = tokenize(query);
+        if query_tokens.is_empty() {
+            return Vec::new();
+        }
+
+        let now = now_unix();
+        let target_filter = options.target.as_ref().map(|v| v.to_ascii_lowercase());
+
+        let mut hits = Vec::new();
+        for entry in self.entries_by_hash.values() {
+            if let Some(target) = target_filter.as_ref() {
+                if !entry.target.to_ascii_lowercase().contains(target) {
+                    continue;
+                }
+            }
+            if let Some(since) = options.since_unix {
+                if entry.created_at_unix < since {
+                    continue;
+                }
+            }
+            if let Some(until) = options.until_unix {
+                if entry.created_at_unix > until {
+                    continue;
+                }
+            }
+
+            let age_secs = now.saturating_sub(entry.created_at_unix);
+            let (score, snippet, matched_tokens) =
+                score_recall_entry(entry, &query_tokens, age_secs);
+            if score <= 0.0 {
+                continue;
+            }
+
+            hits.push(RecallHit {
+                cache_key: entry.cache_key.clone(),
+                target: entry.target.clone(),
+                created_at_unix: entry.created_at_unix,
+                age_secs,
+                score,
+                snippet,
+                matched_tokens,
+            });
+        }
+
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| b.created_at_unix.cmp(&a.created_at_unix))
+                .then_with(|| a.cache_key.cmp(&b.cache_key))
+        });
+        hits.into_iter().take(options.limit.max(1)).collect()
+    }
+
+    pub fn persist_file_path(root: &Path) -> PathBuf {
+        persist_cache_path(root)
+    }
+
     fn collect_live_entries(&self, ttl_secs: u64) -> Vec<PersistPacketCacheEntry> {
         let now = now_unix();
         self.entries_by_hash
@@ -346,6 +666,26 @@ impl PacketCache {
             .filter(|entry| !is_expired(entry.created_at_unix, ttl_secs, now))
             .map(PersistPacketCacheEntry::from_entry)
             .collect()
+    }
+
+    fn remove_where<F>(&mut self, mut predicate: F, reason: EvictionReason) -> usize
+    where
+        F: FnMut(&PacketCacheEntry, u64) -> bool,
+    {
+        let now = now_unix();
+        let before = self.entries_by_hash.len();
+        self.entries_by_hash
+            .retain(|_, entry| !predicate(entry, now));
+        self.rebuild_latest_request_index();
+        let removed = before.saturating_sub(self.entries_by_hash.len());
+        if removed > 0 {
+            self.evict_reason(reason, removed);
+        }
+        removed
+    }
+
+    fn evict_reason(&mut self, reason: EvictionReason, count: usize) {
+        self.eviction_counters.add(reason, count);
     }
 
     fn rebuild_latest_request_index(&mut self) {
@@ -371,6 +711,166 @@ impl PacketCache {
 
 fn persist_cache_path(root: &Path) -> PathBuf {
     root.join(PERSIST_CACHE_DIR).join(PERSIST_CACHE_FILE)
+}
+
+fn tokenize(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != ':' && c != '/')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 2)
+        .collect()
+}
+
+fn score_recall_entry(
+    entry: &PacketCacheEntry,
+    query_tokens: &[String],
+    age_secs: u64,
+) -> (f64, String, Vec<String>) {
+    let mut corpus = Vec::new();
+    corpus.push(entry.target.clone());
+    corpus.push(entry.cache_key.clone());
+    corpus.push(entry.input_hash.clone());
+    collect_texts_from_value(&entry.metadata, &mut corpus, 64);
+
+    let mut path_terms = Vec::new();
+    let mut symbol_terms = Vec::new();
+    for packet in &entry.packets {
+        collect_texts_from_value(&packet.body, &mut corpus, 128);
+        collect_texts_from_value(&packet.metadata, &mut corpus, 64);
+        collect_ref_terms(&packet.body, &mut path_terms, &mut symbol_terms);
+    }
+
+    let corpus_lower = corpus
+        .iter()
+        .map(|item| item.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    let mut matched_tokens = Vec::new();
+    for token in query_tokens {
+        if corpus_lower.iter().any(|item| item.contains(token)) {
+            matched_tokens.push(token.clone());
+        }
+    }
+
+    if matched_tokens.is_empty() {
+        return (0.0, String::new(), Vec::new());
+    }
+
+    let base = matched_tokens.len() as f64 / query_tokens.len() as f64;
+    let path_boost = if query_tokens
+        .iter()
+        .any(|token| path_terms.iter().any(|path| path.contains(token)))
+    {
+        0.2
+    } else {
+        0.0
+    };
+    let symbol_boost = if query_tokens
+        .iter()
+        .any(|token| symbol_terms.iter().any(|symbol| symbol.contains(token)))
+    {
+        0.2
+    } else {
+        0.0
+    };
+    let recency_boost = (1.0 / (1.0 + (age_secs as f64 / 86_400.0))).min(1.0) * 0.2;
+
+    let mut snippet = corpus
+        .iter()
+        .find(|item| {
+            let lower = item.to_ascii_lowercase();
+            matched_tokens.iter().any(|token| lower.contains(token))
+        })
+        .cloned()
+        .unwrap_or_else(|| "{}".to_string());
+    if snippet.len() > 200 {
+        snippet.truncate(200);
+    }
+
+    (
+        base + path_boost + symbol_boost + recency_boost,
+        snippet,
+        matched_tokens,
+    )
+}
+
+fn collect_texts_from_value(value: &Value, out: &mut Vec<String>, max_items: usize) {
+    if out.len() >= max_items {
+        return;
+    }
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_texts_from_value(item, out, max_items);
+                if out.len() >= max_items {
+                    return;
+                }
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_texts_from_value(value, out, max_items);
+                if out.len() >= max_items {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_ref_terms(value: &Value, paths: &mut Vec<String>, symbols: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(path) = map.get("path").and_then(Value::as_str) {
+                paths.push(path.to_ascii_lowercase());
+            }
+            if let Some(file) = map.get("file").and_then(Value::as_str) {
+                paths.push(file.to_ascii_lowercase());
+            }
+            if let Some(name) = map.get("name").and_then(Value::as_str) {
+                symbols.push(name.to_ascii_lowercase());
+            }
+            if map
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
+            {
+                if let Some(value) = map.get("value").and_then(Value::as_str) {
+                    paths.push(value.to_ascii_lowercase());
+                }
+            }
+            if map
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("symbol"))
+            {
+                if let Some(value) = map.get("value").and_then(Value::as_str) {
+                    symbols.push(value.to_ascii_lowercase());
+                }
+            }
+            for child in map.values() {
+                collect_ref_terms(child, paths, symbols);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_ref_terms(item, paths, symbols);
+            }
+        }
+        Value::String(text) => {
+            if text.contains('/') || text.contains('\\') || text.contains("::") {
+                paths.push(text.to_ascii_lowercase());
+            }
+        }
+        _ => {}
+    }
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
@@ -576,5 +1076,84 @@ mod tests {
 
         let loaded = PacketCache::load_from_disk(&config);
         assert!(loaded.is_empty());
+        assert_eq!(loaded.stats().evictions.corrupt_load_recovery, 1);
+    }
+
+    #[test]
+    fn list_get_and_stats_surface_entry_details() {
+        let mut cache = PacketCache::new();
+        let mut hooks = NoopDeltaReuseHooks;
+        let lookup =
+            cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"x"}), &mut hooks);
+        let stored = cache.put_with_hooks(
+            "demo.reducer",
+            &lookup,
+            vec![CachePacket {
+                body: serde_json::json!({
+                    "paths": ["src/lib.rs"],
+                    "refs": [{"kind":"symbol","value":"run"}],
+                    "summary": "hello world"
+                }),
+                ..CachePacket::default()
+            }],
+            serde_json::json!({"source":"test"}),
+            &mut hooks,
+        );
+
+        let listed = cache.list_entries(
+            &ContextStoreListFilter::default(),
+            &ContextStorePaging::default(),
+        );
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].cache_key, stored.cache_key);
+
+        let detail = cache.get_entry(&stored.cache_key).unwrap();
+        assert_eq!(detail.entry.target, "demo.reducer");
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert!(stats.oldest_created_at_unix.is_some());
+    }
+
+    #[test]
+    fn prune_and_recall_produce_expected_outputs() {
+        let mut cache = PacketCache::new();
+        let mut hooks = NoopDeltaReuseHooks;
+        let lookup = cache.lookup_with_hooks(
+            "demo.reducer",
+            &serde_json::json!({"task":"recall"}),
+            &mut hooks,
+        );
+        let stored = cache.put_with_hooks(
+            "demo.reducer",
+            &lookup,
+            vec![CachePacket {
+                body: serde_json::json!({
+                    "sections":[{"body":"Investigated parser crash in src/main.rs"}],
+                    "refs":[{"kind":"file","value":"src/main.rs"},{"kind":"symbol","value":"parse_input"}]
+                }),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        let hits = cache.recall(
+            "parser crash src/main.rs",
+            &RecallOptions {
+                limit: 3,
+                ..RecallOptions::default()
+            },
+        );
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].cache_key, stored.cache_key);
+
+        let report = cache.prune(ContextStorePruneRequest {
+            all: true,
+            ttl_secs: None,
+        });
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.reasons.manual_prune, 1);
+        assert!(cache.is_empty());
     }
 }
