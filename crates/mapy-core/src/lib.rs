@@ -161,7 +161,7 @@ struct RepoScanCache {
     files: BTreeMap<String, CacheEntry>,
 }
 
-const MAP_CACHE_VERSION: u32 = 1;
+const MAP_CACHE_VERSION: u32 = 2;
 const MAP_CACHE_DIR: &str = ".packet28";
 const MAP_CACHE_FILE: &str = "mapy-cache-v1.bin";
 const MAP_CACHE_FILE_LEGACY: &str = "mapy-cache-v1.json";
@@ -851,13 +851,56 @@ fn extract_imports(content: &str) -> Vec<String> {
 }
 
 fn extract_metadata(path: &str, content: &str) -> (Vec<(String, String)>, Vec<String>) {
-    if path.ends_with(".java") {
-        if let Some((symbols, imports)) = extract_java_metadata_ast(content) {
+    if let Some(language) = detect_source_language(path) {
+        if let Some((symbols, imports)) = extract_metadata_ast(language, content) {
             return (symbols, imports);
         }
     }
 
     (extract_symbols(path, content), extract_imports(content))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceLanguage {
+    Java,
+    Rust,
+    Python,
+    TypeScript,
+    JavaScript,
+    Go,
+    Cpp,
+}
+
+fn detect_source_language(path: &str) -> Option<SourceLanguage> {
+    if path.ends_with(".java") {
+        return Some(SourceLanguage::Java);
+    }
+    if path.ends_with(".rs") {
+        return Some(SourceLanguage::Rust);
+    }
+    if path.ends_with(".py") {
+        return Some(SourceLanguage::Python);
+    }
+    if path.ends_with(".ts") || path.ends_with(".tsx") {
+        return Some(SourceLanguage::TypeScript);
+    }
+    if path.ends_with(".js") || path.ends_with(".jsx") {
+        return Some(SourceLanguage::JavaScript);
+    }
+    if path.ends_with(".go") {
+        return Some(SourceLanguage::Go);
+    }
+    if path.ends_with(".cpp")
+        || path.ends_with(".cc")
+        || path.ends_with(".cxx")
+        || path.ends_with(".hpp")
+        || path.ends_with(".hh")
+        || path.ends_with(".h")
+        || path.ends_with(".c")
+    {
+        return Some(SourceLanguage::Cpp);
+    }
+    None
 }
 
 fn file_focus_match(
@@ -948,6 +991,12 @@ fn java_method_re() -> &'static Regex {
 
 thread_local! {
     static JAVA_PARSER: RefCell<Option<Parser>> = RefCell::new(init_java_parser());
+    static RUST_PARSER: RefCell<Option<Parser>> = RefCell::new(init_rust_parser());
+    static PYTHON_PARSER: RefCell<Option<Parser>> = RefCell::new(init_python_parser());
+    static TYPESCRIPT_PARSER: RefCell<Option<Parser>> = RefCell::new(init_typescript_parser());
+    static JAVASCRIPT_PARSER: RefCell<Option<Parser>> = RefCell::new(init_javascript_parser());
+    static GO_PARSER: RefCell<Option<Parser>> = RefCell::new(init_go_parser());
+    static CPP_PARSER: RefCell<Option<Parser>> = RefCell::new(init_cpp_parser());
 }
 
 fn init_java_parser() -> Option<Parser> {
@@ -955,6 +1004,63 @@ fn init_java_parser() -> Option<Parser> {
     let language = tree_sitter::Language::new(tree_sitter_java::LANGUAGE);
     parser.set_language(&language).ok()?;
     Some(parser)
+}
+
+fn init_rust_parser() -> Option<Parser> {
+    let mut parser = Parser::new();
+    let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
+    parser.set_language(&language).ok()?;
+    Some(parser)
+}
+
+fn init_python_parser() -> Option<Parser> {
+    let mut parser = Parser::new();
+    let language = tree_sitter::Language::new(tree_sitter_python::LANGUAGE);
+    parser.set_language(&language).ok()?;
+    Some(parser)
+}
+
+fn init_typescript_parser() -> Option<Parser> {
+    let mut parser = Parser::new();
+    let language = tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT);
+    parser.set_language(&language).ok()?;
+    Some(parser)
+}
+
+fn init_javascript_parser() -> Option<Parser> {
+    let mut parser = Parser::new();
+    let language = tree_sitter::Language::new(tree_sitter_javascript::LANGUAGE);
+    parser.set_language(&language).ok()?;
+    Some(parser)
+}
+
+fn init_go_parser() -> Option<Parser> {
+    let mut parser = Parser::new();
+    let language = tree_sitter::Language::new(tree_sitter_go::LANGUAGE);
+    parser.set_language(&language).ok()?;
+    Some(parser)
+}
+
+fn init_cpp_parser() -> Option<Parser> {
+    let mut parser = Parser::new();
+    let language = tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE);
+    parser.set_language(&language).ok()?;
+    Some(parser)
+}
+
+fn extract_metadata_ast(
+    language: SourceLanguage,
+    content: &str,
+) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    match language {
+        SourceLanguage::Java => extract_java_metadata_ast(content),
+        SourceLanguage::Rust => extract_rust_metadata_ast(content),
+        SourceLanguage::Python => extract_python_metadata_ast(content),
+        SourceLanguage::TypeScript => extract_typescript_metadata_ast(content),
+        SourceLanguage::JavaScript => extract_javascript_metadata_ast(content),
+        SourceLanguage::Go => extract_go_metadata_ast(content),
+        SourceLanguage::Cpp => extract_cpp_metadata_ast(content),
+    }
 }
 
 fn extract_java_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
@@ -973,6 +1079,49 @@ fn extract_java_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Ve
         );
         Some((symbols.into_iter().collect(), imports.into_iter().collect()))
     })
+}
+
+fn extract_rust_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    RUST_PARSER.with(|cell| extract_with_walker(cell, content, walk_rust_ast))
+}
+
+fn extract_python_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    PYTHON_PARSER.with(|cell| extract_with_walker(cell, content, walk_python_ast))
+}
+
+fn extract_typescript_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    TYPESCRIPT_PARSER.with(|cell| extract_with_walker(cell, content, walk_typescript_ast))
+}
+
+fn extract_javascript_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    JAVASCRIPT_PARSER.with(|cell| extract_with_walker(cell, content, walk_javascript_ast))
+}
+
+fn extract_go_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    GO_PARSER.with(|cell| extract_with_walker(cell, content, walk_go_ast))
+}
+
+fn extract_cpp_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    CPP_PARSER.with(|cell| extract_with_walker(cell, content, walk_cpp_ast))
+}
+
+fn extract_with_walker(
+    cell: &RefCell<Option<Parser>>,
+    content: &str,
+    walker: fn(Node<'_>, &[u8], &mut BTreeSet<(String, String)>, &mut BTreeSet<String>),
+) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    let mut parser = cell.borrow_mut();
+    let parser = parser.as_mut()?;
+    let tree = parser.parse(content, None)?;
+    let mut symbols = BTreeSet::<(String, String)>::new();
+    let mut imports = BTreeSet::<String>::new();
+    walker(
+        tree.root_node(),
+        content.as_bytes(),
+        &mut symbols,
+        &mut imports,
+    );
+    Some((symbols.into_iter().collect(), imports.into_iter().collect()))
 }
 
 fn walk_java_ast(
@@ -998,6 +1147,126 @@ fn walk_java_ast(
     }
 }
 
+fn walk_rust_ast(
+    node: Node<'_>,
+    src: &[u8],
+    symbols: &mut BTreeSet<(String, String)>,
+    imports: &mut BTreeSet<String>,
+) {
+    match node.kind() {
+        "function_item" => insert_name_or_identifier(node, src, "function", symbols),
+        "struct_item" => insert_name_or_identifier(node, src, "struct", symbols),
+        "enum_item" => insert_name_or_identifier(node, src, "enum", symbols),
+        "trait_item" => insert_name_or_identifier(node, src, "trait", symbols),
+        "type_item" => insert_name_or_identifier(node, src, "type", symbols),
+        "use_declaration" => insert_import_leaf(node, src, imports),
+        _ => {}
+    }
+
+    walk_children(node, src, symbols, imports, walk_rust_ast);
+}
+
+fn walk_python_ast(
+    node: Node<'_>,
+    src: &[u8],
+    symbols: &mut BTreeSet<(String, String)>,
+    imports: &mut BTreeSet<String>,
+) {
+    match node.kind() {
+        "function_definition" => insert_name_or_identifier(node, src, "function", symbols),
+        "class_definition" => insert_name_or_identifier(node, src, "class", symbols),
+        "import_statement" | "import_from_statement" => insert_import_leaf(node, src, imports),
+        _ => {}
+    }
+
+    walk_children(node, src, symbols, imports, walk_python_ast);
+}
+
+fn walk_typescript_ast(
+    node: Node<'_>,
+    src: &[u8],
+    symbols: &mut BTreeSet<(String, String)>,
+    imports: &mut BTreeSet<String>,
+) {
+    match node.kind() {
+        "function_declaration" => insert_name_or_identifier(node, src, "function", symbols),
+        "class_declaration" => insert_name_or_identifier(node, src, "class", symbols),
+        "interface_declaration" => insert_name_or_identifier(node, src, "interface", symbols),
+        "type_alias_declaration" => insert_name_or_identifier(node, src, "type", symbols),
+        "enum_declaration" => insert_name_or_identifier(node, src, "enum", symbols),
+        "method_definition" => insert_name_or_identifier(node, src, "method", symbols),
+        "import_statement" => insert_import_leaf(node, src, imports),
+        _ => {}
+    }
+
+    walk_children(node, src, symbols, imports, walk_typescript_ast);
+}
+
+fn walk_javascript_ast(
+    node: Node<'_>,
+    src: &[u8],
+    symbols: &mut BTreeSet<(String, String)>,
+    imports: &mut BTreeSet<String>,
+) {
+    match node.kind() {
+        "function_declaration" => insert_name_or_identifier(node, src, "function", symbols),
+        "class_declaration" => insert_name_or_identifier(node, src, "class", symbols),
+        "method_definition" => insert_name_or_identifier(node, src, "method", symbols),
+        "import_statement" => insert_import_leaf(node, src, imports),
+        _ => {}
+    }
+
+    walk_children(node, src, symbols, imports, walk_javascript_ast);
+}
+
+fn walk_go_ast(
+    node: Node<'_>,
+    src: &[u8],
+    symbols: &mut BTreeSet<(String, String)>,
+    imports: &mut BTreeSet<String>,
+) {
+    match node.kind() {
+        "function_declaration" => insert_name_or_identifier(node, src, "function", symbols),
+        "method_declaration" => insert_name_or_identifier(node, src, "method", symbols),
+        "type_spec" => insert_name_or_identifier(node, src, "type", symbols),
+        "import_declaration" | "import_spec" => insert_import_leaf(node, src, imports),
+        _ => {}
+    }
+
+    walk_children(node, src, symbols, imports, walk_go_ast);
+}
+
+fn walk_cpp_ast(
+    node: Node<'_>,
+    src: &[u8],
+    symbols: &mut BTreeSet<(String, String)>,
+    imports: &mut BTreeSet<String>,
+) {
+    match node.kind() {
+        "function_definition" => insert_name_or_identifier(node, src, "function", symbols),
+        "class_specifier" => insert_name_or_identifier(node, src, "class", symbols),
+        "struct_specifier" => insert_name_or_identifier(node, src, "struct", symbols),
+        "enum_specifier" => insert_name_or_identifier(node, src, "enum", symbols),
+        "preproc_include" => insert_import_leaf(node, src, imports),
+        _ => {}
+    }
+
+    walk_children(node, src, symbols, imports, walk_cpp_ast);
+}
+
+fn walk_children(
+    node: Node<'_>,
+    src: &[u8],
+    symbols: &mut BTreeSet<(String, String)>,
+    imports: &mut BTreeSet<String>,
+    walker: fn(Node<'_>, &[u8], &mut BTreeSet<(String, String)>, &mut BTreeSet<String>),
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walker(child, src, symbols, imports);
+    }
+}
+
 fn insert_named_child(
     node: Node<'_>,
     src: &[u8],
@@ -1013,6 +1282,29 @@ fn insert_named_child(
     let name = name.trim();
     if !name.is_empty() && !is_reserved_word(name) {
         out.insert((kind.to_string(), name.to_string()));
+    }
+}
+
+fn insert_name_or_identifier(
+    node: Node<'_>,
+    src: &[u8],
+    kind: &str,
+    out: &mut BTreeSet<(String, String)>,
+) {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if let Ok(name) = name_node.utf8_text(src) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && !is_reserved_word(trimmed) {
+                out.insert((kind.to_string(), trimmed.to_string()));
+                return;
+            }
+        }
+    }
+
+    if let Some(identifier) = find_identifier(node, src, 0) {
+        if !identifier.is_empty() && !is_reserved_word(&identifier) {
+            out.insert((kind.to_string(), identifier));
+        }
     }
 }
 
@@ -1038,6 +1330,60 @@ fn insert_java_import(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
     if !leaf.is_empty() && !is_reserved_word(leaf) {
         out.insert(leaf.to_string());
     }
+}
+
+fn insert_import_leaf(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
+    let Ok(raw) = node.utf8_text(src) else {
+        return;
+    };
+
+    let mut normalized = raw
+        .replace("import", " ")
+        .replace("from", " ")
+        .replace("use", " ")
+        .replace("#include", " ")
+        .replace("static", " ")
+        .replace(';', " ")
+        .replace('{', " ")
+        .replace('}', " ")
+        .replace('\"', " ")
+        .replace('\'', " ")
+        .replace('<', " ")
+        .replace('>', " ");
+    normalized = normalized.trim().to_string();
+    if normalized.is_empty() {
+        return;
+    }
+
+    let leaf = normalized
+        .trim_end_matches(".*")
+        .rsplit(['/', '.', ':'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if !leaf.is_empty() && !is_reserved_word(leaf) {
+        out.insert(leaf.to_string());
+    }
+}
+
+fn find_identifier(node: Node<'_>, src: &[u8], depth: usize) -> Option<String> {
+    if depth > 5 {
+        return None;
+    }
+    if node.kind() == "identifier" || node.kind() == "type_identifier" {
+        let text = node.utf8_text(src).ok()?.trim().to_string();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_identifier(child, src, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn is_reserved_word(name: &str) -> bool {
@@ -1223,5 +1569,58 @@ public class Calculator {
         .unwrap();
 
         assert!(root.join(".packet28/mapy-cache-v1.bin").exists());
+    }
+
+    #[test]
+    fn extracts_symbols_for_non_java_languages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "fn parse_input() {}\nstruct Engine;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.py"),
+            "class Parser:\n  pass\n\ndef parse_input():\n  return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            "interface Runner {}\nfunction parseInput() { return 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            "class Handler {}\nfunction handleInput() { return 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.go"),
+            "package main\nimport \"fmt\"\nfunc ParseInput() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.cpp"),
+            "#include <vector>\nclass Parser{};\nint parse_input(){ return 0; }\n",
+        )
+        .unwrap();
+
+        let env = build_repo_map(RepoMapRequest {
+            repo_root: root.to_string_lossy().to_string(),
+            ..RepoMapRequest::default()
+        })
+        .unwrap();
+
+        let names = env
+            .symbols
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("parse_input") || names.contains("ParseInput"));
+        assert!(names.contains("Engine"));
+        assert!(names.contains("Parser") || names.contains("Handler"));
     }
 }
