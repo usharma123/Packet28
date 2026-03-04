@@ -301,6 +301,7 @@ impl KernelError {
 struct PolicyGuard {
     config: guardy_core::ContextConfig,
     config_path: String,
+    policy_hash: String,
 }
 
 pub struct ExecutionContext {
@@ -433,73 +434,81 @@ impl Kernel {
 
         enforce_budget(&target, BudgetStage::Input, req.budget, input_usage)?;
 
-        let cache_lookup = if policy_guard.is_none() {
-            let cache_input = cache_input_for_request(&req, &target);
-            let cache_lookup = {
-                let cache = self
-                    .memory
-                    .lock()
-                    .map_err(|source| KernelError::CacheLock {
-                        detail: source.to_string(),
-                    })?;
-                cache.lookup_with_hooks(&target, &cache_input, hooks)
-            };
+        let cache_input = cache_input_for_request(&req, &target, policy_guard.as_ref());
+        let cache_lookup = {
+            let cache = self
+                .memory
+                .lock()
+                .map_err(|source| KernelError::CacheLock {
+                    detail: source.to_string(),
+                })?;
+            cache.lookup_with_hooks(&target, &cache_input, hooks)
+        };
 
-            if let Some(entry) = cache_lookup.entry {
-                let output_packets = entry
-                    .packets
-                    .into_iter()
-                    .map(|packet| KernelPacket {
-                        packet_id: packet.packet_id,
-                        format: default_packet_format(),
-                        body: packet.body,
-                        token_usage: packet.token_usage,
-                        runtime_ms: packet.runtime_ms,
-                        metadata: packet.metadata,
-                    })
-                    .collect::<Vec<_>>();
-                let output_packet_count = output_packets.len();
+        if let Some(entry) = cache_lookup.entry.clone() {
+            let output_packets = entry
+                .packets
+                .into_iter()
+                .map(|packet| KernelPacket {
+                    packet_id: packet.packet_id,
+                    format: default_packet_format(),
+                    body: packet.body,
+                    token_usage: packet.token_usage,
+                    runtime_ms: packet.runtime_ms,
+                    metadata: packet.metadata,
+                })
+                .collect::<Vec<_>>();
+            let output_packet_count = output_packets.len();
 
-                let output_usage = usage_for_packets(&output_packets);
-                let total_usage = BudgetUsage {
-                    tokens: input_usage.tokens.saturating_add(output_usage.tokens),
-                    bytes: input_usage.bytes.saturating_add(output_usage.bytes),
-                    runtime_ms: input_usage
-                        .runtime_ms
-                        .saturating_add(output_usage.runtime_ms),
-                };
-                enforce_budget(&target, BudgetStage::Total, req.budget, total_usage)?;
-
-                return Ok(KernelResponse {
-                    request_id,
-                    target: target.clone(),
-                    output_packets,
-                    audit: KernelAudit {
-                        reducer: target,
-                        input_packets: req.input_packets.len(),
-                        output_packets: output_packet_count,
-                        budget: req.budget,
-                        input_usage,
-                        output_usage,
-                        total_usage,
-                        governance,
-                    },
-                    metadata: merge_json(
-                        entry.metadata,
-                        json!({
-                            "cache": {
-                                "hit": true,
-                                "key": cache_lookup.cache_key,
-                            }
-                        }),
-                    ),
-                });
+            if let Some(policy_guard) = &policy_guard {
+                if should_enforce_policy_for_target(&target) {
+                    let output_audits =
+                        audit_packets_against_policy(&policy_guard.config, &output_packets)?;
+                    ensure_policy_audits_pass(&target, "output", &output_audits)?;
+                    governance.output_audits = output_audits;
+                }
             }
 
-            Some(cache_lookup)
-        } else {
-            None
-        };
+            let output_usage = usage_for_packets(&output_packets);
+            let total_usage = BudgetUsage {
+                tokens: input_usage.tokens.saturating_add(output_usage.tokens),
+                bytes: input_usage.bytes.saturating_add(output_usage.bytes),
+                runtime_ms: input_usage
+                    .runtime_ms
+                    .saturating_add(output_usage.runtime_ms),
+            };
+            enforce_budget(&target, BudgetStage::Total, req.budget, total_usage)?;
+            let entry_age_secs = now_unix().saturating_sub(entry.created_at_unix);
+
+            return Ok(KernelResponse {
+                request_id,
+                target: target.clone(),
+                output_packets,
+                audit: KernelAudit {
+                    reducer: target,
+                    input_packets: req.input_packets.len(),
+                    output_packets: output_packet_count,
+                    budget: req.budget,
+                    input_usage,
+                    output_usage,
+                    total_usage,
+                    governance,
+                },
+                metadata: merge_json(
+                    entry.metadata,
+                    json!({
+                        "cache": {
+                            "hit": true,
+                            "key": cache_lookup.cache_key,
+                            "entry_age_secs": entry_age_secs,
+                            "miss_reason": Value::Null,
+                        }
+                    }),
+                ),
+            });
+        }
+
+        let cache_lookup = Some(cache_lookup);
 
         let mut ctx = ExecutionContext {
             request_id,
@@ -535,7 +544,7 @@ impl Kernel {
         enforce_budget(&target, BudgetStage::Total, req.budget, total_usage)?;
 
         let output_packets = reducer_result.output_packets;
-        let response = KernelResponse {
+        let mut response = KernelResponse {
             request_id,
             target: target.clone(),
             output_packets: output_packets.clone(),
@@ -557,7 +566,9 @@ impl Kernel {
                         "key": cache_lookup
                             .as_ref()
                             .map(|lookup| lookup.cache_key.clone())
-                            .unwrap_or_else(|| "governed-no-cache".to_string()),
+                            .unwrap_or_default(),
+                        "entry_age_secs": Value::Null,
+                        "miss_reason": "not_found",
                     }
                 }),
             ),
@@ -586,6 +597,24 @@ impl Kernel {
             if let Some(persist_config) = &self.persist_config {
                 cache.evict_expired(persist_config.ttl_secs);
                 let _ = cache.save_to_disk(persist_config);
+            }
+            let stats = cache.stats();
+            if let Some(cache_obj) = response
+                .metadata
+                .as_object_mut()
+                .and_then(|metadata| metadata.get_mut("cache"))
+                .and_then(Value::as_object_mut)
+            {
+                cache_obj.insert("evictions".to_string(), json!(stats.evictions));
+            } else {
+                response.metadata = merge_json(
+                    response.metadata,
+                    json!({
+                        "cache": {
+                            "evictions": stats.evictions,
+                        }
+                    }),
+                );
             }
         }
 
@@ -865,7 +894,9 @@ fn run_contextq_assemble(
             "schema_version": contextq_core::CONTEXTQ_SCHEMA_VERSION,
             "budget_trim": {
                 "truncated": assembled.assembly.truncated,
+                "sections_input": assembled.assembly.sections_input,
                 "sections_dropped": assembled.assembly.sections_dropped,
+                "refs_input": assembled.assembly.refs_input,
                 "refs_dropped": assembled.assembly.refs_dropped,
                 "estimated_tokens": assembled.assembly.estimated_tokens,
                 "estimated_bytes": assembled.assembly.estimated_bytes,
@@ -882,7 +913,9 @@ fn run_contextq_assemble(
             "schema_version": contextq_core::CONTEXTQ_SCHEMA_VERSION,
             "budget_trim": {
                 "truncated": assembled.assembly.truncated,
+                "sections_input": assembled.assembly.sections_input,
                 "sections_dropped": assembled.assembly.sections_dropped,
+                "refs_input": assembled.assembly.refs_input,
                 "refs_dropped": assembled.assembly.refs_dropped,
                 "estimated_tokens": assembled.assembly.estimated_tokens,
                 "estimated_bytes": assembled.assembly.estimated_bytes,
@@ -1155,10 +1188,50 @@ fn load_policy_guard(policy_context: &Value) -> Result<Option<PolicyGuard>, Kern
         }
     })?;
 
+    let policy_hash =
+        policy_config_hash(&config).map_err(|source| KernelError::InvalidRequest {
+            detail: format!("failed to hash policy config: {source}"),
+        })?;
+
     Ok(Some(PolicyGuard {
         config,
         config_path: config_path.to_string(),
+        policy_hash,
     }))
+}
+
+fn policy_config_hash(config: &guardy_core::ContextConfig) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(config)?;
+    normalize_semantic_set_arrays(&mut value);
+    Ok(suite_packet_core::canonical_hash_json(&value))
+}
+
+fn normalize_semantic_set_arrays(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                normalize_semantic_set_arrays(item);
+            }
+            if items.iter().all(Value::is_string) {
+                let mut normalized = items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                normalized.sort();
+                normalized.dedup();
+                *items = normalized.into_iter().map(Value::String).collect();
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                normalize_semantic_set_arrays(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn should_enforce_policy_for_target(target: &str) -> bool {
@@ -1419,7 +1492,11 @@ fn default_packet_format() -> String {
     "packet-json".to_string()
 }
 
-fn cache_input_for_request(req: &KernelRequest, target: &str) -> Value {
+fn cache_input_for_request(
+    req: &KernelRequest,
+    target: &str,
+    policy_guard: Option<&PolicyGuard>,
+) -> Value {
     let inputs = req
         .input_packets
         .iter()
@@ -1443,9 +1520,21 @@ fn cache_input_for_request(req: &KernelRequest, target: &str) -> Value {
             "byte_cap": req.budget.byte_cap,
             "runtime_ms_cap": req.budget.runtime_ms_cap,
         },
-        "policy_context": req.policy_context.clone(),
+        "governance": {
+            "enabled": policy_guard.is_some(),
+            "policy_hash": policy_guard.map(|policy| policy.policy_hash.clone()),
+            "context_overrides": cache_policy_context_overrides(&req.policy_context),
+        },
         "reducer_input": req.reducer_input.clone(),
     })
+}
+
+fn cache_policy_context_overrides(policy_context: &Value) -> Value {
+    let mut value = policy_context.clone();
+    if let Value::Object(map) = &mut value {
+        map.remove("config_path");
+    }
+    value
 }
 
 fn estimate_json_bytes(value: &Value) -> usize {
@@ -1456,6 +1545,13 @@ fn estimate_json_bytes(value: &Value) -> usize {
 
 fn estimate_tokens(bytes: usize) -> u64 {
     (bytes as u64).div_ceil(4)
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn merge_json(left: Value, right: Value) -> Value {
@@ -1998,6 +2094,210 @@ policy:
             Some(true)
         );
         assert!(dir.path().join(".packet28/packet-cache-v1.bin").exists());
+    }
+
+    #[test]
+    fn governed_cache_reuses_entries_for_same_policy_content_across_paths() {
+        let dir = tempdir().unwrap();
+        let persist = PersistConfig::new(dir.path().to_path_buf());
+        let config_a = dir.path().join("policy-a.yaml");
+        let config_b = dir.path().join("policy-b.yaml");
+        write_policy_file(&config_a, &["diffy"], &[]);
+        write_policy_file(&config_b, &["diffy"], &[]);
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = calls.clone();
+        let mut kernel = Kernel::with_v1_reducers_and_persistence(persist);
+        kernel.register_reducer("count.reducer", move |_ctx, _packets| {
+            calls_ref.fetch_add(1, Ordering::Relaxed);
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(
+                    json!({
+                        "tool": "diffy",
+                        "reducer": "analyze",
+                        "paths": ["src/lib.rs"],
+                        "payload": {"message": "ok"},
+                    }),
+                    None,
+                )],
+                metadata: json!({"source":"reducer"}),
+            })
+        });
+
+        let mut request = KernelRequest {
+            target: "count.reducer".to_string(),
+            reducer_input: json!({"task":"governed-cache"}),
+            policy_context: json!({
+                "config_path": config_a.to_string_lossy().to_string()
+            }),
+            ..KernelRequest::default()
+        };
+        let first = kernel.execute(request.clone()).unwrap();
+        assert_eq!(
+            first
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(first.audit.governance.enabled);
+
+        request.policy_context = json!({
+            "config_path": config_b.to_string_lossy().to_string()
+        });
+        let second = kernel.execute(request).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            second
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn governed_cache_misses_when_policy_content_changes() {
+        let dir = tempdir().unwrap();
+        let persist = PersistConfig::new(dir.path().to_path_buf());
+        let config_path = dir.path().join("policy.yaml");
+        write_policy_file(&config_path, &["diffy"], &[]);
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = calls.clone();
+        let mut kernel = Kernel::with_v1_reducers_and_persistence(persist);
+        kernel.register_reducer("count.reducer", move |_ctx, _packets| {
+            calls_ref.fetch_add(1, Ordering::Relaxed);
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(
+                    json!({
+                        "tool": "diffy",
+                        "reducer": "analyze",
+                        "paths": ["src/lib.rs"],
+                        "payload": {"message": "ok"},
+                    }),
+                    None,
+                )],
+                metadata: json!({"source":"reducer"}),
+            })
+        });
+
+        let request = KernelRequest {
+            target: "count.reducer".to_string(),
+            reducer_input: json!({"task":"governed-cache"}),
+            policy_context: json!({
+                "config_path": config_path.to_string_lossy().to_string()
+            }),
+            ..KernelRequest::default()
+        };
+        let first = kernel.execute(request.clone()).unwrap();
+        assert_eq!(
+            first
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        std::fs::write(
+            &config_path,
+            r#"
+version: 1
+policy:
+  allowed_tools: ["diffy"]
+  allowed_reducers: []
+  paths:
+    include: ["src/**"]
+    exclude: []
+  budgets:
+    token_cap: 9000
+    runtime_ms_cap: 2000
+  redaction:
+    forbidden_patterns: []
+"#,
+        )
+        .unwrap();
+
+        let second = kernel.execute(request).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            second
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn governed_cache_hit_rechecks_output_policy_audits() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+version: 1
+policy:
+  paths:
+    include: ["src/**"]
+    exclude: []
+  redaction:
+    forbidden_patterns: ["secret123"]
+"#,
+        )
+        .unwrap();
+
+        let mut kernel = Kernel::new();
+        kernel.register_reducer("count.reducer", |_ctx, _packets| {
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(json!({"ok": true}), None)],
+                metadata: Value::Null,
+            })
+        });
+
+        let request = KernelRequest {
+            target: "count.reducer".to_string(),
+            policy_context: json!({
+                "config_path": config_path.to_string_lossy().to_string()
+            }),
+            ..KernelRequest::default()
+        };
+        let policy_guard = load_policy_guard(&request.policy_context).unwrap().unwrap();
+        let cache_input = cache_input_for_request(&request, &request.target, Some(&policy_guard));
+        let mut hooks = NoopDeltaReuseHooks;
+
+        let lookup = {
+            let cache = kernel.memory.lock().unwrap();
+            cache.lookup_with_hooks(&request.target, &cache_input, &mut hooks)
+        };
+        {
+            let mut cache = kernel.memory.lock().unwrap();
+            cache.put_with_hooks(
+                &request.target,
+                &lookup,
+                vec![CachePacket {
+                    packet_id: Some("cached-bad".to_string()),
+                    body: json!({
+                        "tool": "diffy",
+                        "reducer": "analyze",
+                        "paths": ["src/lib.rs"],
+                        "payload": {"secret": "secret123"},
+                    }),
+                    token_usage: None,
+                    runtime_ms: None,
+                    metadata: Value::Null,
+                }],
+                Value::Null,
+                &mut hooks,
+            );
+        }
+
+        let err = kernel.execute(request).unwrap_err();
+        assert!(matches!(err, KernelError::PolicyViolation { .. }));
     }
 
     #[test]
