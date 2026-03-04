@@ -14,6 +14,7 @@ fn multi_packet_fixture_dedupes_overlapping_refs() {
         contextq_core::AssembleOptions {
             budget_tokens: 1200,
             budget_bytes: 24_000,
+            ..contextq_core::AssembleOptions::default()
         },
     )
     .unwrap();
@@ -44,6 +45,7 @@ fn budget_fixture_is_trimmed_to_caps() {
         contextq_core::AssembleOptions {
             budget_tokens: 40,
             budget_bytes: 400,
+            ..contextq_core::AssembleOptions::default()
         },
     )
     .unwrap();

@@ -10,14 +10,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use suite_foundation_core::error::CovyError;
 
-pub const DEFAULT_BUDGET_TOKENS: u64 = 1200;
-pub const DEFAULT_BUDGET_BYTES: usize = 24_000;
+pub const DEFAULT_BUDGET_TOKENS: u64 = 5_000;
+pub const DEFAULT_BUDGET_BYTES: usize = 32_000;
 pub const CONTEXTQ_SCHEMA_VERSION: &str = "contextq.assemble.v1";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DetailMode {
+    #[default]
+    Compact,
+    Rich,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct AssembleOptions {
     pub budget_tokens: u64,
     pub budget_bytes: usize,
+    pub detail_mode: DetailMode,
+    pub compact_assembly: bool,
 }
 
 impl Default for AssembleOptions {
@@ -25,6 +34,8 @@ impl Default for AssembleOptions {
         Self {
             budget_tokens: DEFAULT_BUDGET_TOKENS,
             budget_bytes: DEFAULT_BUDGET_BYTES,
+            detail_mode: DetailMode::Compact,
+            compact_assembly: false,
         }
     }
 }
@@ -72,6 +83,24 @@ pub struct ReducerInvocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
+pub struct PacketFileRef {
+    pub path: String,
+    pub relevance: Option<f64>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PacketSymbolRef {
+    pub name: String,
+    pub file: Option<String>,
+    pub kind: Option<String>,
+    pub relevance: Option<f64>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct InputPacket {
     pub packet_id: Option<String>,
     pub tool: Option<String>,
@@ -82,6 +111,8 @@ pub struct InputPacket {
     pub token_usage: Option<u64>,
     pub runtime_ms: Option<u64>,
     pub payload: Value,
+    pub files: Vec<PacketFileRef>,
+    pub symbols: Vec<PacketSymbolRef>,
     pub tool_invocations: Vec<ToolInvocation>,
     pub reducer_invocations: Vec<ReducerInvocation>,
     pub text_blobs: Vec<String>,
@@ -192,6 +223,11 @@ pub fn assemble_packets(
                 paths.insert(normalize_path(path));
             }
         }
+        for file in &packet.files {
+            if let Some(path) = non_empty(Some(file.path.as_str())) {
+                paths.insert(normalize_path(path));
+            }
+        }
 
         total_runtime_ms = total_runtime_ms.saturating_add(packet.runtime_ms.unwrap_or(0));
 
@@ -200,9 +236,11 @@ pub fn assemble_packets(
         packet.refs = dedupe_refs(packet.refs.drain(..));
 
         if packet.sections.is_empty() {
-            packet
-                .sections
-                .push(build_default_section(packet, &packet_label));
+            packet.sections.push(build_default_section(
+                packet,
+                &packet_label,
+                options.detail_mode,
+            ));
         }
 
         for (section_idx, section) in packet.sections.iter_mut().enumerate() {
@@ -334,6 +372,12 @@ pub fn assemble_packets(
         truncated: false,
     };
 
+    if options.compact_assembly {
+        for section in &mut payload.sections {
+            section.refs.clear();
+        }
+    }
+
     enforce_budget(&mut payload, options);
 
     let payload_value = serde_json::to_value(&payload).unwrap_or(Value::Null);
@@ -373,11 +417,15 @@ pub fn assemble_packets(
                 "truncated": truncated
             }),
         }],
-        text_blobs: payload
-            .sections
-            .iter()
-            .map(|section| section.body.clone())
-            .collect(),
+        text_blobs: if options.compact_assembly {
+            Vec::new()
+        } else {
+            payload
+                .sections
+                .iter()
+                .map(|section| section.body.clone())
+                .collect()
+        },
         assembly: AssemblySummary {
             input_packets: packets.len(),
             sections_input,
@@ -411,7 +459,11 @@ impl InputPacket {
     }
 }
 
-fn build_default_section(packet: &InputPacket, packet_label: &str) -> ContextSection {
+fn build_default_section(
+    packet: &InputPacket,
+    packet_label: &str,
+    detail_mode: DetailMode,
+) -> ContextSection {
     let title = if let Some(reducer) = non_empty(packet.reducer.as_deref()) {
         format!("{reducer} output")
     } else if let Some(tool) = non_empty(packet.tool.as_deref()) {
@@ -423,7 +475,14 @@ fn build_default_section(packet: &InputPacket, packet_label: &str) -> ContextSec
     let body = match &packet.payload {
         Value::Null => "{}".to_string(),
         Value::String(text) => text.clone(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+        other => match detail_mode {
+            DetailMode::Rich => {
+                serde_json::to_string_pretty(other).unwrap_or_else(|_| "{}".to_string())
+            }
+            DetailMode::Compact => {
+                serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string())
+            }
+        },
     };
 
     ContextSection {
@@ -438,6 +497,36 @@ fn build_default_section(packet: &InputPacket, packet_label: &str) -> ContextSec
 
 fn derive_refs(packet: &InputPacket, payload: &Value, packet_label: &str) -> Vec<ContextRef> {
     let mut refs = Vec::new();
+
+    for file in &packet.files {
+        if let Some(path) = non_empty(Some(file.path.as_str())) {
+            refs.push(ContextRef {
+                kind: "file".to_string(),
+                value: normalize_path(path),
+                source: Some(packet_label.to_string()),
+                relevance: file.relevance.or(Some(0.8)),
+            });
+        }
+    }
+
+    for symbol in &packet.symbols {
+        if let Some(name) = non_empty(Some(symbol.name.as_str())) {
+            refs.push(ContextRef {
+                kind: "symbol".to_string(),
+                value: name.to_string(),
+                source: Some(packet_label.to_string()),
+                relevance: symbol.relevance.or(Some(0.7)),
+            });
+        }
+        if let Some(file) = symbol.file.as_deref().and_then(|v| non_empty(Some(v))) {
+            refs.push(ContextRef {
+                kind: "file".to_string(),
+                value: normalize_path(file),
+                source: Some(packet_label.to_string()),
+                relevance: symbol.relevance.or(Some(0.65)),
+            });
+        }
+    }
 
     for path in &packet.paths {
         if let Some(path) = non_empty(Some(path.as_str())) {
@@ -733,6 +822,7 @@ mod tests {
             AssembleOptions {
                 budget_tokens: 1000,
                 budget_bytes: 50_000,
+                ..AssembleOptions::default()
             },
         );
 
@@ -762,6 +852,7 @@ mod tests {
             AssembleOptions {
                 budget_tokens: 60,
                 budget_bytes: 500,
+                ..AssembleOptions::default()
             },
         );
 
@@ -793,11 +884,107 @@ mod tests {
             AssembleOptions {
                 budget_tokens: 1200,
                 budget_bytes: 24_000,
+                ..AssembleOptions::default()
             },
         )
         .unwrap();
 
         assert_eq!(assembled.assembly.input_packets, 2);
         assert!(assembled.paths.contains(&"src/a.rs".to_string()));
+    }
+
+    #[test]
+    fn derives_refs_from_envelope_top_level_refs() {
+        let packet = InputPacket {
+            packet_id: Some("mapy".to_string()),
+            files: vec![PacketFileRef {
+                path: "src/main.rs".to_string(),
+                relevance: Some(0.9),
+                source: Some("mapy.repo".to_string()),
+            }],
+            symbols: vec![PacketSymbolRef {
+                name: "run".to_string(),
+                file: Some("src/main.rs".to_string()),
+                kind: Some("function".to_string()),
+                relevance: Some(0.8),
+                source: Some("mapy.repo".to_string()),
+            }],
+            ..InputPacket::default()
+        };
+
+        let assembled = assemble_packets(
+            vec![packet],
+            AssembleOptions {
+                budget_tokens: 1200,
+                budget_bytes: 24_000,
+                ..AssembleOptions::default()
+            },
+        );
+        let payload: AssembledPayload = serde_json::from_value(assembled.payload).unwrap();
+
+        assert!(payload
+            .refs
+            .iter()
+            .any(|r| r.kind == "file" && r.value == "src/main.rs"));
+        assert!(payload
+            .refs
+            .iter()
+            .any(|r| r.kind == "symbol" && r.value == "run"));
+    }
+
+    #[test]
+    fn default_section_body_uses_pretty_json_in_rich_mode() {
+        let packet = InputPacket {
+            packet_id: Some("mapy".to_string()),
+            payload: json!({
+                "alpha": "beta",
+                "items": [1, 2],
+            }),
+            ..InputPacket::default()
+        };
+
+        let assembled = assemble_packets(
+            vec![packet],
+            AssembleOptions {
+                detail_mode: DetailMode::Rich,
+                ..AssembleOptions::default()
+            },
+        );
+        let payload: AssembledPayload = serde_json::from_value(assembled.payload).unwrap();
+        let body = &payload.sections[0].body;
+        assert!(body.contains('\n'));
+        assert!(body.contains("  \"alpha\""));
+    }
+
+    #[test]
+    fn compact_assembly_drops_duplicate_section_refs_and_text_blobs() {
+        let packet = InputPacket {
+            packet_id: Some("diffy".to_string()),
+            sections: vec![ContextSection {
+                title: "Diff".to_string(),
+                body: "critical regression".to_string(),
+                refs: vec![ContextRef {
+                    kind: "file".to_string(),
+                    value: "src/lib.rs".to_string(),
+                    source: Some("diffy".to_string()),
+                    relevance: Some(0.9),
+                }],
+                ..ContextSection::default()
+            }],
+            ..InputPacket::default()
+        };
+
+        let assembled = assemble_packets(
+            vec![packet],
+            AssembleOptions {
+                compact_assembly: true,
+                ..AssembleOptions::default()
+            },
+        );
+        let payload: AssembledPayload = serde_json::from_value(assembled.payload).unwrap();
+        assert_eq!(assembled.text_blobs.len(), 0);
+        assert_eq!(payload.sections.len(), 1);
+        assert!(payload.sections[0].refs.is_empty());
+        assert_eq!(payload.refs.len(), 1);
     }
 }

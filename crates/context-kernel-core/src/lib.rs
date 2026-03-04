@@ -10,6 +10,8 @@ use thiserror::Error;
 
 use context_memory_core::{CachePacket, DeltaReuseHooks, NoopDeltaReuseHooks, PacketCache};
 
+pub use context_memory_core::PersistConfig;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ExecutionBudget {
     pub token_cap: Option<u64>,
@@ -332,6 +334,7 @@ pub struct Kernel {
     reducers: HashMap<String, Arc<ReducerFn>>,
     next_request_id: AtomicU64,
     memory: Mutex<PacketCache>,
+    persist_config: Option<PersistConfig>,
 }
 
 impl Default for Kernel {
@@ -346,11 +349,23 @@ impl Kernel {
             reducers: HashMap::new(),
             next_request_id: AtomicU64::new(1),
             memory: Mutex::new(PacketCache::new()),
+            persist_config: None,
         }
     }
 
     pub fn with_v1_reducers() -> Self {
         let mut kernel = Self::new();
+        register_v1_reducers(&mut kernel);
+        kernel
+    }
+
+    pub fn with_v1_reducers_and_persistence(config: PersistConfig) -> Self {
+        let mut kernel = Self {
+            reducers: HashMap::new(),
+            next_request_id: AtomicU64::new(1),
+            memory: Mutex::new(PacketCache::load_from_disk(&config)),
+            persist_config: Some(config),
+        };
         register_v1_reducers(&mut kernel);
         kernel
     }
@@ -568,6 +583,10 @@ impl Kernel {
 
             let metadata = response.metadata.clone();
             cache.put_with_hooks(&target, &cache_lookup, packets, metadata, hooks);
+            if let Some(persist_config) = &self.persist_config {
+                cache.evict_expired(persist_config.ttl_secs);
+                let _ = cache.save_to_disk(persist_config);
+            }
         }
 
         Ok(response)
@@ -802,6 +821,12 @@ fn run_contextq_assemble(
             .budget
             .byte_cap
             .unwrap_or(contextq_core::DEFAULT_BUDGET_BYTES),
+        detail_mode: parse_contextq_detail_mode(&ctx.policy_context),
+        compact_assembly: ctx
+            .policy_context
+            .get("compact_assembly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     };
 
     let packets: Vec<contextq_core::InputPacket> = input_packets
@@ -894,11 +919,7 @@ fn run_guardy_check(
         }
     })?;
 
-    let packet: guardy_core::GuardPacket = serde_json::from_value(input_packets[0].body.clone())
-        .map_err(|source| KernelError::ReducerFailed {
-            target: ctx.target.clone(),
-            detail: format!("invalid guard packet: {source}"),
-        })?;
+    let packet = kernel_packet_to_guard_packet(&input_packets[0])?;
 
     let audit = guardy_core::check_packet(&config, &packet);
 
@@ -1034,15 +1055,17 @@ fn run_proxy_run(
             }
         })?;
 
-    let envelope = suite_proxy_core::run_and_reduce(input).map_err(|source| {
-        KernelError::ReducerFailed {
+    let envelope =
+        suite_proxy_core::run_and_reduce(input).map_err(|source| KernelError::ReducerFailed {
             target: ctx.target.clone(),
             detail: source.to_string(),
-        }
-    })?;
+        })?;
 
     let kernel_packet = KernelPacket {
-        packet_id: Some(format!("proxy-{}", envelope.hash.chars().take(12).collect::<String>())),
+        packet_id: Some(format!(
+            "proxy-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
         format: default_packet_format(),
         body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
             target: ctx.target.clone(),
@@ -1073,21 +1096,23 @@ fn run_mapy_repo(
     ctx: &mut ExecutionContext,
     _input_packets: &[KernelPacket],
 ) -> Result<ReducerResult, KernelError> {
-    let input: mapy_core::RepoMapRequest =
-        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
-            KernelError::ReducerFailed {
-                target: ctx.target.clone(),
-                detail: format!("invalid reducer input: {source}"),
-            }
+    let input: mapy_core::RepoMapRequest = serde_json::from_value(ctx.reducer_input.clone())
+        .map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: format!("invalid reducer input: {source}"),
         })?;
 
-    let envelope = mapy_core::build_repo_map(input).map_err(|source| KernelError::ReducerFailed {
-        target: ctx.target.clone(),
-        detail: source.to_string(),
-    })?;
+    let envelope =
+        mapy_core::build_repo_map(input).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?;
 
     let kernel_packet = KernelPacket {
-        packet_id: Some(format!("mapy-{}", envelope.hash.chars().take(12).collect::<String>())),
+        packet_id: Some(format!(
+            "mapy-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
         format: default_packet_format(),
         body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
             target: ctx.target.clone(),
@@ -1185,15 +1210,16 @@ fn audit_packets_against_policy(
 fn kernel_packet_to_guard_packet(
     packet: &KernelPacket,
 ) -> Result<guardy_core::GuardPacket, KernelError> {
-    let mut guard_packet = if packet.body.is_object() {
-        serde_json::from_value::<guardy_core::GuardPacket>(packet.body.clone()).map_err(
+    let guard_candidate = extract_guard_candidate(&packet.body);
+    let mut guard_packet = if guard_candidate.is_object() {
+        serde_json::from_value::<guardy_core::GuardPacket>(guard_candidate.clone()).map_err(
             |source| KernelError::InvalidRequest {
                 detail: format!("packet is not guard-compatible JSON: {source}"),
             },
         )?
     } else {
         guardy_core::GuardPacket {
-            payload: packet.body.clone(),
+            payload: guard_candidate.clone(),
             ..guardy_core::GuardPacket::default()
         }
     };
@@ -1212,12 +1238,18 @@ fn kernel_packet_to_guard_packet(
             .body
             .get("budget_cost")
             .and_then(|v| v.get("tool_calls"))
+            .or_else(|| {
+                guard_candidate
+                    .get("budget_cost")
+                    .and_then(|v| v.get("tool_calls"))
+            })
             .and_then(Value::as_u64);
     }
     if guard_packet.tool.is_none() {
         guard_packet.tool = packet
             .body
             .get("tool")
+            .or_else(|| guard_candidate.get("tool"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
@@ -1229,14 +1261,14 @@ fn kernel_packet_to_guard_packet(
             .map(ToOwned::to_owned);
     }
     if guard_packet.paths.is_empty() {
-        if let Some(paths) = packet.body.get("paths").and_then(Value::as_array) {
+        if let Some(paths) = guard_candidate.get("paths").and_then(Value::as_array) {
             for path in paths.iter().filter_map(Value::as_str) {
                 guard_packet.paths.push(path.to_string());
             }
         }
     }
     if guard_packet.paths.is_empty() {
-        if let Some(files) = packet.body.get("files").and_then(Value::as_array) {
+        if let Some(files) = guard_candidate.get("files").and_then(Value::as_array) {
             for file in files {
                 if let Some(path) = file.get("path").and_then(Value::as_str) {
                     guard_packet.paths.push(path.to_string());
@@ -1245,14 +1277,42 @@ fn kernel_packet_to_guard_packet(
         }
     }
     if guard_packet.payload.is_null() {
-        guard_packet.payload = packet
-            .body
+        guard_packet.payload = guard_candidate
             .get("payload")
             .cloned()
-            .unwrap_or_else(|| packet.body.clone());
+            .unwrap_or_else(|| guard_candidate.clone());
     }
 
     Ok(guard_packet)
+}
+
+fn extract_guard_candidate(value: &Value) -> Value {
+    if !value.is_object() {
+        return value.clone();
+    }
+
+    for key in ["packet", "envelope_v1", "final_packet"] {
+        if let Some(candidate) = value.get(key) {
+            if candidate.is_object() {
+                return candidate.clone();
+            }
+        }
+    }
+
+    value.clone()
+}
+
+fn parse_contextq_detail_mode(policy_context: &Value) -> contextq_core::DetailMode {
+    let mode = policy_context
+        .get("detail_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("compact");
+
+    if mode.eq_ignore_ascii_case("rich") {
+        contextq_core::DetailMode::Rich
+    } else {
+        contextq_core::DetailMode::Compact
+    }
 }
 
 fn ensure_policy_audits_pass(
@@ -1798,6 +1858,57 @@ policy:
     }
 
     #[test]
+    fn guardy_reducer_scans_wrapped_packet_payloads() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("context.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+version: 1
+policy:
+  paths:
+    include: ["**"]
+    exclude: []
+  redaction:
+    forbidden_patterns: ["secret123"]
+"#,
+        )
+        .unwrap();
+
+        let kernel = Kernel::with_v1_reducers();
+        let packet = KernelPacket::from_value(
+            json!({
+                "schema_version": "suite.proxy.run.v1",
+                "packet": {
+                    "tool": "proxy",
+                    "payload": {
+                        "highlights": ["my_password_is_secret123"]
+                    }
+                }
+            }),
+            None,
+        );
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "guardy.check".to_string(),
+                input_packets: vec![packet],
+                policy_context: json!({
+                    "config_path": config_path.to_string_lossy().to_string()
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        let passed = response.output_packets[0]
+            .body
+            .get("passed")
+            .and_then(Value::as_bool)
+            .unwrap();
+        assert!(!passed);
+    }
+
+    #[test]
     fn caches_reducer_packets_by_request_hash() {
         let mut kernel = Kernel::new();
         let calls = Arc::new(AtomicU64::new(0));
@@ -1829,6 +1940,64 @@ policy:
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn persistent_kernel_reuses_cache_across_instances() {
+        let dir = tempdir().unwrap();
+        let config = PersistConfig::new(dir.path().to_path_buf());
+
+        let first_calls = Arc::new(AtomicU64::new(0));
+        let first_calls_ref = first_calls.clone();
+        let mut first_kernel = Kernel::with_v1_reducers_and_persistence(config.clone());
+        first_kernel.register_reducer("count.reducer", move |_ctx, _packets| {
+            first_calls_ref.fetch_add(1, Ordering::Relaxed);
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(json!({"ok": true}), None)],
+                metadata: json!({"source":"reducer"}),
+            })
+        });
+
+        let request = KernelRequest {
+            target: "count.reducer".to_string(),
+            reducer_input: json!({"task":"persisted"}),
+            ..KernelRequest::default()
+        };
+
+        let first = first_kernel.execute(request.clone()).unwrap();
+        assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        drop(first_kernel);
+
+        let second_calls = Arc::new(AtomicU64::new(0));
+        let second_calls_ref = second_calls.clone();
+        let mut second_kernel = Kernel::with_v1_reducers_and_persistence(config);
+        second_kernel.register_reducer("count.reducer", move |_ctx, _packets| {
+            second_calls_ref.fetch_add(1, Ordering::Relaxed);
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(json!({"ok": true}), None)],
+                metadata: json!({"source":"reducer"}),
+            })
+        });
+
+        let second = second_kernel.execute(request).unwrap();
+        assert_eq!(second_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            second
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(dir.path().join(".packet28/packet-cache-v1.bin").exists());
     }
 
     #[test]
