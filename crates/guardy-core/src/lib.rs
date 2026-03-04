@@ -28,6 +28,7 @@ pub struct PolicyConfig {
     pub paths: PathPolicy,
     pub token_budget: TokenBudgetPolicy,
     pub runtime_budget: RuntimeBudgetPolicy,
+    pub tool_call_budget: ToolCallBudgetPolicy,
     #[serde(alias = "budget_rules")]
     pub budgets: BudgetPolicy,
     #[serde(alias = "redaction_rules")]
@@ -72,6 +73,12 @@ pub struct RuntimeBudgetPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
+pub struct ToolCallBudgetPolicy {
+    pub cap: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RedactionPolicy {
     pub forbidden_patterns: Vec<String>,
 }
@@ -83,6 +90,7 @@ pub struct HumanReviewPolicy {
     pub on_policy_violation: bool,
     pub on_budget_violation: bool,
     pub on_redaction_violation: bool,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -96,6 +104,7 @@ pub struct GuardPacket {
     pub paths: Vec<String>,
     pub token_usage: Option<u64>,
     pub runtime_ms: Option<u64>,
+    pub tool_call_count: Option<u64>,
     pub payload: Value,
     pub tool_invocations: Vec<ToolInvocation>,
     pub reducer_invocations: Vec<ReducerInvocation>,
@@ -153,6 +162,7 @@ pub struct AuditTotals {
     pub paths_seen: usize,
     pub total_token_usage: u64,
     pub total_runtime_ms: u64,
+    pub total_tool_calls: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +264,10 @@ impl ContextConfig {
             errors.push("policy.budgets.runtime_ms_cap must be greater than 0".to_string());
         }
 
+        if self.policy.tool_call_budget.cap == Some(0) {
+            errors.push("policy.tool_call_budget.cap must be greater than 0".to_string());
+        }
+
         for (idx, pattern) in self.policy.paths.include.iter().enumerate() {
             if let Err(err) = Pattern::new(pattern) {
                 errors.push(format!("policy.paths.include[{idx}] invalid glob: {err}"));
@@ -263,6 +277,12 @@ impl ContextConfig {
         for (idx, pattern) in self.policy.paths.exclude.iter().enumerate() {
             if let Err(err) = Pattern::new(pattern) {
                 errors.push(format!("policy.paths.exclude[{idx}] invalid glob: {err}"));
+            }
+        }
+
+        for (idx, pattern) in self.policy.human_review.paths.iter().enumerate() {
+            if let Err(err) = Pattern::new(pattern) {
+                errors.push(format!("policy.human_review.paths[{idx}] invalid glob: {err}"));
             }
         }
 
@@ -301,6 +321,10 @@ impl PolicyConfig {
 
     pub fn effective_runtime_ms_cap(&self) -> Option<u64> {
         self.runtime_budget.cap_ms.or(self.budgets.runtime_ms_cap)
+    }
+
+    pub fn effective_tool_call_cap(&self) -> Option<u64> {
+        self.tool_call_budget.cap
     }
 }
 
@@ -399,6 +423,12 @@ impl GuardPacket {
         self.runtime_ms.unwrap_or(0) + tool_runtime + reducer_runtime
     }
 
+    fn total_tool_calls(&self) -> u64 {
+        let direct = self.tool_call_count.unwrap_or(0);
+        let inferred = self.tool_invocations.len() as u64;
+        direct.max(inferred)
+    }
+
     fn collect_text_for_redaction_scan(&self) -> Vec<TextCandidate> {
         let mut out = Vec::new();
 
@@ -482,6 +512,7 @@ pub fn check_packet(config: &ContextConfig, packet: &GuardPacket) -> AuditResult
     let paths = packet.collect_paths();
     let total_token_usage = packet.total_token_usage();
     let total_runtime_ms = packet.total_runtime_ms();
+    let total_tool_calls = packet.total_tool_calls();
 
     let mut findings = Vec::new();
 
@@ -570,6 +601,34 @@ pub fn check_packet(config: &ContextConfig, packet: &GuardPacket) -> AuditResult
         }
     }
 
+    if let Some(tool_call_cap) = config.policy.effective_tool_call_cap() {
+        if total_tool_calls > tool_call_cap {
+            findings.push(AuditFinding {
+                rule: "tool_call_cap".to_string(),
+                subject: "packet".to_string(),
+                message: format!(
+                    "tool call count {} exceeded cap {}",
+                    total_tool_calls, tool_call_cap
+                ),
+            });
+        }
+    }
+
+    let human_review_paths =
+        compile_globs(&config.policy.human_review.paths, "human_review.paths", &mut findings);
+    if !human_review_paths.is_empty() {
+        for path in &paths {
+            if matches_any(&human_review_paths, path) {
+                findings.push(AuditFinding {
+                    rule: "human_review_required".to_string(),
+                    subject: path.clone(),
+                    message: "path matched policy.human_review.paths and requires human review"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
     let redaction_patterns = compile_regexes(
         &config.policy.redaction.forbidden_patterns,
         "redaction.forbidden_patterns",
@@ -602,6 +661,7 @@ pub fn check_packet(config: &ContextConfig, packet: &GuardPacket) -> AuditResult
             paths_seen: paths.len(),
             total_token_usage,
             total_runtime_ms,
+            total_tool_calls,
         },
         findings,
     }

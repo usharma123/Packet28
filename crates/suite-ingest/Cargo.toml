@@ -1,5 +1,5 @@
 [package]
-name = "suite-packet-core"
+name = "suite-ingest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,9 +9,5 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-roaring.workspace = true
-thiserror.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-toml.workspace = true
-blake3.workspace = true
+suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
+covy-ingest = { version = "0.2.0", path = "../covy-ingest" }

@@ -749,6 +749,8 @@ pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("guardy.check", run_guardy_check);
     kernel.register_reducer("stacky.slice", run_stacky_slice);
     kernel.register_reducer("buildy.reduce", run_buildy_reduce);
+    kernel.register_reducer("proxy.run", run_proxy_run);
+    kernel.register_reducer("mapy.repo", run_mapy_repo);
 }
 
 fn run_governed_assemble(
@@ -1020,6 +1022,98 @@ fn run_buildy_reduce(
     })
 }
 
+fn run_proxy_run(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let input: suite_proxy_core::ProxyRunRequest =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+
+    let envelope = suite_proxy_core::run_and_reduce(input).map_err(|source| {
+        KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        }
+    })?;
+
+    let kernel_packet = KernelPacket {
+        packet_id: Some(format!("proxy-{}", envelope.hash.chars().take(12).collect::<String>())),
+        format: default_packet_format(),
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
+        metadata: json!({
+            "tool": "proxy",
+            "reducer": "run",
+            "kind": envelope.kind,
+            "hash": envelope.hash,
+            "lines_out": envelope.payload.lines_out,
+            "bytes_saved": envelope.payload.bytes_saved,
+        }),
+    };
+
+    Ok(ReducerResult {
+        output_packets: vec![kernel_packet],
+        metadata: json!({
+            "reducer": "proxy.run",
+            "kind": "command_summary",
+        }),
+    })
+}
+
+fn run_mapy_repo(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let input: mapy_core::RepoMapRequest =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+
+    let envelope = mapy_core::build_repo_map(input).map_err(|source| KernelError::ReducerFailed {
+        target: ctx.target.clone(),
+        detail: source.to_string(),
+    })?;
+
+    let kernel_packet = KernelPacket {
+        packet_id: Some(format!("mapy-{}", envelope.hash.chars().take(12).collect::<String>())),
+        format: default_packet_format(),
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
+        metadata: json!({
+            "tool": "mapy",
+            "reducer": "repo",
+            "kind": envelope.kind,
+            "hash": envelope.hash,
+            "files_ranked": envelope.payload.files_ranked.len(),
+            "symbols_ranked": envelope.payload.symbols_ranked.len(),
+        }),
+    };
+
+    Ok(ReducerResult {
+        output_packets: vec![kernel_packet],
+        metadata: json!({
+            "reducer": "mapy.repo",
+            "kind": "repo_map",
+        }),
+    })
+}
+
 fn load_policy_guard(policy_context: &Value) -> Result<Option<PolicyGuard>, KernelError> {
     let Some(config_path) = policy_context
         .get("config_path")
@@ -1059,7 +1153,7 @@ fn enforce_reducer_execution_policy(
         });
     }
 
-    if let Some(matched_by) = match_reducer_allowlist(target, &allowlist) {
+    if let Some(matched_by) = suite_policy_core::match_reducer_allowlist(target, &allowlist) {
         return Ok(ReducerExecutionAudit {
             reducer: target.to_string(),
             allowed: true,
@@ -1074,35 +1168,6 @@ fn enforce_reducer_execution_policy(
             allowlist.join(", ")
         ),
     })
-}
-
-fn match_reducer_allowlist(target: &str, allowlist: &[String]) -> Option<String> {
-    let candidates = reducer_candidates(target);
-    allowlist
-        .iter()
-        .find(|allowed| {
-            candidates
-                .iter()
-                .any(|candidate| allowed.as_str() == candidate.as_str())
-        })
-        .cloned()
-}
-
-fn reducer_candidates(target: &str) -> Vec<String> {
-    let mut candidates = vec![target.to_string()];
-    if let Some(leaf) = target.rsplit('.').next() {
-        if !leaf.is_empty() && leaf != target {
-            candidates.push(leaf.to_string());
-        }
-    }
-
-    if target == "governed.assemble" {
-        candidates.push("contextq.assemble".to_string());
-    }
-
-    candidates.sort();
-    candidates.dedup();
-    candidates
 }
 
 fn audit_packets_against_policy(
@@ -1142,8 +1207,49 @@ fn kernel_packet_to_guard_packet(
     if guard_packet.runtime_ms.is_none() {
         guard_packet.runtime_ms = packet.runtime_ms;
     }
+    if guard_packet.tool_call_count.is_none() {
+        guard_packet.tool_call_count = packet
+            .body
+            .get("budget_cost")
+            .and_then(|v| v.get("tool_calls"))
+            .and_then(Value::as_u64);
+    }
+    if guard_packet.tool.is_none() {
+        guard_packet.tool = packet
+            .body
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if guard_packet.reducer.is_none() {
+        guard_packet.reducer = packet
+            .metadata
+            .get("reducer")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if guard_packet.paths.is_empty() {
+        if let Some(paths) = packet.body.get("paths").and_then(Value::as_array) {
+            for path in paths.iter().filter_map(Value::as_str) {
+                guard_packet.paths.push(path.to_string());
+            }
+        }
+    }
+    if guard_packet.paths.is_empty() {
+        if let Some(files) = packet.body.get("files").and_then(Value::as_array) {
+            for file in files {
+                if let Some(path) = file.get("path").and_then(Value::as_str) {
+                    guard_packet.paths.push(path.to_string());
+                }
+            }
+        }
+    }
     if guard_packet.payload.is_null() {
-        guard_packet.payload = packet.body.clone();
+        guard_packet.payload = packet
+            .body
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| packet.body.clone());
     }
 
     Ok(guard_packet)
