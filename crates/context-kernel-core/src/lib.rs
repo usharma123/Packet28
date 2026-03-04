@@ -801,6 +801,21 @@ pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("mapy.repo", run_mapy_repo);
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct ContextAssembleEnvelopePayload {
+    sources: Vec<String>,
+    sections: Vec<contextq_core::ContextSection>,
+    refs: Vec<contextq_core::ContextRef>,
+    truncated: bool,
+    assembly: contextq_core::AssemblySummary,
+    tool_invocations: Vec<contextq_core::ToolInvocation>,
+    reducer_invocations: Vec<contextq_core::ReducerInvocation>,
+    text_blobs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug: Option<Value>,
+}
+
 fn run_governed_assemble(
     ctx: &mut ExecutionContext,
     input_packets: &[KernelPacket],
@@ -866,11 +881,18 @@ fn run_contextq_assemble(
                 .packet_id
                 .clone()
                 .unwrap_or_else(|| format!("packet-{}", idx + 1));
-            contextq_core::InputPacket::from_value(packet.body.clone(), &fallback)
+            contextq_core::InputPacket::from_value(extract_packet_value(&packet.body), &fallback)
         })
         .collect();
 
     let assembled = contextq_core::assemble_packets(packets, options);
+    let assembled_payload: contextq_core::AssembledPayload =
+        serde_json::from_value(assembled.payload.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid assembled payload: {source}"),
+            }
+        })?;
 
     ctx.set_shared("truncated", Value::Bool(assembled.assembly.truncated));
     ctx.set_shared(
@@ -878,19 +900,89 @@ fn run_contextq_assemble(
         Value::from(assembled.assembly.sections_kept as u64),
     );
 
+    let mut files = Vec::new();
+    let mut symbols = Vec::new();
+    for reference in &assembled_payload.refs {
+        match reference.kind.as_str() {
+            "file" | "path" => files.push(suite_packet_core::FileRef {
+                path: reference.value.clone(),
+                relevance: reference.relevance,
+                source: reference.source.clone(),
+            }),
+            "symbol" => symbols.push(suite_packet_core::SymbolRef {
+                name: reference.value.clone(),
+                file: None,
+                kind: Some("symbol".to_string()),
+                relevance: reference.relevance,
+                source: reference.source.clone(),
+            }),
+            _ => {}
+        }
+    }
+
+    let payload = ContextAssembleEnvelopePayload {
+        sources: assembled_payload.sources,
+        sections: assembled_payload.sections,
+        refs: assembled_payload.refs,
+        truncated: assembled_payload.truncated,
+        assembly: assembled.assembly.clone(),
+        tool_invocations: assembled.tool_invocations.clone(),
+        reducer_invocations: assembled.reducer_invocations.clone(),
+        text_blobs: assembled.text_blobs.clone(),
+        debug: None,
+    };
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map(|buf| buf.len())
+        .unwrap_or_default();
+    let envelope = suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "contextq".to_string(),
+        kind: "context_assemble".to_string(),
+        hash: String::new(),
+        summary: format!(
+            "context assemble sections={} refs={} truncated={}",
+            payload.assembly.sections_kept, payload.assembly.refs_kept, payload.truncated
+        ),
+        files,
+        symbols,
+        risk: None,
+        confidence: Some(if payload.truncated { 0.8 } else { 1.0 }),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: assembled.runtime_ms.unwrap_or(0),
+            tool_calls: payload.tool_invocations.len() as u64,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: payload.sources.clone(),
+            git_base: None,
+            git_head: None,
+            generated_at_unix: now_unix(),
+        },
+        payload,
+    }
+    .with_canonical_hash_and_real_budget();
+
     let packet = KernelPacket {
-        packet_id: assembled.packet_id.clone(),
+        packet_id: Some(format!(
+            "contextq-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
         format: default_packet_format(),
-        body: serde_json::to_value(&assembled).map_err(|source| KernelError::ReducerFailed {
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
             target: ctx.target.clone(),
             detail: source.to_string(),
         })?,
-        token_usage: assembled.token_usage,
-        runtime_ms: assembled.runtime_ms,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
         metadata: json!({
-            "tool": assembled.tool,
-            "reducer": assembled.reducer,
+            "tool": envelope.tool,
+            "reducer": "assemble",
             "truncated": assembled.assembly.truncated,
+            "kind": envelope.kind,
+            "hash": envelope.hash,
             "schema_version": contextq_core::CONTEXTQ_SCHEMA_VERSION,
             "budget_trim": {
                 "truncated": assembled.assembly.truncated,
@@ -910,6 +1002,7 @@ fn run_contextq_assemble(
         output_packets: vec![packet],
         metadata: json!({
             "reducer": "contextq.assemble",
+            "kind": "context_assemble",
             "schema_version": contextq_core::CONTEXTQ_SCHEMA_VERSION,
             "budget_trim": {
                 "truncated": assembled.assembly.truncated,
@@ -943,9 +1036,10 @@ fn run_guardy_check(
         .filter(|path| !path.trim().is_empty())
         .ok_or_else(|| KernelError::InvalidRequest {
             detail: "guardy.check requires policy_context.config_path".to_string(),
-        })?;
+        })?
+        .to_string();
 
-    let config = guardy_core::ContextConfig::load(Path::new(config_path)).map_err(|source| {
+    let config = guardy_core::ContextConfig::load(Path::new(&config_path)).map_err(|source| {
         KernelError::ReducerFailed {
             target: ctx.target.clone(),
             detail: source.to_string(),
@@ -959,19 +1053,79 @@ fn run_guardy_check(
     ctx.set_shared("passed", Value::Bool(audit.passed));
     ctx.set_shared("policy_version", Value::from(audit.policy_version));
 
+    let mut files = Vec::new();
+    let mut symbols = Vec::new();
+    for finding in &audit.findings {
+        if finding.subject.contains('/') || finding.subject.contains('.') {
+            files.push(suite_packet_core::FileRef {
+                path: finding.subject.clone(),
+                relevance: Some(1.0),
+                source: Some("guardy.check".to_string()),
+            });
+        } else {
+            symbols.push(suite_packet_core::SymbolRef {
+                name: finding.subject.clone(),
+                file: None,
+                kind: Some("policy_subject".to_string()),
+                relevance: Some(1.0),
+                source: Some("guardy.check".to_string()),
+            });
+        }
+    }
+
+    let payload_bytes = serde_json::to_vec(&audit)
+        .map(|buf| buf.len())
+        .unwrap_or_default();
+    let envelope = suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "guardy".to_string(),
+        kind: "guard_check".to_string(),
+        hash: String::new(),
+        summary: format!(
+            "guard check passed={} findings={}",
+            audit.passed,
+            audit.findings.len()
+        ),
+        files,
+        symbols,
+        risk: None,
+        confidence: Some(if audit.passed { 1.0 } else { 0.75 }),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: vec![config_path.to_string()],
+            git_base: None,
+            git_head: None,
+            generated_at_unix: now_unix(),
+        },
+        payload: audit.clone(),
+    }
+    .with_canonical_hash_and_real_budget();
+
     let packet = KernelPacket {
-        packet_id: Some("guardy-audit-v1".to_string()),
+        packet_id: Some(format!(
+            "guardy-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
         format: default_packet_format(),
-        body: serde_json::to_value(&audit).map_err(|source| KernelError::ReducerFailed {
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
             target: ctx.target.clone(),
             detail: source.to_string(),
         })?,
-        token_usage: None,
-        runtime_ms: None,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
         metadata: json!({
             "reducer": "guardy.check",
             "passed": audit.passed,
             "findings": audit.findings.len(),
+            "kind": "guard_check",
+            "hash": envelope.hash,
         }),
     };
 
@@ -994,26 +1148,26 @@ fn run_stacky_slice(
         detail: format!("invalid reducer input: {source}"),
     })?;
 
-    let packet = stacky_core::slice_to_packet(input);
-    let payload: stacky_core::StackSliceOutput = serde_json::from_value(packet.payload.clone())
-        .map_err(|source| KernelError::ReducerFailed {
-            target: ctx.target.clone(),
-            detail: format!("invalid stacky payload: {source}"),
-        })?;
+    let envelope = stacky_core::slice_to_envelope(input);
+    let payload = envelope.payload.clone();
 
     let kernel_packet = KernelPacket {
-        packet_id: packet.packet_id.clone(),
+        packet_id: Some(format!(
+            "stacky-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
         format: default_packet_format(),
-        body: serde_json::to_value(&packet).map_err(|source| KernelError::ReducerFailed {
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
             target: ctx.target.clone(),
             detail: source.to_string(),
         })?,
-        token_usage: None,
-        runtime_ms: None,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
         metadata: json!({
-            "tool": "stacky",
+            "tool": envelope.tool,
             "reducer": "slice",
-            "schema_version": payload.schema_version,
+            "kind": envelope.kind,
+            "hash": envelope.hash,
             "unique_failures": payload.unique_failures,
             "duplicates_removed": payload.duplicates_removed,
         }),
@@ -1023,7 +1177,7 @@ fn run_stacky_slice(
         output_packets: vec![kernel_packet],
         metadata: json!({
             "reducer": "stacky.slice",
-            "schema_version": stacky_core::STACKY_SCHEMA_VERSION,
+            "kind": "stack_slice",
             "unique_failures": payload.unique_failures,
             "duplicates_removed": payload.duplicates_removed,
         }),
@@ -1040,26 +1194,26 @@ fn run_buildy_reduce(
             detail: format!("invalid reducer input: {source}"),
         })?;
 
-    let packet = buildy_core::reduce_to_packet(input);
-    let payload: buildy_core::BuildReduceOutput = serde_json::from_value(packet.payload.clone())
-        .map_err(|source| KernelError::ReducerFailed {
-            target: ctx.target.clone(),
-            detail: format!("invalid buildy payload: {source}"),
-        })?;
+    let envelope = buildy_core::reduce_to_envelope(input);
+    let payload = envelope.payload.clone();
 
     let kernel_packet = KernelPacket {
-        packet_id: packet.packet_id.clone(),
+        packet_id: Some(format!(
+            "buildy-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
         format: default_packet_format(),
-        body: serde_json::to_value(&packet).map_err(|source| KernelError::ReducerFailed {
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
             target: ctx.target.clone(),
             detail: source.to_string(),
         })?,
-        token_usage: None,
-        runtime_ms: None,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
         metadata: json!({
-            "tool": "buildy",
+            "tool": envelope.tool,
             "reducer": "reduce",
-            "schema_version": payload.schema_version,
+            "kind": envelope.kind,
+            "hash": envelope.hash,
             "unique_diagnostics": payload.unique_diagnostics,
             "duplicates_removed": payload.duplicates_removed,
         }),
@@ -1069,7 +1223,7 @@ fn run_buildy_reduce(
         output_packets: vec![kernel_packet],
         metadata: json!({
             "reducer": "buildy.reduce",
-            "schema_version": buildy_core::BUILDY_SCHEMA_VERSION,
+            "kind": "build_reduce",
             "unique_diagnostics": payload.unique_diagnostics,
             "duplicates_removed": payload.duplicates_removed,
         }),
@@ -1369,6 +1523,25 @@ fn extract_guard_candidate(value: &Value) -> Value {
             if candidate.is_object() {
                 return candidate.clone();
             }
+        }
+    }
+
+    value.clone()
+}
+
+fn extract_packet_value(value: &Value) -> Value {
+    if !value.is_object() {
+        return value.clone();
+    }
+
+    let is_machine_wrapper = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| schema == suite_packet_core::MACHINE_SCHEMA_VERSION);
+
+    if is_machine_wrapper {
+        if let Some(packet) = value.get("packet") {
+            return packet.clone();
         }
     }
 
