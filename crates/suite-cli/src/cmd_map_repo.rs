@@ -60,6 +60,10 @@ pub struct RepoArgs {
     #[arg(long)]
     pub cache: bool,
 
+    /// Optional task identifier for state-aware focus propagation.
+    #[arg(long)]
+    pub task_id: Option<String>,
+
     /// Run governed packet path using this context policy config (context.yaml)
     #[arg(long)]
     pub context_config: Option<String>,
@@ -96,7 +100,7 @@ pub fn run(args: RepoArgs) -> Result<i32> {
         include_tests: args.include_tests,
     };
 
-    let use_kernel = args.cache || args.context_config.is_some();
+    let use_kernel = args.cache || args.context_config.is_some() || args.task_id.is_some();
     if !use_kernel {
         let envelope = mapy_core::build_repo_map(input)?;
         if let Some(profile) = machine_profile {
@@ -126,15 +130,26 @@ pub fn run(args: RepoArgs) -> Result<i32> {
         return Ok(0);
     }
 
-    let kernel = build_kernel(args.cache, PathBuf::from(&input.repo_root));
+    let kernel = build_kernel(
+        args.cache || args.task_id.is_some(),
+        PathBuf::from(&input.repo_root),
+    );
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "mapy.repo".to_string(),
         reducer_input: serde_json::to_value(input)?,
-        policy_context: args
-            .context_config
-            .as_ref()
-            .map(|path| json!({"config_path": path}))
-            .unwrap_or(Value::Null),
+        policy_context: match (args.context_config.as_ref(), args.task_id.as_ref()) {
+            (Some(path), Some(task_id)) => json!({
+                "config_path": path,
+                "task_id": task_id,
+                "disable_cache": true,
+            }),
+            (Some(path), None) => json!({"config_path": path}),
+            (None, Some(task_id)) => json!({
+                "task_id": task_id,
+                "disable_cache": true,
+            }),
+            (None, None) => Value::Null,
+        },
         ..context_kernel_core::KernelRequest::default()
     })?;
 
@@ -170,6 +185,8 @@ pub fn run(args: RepoArgs) -> Result<i32> {
                     PacketDetailArg::Compact => "compact",
                 },
                 "compact_assembly": detail_mode == PacketDetailArg::Compact,
+                "task_id": args.task_id,
+                "disable_cache": args.task_id.is_some(),
             }),
             ..context_kernel_core::KernelRequest::default()
         })?)

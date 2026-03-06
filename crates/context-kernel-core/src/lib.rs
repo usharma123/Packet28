@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -817,6 +818,8 @@ pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("contextq.assemble", run_contextq_assemble);
     kernel.register_reducer("governed.assemble", run_governed_assemble);
     kernel.register_reducer("guardy.check", run_guardy_check);
+    kernel.register_reducer("diffy.analyze", run_diffy_analyze_reducer);
+    kernel.register_reducer("testy.impact", run_testy_impact_reducer);
     kernel.register_reducer("stacky.slice", run_stacky_slice);
     kernel.register_reducer("buildy.reduce", run_buildy_reduce);
     kernel.register_reducer("proxy.run", run_proxy_run);
@@ -842,6 +845,334 @@ struct ContextAssembleEnvelopePayload {
 #[serde(default)]
 struct AgentSnapshotRequest {
     task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffAnalyzeKernelInput {
+    pub base: String,
+    pub head: String,
+    pub fail_under_changed: Option<f64>,
+    pub fail_under_total: Option<f64>,
+    pub fail_under_new: Option<f64>,
+    pub max_new_errors: Option<u32>,
+    pub max_new_warnings: Option<u32>,
+    pub max_new_issues: Option<u32>,
+    pub issues: Vec<String>,
+    pub issues_state: Option<String>,
+    pub no_issues_state: bool,
+    pub coverage: Vec<String>,
+    pub input: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffAnalyzeKernelOutput {
+    pub gate_result: suite_packet_core::QualityGateResult,
+    pub diagnostics: Option<suite_packet_core::DiagnosticsData>,
+    pub diffs: Vec<SerializableFileDiff>,
+}
+
+impl Default for DiffAnalyzeKernelOutput {
+    fn default() -> Self {
+        Self {
+            gate_result: suite_packet_core::QualityGateResult {
+                passed: false,
+                total_coverage_pct: None,
+                changed_coverage_pct: None,
+                new_file_coverage_pct: None,
+                violations: Vec::new(),
+                issue_counts: None,
+            },
+            diagnostics: None,
+            diffs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableFileDiff {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: suite_packet_core::DiffStatus,
+    pub changed_lines: Vec<u32>,
+}
+
+impl SerializableFileDiff {
+    pub fn from_file_diff(diff: &suite_packet_core::FileDiff) -> Self {
+        Self {
+            path: diff.path.clone(),
+            old_path: diff.old_path.clone(),
+            status: diff.status,
+            changed_lines: diff.changed_lines.iter().collect(),
+        }
+    }
+
+    pub fn into_file_diff(self) -> suite_packet_core::FileDiff {
+        let mut bitmap = RoaringBitmap::new();
+        for line in self.changed_lines {
+            bitmap.insert(line);
+        }
+
+        suite_packet_core::FileDiff {
+            path: self.path,
+            old_path: self.old_path,
+            status: self.status,
+            changed_lines: bitmap,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactKernelInput {
+    pub base: Option<String>,
+    pub head: Option<String>,
+    pub testmap: String,
+    pub print_command: bool,
+    pub config_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ImpactKernelOutput {
+    pub result: suite_packet_core::ImpactResult,
+    pub known_tests: usize,
+    pub print_command: Option<String>,
+}
+
+fn format_pct(value: Option<f64>) -> String {
+    value
+        .map(|pct| format!("{pct:.2}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn default_diff_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineIngestAdapters {
+    diffy_core::pipeline::PipelineIngestAdapters {
+        ingest_coverage_auto,
+        ingest_coverage_with_format,
+        ingest_coverage_stdin,
+        ingest_diagnostics,
+    }
+}
+
+fn ingest_coverage_auto(path: &Path) -> anyhow::Result<diffy_core::model::CoverageData> {
+    covy_ingest::ingest_path(path).map_err(Into::into)
+}
+
+fn ingest_coverage_with_format(
+    path: &Path,
+    format: diffy_core::model::CoverageFormat,
+) -> anyhow::Result<diffy_core::model::CoverageData> {
+    covy_ingest::ingest_path_with_format(path, format).map_err(Into::into)
+}
+
+fn ingest_coverage_stdin(
+    format: diffy_core::model::CoverageFormat,
+) -> anyhow::Result<diffy_core::model::CoverageData> {
+    covy_ingest::ingest_reader(std::io::stdin().lock(), format).map_err(Into::into)
+}
+
+fn ingest_diagnostics(
+    path: &Path,
+) -> anyhow::Result<diffy_core::diagnostics::DiagnosticsData> {
+    covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
+}
+
+pub fn build_diff_pipeline_request(
+    input: &DiffAnalyzeKernelInput,
+) -> diffy_core::pipeline::PipelineRequest {
+    diffy_core::pipeline::PipelineRequest {
+        base: input.base.clone(),
+        head: input.head.clone(),
+        source_root: None,
+        coverage: diffy_core::pipeline::PipelineCoverageInput {
+            paths: input.coverage.clone(),
+            format: None,
+            stdin: false,
+            input_state_path: input.input.clone(),
+            default_input_state_path: Some(".covy/state/latest.bin".to_string()),
+            strip_prefixes: Vec::new(),
+            reject_paths_with_input: false,
+            no_inputs_error: "No coverage data found. Run `covy ingest` first or use --coverage."
+                .to_string(),
+        },
+        diagnostics: diffy_core::pipeline::PipelineDiagnosticsInput {
+            issue_patterns: input.issues.clone(),
+            issues_state_path: input.issues_state.clone(),
+            no_issues_state: input.no_issues_state,
+            default_issues_state_path: ".covy/state/issues.bin".to_string(),
+        },
+        gate: suite_foundation_core::config::GateConfig {
+            fail_under_total: input.fail_under_total,
+            fail_under_changed: input.fail_under_changed,
+            fail_under_new: input.fail_under_new,
+            issues: suite_foundation_core::config::IssueGateConfig {
+                max_new_errors: input.max_new_errors,
+                max_new_warnings: input.max_new_warnings,
+                max_new_issues: input.max_new_issues,
+            },
+        },
+    }
+}
+
+pub fn build_diff_analyze_envelope(
+    output: &diffy_core::pipeline::PipelineOutput,
+    base: &str,
+    head: &str,
+) -> suite_packet_core::EnvelopeV1<DiffAnalyzeKernelOutput> {
+    let kernel_output = DiffAnalyzeKernelOutput {
+        gate_result: output.gate_result.clone(),
+        diagnostics: output.diagnostics.clone(),
+        diffs: output
+            .changed_line_context
+            .diffs
+            .iter()
+            .map(SerializableFileDiff::from_file_diff)
+            .collect(),
+    };
+
+    let mut changed_paths = output
+        .changed_line_context
+        .changed_paths
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    changed_paths.sort();
+
+    let gate_summary = format!(
+        "passed: {}\nchanged_coverage_pct: {}\ntotal_coverage_pct: {}\nnew_file_coverage_pct: {}\nviolations: {}",
+        kernel_output.gate_result.passed,
+        format_pct(kernel_output.gate_result.changed_coverage_pct),
+        format_pct(kernel_output.gate_result.total_coverage_pct),
+        format_pct(kernel_output.gate_result.new_file_coverage_pct),
+        if kernel_output.gate_result.violations.is_empty() {
+            "none".to_string()
+        } else {
+            kernel_output.gate_result.violations.join("; ")
+        }
+    );
+
+    let changed_file_body = if changed_paths.is_empty() {
+        "No changed files".to_string()
+    } else {
+        changed_paths.join("\n")
+    };
+
+    let files = changed_paths
+        .iter()
+        .map(|path| suite_packet_core::FileRef {
+            path: path.clone(),
+            relevance: Some(0.75),
+            source: Some("diffy.analyze".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let payload_bytes = serde_json::to_vec(&kernel_output).unwrap_or_default().len();
+
+    suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "diffy".to_string(),
+        kind: "diff_analyze".to_string(),
+        hash: String::new(),
+        summary: format!("{gate_summary}\nchanged_files: {changed_file_body}"),
+        files,
+        symbols: Vec::new(),
+        risk: None,
+        confidence: Some(if output.gate_result.passed { 1.0 } else { 0.8 }),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: changed_paths,
+            git_base: Some(base.to_string()),
+            git_head: Some(head.to_string()),
+            generated_at_unix: now_unix(),
+        },
+        payload: kernel_output,
+    }
+    .with_canonical_hash_and_real_budget()
+}
+
+pub fn build_test_impact_envelope(
+    output: &testy_core::command_impact::ImpactLegacyOutput,
+    testmap_path: &str,
+    git_base: Option<&str>,
+    git_head: Option<&str>,
+) -> suite_packet_core::EnvelopeV1<ImpactKernelOutput> {
+    let impact_output = ImpactKernelOutput {
+        result: output.result.clone(),
+        known_tests: output.known_tests,
+        print_command: output.print_command.clone(),
+    };
+
+    let mut paths = output.result.missing_mappings.clone();
+    paths.sort();
+    paths.dedup();
+
+    let mut symbol_refs = output.result.selected_tests.clone();
+    symbol_refs.extend(output.result.smoke_tests.clone());
+    symbol_refs.sort();
+    symbol_refs.dedup();
+
+    let summary = format!(
+        "selected: {}\nknown: {}\nmissing: {}\nconfidence: {:.2}\nstale: {}\nescalate_full_suite: {}",
+        output.result.selected_tests.len(),
+        output.known_tests,
+        output.result.missing_mappings.len(),
+        output.result.confidence,
+        output.result.stale,
+        output.result.escalate_full_suite,
+    );
+
+    let files = paths
+        .iter()
+        .map(|path: &String| suite_packet_core::FileRef {
+            path: path.clone(),
+            relevance: Some(0.8),
+            source: Some("testy.impact".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let symbols = symbol_refs
+        .iter()
+        .map(|symbol: &String| suite_packet_core::SymbolRef {
+            name: symbol.clone(),
+            file: None,
+            kind: Some("test_id".to_string()),
+            relevance: Some(0.8),
+            source: Some("testy.impact".to_string()),
+        })
+        .collect::<Vec<_>>();
+
+    let payload_bytes = serde_json::to_vec(&impact_output).unwrap_or_default().len();
+
+    suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "testy".to_string(),
+        kind: "test_impact".to_string(),
+        hash: String::new(),
+        summary,
+        files,
+        symbols,
+        risk: None,
+        confidence: Some(output.result.confidence.clamp(0.0, 1.0)),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: vec![testmap_path.to_string()],
+            git_base: git_base.map(ToOwned::to_owned),
+            git_head: git_head.map(ToOwned::to_owned),
+            generated_at_unix: now_unix(),
+        },
+        payload: impact_output,
+    }
+    .with_canonical_hash_and_real_budget()
 }
 
 fn run_governed_assemble(
@@ -874,33 +1205,31 @@ fn run_governed_assemble(
     })
 }
 
-fn run_agenty_state_write(
-    ctx: &mut ExecutionContext,
-    _input_packets: &[KernelPacket],
-) -> Result<ReducerResult, KernelError> {
-    let event: suite_packet_core::AgentStateEventPayload =
-        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
-            KernelError::ReducerFailed {
-                target: ctx.target.clone(),
-                detail: format!("invalid reducer input: {source}"),
-            }
-        })?;
-    validate_agent_state_event(&event).map_err(|detail| KernelError::InvalidRequest { detail })?;
-
-    let payload_bytes = serde_json::to_vec(&event).unwrap_or_default().len();
+fn build_agent_state_packet(
+    target: &str,
+    event: &suite_packet_core::AgentStateEventPayload,
+    source: &str,
+) -> Result<
+    (
+        suite_packet_core::EnvelopeV1<suite_packet_core::AgentStateEventPayload>,
+        KernelPacket,
+    ),
+    KernelError,
+> {
+    let payload_bytes = serde_json::to_vec(event).unwrap_or_default().len();
     let envelope = suite_packet_core::EnvelopeV1 {
         version: "1".to_string(),
         tool: "agenty".to_string(),
         kind: "agent_state".to_string(),
         hash: String::new(),
-        summary: summarize_agent_state_event(&event),
+        summary: summarize_agent_state_event(event),
         files: event
             .paths
             .iter()
             .map(|path| suite_packet_core::FileRef {
                 path: path.clone(),
                 relevance: Some(1.0),
-                source: Some("agenty.state.write".to_string()),
+                source: Some(source.to_string()),
             })
             .collect(),
         symbols: event
@@ -911,7 +1240,7 @@ fn run_agenty_state_write(
                 file: None,
                 kind: Some("focus_symbol".to_string()),
                 relevance: Some(1.0),
-                source: Some("agenty.state.write".to_string()),
+                source: Some(source.to_string()),
             })
             .collect(),
         risk: None,
@@ -934,9 +1263,6 @@ fn run_agenty_state_write(
     }
     .with_canonical_hash_and_real_budget();
 
-    ctx.set_shared("task_id", Value::String(event.task_id.clone()));
-    ctx.set_shared("event_id", Value::String(event.event_id.clone()));
-
     let packet = KernelPacket {
         packet_id: Some(format!(
             "agenty-state-{}",
@@ -944,14 +1270,14 @@ fn run_agenty_state_write(
         )),
         format: default_packet_format(),
         body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
-            target: ctx.target.clone(),
+            target: target.to_string(),
             detail: source.to_string(),
         })?,
         token_usage: Some(envelope.budget_cost.est_tokens),
         runtime_ms: Some(envelope.budget_cost.runtime_ms),
         metadata: json!({
             "tool": "agenty",
-            "reducer": "state.write",
+            "reducer": source,
             "kind": "agent_state",
             "task_id": event.task_id,
             "event_id": event.event_id,
@@ -959,6 +1285,26 @@ fn run_agenty_state_write(
             "hash": envelope.hash,
         }),
     };
+
+    Ok((envelope, packet))
+}
+
+fn run_agenty_state_write(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let event: suite_packet_core::AgentStateEventPayload =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+    validate_agent_state_event(&event).map_err(|detail| KernelError::InvalidRequest { detail })?;
+    let (envelope, packet) = build_agent_state_packet(&ctx.target, &event, "agenty.state.write")?;
+
+    ctx.set_shared("task_id", Value::String(event.task_id.clone()));
+    ctx.set_shared("event_id", Value::String(event.event_id.clone()));
 
     Ok(ReducerResult {
         output_packets: vec![packet],
@@ -1080,6 +1426,22 @@ fn run_agenty_state_snapshot(
     })
 }
 
+fn load_agent_snapshot(
+    ctx: &ExecutionContext,
+) -> Result<Option<suite_packet_core::AgentSnapshotPayload>, KernelError> {
+    let Some(task_id) = ctx
+        .policy_context
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let entries = ctx.cache_entries()?;
+    Ok(Some(derive_agent_snapshot(&entries, task_id)))
+}
+
 fn run_contextq_assemble(
     ctx: &mut ExecutionContext,
     input_packets: &[KernelPacket],
@@ -1090,16 +1452,7 @@ fn run_contextq_assemble(
         });
     }
 
-    let agent_snapshot = ctx
-        .policy_context
-        .get("task_id")
-        .and_then(Value::as_str)
-        .filter(|task_id| !task_id.trim().is_empty())
-        .map(|task_id| {
-            let entries = ctx.cache_entries()?;
-            Ok::<_, KernelError>(derive_agent_snapshot(&entries, task_id))
-        })
-        .transpose()?;
+    let agent_snapshot = load_agent_snapshot(ctx)?;
 
     let options = contextq_core::AssembleOptions {
         budget_tokens: ctx
@@ -1388,6 +1741,192 @@ fn run_guardy_check(
     })
 }
 
+fn run_diffy_analyze_reducer(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let input: DiffAnalyzeKernelInput =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+
+    let git_base = input.base.clone();
+    let git_head = input.head.clone();
+    let request = build_diff_pipeline_request(&input);
+    let adapters = default_diff_pipeline_ingest_adapters();
+    let output = diffy_core::pipeline::run_analysis(request, &adapters).map_err(|source| {
+        KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        }
+    })?;
+    let envelope = build_diff_analyze_envelope(&output, &git_base, &git_head);
+
+    let mut output_packets = vec![KernelPacket {
+        packet_id: Some(format!(
+            "diffy-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
+        format: default_packet_format(),
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
+        metadata: json!({
+            "reducer": "diffy.analyze",
+            "kind": "diff_analyze",
+            "hash": envelope.hash,
+            "passed": output.gate_result.passed,
+        }),
+    }];
+
+    if let Some(task_id) = ctx
+        .policy_context
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.trim().is_empty())
+    {
+        let mut changed_paths = output
+            .changed_line_context
+            .changed_paths
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        changed_paths.sort();
+
+        let clear_focus = suite_packet_core::AgentStateEventPayload {
+            task_id: task_id.to_string(),
+            event_id: format!("system-diff-focus-clear-{}", envelope.hash),
+            occurred_at_unix: envelope.provenance.generated_at_unix,
+            actor: "system:diffy.analyze".to_string(),
+            paths: Vec::new(),
+            symbols: Vec::new(),
+            kind: suite_packet_core::AgentStateEventKind::FocusCleared,
+            data: suite_packet_core::AgentStateEventData::FocusCleared { clear_all: true },
+        };
+        validate_agent_state_event(&clear_focus)
+            .map_err(|detail| KernelError::InvalidRequest { detail })?;
+        let (_, focus_clear_packet) =
+            build_agent_state_packet(&ctx.target, &clear_focus, "diffy.analyze")?;
+        output_packets.push(focus_clear_packet);
+
+        if !changed_paths.is_empty() {
+            let focus_event = suite_packet_core::AgentStateEventPayload {
+                task_id: task_id.to_string(),
+                event_id: format!("system-diff-focus-set-{}", envelope.hash),
+                occurred_at_unix: envelope.provenance.generated_at_unix,
+                actor: "system:diffy.analyze".to_string(),
+                paths: changed_paths.clone(),
+                symbols: Vec::new(),
+                kind: suite_packet_core::AgentStateEventKind::FocusSet,
+                data: suite_packet_core::AgentStateEventData::FocusSet { note: None },
+            };
+            validate_agent_state_event(&focus_event)
+                .map_err(|detail| KernelError::InvalidRequest { detail })?;
+            let (_, focus_packet) =
+                build_agent_state_packet(&ctx.target, &focus_event, "diffy.analyze")?;
+            output_packets.push(focus_packet);
+        }
+
+        let step_event = suite_packet_core::AgentStateEventPayload {
+            task_id: task_id.to_string(),
+            event_id: format!("system-diff-step-{}", envelope.hash),
+            occurred_at_unix: envelope.provenance.generated_at_unix,
+            actor: "system:diffy.analyze".to_string(),
+            paths: changed_paths,
+            symbols: Vec::new(),
+            kind: suite_packet_core::AgentStateEventKind::StepCompleted,
+            data: suite_packet_core::AgentStateEventData::StepCompleted {
+                step_id: "diff.analyze".to_string(),
+            },
+        };
+        validate_agent_state_event(&step_event)
+            .map_err(|detail| KernelError::InvalidRequest { detail })?;
+        let (_, step_packet) = build_agent_state_packet(&ctx.target, &step_event, "diffy.analyze")?;
+        output_packets.push(step_packet);
+
+        ctx.set_shared("task_id", Value::String(task_id.to_string()));
+    }
+
+    Ok(ReducerResult {
+        output_packets,
+        metadata: json!({
+            "reducer": "diffy.analyze",
+            "kind": "diff_analyze",
+            "passed": output.gate_result.passed,
+        }),
+    })
+}
+
+fn run_testy_impact_reducer(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let input: ImpactKernelInput =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+
+    let testmap_path = input.testmap.clone();
+    let git_base = input.base.clone();
+    let git_head = input.head.clone();
+    let adapters = testy_cli_common::adapters::default_impact_adapters();
+    let output = testy_core::command_impact::run_legacy_impact(
+        testy_core::command_impact::LegacyImpactArgs {
+            base: input.base.clone(),
+            head: input.head.clone(),
+            testmap: input.testmap.clone(),
+            print_command: input.print_command,
+        },
+        &input.config_path,
+        &adapters,
+    )
+    .map_err(|source| KernelError::ReducerFailed {
+        target: ctx.target.clone(),
+        detail: source.to_string(),
+    })?;
+
+    let envelope =
+        build_test_impact_envelope(&output, &testmap_path, git_base.as_deref(), git_head.as_deref());
+
+    Ok(ReducerResult {
+        output_packets: vec![KernelPacket {
+            packet_id: Some(format!(
+                "testy-{}",
+                envelope.hash.chars().take(12).collect::<String>()
+            )),
+            format: "packet-json".to_string(),
+            body: serde_json::to_value(&envelope).map_err(|source| {
+                KernelError::ReducerFailed {
+                    target: ctx.target.clone(),
+                    detail: source.to_string(),
+                }
+            })?,
+            token_usage: Some(envelope.budget_cost.est_tokens),
+            runtime_ms: Some(envelope.budget_cost.runtime_ms),
+            metadata: json!({
+                "reducer": "testy.impact",
+                "kind": "test_impact",
+                "hash": envelope.hash,
+                "selected_tests": output.result.selected_tests.len(),
+            }),
+        }],
+        metadata: json!({
+            "reducer": "testy.impact",
+            "kind": "test_impact",
+            "selected_tests": output.result.selected_tests.len(),
+        }),
+    })
+}
+
 fn run_stacky_slice(
     ctx: &mut ExecutionContext,
     _input_packets: &[KernelPacket],
@@ -1398,8 +1937,22 @@ fn run_stacky_slice(
         detail: format!("invalid reducer input: {source}"),
     })?;
 
+    let agent_snapshot = load_agent_snapshot(ctx)?;
     let envelope = stacky_core::slice_to_envelope(input);
     let payload = envelope.payload.clone();
+    let focus_paths = agent_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.focus_paths.clone())
+        .unwrap_or_default();
+    let mut matching_files = BTreeSet::new();
+    let mut unrelated_files = BTreeSet::new();
+    for file in envelope.files.iter().map(|file| file.path.as_str()) {
+        if path_matches_any(&focus_paths, file) {
+            matching_files.insert(file.to_string());
+        } else {
+            unrelated_files.insert(file.to_string());
+        }
+    }
 
     let kernel_packet = KernelPacket {
         packet_id: Some(format!(
@@ -1420,6 +1973,11 @@ fn run_stacky_slice(
             "hash": envelope.hash,
             "unique_failures": payload.unique_failures,
             "duplicates_removed": payload.duplicates_removed,
+            "task_state": {
+                "focus_paths": focus_paths,
+                "matching_files": matching_files,
+                "unrelated_files": unrelated_files,
+            },
         }),
     };
 
@@ -1430,6 +1988,10 @@ fn run_stacky_slice(
             "kind": "stack_slice",
             "unique_failures": payload.unique_failures,
             "duplicates_removed": payload.duplicates_removed,
+            "task_state": {
+                "matching_failures": matching_files.len(),
+                "unrelated_failures": unrelated_files.len(),
+            },
         }),
     })
 }
@@ -1533,11 +2095,25 @@ fn run_mapy_repo(
     ctx: &mut ExecutionContext,
     _input_packets: &[KernelPacket],
 ) -> Result<ReducerResult, KernelError> {
-    let input: mapy_core::RepoMapRequest = serde_json::from_value(ctx.reducer_input.clone())
+    let mut input: mapy_core::RepoMapRequest = serde_json::from_value(ctx.reducer_input.clone())
         .map_err(|source| KernelError::ReducerFailed {
             target: ctx.target.clone(),
             detail: format!("invalid reducer input: {source}"),
         })?;
+    if let Some(snapshot) = load_agent_snapshot(ctx)? {
+        for path in snapshot.focus_paths {
+            if !input.focus_paths.iter().any(|existing| existing == &path) {
+                input.focus_paths.push(path);
+            }
+        }
+        for symbol in snapshot.focus_symbols {
+            if !input.focus_symbols.iter().any(|existing| existing == &symbol) {
+                input.focus_symbols.push(symbol);
+            }
+        }
+    }
+    let effective_focus_paths = input.focus_paths.clone();
+    let effective_focus_symbols = input.focus_symbols.clone();
 
     let envelope =
         mapy_core::build_repo_map(input).map_err(|source| KernelError::ReducerFailed {
@@ -1564,6 +2140,9 @@ fn run_mapy_repo(
             "hash": envelope.hash,
             "files_ranked": envelope.payload.files_ranked.len(),
             "symbols_ranked": envelope.payload.symbols_ranked.len(),
+            "focus_paths": effective_focus_paths,
+            "focus_symbols": effective_focus_symbols,
+            "focus_hits": envelope.payload.focus_hits.clone(),
         }),
     };
 
@@ -1572,6 +2151,9 @@ fn run_mapy_repo(
         metadata: json!({
             "reducer": "mapy.repo",
             "kind": "repo_map",
+            "focus_paths": effective_focus_paths,
+            "focus_symbols": effective_focus_symbols,
+            "focus_hits": envelope.payload.focus_hits.clone(),
         }),
     })
 }
@@ -2136,7 +2718,7 @@ fn derive_agent_snapshot(
 ) -> suite_packet_core::AgentSnapshotPayload {
     let mut events = entries
         .iter()
-        .filter_map(extract_agent_state_event)
+        .flat_map(extract_agent_state_events)
         .filter(|event| event.task_id == task_id)
         .collect::<Vec<_>>();
 
@@ -2234,19 +2816,33 @@ fn derive_agent_snapshot(
     }
 }
 
-fn extract_agent_state_event(
+fn extract_agent_state_events(
     entry: &context_memory_core::PacketCacheEntry,
-) -> Option<suite_packet_core::AgentStateEventPayload> {
-    if entry.target != "agenty.state.write" {
-        return None;
-    }
+) -> Vec<suite_packet_core::AgentStateEventPayload> {
+    entry
+        .packets
+        .iter()
+        .filter_map(|packet| {
+            serde_json::from_value::<
+                suite_packet_core::EnvelopeV1<suite_packet_core::AgentStateEventPayload>,
+            >(packet.body.clone())
+            .ok()
+            .and_then(|envelope| {
+                (envelope.tool == "agenty" && envelope.kind == "agent_state")
+                    .then_some(envelope.payload)
+            })
+        })
+        .collect()
+}
 
-    entry.packets.iter().find_map(|packet| {
-        serde_json::from_value::<
-            suite_packet_core::EnvelopeV1<suite_packet_core::AgentStateEventPayload>,
-        >(packet.body.clone())
-        .ok()
-        .map(|envelope| envelope.payload)
+fn path_matches_any(patterns: &[String], candidate: &str) -> bool {
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.trim();
+        !pattern.is_empty()
+            && (candidate == pattern
+                || candidate.starts_with(pattern)
+                || pattern.starts_with(candidate)
+                || candidate.contains(pattern))
     })
 }
 
@@ -2277,9 +2873,76 @@ fn merge_json(left: Value, right: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::AtomicU64;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::tempdir;
+
+    fn fixture(rel: &str) -> String {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        workspace
+            .join("tests")
+            .join("fixtures")
+            .join(rel)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn git_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed with {status}", args);
+    }
+
+    fn setup_diff_repo(dir: &Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/alpha.rs"), "pub fn alpha() -> i32 { 1 }\n").unwrap();
+        std::fs::write(dir.join("src/beta.rs"), "pub fn beta() -> i32 { 2 }\n").unwrap();
+
+        git(dir, &["init"]);
+        git(dir, &["add", "src/alpha.rs", "src/beta.rs"]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+
+        std::fs::write(dir.join("src/alpha.rs"), "pub fn alpha() -> i32 { 3 }\n").unwrap();
+        git(dir, &["add", "src/alpha.rs"]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "change alpha",
+            ],
+        );
+    }
 
     fn write_policy_file(path: &Path, tools: &[&str], reducers: &[&str]) {
         let tools_yaml = if tools.is_empty() {
@@ -3260,6 +3923,81 @@ policy:
         assert!(envelope.payload.open_questions.is_empty());
         assert_eq!(envelope.payload.active_decisions.len(), 1);
         assert_eq!(envelope.payload.active_decisions[0].id, "d1");
+    }
+
+    #[test]
+    fn diffy_analyze_emits_task_state_focus_packets() {
+        let _lock = git_test_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        setup_diff_repo(dir.path());
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let kernel =
+            Kernel::with_v1_reducers_and_persistence(PersistConfig::new(dir.path().to_path_buf()));
+        let response = kernel
+            .execute(KernelRequest {
+                target: "diffy.analyze".to_string(),
+                reducer_input: json!({
+                    "base": "HEAD~1",
+                    "head": "HEAD",
+                    "fail_under_changed": null,
+                    "fail_under_total": null,
+                    "fail_under_new": null,
+                    "max_new_errors": null,
+                    "max_new_warnings": null,
+                    "max_new_issues": null,
+                    "issues": [],
+                    "issues_state": null,
+                    "no_issues_state": true,
+                    "coverage": [fixture("lcov/basic.info")],
+                    "input": null
+                }),
+                policy_context: json!({
+                    "task_id": "task-diff"
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert_eq!(response.output_packets.len(), 4);
+        let focus_packet = response
+            .output_packets
+            .iter()
+            .find(|packet| {
+                packet
+                    .metadata
+                    .get("event_kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "focus_set")
+            })
+            .expect("focus_set packet should be emitted");
+        let focus_envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentStateEventPayload> =
+            serde_json::from_value(focus_packet.body.clone()).unwrap();
+        assert_eq!(focus_envelope.payload.paths, vec!["src/alpha.rs"]);
+
+        let snapshot = kernel
+            .execute(KernelRequest {
+                target: "agenty.state.snapshot".to_string(),
+                reducer_input: json!({
+                    "task_id": "task-diff"
+                }),
+                policy_context: json!({
+                    "disable_cache": true
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        let snapshot_envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentSnapshotPayload> =
+            serde_json::from_value(snapshot.output_packets[0].body.clone()).unwrap();
+        assert_eq!(snapshot_envelope.payload.focus_paths, vec!["src/alpha.rs"]);
+        assert!(snapshot_envelope
+            .payload
+            .completed_steps
+            .iter()
+            .any(|step| step == "diff.analyze"));
     }
 
     #[test]

@@ -20,6 +20,12 @@ stacky-core = { version = "0.2.0", path = "../stacky-core" }
 buildy-core = { version = "0.2.0", path = "../buildy-core" }
 suite-proxy-core = { version = "0.2.0", path = "../suite-proxy-core" }
 mapy-core = { version = "0.2.0", path = "../mapy-core" }
+diffy-core = { version = "0.2.0", path = "../diffy-core" }
+testy-core = { version = "0.2.0", path = "../testy-core" }
+testy-cli-common = { version = "0.2.0", path = "../testy-cli-common" }
+covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
+roaring.workspace = true
+anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

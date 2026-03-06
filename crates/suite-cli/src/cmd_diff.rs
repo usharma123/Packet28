@@ -3,10 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::Args;
-use roaring::RoaringBitmap;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use suite_foundation_core::config::{GateConfig, IssueGateConfig};
 use suite_foundation_core::CovyConfig;
 
 #[derive(Args)]
@@ -71,6 +68,10 @@ pub struct AnalyzeArgs {
     #[arg(long)]
     cache: bool,
 
+    /// Optional task identifier for agent-state propagation.
+    #[arg(long)]
+    task_id: Option<String>,
+
     /// Run governed packet path using this context policy config (context.yaml).
     #[arg(long)]
     context_config: Option<String>,
@@ -84,98 +85,23 @@ pub struct AnalyzeArgs {
     context_budget_bytes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiffAnalyzeKernelInput {
-    base: String,
-    head: String,
-    fail_under_changed: Option<f64>,
-    fail_under_total: Option<f64>,
-    fail_under_new: Option<f64>,
-    max_new_errors: Option<u32>,
-    max_new_warnings: Option<u32>,
-    max_new_issues: Option<u32>,
-    issues: Vec<String>,
-    issues_state: Option<String>,
-    no_issues_state: bool,
-    coverage: Vec<String>,
-    input: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiffAnalyzeKernelOutput {
-    gate_result: suite_packet_core::QualityGateResult,
-    diagnostics: Option<suite_packet_core::DiagnosticsData>,
-    diffs: Vec<SerializableFileDiff>,
-}
-
-impl Default for DiffAnalyzeKernelOutput {
-    fn default() -> Self {
-        Self {
-            gate_result: suite_packet_core::QualityGateResult {
-                passed: false,
-                total_coverage_pct: None,
-                changed_coverage_pct: None,
-                new_file_coverage_pct: None,
-                violations: Vec::new(),
-                issue_counts: None,
-            },
-            diagnostics: None,
-            diffs: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializableFileDiff {
-    path: String,
-    old_path: Option<String>,
-    status: suite_packet_core::DiffStatus,
-    changed_lines: Vec<u32>,
-}
-
-impl SerializableFileDiff {
-    fn from_file_diff(diff: &suite_packet_core::FileDiff) -> Self {
-        Self {
-            path: diff.path.clone(),
-            old_path: diff.old_path.clone(),
-            status: diff.status,
-            changed_lines: diff.changed_lines.iter().collect(),
-        }
-    }
-
-    fn into_file_diff(self) -> suite_packet_core::FileDiff {
-        let mut bitmap = RoaringBitmap::new();
-        for line in self.changed_lines {
-            bitmap.insert(line);
-        }
-
-        suite_packet_core::FileDiff {
-            path: self.path,
-            old_path: self.old_path,
-            status: self.status,
-            changed_lines: bitmap,
-        }
-    }
-}
-
-fn format_pct(value: Option<f64>) -> String {
-    value
-        .map(|pct| format!("{pct:.2}"))
-        .unwrap_or_else(|| "n/a".to_string())
-}
-
 pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     let governed_context_config = args.context_config.clone();
     let governed_budget_tokens = args.context_budget_tokens;
     let governed_budget_bytes = args.context_budget_bytes;
-    let policy_context = governed_context_config
-        .as_ref()
-        .map(|config_path| {
-            json!({
-                "config_path": config_path,
-            })
-        })
-        .unwrap_or(Value::Null);
+    let policy_context = match (governed_context_config.as_ref(), args.task_id.as_ref()) {
+        (Some(config_path), Some(task_id)) => json!({
+            "config_path": config_path,
+            "task_id": task_id,
+        }),
+        (Some(config_path), None) => json!({
+            "config_path": config_path,
+        }),
+        (None, Some(task_id)) => json!({
+            "task_id": task_id,
+        }),
+        (None, None) => Value::Null,
+    };
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let machine_profile =
         crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
@@ -188,7 +114,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
 
-    let kernel_input = DiffAnalyzeKernelInput {
+    let kernel_input = context_kernel_core::DiffAnalyzeKernelInput {
         base: base.to_string(),
         head: head.to_string(),
         fail_under_changed: args.fail_under_changed.or(config.gate.fail_under_changed),
@@ -204,12 +130,16 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         input: args.input,
     };
 
-    if machine_profile.is_some() && !args.legacy_json && !args.cache && governed_context_config.is_none()
+    if machine_profile.is_some()
+        && !args.legacy_json
+        && !args.cache
+        && args.task_id.is_none()
+        && governed_context_config.is_none()
     {
-        let request = build_pipeline_request(&kernel_input);
+        let request = context_kernel_core::build_diff_pipeline_request(&kernel_input);
         let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
         let output = diffy_core::pipeline::run_analysis(request, &adapters)?;
-        let envelope = build_diff_envelope(&output, base, head);
+        let envelope = context_kernel_core::build_diff_analyze_envelope(&output, base, head);
         crate::cmd_common::emit_machine_envelope(
             suite_packet_core::PACKET_TYPE_DIFF_ANALYZE,
             &envelope,
@@ -221,8 +151,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         return Ok(if output.gate_result.passed { 0 } else { 1 });
     }
 
-    let mut kernel = build_kernel(args.cache, std::env::current_dir()?);
-    kernel.register_reducer("diffy.analyze", run_diff_analyze_reducer);
+    let kernel = build_kernel(args.cache || args.task_id.is_some(), std::env::current_dir()?);
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "diffy.analyze".to_string(),
         reducer_input: serde_json::to_value(kernel_input)?,
@@ -234,7 +163,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let envelope: suite_packet_core::EnvelopeV1<DiffAnalyzeKernelOutput> =
+    let envelope: suite_packet_core::EnvelopeV1<context_kernel_core::DiffAnalyzeKernelOutput> =
         serde_json::from_value(output_packet.body.clone())
             .map_err(|source| anyhow!("invalid diff analyze output packet: {source}"))?;
     let output = envelope.payload.clone();
@@ -251,6 +180,8 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
             },
             policy_context: json!({
                 "config_path": context_config,
+                "task_id": args.task_id,
+                "disable_cache": args.task_id.is_some(),
             }),
             ..context_kernel_core::KernelRequest::default()
         })?)
@@ -366,7 +297,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                     .diffs
                     .iter()
                     .cloned()
-                    .map(SerializableFileDiff::into_file_diff)
+                    .map(context_kernel_core::SerializableFileDiff::into_file_diff)
                     .collect::<Vec<_>>();
                 diffy_core::report::render_issues_terminal(diag, Some(&diffs));
             }
@@ -422,182 +353,4 @@ fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
         );
     }
     context_kernel_core::Kernel::with_v1_reducers()
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn build_pipeline_request(input: &DiffAnalyzeKernelInput) -> diffy_core::pipeline::PipelineRequest {
-    diffy_core::pipeline::PipelineRequest {
-        base: input.base.clone(),
-        head: input.head.clone(),
-        source_root: None,
-        coverage: diffy_core::pipeline::PipelineCoverageInput {
-            paths: input.coverage.clone(),
-            format: None,
-            stdin: false,
-            input_state_path: input.input.clone(),
-            default_input_state_path: Some(".covy/state/latest.bin".to_string()),
-            strip_prefixes: Vec::new(),
-            reject_paths_with_input: false,
-            no_inputs_error: "No coverage data found. Run `covy ingest` first or use --coverage."
-                .to_string(),
-        },
-        diagnostics: diffy_core::pipeline::PipelineDiagnosticsInput {
-            issue_patterns: input.issues.clone(),
-            issues_state_path: input.issues_state.clone(),
-            no_issues_state: input.no_issues_state,
-            default_issues_state_path: ".covy/state/issues.bin".to_string(),
-        },
-        gate: GateConfig {
-            fail_under_total: input.fail_under_total,
-            fail_under_changed: input.fail_under_changed,
-            fail_under_new: input.fail_under_new,
-            issues: IssueGateConfig {
-                max_new_errors: input.max_new_errors,
-                max_new_warnings: input.max_new_warnings,
-                max_new_issues: input.max_new_issues,
-            },
-        },
-    }
-}
-
-fn build_diff_envelope(
-    output: &diffy_core::pipeline::PipelineOutput,
-    base: &str,
-    head: &str,
-) -> suite_packet_core::EnvelopeV1<DiffAnalyzeKernelOutput> {
-    let kernel_output = DiffAnalyzeKernelOutput {
-        gate_result: output.gate_result.clone(),
-        diagnostics: output.diagnostics.clone(),
-        diffs: output
-            .changed_line_context
-            .diffs
-            .iter()
-            .map(SerializableFileDiff::from_file_diff)
-            .collect(),
-    };
-
-    let mut changed_paths = output
-        .changed_line_context
-        .changed_paths
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    changed_paths.sort();
-
-    let gate_summary = format!(
-        "passed: {}\nchanged_coverage_pct: {}\ntotal_coverage_pct: {}\nnew_file_coverage_pct: {}\nviolations: {}",
-        kernel_output.gate_result.passed,
-        format_pct(kernel_output.gate_result.changed_coverage_pct),
-        format_pct(kernel_output.gate_result.total_coverage_pct),
-        format_pct(kernel_output.gate_result.new_file_coverage_pct),
-        if kernel_output.gate_result.violations.is_empty() {
-            "none".to_string()
-        } else {
-            kernel_output.gate_result.violations.join("; ")
-        }
-    );
-
-    let changed_file_body = if changed_paths.is_empty() {
-        "No changed files".to_string()
-    } else {
-        changed_paths.join("\n")
-    };
-
-    let files = changed_paths
-        .iter()
-        .map(|path| suite_packet_core::FileRef {
-            path: path.clone(),
-            relevance: Some(0.75),
-            source: Some("diffy.analyze".to_string()),
-        })
-        .collect::<Vec<_>>();
-    let payload_bytes = serde_json::to_vec(&kernel_output).unwrap_or_default().len();
-
-    suite_packet_core::EnvelopeV1 {
-        version: "1".to_string(),
-        tool: "diffy".to_string(),
-        kind: "diff_analyze".to_string(),
-        hash: String::new(),
-        summary: format!("{gate_summary}\nchanged_files: {changed_file_body}"),
-        files,
-        symbols: Vec::new(),
-        risk: None,
-        confidence: Some(if output.gate_result.passed { 1.0 } else { 0.8 }),
-        budget_cost: suite_packet_core::BudgetCost {
-            est_tokens: 0,
-            est_bytes: 0,
-            runtime_ms: 0,
-            tool_calls: 1,
-            payload_est_tokens: Some((payload_bytes / 4) as u64),
-            payload_est_bytes: Some(payload_bytes),
-        },
-        provenance: suite_packet_core::Provenance {
-            inputs: changed_paths,
-            git_base: Some(base.to_string()),
-            git_head: Some(head.to_string()),
-            generated_at_unix: now_unix(),
-        },
-        payload: kernel_output,
-    }
-    .with_canonical_hash_and_real_budget()
-}
-
-fn run_diff_analyze_reducer(
-    ctx: &mut context_kernel_core::ExecutionContext,
-    _input_packets: &[context_kernel_core::KernelPacket],
-) -> Result<context_kernel_core::ReducerResult, context_kernel_core::KernelError> {
-    let input: DiffAnalyzeKernelInput =
-        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
-            context_kernel_core::KernelError::ReducerFailed {
-                target: ctx.target.clone(),
-                detail: format!("invalid reducer input: {source}"),
-            }
-        })?;
-
-    let git_base = input.base.clone();
-    let git_head = input.head.clone();
-    let request = build_pipeline_request(&input);
-    let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
-    let output = diffy_core::pipeline::run_analysis(request, &adapters).map_err(|source| {
-        context_kernel_core::KernelError::ReducerFailed {
-            target: ctx.target.clone(),
-            detail: source.to_string(),
-        }
-    })?;
-    let envelope = build_diff_envelope(&output, &git_base, &git_head);
-
-    Ok(context_kernel_core::ReducerResult {
-        output_packets: vec![context_kernel_core::KernelPacket {
-            packet_id: Some(format!(
-                "diffy-{}",
-                envelope.hash.chars().take(12).collect::<String>()
-            )),
-            format: "packet-json".to_string(),
-            body: serde_json::to_value(&envelope).map_err(|source| {
-                context_kernel_core::KernelError::ReducerFailed {
-                    target: ctx.target.clone(),
-                    detail: source.to_string(),
-                }
-            })?,
-            token_usage: Some(envelope.budget_cost.est_tokens),
-            runtime_ms: Some(envelope.budget_cost.runtime_ms),
-            metadata: json!({
-                "reducer": "diffy.analyze",
-                "kind": "diff_analyze",
-                "hash": envelope.hash,
-                "passed": output.gate_result.passed,
-            }),
-        }],
-        metadata: json!({
-            "reducer": "diffy.analyze",
-            "kind": "diff_analyze",
-            "passed": output.gate_result.passed,
-        }),
-    })
 }

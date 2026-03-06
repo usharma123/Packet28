@@ -267,6 +267,56 @@ enum Beta {
     .unwrap();
 }
 
+fn git(root: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {:?} failed with {status}", args);
+}
+
+fn setup_changed_repo(root: &Path) {
+    write_repo_fixture(root);
+    git(root, &["init"]);
+    git(root, &["add", "src/alpha.rs", "src/beta.rs"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    fs::write(
+        root.join("src/alpha.rs"),
+        r#"
+use crate::beta::Beta;
+
+fn alpha() -> i32 { 2 }
+struct Alpha;
+"#,
+    )
+    .unwrap();
+    git(root, &["add", "src/alpha.rs"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "change alpha",
+        ],
+    );
+}
+
 fn kernel_cache_file(root: &Path) -> PathBuf {
     root.join(".packet28").join("packet-cache-v1.bin")
 }
@@ -535,6 +585,68 @@ fn test_suite_diff_analyze_governed_json_metadata_shape() {
         .and_then(|meta| meta.get("governed"))
         .and_then(|governed| governed.get("budget_trim"))
         .is_some());
+}
+
+#[test]
+fn test_suite_diff_analyze_task_id_propagates_focus_to_map_repo() {
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+
+    suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "diff",
+            "analyze",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD~1",
+            "--head",
+            "HEAD",
+            "--task-id",
+            "task-diff",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "map",
+            "repo",
+            "--repo-root",
+            ".",
+            "--task-id",
+            "task-diff",
+            "--json",
+            "--packet-detail",
+            "rich",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.map.repo.v1");
+    let files = value
+        .get("packet")
+        .and_then(|packet| packet.get("files"))
+        .and_then(Value::as_array)
+        .unwrap();
+    assert_eq!(
+        files
+            .first()
+            .and_then(|file| file.get("path"))
+            .and_then(Value::as_str),
+        Some("src/alpha.rs")
+    );
+    assert!(files[0]
+        .get("relevance")
+        .and_then(Value::as_f64)
+        .unwrap()
+        > files[1].get("relevance").and_then(Value::as_f64).unwrap());
 }
 
 #[test]
