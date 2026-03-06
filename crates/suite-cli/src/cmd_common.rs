@@ -5,6 +5,15 @@ use clap::ValueEnum;
 use serde_json::{json, Value};
 use suite_packet_core::{CoverageData, CoverageFormat, EnvelopeV1, JsonProfile, PacketWrapperV1};
 
+pub fn via_daemon_env_enabled() -> bool {
+    std::env::var("PACKET28_VIA_DAEMON")
+        .ok()
+        .is_some_and(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes"
+        })
+}
+
 pub fn resolve_report_format(explicit: Option<&str>) -> String {
     match explicit {
         Some(fmt) => fmt.to_string(),

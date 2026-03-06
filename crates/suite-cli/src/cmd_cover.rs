@@ -302,6 +302,56 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     Ok(if output.gate_result.passed { 0 } else { 1 })
 }
 
+pub fn run_remote(args: CheckArgs, config_path: &str) -> Result<i32> {
+    let machine_profile =
+        crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
+    if machine_profile.is_none() || args.legacy_json || args.stdin {
+        return run(args, config_path);
+    }
+
+    let root = std::env::current_dir()?;
+    let response = crate::cmd_daemon::send_cover_check(
+        &root,
+        packet28_daemon_core::CoverCheckRequest {
+            coverage: args.coverage,
+            paths: args.paths,
+            format: args.format,
+            issues: args.issues,
+            issues_state: args.issues_state,
+            no_issues_state: args.no_issues_state,
+            base: args.base,
+            head: args.head,
+            fail_under_total: args.fail_under_total,
+            fail_under_changed: args.fail_under_changed,
+            fail_under_new: args.fail_under_new,
+            max_new_errors: args.max_new_errors,
+            max_new_warnings: args.max_new_warnings,
+            input: args.input,
+            strip_prefix: args.strip_prefix,
+            source_root: args.source_root,
+            show_missing: args.show_missing,
+            config_path: config_path.to_string(),
+        },
+    )?;
+
+    let mut effective_profile =
+        machine_profile.unwrap_or(suite_packet_core::JsonProfile::Compact);
+    if effective_profile == suite_packet_core::JsonProfile::Compact
+        && args.packet_detail == PacketDetailArg::Rich
+    {
+        effective_profile = suite_packet_core::JsonProfile::Full;
+    }
+    crate::cmd_common::emit_machine_envelope(
+        &response.packet_type,
+        &response.envelope,
+        effective_profile,
+        args.pretty,
+        &crate::cmd_common::resolve_artifact_root(None),
+        None,
+    )?;
+    Ok(response.exit_code)
+}
+
 fn parse_format(s: &str) -> Result<Option<CoverageFormat>> {
     match s {
         "lcov" => Ok(Some(CoverageFormat::Lcov)),
