@@ -52,7 +52,10 @@ pub struct SliceArgs {
 pub fn run(args: SliceArgs) -> Result<i32> {
     let input_text = read_input_text(args.input.as_deref())?;
 
-    let kernel = build_kernel(args.cache || args.task_id.is_some(), std::env::current_dir()?);
+    let kernel = build_kernel(
+        args.cache || args.task_id.is_some(),
+        std::env::current_dir()?,
+    );
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "stacky.slice".to_string(),
         reducer_input: serde_json::to_value(stacky_core::StackSliceRequest {

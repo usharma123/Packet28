@@ -424,10 +424,6 @@ pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
 }
 
 pub fn run_assemble_remote(args: AssembleArgs, daemon_root: &Path) -> Result<i32> {
-    if args.legacy_json {
-        return run_assemble(args);
-    }
-
     let profile = args
         .json
         .map(suite_packet_core::JsonProfile::from)
@@ -490,46 +486,87 @@ pub fn run_assemble_remote(args: AssembleArgs, daemon_root: &Path) -> Result<i32
             args.budget_bytes,
             "Packet28 context assemble --context-config <context.yaml>",
         );
-        crate::cmd_common::emit_machine_envelope(
-            suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE,
-            &envelope,
-            profile,
-            args.pretty,
-            &crate::cmd_common::resolve_artifact_root(None),
-            Some(json!({
-                "kernel_audit": {
-                    "governed": response.audit,
-                },
-                "kernel_metadata": {
-                    "governed": response.metadata,
-                },
-                "cache": {
-                    "governed": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                },
-                "hints": {
-                    "budget_retry": budget_hint,
-                },
-            })),
-        )?;
+        if args.legacy_json {
+            crate::cmd_common::emit_json(
+                &json!({
+                    "schema_version": "suite.context.assemble.v1",
+                    "final_packet": assembled.body,
+                    "kernel_audit": {
+                        "governed": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "governed": response.metadata,
+                    },
+                    "cache": {
+                        "governed": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                    "hints": {
+                        "budget_retry": budget_hint,
+                    },
+                }),
+                args.pretty,
+            )?;
+        } else {
+            crate::cmd_common::emit_machine_envelope(
+                suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE,
+                &envelope,
+                profile,
+                args.pretty,
+                &crate::cmd_common::resolve_artifact_root(None),
+                Some(json!({
+                    "kernel_audit": {
+                        "governed": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "governed": response.metadata,
+                    },
+                    "cache": {
+                        "governed": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                    "hints": {
+                        "budget_retry": budget_hint,
+                    },
+                })),
+            )?;
+        }
     } else {
-        crate::cmd_common::emit_machine_envelope(
-            suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE,
-            &envelope,
-            profile,
-            args.pretty,
-            &crate::cmd_common::resolve_artifact_root(None),
-            Some(json!({
-                "kernel_audit": {
-                    "context": response.audit,
-                },
-                "kernel_metadata": {
-                    "context": response.metadata,
-                },
-                "cache": {
-                    "context": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                },
-            })),
-        )?;
+        if args.legacy_json {
+            crate::cmd_common::emit_json(
+                &json!({
+                    "schema_version": "suite.context.assemble.v1",
+                    "packet": assembled.body,
+                    "kernel_audit": {
+                        "context": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "context": response.metadata,
+                    },
+                    "cache": {
+                        "context": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                }),
+                args.pretty,
+            )?;
+        } else {
+            crate::cmd_common::emit_machine_envelope(
+                suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE,
+                &envelope,
+                profile,
+                args.pretty,
+                &crate::cmd_common::resolve_artifact_root(None),
+                Some(json!({
+                    "kernel_audit": {
+                        "context": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "context": response.metadata,
+                    },
+                    "cache": {
+                        "context": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                })),
+            )?;
+        }
     }
     Ok(0)
 }

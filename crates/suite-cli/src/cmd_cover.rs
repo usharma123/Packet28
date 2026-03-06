@@ -333,8 +333,7 @@ pub fn run_remote(args: CheckArgs, config_path: &str, daemon_root: &Path) -> Res
         },
     )?;
 
-    let mut effective_profile =
-        machine_profile.unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let mut effective_profile = machine_profile.unwrap_or(suite_packet_core::JsonProfile::Compact);
     if effective_profile == suite_packet_core::JsonProfile::Compact
         && args.packet_detail == PacketDetailArg::Rich
     {

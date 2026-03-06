@@ -10,7 +10,10 @@ fn git_fingerprint(repo_root: &Path) -> Option<String> {
     let repo_root = canonical_or_original(repo_root);
     let top_level = git_output(&repo_root, &["rev-parse", "--show-toplevel"])?;
     let head = git_output(&repo_root, &["rev-parse", "HEAD"])?;
-    let status = git_output(&repo_root, &["status", "--porcelain", "--untracked-files=no"])?;
+    let status = git_output(
+        &repo_root,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )?;
 
     let mut modified_paths = status
         .lines()
@@ -22,7 +25,11 @@ fn git_fingerprint(repo_root: &Path) -> Option<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(top_level.trim().as_bytes());
     hasher.update(head.trim().as_bytes());
-    hasher.update(if modified_paths.is_empty() { b"clean" } else { b"dirty" });
+    hasher.update(if modified_paths.is_empty() {
+        b"clean"
+    } else {
+        b"dirty"
+    });
     for path in modified_paths {
         hasher.update(path.as_bytes());
         if let Ok(metadata) = std::fs::metadata(repo_root.join(&path)) {
@@ -35,7 +42,11 @@ fn git_fingerprint(repo_root: &Path) -> Option<String> {
 
 fn filesystem_fingerprint(repo_root: &Path, relevant_paths: &[PathBuf]) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(canonical_or_original(repo_root).to_string_lossy().as_bytes());
+    hasher.update(
+        canonical_or_original(repo_root)
+            .to_string_lossy()
+            .as_bytes(),
+    );
 
     let mut paths = if relevant_paths.is_empty() {
         collect_repo_files(repo_root)
@@ -129,7 +140,9 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
-    path.canonicalize().ok().unwrap_or_else(|| path.to_path_buf())
+    path.canonicalize()
+        .ok()
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 #[cfg(test)]

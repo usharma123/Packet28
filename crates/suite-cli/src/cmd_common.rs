@@ -5,13 +5,17 @@ use clap::ValueEnum;
 use serde_json::{json, Value};
 use suite_packet_core::{CoverageData, CoverageFormat, EnvelopeV1, JsonProfile, PacketWrapperV1};
 
+pub fn parse_daemon_env_flag(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
+}
+
 pub fn via_daemon_env_enabled() -> bool {
-    std::env::var("PACKET28_VIA_DAEMON")
-        .ok()
-        .is_some_and(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes"
-        })
+    parse_daemon_env_flag(std::env::var("PACKET28_VIA_DAEMON").ok().as_deref())
 }
 
 pub fn resolve_report_format(explicit: Option<&str>) -> String {
@@ -95,10 +99,7 @@ pub fn emit_machine_envelope<T: serde::Serialize + Clone>(
     refresh_packet_budget(&mut packet);
 
     let mut wrapper = PacketWrapperV1::new(packet_type.to_string(), packet);
-    wrapper.cache_hit = debug
-        .as_ref()
-        .and_then(extract_cache_hit)
-        .unwrap_or(false);
+    wrapper.cache_hit = debug.as_ref().and_then(extract_cache_hit).unwrap_or(false);
     emit_json(&serde_json::to_value(wrapper)?, pretty)
 }
 
@@ -251,7 +252,9 @@ fn compact_packet_payload(packet_type: &str, packet: &mut Value) {
             suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE => {
                 compact_context_assemble_payload(payload, &mut stats)
             }
-            suite_packet_core::PACKET_TYPE_DIFF_ANALYZE => compact_diff_payload(payload, &mut stats),
+            suite_packet_core::PACKET_TYPE_DIFF_ANALYZE => {
+                compact_diff_payload(payload, &mut stats)
+            }
             suite_packet_core::PACKET_TYPE_TEST_IMPACT => {
                 compact_test_impact_payload(payload, &mut stats)
             }
@@ -261,7 +264,9 @@ fn compact_packet_payload(packet_type: &str, packet: &mut Value) {
             suite_packet_core::PACKET_TYPE_BUILD_REDUCE => {
                 compact_build_reduce_payload(payload, &mut stats)
             }
-            suite_packet_core::PACKET_TYPE_MAP_REPO => compact_map_repo_payload(payload, &mut stats),
+            suite_packet_core::PACKET_TYPE_MAP_REPO => {
+                compact_map_repo_payload(payload, &mut stats)
+            }
             suite_packet_core::PACKET_TYPE_PROXY_RUN => compact_proxy_payload(payload, &mut stats),
             suite_packet_core::PACKET_TYPE_GUARD_CHECK => {
                 compact_guard_check_payload(payload, &mut stats)
@@ -551,7 +556,9 @@ fn compact_map_repo_payload(payload: &mut Value, stats: &mut CompactStats) {
         }
     }
     if let Some(Value::Object(truncation)) = map.get_mut("truncation") {
-        let all_zero = truncation.values().all(|value| value.as_u64().unwrap_or_default() == 0);
+        let all_zero = truncation
+            .values()
+            .all(|value| value.as_u64().unwrap_or_default() == 0);
         if all_zero {
             map.remove("truncation");
             stats.truncated = true;
@@ -873,7 +880,10 @@ mod tests {
         assert!(payload.get("tool_invocations").is_none());
         assert!(payload.get("reducer_invocations").is_none());
         assert!(payload.get("debug").is_none());
-        assert!(payload.get("truncated").and_then(Value::as_bool).unwrap_or(false));
+        assert!(payload
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false));
 
         let section = payload
             .get("sections")

@@ -1,22 +1,32 @@
-use std::io::{BufReader, BufWriter};
-use std::os::unix::net::UnixStream;
-use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use packet28_daemon_core::{
-    log_path, read_runtime_info, read_socket_message, ready_path, resolve_workspace_root, socket_path,
-    write_socket_message, ContextRecallRequest, ContextRecallResponse, ContextStoreGetRequest,
-    ContextStoreGetResponse, ContextStoreListRequest, ContextStoreListResponse,
-    ContextStorePruneDaemonRequest, ContextStorePruneResponse, ContextStoreStatsRequest,
-    ContextStoreStatsResponse, CoverCheckRequest, CoverCheckResponse, DaemonRequest,
-    DaemonResponse, PacketFetchRequest, PacketFetchResponse, TaskSubmitSpec, TestMapRequest,
-    TestMapResponse, TestShardRequest, TestShardResponse,
+    log_path, read_runtime_info, read_socket_message, ready_path, resolve_workspace_root,
+    socket_path, write_socket_message, ContextRecallRequest, ContextRecallResponse,
+    ContextStoreGetRequest, ContextStoreGetResponse, ContextStoreListRequest,
+    ContextStoreListResponse, ContextStorePruneDaemonRequest, ContextStorePruneResponse,
+    ContextStoreStatsRequest, ContextStoreStatsResponse, CoverCheckRequest, CoverCheckResponse,
+    DaemonRequest, DaemonResponse, PacketFetchRequest, PacketFetchResponse, TaskSubmitSpec,
+    TestMapRequest, TestMapResponse, TestShardRequest, TestShardResponse,
 };
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::{BufReader, BufWriter};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+const DAEMON_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Args)]
 pub struct DaemonArgs {
@@ -134,6 +144,7 @@ pub struct WatchRemoveArgs {
     pub pretty: bool,
 }
 
+#[cfg(unix)]
 pub fn run(args: DaemonArgs) -> Result<i32> {
     match args.command {
         DaemonCommands::Start(args) => run_start(args),
@@ -144,6 +155,12 @@ pub fn run(args: DaemonArgs) -> Result<i32> {
     }
 }
 
+#[cfg(not(unix))]
+pub fn run(_args: DaemonArgs) -> Result<i32> {
+    daemon_not_supported()
+}
+
+#[cfg(unix)]
 pub fn run_via_daemon(cli: crate::Cli, _raw_args: &[String]) -> Result<i32> {
     let daemon_root = daemon_workspace_root(cli.daemon_root.as_deref())?;
     match cli.command {
@@ -213,11 +230,13 @@ pub fn run_via_daemon(cli: crate::Cli, _raw_args: &[String]) -> Result<i32> {
     }
 }
 
+#[cfg(not(unix))]
+pub fn run_via_daemon(_cli: crate::Cli, _raw_args: &[String]) -> Result<i32> {
+    daemon_not_supported()
+}
+
 pub fn via_daemon_env_enabled() -> bool {
-    std::env::var("PACKET28_VIA_DAEMON")
-        .ok()
-        .map(|value| !matches!(value.trim(), "" | "0" | "false" | "False" | "FALSE"))
-        .unwrap_or(false)
+    crate::cmd_common::parse_daemon_env_flag(std::env::var("PACKET28_VIA_DAEMON").ok().as_deref())
 }
 
 pub fn daemon_root_env() -> Option<String> {
@@ -238,7 +257,21 @@ pub fn daemon_workspace_root(explicit_root: Option<&str>) -> Result<PathBuf> {
     Ok(resolve_workspace_root(&start))
 }
 
-pub fn execute_kernel_request(root: &Path, request: context_kernel_core::KernelRequest) -> Result<context_kernel_core::KernelResponse> {
+fn normalize_daemon_root(root: &Path) -> PathBuf {
+    resolve_workspace_root(root)
+}
+
+#[cfg(not(unix))]
+fn daemon_not_supported<T>() -> Result<T> {
+    Err(anyhow!(
+        "packet28 daemon commands are only supported on Unix targets"
+    ))
+}
+
+pub fn execute_kernel_request(
+    root: &Path,
+    request: context_kernel_core::KernelRequest,
+) -> Result<context_kernel_core::KernelResponse> {
     ensure_daemon(root)?;
     match send_request(root, &DaemonRequest::Execute { request })? {
         DaemonResponse::Execute { response } => Ok(response),
@@ -247,20 +280,28 @@ pub fn execute_kernel_request(root: &Path, request: context_kernel_core::KernelR
     }
 }
 
-pub fn send_kernel_request(root: &Path, request: context_kernel_core::KernelRequest) -> Result<context_kernel_core::KernelResponse> {
+pub fn send_kernel_request(
+    root: &Path,
+    request: context_kernel_core::KernelRequest,
+) -> Result<context_kernel_core::KernelResponse> {
     execute_kernel_request(root, request)
 }
 
-pub fn execute_sequence(root: &Path, spec: TaskSubmitSpec) -> Result<packet28_daemon_core::SequenceSubmitResponse> {
+pub fn execute_sequence(
+    root: &Path,
+    spec: TaskSubmitSpec,
+) -> Result<packet28_daemon_core::SequenceSubmitResponse> {
     ensure_daemon(root)?;
     match send_request(root, &DaemonRequest::ExecuteSequence { spec })? {
-        DaemonResponse::ExecuteSequence { response, task, watches } => {
-            Ok(packet28_daemon_core::SequenceSubmitResponse {
-                task_id: task.task_id,
-                watch_ids: watches.iter().map(|watch| watch.watch_id.clone()).collect(),
-                response,
-            })
-        }
+        DaemonResponse::ExecuteSequence {
+            response,
+            task,
+            watches,
+        } => Ok(packet28_daemon_core::SequenceSubmitResponse {
+            task_id: task.task_id,
+            watch_ids: watches.iter().map(|watch| watch.watch_id.clone()).collect(),
+            response,
+        }),
         DaemonResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
     }
@@ -275,7 +316,10 @@ pub fn execute_cover_check(root: &Path, request: CoverCheckRequest) -> Result<Co
     }
 }
 
-pub fn execute_packet_fetch(root: &Path, request: PacketFetchRequest) -> Result<PacketFetchResponse> {
+pub fn execute_packet_fetch(
+    root: &Path,
+    request: PacketFetchRequest,
+) -> Result<PacketFetchResponse> {
     ensure_daemon(root)?;
     match send_request(root, &DaemonRequest::PacketFetch { request })? {
         DaemonResponse::PacketFetch { response } => Ok(response),
@@ -370,22 +414,69 @@ pub fn execute_context_recall(
     }
 }
 
+#[cfg(unix)]
 pub fn send_request(root: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
-    let socket = socket_path(root);
+    let root = normalize_daemon_root(root);
+    let socket = socket_path(&root);
     let stream = UnixStream::connect(&socket)
         .with_context(|| format!("failed to connect to '{}'", socket.display()))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+    stream
+        .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+        .with_context(|| {
+            format!(
+                "failed to configure read timeout for '{}'",
+                socket.display()
+            )
+        })?;
+    stream
+        .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+        .with_context(|| {
+            format!(
+                "failed to configure write timeout for '{}'",
+                socket.display()
+            )
+        })?;
+    let reader_stream = stream.try_clone()?;
+    reader_stream
+        .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+        .with_context(|| {
+            format!(
+                "failed to configure cloned read timeout for '{}'",
+                socket.display()
+            )
+        })?;
+    reader_stream
+        .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+        .with_context(|| {
+            format!(
+                "failed to configure cloned write timeout for '{}'",
+                socket.display()
+            )
+        })?;
+    let mut reader = BufReader::new(reader_stream);
     let mut writer = BufWriter::new(stream);
     write_socket_message(&mut writer, request)?;
     read_socket_message(&mut reader)
 }
 
+#[cfg(not(unix))]
+pub fn send_request(_root: &Path, _request: &DaemonRequest) -> Result<DaemonResponse> {
+    daemon_not_supported()
+}
+
+#[cfg(unix)]
 pub fn ensure_daemon(root: &Path) -> Result<()> {
-    if socket_path(root).exists() && UnixStream::connect(socket_path(root)).is_ok() {
+    let root = normalize_daemon_root(root);
+    if socket_path(&root).exists() && UnixStream::connect(socket_path(&root)).is_ok() {
         return Ok(());
     }
-    start_daemon(root)?;
-    wait_for_daemon(root, Duration::from_secs(10))
+    start_daemon(&root)?;
+    wait_for_daemon(&root, Duration::from_secs(10))
+}
+
+#[cfg(not(unix))]
+pub fn ensure_daemon(_root: &Path) -> Result<()> {
+    daemon_not_supported()
 }
 
 pub fn resolve_root_arg(root: &str) -> PathBuf {
@@ -415,7 +506,6 @@ fn run_stop(args: StatusRootArgs) -> Result<i32> {
 
 fn run_status(args: JsonRootArgs) -> Result<i32> {
     let root = resolve_root_arg(&args.root);
-    ensure_daemon(&root)?;
     match send_request(&root, &DaemonRequest::Status)? {
         DaemonResponse::Status { status } => {
             if args.json {
@@ -445,7 +535,11 @@ fn run_task(args: TaskArgs) -> Result<i32> {
             let spec: TaskSubmitSpec = serde_json::from_str(&raw)
                 .with_context(|| format!("invalid JSON in '{}'", args.spec))?;
             match send_request(&root, &DaemonRequest::ExecuteSequence { spec })? {
-                DaemonResponse::ExecuteSequence { response, task, watches } => {
+                DaemonResponse::ExecuteSequence {
+                    response,
+                    task,
+                    watches,
+                } => {
                     if args.json {
                         crate::cmd_common::emit_json(
                             &serde_json::json!({
@@ -475,7 +569,12 @@ fn run_task(args: TaskArgs) -> Result<i32> {
         TaskCommands::Status(args) => {
             let root = resolve_root_arg(&args.root);
             ensure_daemon(&root)?;
-            match send_request(&root, &DaemonRequest::TaskStatus { task_id: args.task_id })? {
+            match send_request(
+                &root,
+                &DaemonRequest::TaskStatus {
+                    task_id: args.task_id,
+                },
+            )? {
                 DaemonResponse::TaskStatus { task } => {
                     if args.json {
                         crate::cmd_common::emit_json(&serde_json::to_value(task)?, args.pretty)?;
@@ -495,7 +594,12 @@ fn run_task(args: TaskArgs) -> Result<i32> {
         TaskCommands::Cancel(args) => {
             let root = resolve_root_arg(&args.root);
             ensure_daemon(&root)?;
-            match send_request(&root, &DaemonRequest::TaskCancel { task_id: args.task_id })? {
+            match send_request(
+                &root,
+                &DaemonRequest::TaskCancel {
+                    task_id: args.task_id,
+                },
+            )? {
                 DaemonResponse::TaskCancel {
                     task,
                     removed_watch_ids,
@@ -525,7 +629,12 @@ fn run_watch(args: WatchArgs) -> Result<i32> {
         WatchCommands::List(args) => {
             let root = resolve_root_arg(&args.root);
             ensure_daemon(&root)?;
-            match send_request(&root, &DaemonRequest::WatchList { task_id: args.task_id })? {
+            match send_request(
+                &root,
+                &DaemonRequest::WatchList {
+                    task_id: args.task_id,
+                },
+            )? {
                 DaemonResponse::WatchList { watches } => {
                     if args.json {
                         crate::cmd_common::emit_json(&serde_json::to_value(watches)?, args.pretty)?;
@@ -549,7 +658,12 @@ fn run_watch(args: WatchArgs) -> Result<i32> {
         WatchCommands::Remove(args) => {
             let root = resolve_root_arg(&args.root);
             ensure_daemon(&root)?;
-            match send_request(&root, &DaemonRequest::WatchRemove { watch_id: args.watch_id })? {
+            match send_request(
+                &root,
+                &DaemonRequest::WatchRemove {
+                    watch_id: args.watch_id,
+                },
+            )? {
                 DaemonResponse::WatchRemove { removed } => {
                     if args.json {
                         crate::cmd_common::emit_json(&serde_json::to_value(removed)?, args.pretty)?;
@@ -567,6 +681,7 @@ fn run_watch(args: WatchArgs) -> Result<i32> {
     }
 }
 
+#[cfg(unix)]
 fn start_daemon(root: &Path) -> Result<()> {
     let binary = packet28d_binary()?;
     let root_arg = root.to_string_lossy().to_string();
@@ -597,6 +712,7 @@ fn start_daemon(root: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -619,6 +735,7 @@ fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
     Err(anyhow!("packet28d did not become ready"))
 }
 
+#[cfg(unix)]
 fn packet28d_binary() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_packet28d") {
         return Ok(PathBuf::from(path));

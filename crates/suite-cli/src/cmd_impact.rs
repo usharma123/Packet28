@@ -59,10 +59,8 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     let governed_budget_tokens = args.context_budget_tokens;
     let governed_budget_bytes = args.context_budget_bytes;
     let cwd = std::env::current_dir()?;
-    let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(
-        &cwd,
-        &[cwd.join(&args.testmap)],
-    );
+    let cache_fingerprint =
+        crate::cmd_common::repo_cache_fingerprint(&cwd, &[cwd.join(&args.testmap)]);
     let policy_context = match (governed_context_config.as_ref(), args.task_id.as_ref()) {
         (Some(config_path), Some(task_id)) => json!({
             "config_path": config_path,
@@ -354,7 +352,8 @@ pub fn run_remote(args: ImpactArgs, config_path: &str, daemon_root: &Path) -> Re
     let governed_budget_tokens = args.context_budget_tokens;
     let governed_budget_bytes = args.context_budget_bytes;
     let cwd = std::env::current_dir()?;
-    let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(&cwd, &[cwd.join(&args.testmap)]);
+    let cache_fingerprint =
+        crate::cmd_common::repo_cache_fingerprint(&cwd, &[cwd.join(&args.testmap)]);
     let policy_context = match (governed_context_config.as_ref(), args.task_id.as_ref()) {
         (Some(config_path), Some(task_id)) => json!({
             "config_path": config_path,

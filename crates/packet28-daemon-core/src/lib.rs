@@ -4,11 +4,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use context_kernel_core::{
+    KernelRequest, KernelResponse, KernelSequenceRequest, KernelSequenceResponse,
+};
 use context_memory_core::{
     ContextStoreEntryDetail, ContextStoreEntrySummary, ContextStorePruneReport, ContextStoreStats,
     RecallHit,
 };
-use context_kernel_core::{KernelRequest, KernelResponse, KernelSequenceRequest, KernelSequenceResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -20,6 +22,7 @@ pub const READY_FILE_NAME: &str = "ready";
 pub const LOG_FILE_NAME: &str = "packet28d.log";
 pub const WATCH_REGISTRY_FILE_NAME: &str = "watch-registry-v1.json";
 pub const TASK_REGISTRY_FILE_NAME: &str = "task-registry-v1.json";
+pub const MAX_SOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -477,7 +480,12 @@ pub fn read_runtime_info(root: &Path) -> Result<DaemonRuntimeInfo> {
 }
 
 pub fn remove_runtime_files(root: &Path) -> Result<()> {
-    for path in [socket_path(root), pid_path(root), runtime_path(root), ready_path(root)] {
+    for path in [
+        socket_path(root),
+        pid_path(root),
+        runtime_path(root),
+        ready_path(root),
+    ] {
         if path.exists() {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to remove '{}'", path.display()))?;
@@ -523,9 +531,7 @@ pub fn save_task_registry(root: &Path, registry: &TaskRegistry) -> Result<()> {
 }
 
 pub fn resolve_workspace_root(start: &Path) -> PathBuf {
-    let mut dir = start
-        .canonicalize()
-        .unwrap_or_else(|_| start.to_path_buf());
+    let mut dir = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     loop {
         if dir.join(".git").exists() {
             return dir;
@@ -548,7 +554,16 @@ pub fn write_socket_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -
 pub fn read_socket_message<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> Result<T> {
     let mut len_bytes = [0_u8; 8];
     reader.read_exact(&mut len_bytes)?;
-    let len = u64::from_be_bytes(len_bytes) as usize;
+    let len = usize::try_from(u64::from_be_bytes(len_bytes))
+        .context("socket frame length does not fit in usize")?;
+    if len == 0 {
+        anyhow::bail!("socket frame length must be greater than zero");
+    }
+    if len > MAX_SOCKET_MESSAGE_BYTES {
+        anyhow::bail!(
+            "socket frame too large: {len} bytes exceeds limit of {MAX_SOCKET_MESSAGE_BYTES}"
+        );
+    }
     let mut body = vec![0_u8; len];
     reader.read_exact(&mut body)?;
     Ok(serde_json::from_slice(&body)?)

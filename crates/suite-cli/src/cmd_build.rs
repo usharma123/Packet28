@@ -68,11 +68,8 @@ pub fn run(args: ReduceArgs) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let packet: EnvelopeV1<buildy_core::BuildReduceOutput> =
-        serde_json::from_value(output_packet.body.clone())
-            .map_err(|source| anyhow!("invalid buildy output packet: {source}"))?;
 
-    let governed_response = if let Some(context_config) = args.context_config {
+    let governed_response = if let Some(context_config) = args.context_config.clone() {
         Some(kernel.execute(context_kernel_core::KernelRequest {
             target: "governed.assemble".to_string(),
             input_packets: vec![output_packet.clone()],
@@ -90,162 +87,7 @@ pub fn run(args: ReduceArgs) -> Result<i32> {
         None
     };
 
-    if let Some(profile_arg) = args.json {
-        let profile: suite_packet_core::JsonProfile = profile_arg.into();
-        if let Some(governed) = governed_response {
-            let budget_hint = crate::cmd_common::budget_retry_hint(
-                &governed.metadata,
-                args.context_budget_tokens,
-                args.context_budget_bytes,
-                "Packet28 build reduce --context-config <context.yaml>",
-            );
-            let final_packet = governed
-                .output_packets
-                .first()
-                .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-            if args.legacy_json {
-                crate::cmd_common::emit_json(
-                    &json!({
-                        "schema_version": "suite.build.reduce.v1",
-                        "packet": packet,
-                        "final_packet": final_packet.body,
-                        "kernel_audit": {
-                            "build": response.audit,
-                            "governed": governed.audit,
-                        },
-                        "kernel_metadata": {
-                            "build": response.metadata,
-                            "governed": governed.metadata,
-                        },
-                        "cache": {
-                            "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        },
-                        "hints": {
-                            "budget_retry": budget_hint,
-                        },
-                    }),
-                    args.pretty,
-                )?;
-            } else {
-                crate::cmd_common::emit_machine_envelope(
-                    suite_packet_core::PACKET_TYPE_BUILD_REDUCE,
-                    &packet,
-                    profile,
-                    args.pretty,
-                    &crate::cmd_common::resolve_artifact_root(None),
-                    Some(json!({
-                        "kernel_audit": {
-                            "build": response.audit,
-                            "governed": governed.audit,
-                        },
-                        "kernel_metadata": {
-                            "build": response.metadata,
-                            "governed": governed.metadata,
-                        },
-                        "cache": {
-                            "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                            "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        },
-                        "hints": {
-                            "budget_retry": budget_hint,
-                        },
-                        "governed_packet": final_packet.body,
-                    })),
-                )?;
-            }
-        } else {
-            if args.legacy_json {
-                crate::cmd_common::emit_json(
-                    &json!({
-                        "schema_version": "suite.build.reduce.v1",
-                        "packet": packet,
-                        "kernel_audit": {
-                            "build": response.audit,
-                        },
-                        "kernel_metadata": {
-                            "build": response.metadata,
-                        },
-                        "cache": {
-                            "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        },
-                    }),
-                    args.pretty,
-                )?;
-            } else {
-                crate::cmd_common::emit_machine_envelope(
-                    suite_packet_core::PACKET_TYPE_BUILD_REDUCE,
-                    &packet,
-                    profile,
-                    args.pretty,
-                    &crate::cmd_common::resolve_artifact_root(None),
-                    Some(json!({
-                        "kernel_audit": {
-                            "build": response.audit,
-                        },
-                        "kernel_metadata": {
-                            "build": response.metadata,
-                        },
-                        "cache": {
-                            "build": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        },
-                    })),
-                )?;
-            }
-        }
-        return Ok(0);
-    }
-
-    let payload = packet.payload.clone();
-    println!(
-        "summary: total={} unique={} duplicates_removed={}",
-        payload.total_diagnostics, payload.unique_diagnostics, payload.duplicates_removed
-    );
-    for fix in payload.ordered_fixes {
-        println!("- {fix}");
-    }
-    if let Some(summary) = crate::cmd_common::cache_summary_line(&response.metadata) {
-        println!("{summary}");
-    }
-
-    if let Some(governed) = governed_response {
-        if let Some(summary) = crate::cmd_common::cache_summary_line(&governed.metadata) {
-            println!("{summary}");
-        }
-        if let Some(hint) = crate::cmd_common::budget_retry_hint(
-            &governed.metadata,
-            args.context_budget_tokens,
-            args.context_budget_bytes,
-            "Packet28 build reduce --context-config <context.yaml>",
-        ) {
-            if let Some(retry) = hint.get("retry_command").and_then(Value::as_str) {
-                println!("hint: high truncation detected; retry with: {retry}");
-            }
-        }
-        let final_packet = governed
-            .output_packets
-            .first()
-            .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-        let sections = final_packet
-            .body
-            .get("payload")
-            .and_then(|payload| payload.get("assembly"))
-            .and_then(|assembly| assembly.get("sections_kept"))
-            .or_else(|| {
-                final_packet
-                    .body
-                    .get("assembly")
-                    .and_then(|assembly| assembly.get("sections_kept"))
-            })
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        println!(
-            "governed packet assembled: packet_id={} sections_kept={sections}",
-            final_packet.packet_id.as_deref().unwrap_or("unknown")
-        );
-    }
-
-    Ok(0)
+    handle_reduce_response(&args, response, governed_response)
 }
 
 pub fn run_remote(args: ReduceArgs, daemon_root: &Path) -> Result<i32> {
@@ -272,9 +114,6 @@ pub fn run_remote(args: ReduceArgs, daemon_root: &Path) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let packet: EnvelopeV1<buildy_core::BuildReduceOutput> =
-        serde_json::from_value(output_packet.body.clone())
-            .map_err(|source| anyhow!("invalid buildy output packet: {source}"))?;
 
     let governed_response = if let Some(context_config) = args.context_config.clone() {
         Some(crate::cmd_daemon::send_kernel_request(
@@ -296,6 +135,22 @@ pub fn run_remote(args: ReduceArgs, daemon_root: &Path) -> Result<i32> {
     } else {
         None
     };
+
+    handle_reduce_response(&args, response, governed_response)
+}
+
+fn handle_reduce_response(
+    args: &ReduceArgs,
+    response: context_kernel_core::KernelResponse,
+    governed_response: Option<context_kernel_core::KernelResponse>,
+) -> Result<i32> {
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let packet: EnvelopeV1<buildy_core::BuildReduceOutput> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid buildy output packet: {source}"))?;
 
     if let Some(profile_arg) = args.json {
         let profile: suite_packet_core::JsonProfile = profile_arg.into();

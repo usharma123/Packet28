@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, BufWriter};
-use std::os::unix::net::UnixStream;
+use std::io::{BufReader, BufWriter, ErrorKind};
 use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -12,24 +12,25 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use context_kernel_core::{Kernel, KernelRequest, PersistConfig};
 use context_memory_core::{
     ContextStoreListFilter, ContextStorePaging, ContextStorePruneRequest, PacketCache,
     PersistConfig as MemoryPersistConfig, RecallOptions,
 };
-use context_kernel_core::{Kernel, KernelRequest, PersistConfig};
 use diffy_core::model::CoverageFormat;
 use glob::Pattern;
 use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
 use packet28_daemon_core::{
-    ensure_daemon_dir, load_task_registry, load_watch_registry, log_path, now_unix, ready_path,
-    read_socket_message, remove_runtime_files, save_task_registry, save_watch_registry,
-    socket_path, write_runtime_info, write_socket_message, CoverCheckRequest, CoverCheckResponse,
-    ContextRecallRequest, ContextRecallResponse, ContextStoreGetRequest, ContextStoreGetResponse,
+    ensure_daemon_dir, load_task_registry, load_watch_registry, log_path, now_unix,
+    read_socket_message, ready_path, remove_runtime_files, save_task_registry, save_watch_registry,
+    socket_path, write_runtime_info, write_socket_message, ContextRecallRequest,
+    ContextRecallResponse, ContextStoreGetRequest, ContextStoreGetResponse,
     ContextStoreListRequest, ContextStoreListResponse, ContextStorePruneDaemonRequest,
-    ContextStorePruneResponse, ContextStoreStatsRequest, ContextStoreStatsResponse, DaemonRequest,
-    DaemonResponse, DaemonRuntimeInfo, DaemonStatus, PacketFetchResponse, TaskRecord,
-    TaskRegistry, TaskSubmitSpec, TestMapRequest, TestMapResponse, TestMapSummary,
-    TestShardRequest, TestShardResponse, WatchKind, WatchRegistration, WatchRegistry, WatchSpec,
+    ContextStorePruneResponse, ContextStoreStatsRequest, ContextStoreStatsResponse,
+    CoverCheckRequest, CoverCheckResponse, DaemonRequest, DaemonResponse, DaemonRuntimeInfo,
+    DaemonStatus, PacketFetchResponse, TaskRecord, TaskRegistry, TaskSubmitSpec, TestMapRequest,
+    TestMapResponse, TestMapSummary, TestShardRequest, TestShardResponse, WatchKind,
+    WatchRegistration, WatchRegistry, WatchSpec,
 };
 use serde_json::json;
 
@@ -92,13 +93,7 @@ fn serve(root: PathBuf) -> Result<()> {
     ensure_daemon_dir(&root)?;
     let daemon_log_path = log_path(&root);
     let socket = socket_path(&root);
-    if socket.exists() {
-        fs::remove_file(&socket)
-            .with_context(|| format!("failed to remove stale socket '{}'", socket.display()))?;
-    }
-
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("failed to bind '{}'", socket.display()))?;
+    let listener = bind_listener(&socket)?;
 
     let runtime = DaemonRuntimeInfo {
         pid: std::process::id(),
@@ -116,9 +111,9 @@ fn serve(root: PathBuf) -> Result<()> {
         daemon_log_path.display()
     ));
 
-    let kernel = Arc::new(Kernel::with_v1_reducers_and_persistence(PersistConfig::new(
-        root.clone(),
-    )));
+    let kernel = Arc::new(Kernel::with_v1_reducers_and_persistence(
+        PersistConfig::new(root.clone()),
+    ));
     let tasks = load_task_registry(&root)?;
     let watches = load_watch_registry(&root)?;
     let state = Arc::new(Mutex::new(DaemonState {
@@ -419,11 +414,35 @@ fn register_task_and_watches(
             last_sequence_metadata: None,
         };
         guard.tasks.tasks.insert(spec.task_id.clone(), task.clone());
-        persist_state(&guard)?;
     }
 
+    let mut installed_watch_ids: Vec<String> = Vec::new();
     for registration in &registrations {
-        install_watch(state.clone(), watch_tx.clone(), registration.watch_id.clone())?;
+        if let Err(err) = install_watch(
+            state.clone(),
+            watch_tx.clone(),
+            registration.watch_id.clone(),
+        ) {
+            let _ = remove_watch(state.clone(), &registration.watch_id);
+            for watch_id in &installed_watch_ids {
+                let _ = remove_watch(state.clone(), watch_id);
+            }
+            let mut guard = state.lock().map_err(lock_err)?;
+            guard.tasks.tasks.remove(&spec.task_id);
+            guard.watches.watches.retain(|watch| {
+                !registrations
+                    .iter()
+                    .any(|candidate| candidate.watch_id == watch.watch_id)
+            });
+            persist_state(&guard)?;
+            return Err(err);
+        }
+        installed_watch_ids.push(registration.watch_id.clone());
+    }
+
+    {
+        let guard = state.lock().map_err(lock_err)?;
+        persist_state(&guard)?;
     }
 
     let task = state
@@ -499,7 +518,10 @@ fn run_sequence_for_task(
     }
 }
 
-fn cancel_task(state: Arc<Mutex<DaemonState>>, task_id: &str) -> Result<(Option<TaskRecord>, Vec<String>)> {
+fn cancel_task(
+    state: Arc<Mutex<DaemonState>>,
+    task_id: &str,
+) -> Result<(Option<TaskRecord>, Vec<String>)> {
     let watch_ids = {
         let mut guard = state.lock().map_err(lock_err)?;
         let Some(task) = guard.tasks.tasks.get_mut(task_id) else {
@@ -517,7 +539,10 @@ fn cancel_task(state: Arc<Mutex<DaemonState>>, task_id: &str) -> Result<(Option<
     Ok((removed, watch_ids))
 }
 
-fn remove_watch(state: Arc<Mutex<DaemonState>>, watch_id: &str) -> Result<Option<WatchRegistration>> {
+fn remove_watch(
+    state: Arc<Mutex<DaemonState>>,
+    watch_id: &str,
+) -> Result<Option<WatchRegistration>> {
     let mut guard = state.lock().map_err(lock_err)?;
     guard.watcher_handles.remove(watch_id);
     let removed = if let Some(index) = guard
@@ -537,7 +562,10 @@ fn remove_watch(state: Arc<Mutex<DaemonState>>, watch_id: &str) -> Result<Option
     Ok(removed)
 }
 
-fn restore_watchers(state: &Arc<Mutex<DaemonState>>, watch_tx: &Sender<WatchEventMsg>) -> Result<()> {
+fn restore_watchers(
+    state: &Arc<Mutex<DaemonState>>,
+    watch_tx: &Sender<WatchEventMsg>,
+) -> Result<()> {
     let watch_ids = state
         .lock()
         .map_err(lock_err)?
@@ -588,7 +616,8 @@ fn install_watch(
                 });
             }
         },
-        Config::default().with_poll_interval(Duration::from_millis(spec.debounce_ms.unwrap_or(250))),
+        Config::default()
+            .with_poll_interval(Duration::from_millis(spec.debounce_ms.unwrap_or(250))),
     )?;
 
     let paths = watch_paths(&spec);
@@ -635,14 +664,22 @@ fn spawn_watch_processor(state: Arc<Mutex<DaemonState>>, watch_rx: Receiver<Watc
             let timeout = next_watch_timeout(&pending).unwrap_or(Duration::from_secs(60));
             match watch_rx.recv_timeout(timeout) {
                 Ok(message) => {
-                    if state.lock().map_err(lock_err).map(|guard| guard.shutting_down).unwrap_or(false)
+                    if state
+                        .lock()
+                        .map_err(lock_err)
+                        .map(|guard| guard.shutting_down)
+                        .unwrap_or(false)
                     {
                         break;
                     }
                     merge_watch_event(state.clone(), &mut pending, message);
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if state.lock().map_err(lock_err).map(|guard| guard.shutting_down).unwrap_or(false)
+                    if state
+                        .lock()
+                        .map_err(lock_err)
+                        .map(|guard| guard.shutting_down)
+                        .unwrap_or(false)
                     {
                         break;
                     }
@@ -735,6 +772,7 @@ fn process_watch_event(state: Arc<Mutex<DaemonState>>, message: WatchEventMsg) -
                 if task.running {
                     task.pending_replan = true;
                 } else {
+                    task.running = true;
                     spawn_replan = true;
                 }
             }
@@ -788,6 +826,7 @@ fn git_changed_paths(root: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
         .arg("status")
         .arg("--porcelain")
+        .arg("-z")
         .arg("--untracked-files=no")
         .current_dir(root)
         .output()
@@ -795,14 +834,28 @@ fn git_changed_paths(root: &Path) -> Result<Vec<String>> {
     if !output.status.success() {
         return Ok(Vec::new());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut paths = Vec::new();
-    for line in stdout.lines() {
-        if line.len() > 3 {
-            let path = line[3..].trim().replace('\\', "/");
-            if !path.is_empty() && !paths.iter().any(|candidate| candidate == &path) {
-                paths.push(path);
-            }
+    let entries = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut index = 0;
+    while index < entries.len() {
+        let entry = entries[index];
+        index += 1;
+        if entry.len() <= 3 {
+            continue;
+        }
+        let record = String::from_utf8_lossy(entry);
+        let status = &record[..3];
+        let mut path = record[3..].trim().to_string();
+        let is_rename_or_copy = matches!(status.chars().next(), Some('R' | 'C'))
+            || matches!(status.chars().nth(1), Some('R' | 'C'));
+        if let Some((_, destination)) = path.rsplit_once("->") {
+            path = destination.trim().to_string();
+        } else if is_rename_or_copy && index < entries.len() {
+            index += 1;
+        }
+        let path = path.replace('\\', "/");
+        if !path.is_empty() && !paths.iter().any(|candidate| candidate == &path) {
+            paths.push(path);
         }
     }
     Ok(paths)
@@ -827,12 +880,23 @@ fn watch_paths(spec: &WatchSpec) -> Vec<PathBuf> {
 }
 
 fn watch_id_for(spec: &WatchSpec) -> String {
-    let mut seed = format!("{:?}:{}:{}", spec.kind, spec.task_id, spec.root);
-    for path in &spec.paths {
-        seed.push(':');
-        seed.push_str(path);
-    }
-    let hash = blake3::hash(seed.as_bytes()).to_hex();
+    let mut paths = spec.paths.clone();
+    paths.sort();
+    let mut include_globs = spec.include_globs.clone();
+    include_globs.sort();
+    let mut exclude_globs = spec.exclude_globs.clone();
+    exclude_globs.sort();
+    let seed = serde_json::to_vec(&json!({
+        "kind": spec.kind,
+        "task_id": spec.task_id,
+        "root": spec.root,
+        "paths": paths,
+        "include_globs": include_globs,
+        "exclude_globs": exclude_globs,
+        "debounce_ms": spec.debounce_ms,
+    }))
+    .expect("watch id seed should serialize");
+    let hash = blake3::hash(&seed).to_hex();
     format!("watch-{}", &hash[..12])
 }
 
@@ -994,8 +1058,11 @@ fn mark_ready(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
         (guard.root.clone(), guard.runtime.clone())
     };
     write_runtime_info(&root, &runtime)?;
-    fs::write(ready_path(&root), format!("{}\n", runtime.ready_at_unix.unwrap_or_default()))
-        .with_context(|| format!("failed to write ready file for '{}'", root.display()))?;
+    fs::write(
+        ready_path(&root),
+        format!("{}\n", runtime.ready_at_unix.unwrap_or_default()),
+    )
+    .with_context(|| format!("failed to write ready file for '{}'", root.display()))?;
     daemon_log(&format!(
         "daemon ready root={} socket={}",
         root.display(),
@@ -1012,10 +1079,38 @@ fn daemon_log(message: &str) {
     eprintln!("[packet28d {}] {message}", now_unix());
 }
 
+fn bind_listener(socket: &Path) -> Result<UnixListener> {
+    if socket.exists() {
+        match UnixStream::connect(socket) {
+            Ok(_) => {
+                anyhow::bail!(
+                    "packet28d is already running for '{}'; refusing to replace a live socket",
+                    socket.display()
+                );
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                ) =>
+            {
+                fs::remove_file(socket).with_context(|| {
+                    format!("failed to remove stale socket '{}'", socket.display())
+                })?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to probe existing socket '{}'", socket.display())
+                });
+            }
+        }
+    }
+
+    UnixListener::bind(socket).with_context(|| format!("failed to bind '{}'", socket.display()))
+}
+
 fn resolve_root(path: &Path) -> PathBuf {
-    let mut current = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let mut current = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     loop {
         if current.join(".git").exists() {
             return current;
@@ -1031,8 +1126,11 @@ fn lock_err<T>(err: std::sync::PoisonError<T>) -> anyhow::Error {
 }
 
 fn run_cover_check(request: CoverCheckRequest) -> Result<CoverCheckResponse> {
-    let config = suite_foundation_core::CovyConfig::load(Path::new(&request.config_path))
-        .unwrap_or_default();
+    let config = if request.config_path.trim().is_empty() {
+        suite_foundation_core::CovyConfig::default()
+    } else {
+        suite_foundation_core::CovyConfig::load(Path::new(&request.config_path))?
+    };
     let base = request.base.as_deref().unwrap_or(&config.diff.base);
     let head = request.head.as_deref().unwrap_or(&config.diff.head);
     let issue_gate = suite_foundation_core::config::IssueGateConfig {
@@ -1092,8 +1190,12 @@ fn run_cover_check(request: CoverCheckRequest) -> Result<CoverCheckResponse> {
             ingest_coverage_with_format: |path, format| {
                 covy_ingest::ingest_path_with_format(path, format).map_err(Into::into)
             },
-            ingest_coverage_stdin: |_format| anyhow::bail!("stdin is not supported through packet28d"),
-            ingest_diagnostics: |path| covy_ingest::ingest_diagnostics_path(path).map_err(Into::into),
+            ingest_coverage_stdin: |_format| {
+                anyhow::bail!("stdin is not supported through packet28d")
+            },
+            ingest_diagnostics: |path| {
+                covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
+            },
         },
     )?;
 
@@ -1262,7 +1364,9 @@ fn run_context_store_prune(
 
 fn run_context_store_stats(request: ContextStoreStatsRequest) -> Result<ContextStoreStatsResponse> {
     let cache = load_cache_root(&request.root);
-    Ok(ContextStoreStatsResponse { stats: cache.stats() })
+    Ok(ContextStoreStatsResponse {
+        stats: cache.stats(),
+    })
 }
 
 fn run_context_recall(request: ContextRecallRequest) -> Result<ContextRecallResponse> {
@@ -1294,7 +1398,9 @@ fn parse_shard_algorithm(
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         None => Ok(None),
         Some("lpt") => Ok(Some(testy_core::command_shard::PlannerAlgorithmArg::Lpt)),
-        Some("whale-lpt") => Ok(Some(testy_core::command_shard::PlannerAlgorithmArg::WhaleLpt)),
+        Some("whale-lpt") => Ok(Some(
+            testy_core::command_shard::PlannerAlgorithmArg::WhaleLpt,
+        )),
         Some(other) => Err(anyhow!(
             "unsupported shard algorithm '{other}'. Expected 'lpt' or 'whale-lpt'"
         )),

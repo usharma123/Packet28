@@ -665,11 +665,10 @@ fn test_suite_diff_analyze_task_id_propagates_focus_to_map_repo() {
             .and_then(Value::as_str),
         Some("src/alpha.rs")
     );
-    assert!(files[0]
-        .get("relevance")
-        .and_then(Value::as_f64)
-        .unwrap()
-        > files[1].get("relevance").and_then(Value::as_f64).unwrap());
+    assert!(
+        files[0].get("relevance").and_then(Value::as_f64).unwrap()
+            > files[1].get("relevance").and_then(Value::as_f64).unwrap()
+    );
 }
 
 #[test]
@@ -1133,12 +1132,12 @@ fn test_suite_context_correlate_emits_v1_findings() {
         .and_then(Value::as_array)
         .unwrap();
     assert_eq!(findings.len(), 3);
-    assert!(findings.iter().any(|finding| {
-        finding.get("relation").and_then(Value::as_str) == Some("unrelated")
-    }));
-    assert!(findings.iter().any(|finding| {
-        finding.get("relation").and_then(Value::as_str) == Some("supports")
-    }));
+    assert!(findings
+        .iter()
+        .any(|finding| { finding.get("relation").and_then(Value::as_str) == Some("unrelated") }));
+    assert!(findings
+        .iter()
+        .any(|finding| { finding.get("relation").and_then(Value::as_str) == Some("supports") }));
     assert!(findings.iter().any(|finding| {
         finding.get("relation").and_then(Value::as_str) == Some("pre_existing_or_unrelated")
     }));
@@ -2836,8 +2835,14 @@ fn test_suite_via_daemon_uses_explicit_daemon_root_for_map_repo() {
         .clone();
     let value = parse_packet_wrapper(&output, "suite.map.repo.v1");
     assert!(packet_payload(&value).get("files_ranked").is_some());
-    assert!(daemon_root.path().join(".packet28/daemon/runtime.json").exists());
-    assert!(!repo_root.path().join(".packet28/daemon/runtime.json").exists());
+    assert!(daemon_root
+        .path()
+        .join(".packet28/daemon/runtime.json")
+        .exists());
+    assert!(!repo_root
+        .path()
+        .join(".packet28/daemon/runtime.json")
+        .exists());
 
     suite_cmd()
         .args([
@@ -2864,10 +2869,7 @@ fn test_suite_via_daemon_honors_daemon_root_env() {
 
     suite_cmd()
         .current_dir(work_root.path())
-        .env(
-            "PACKET28_DAEMON_ROOT",
-            daemon_root.path().to_str().unwrap(),
-        )
+        .env("PACKET28_DAEMON_ROOT", daemon_root.path().to_str().unwrap())
         .args([
             "--via-daemon",
             "test",
@@ -2883,8 +2885,14 @@ fn test_suite_via_daemon_honors_daemon_root_env() {
         .assert()
         .success();
 
-    assert!(daemon_root.path().join(".packet28/daemon/runtime.json").exists());
-    assert!(!work_root.path().join(".packet28/daemon/runtime.json").exists());
+    assert!(daemon_root
+        .path()
+        .join(".packet28/daemon/runtime.json")
+        .exists());
+    assert!(!work_root
+        .path()
+        .join(".packet28/daemon/runtime.json")
+        .exists());
 
     suite_cmd()
         .args([
@@ -3000,8 +3008,14 @@ fn test_suite_via_daemon_diff_wrapper_surfaces_cache_hit() {
 
     let first_value: Value = serde_json::from_slice(&first).unwrap();
     let second_value: Value = serde_json::from_slice(&second).unwrap();
-    assert_eq!(first_value.get("cache_hit").and_then(Value::as_bool), Some(false));
-    assert_eq!(second_value.get("cache_hit").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        first_value.get("cache_hit").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        second_value.get("cache_hit").and_then(Value::as_bool),
+        Some(true)
+    );
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
@@ -3469,7 +3483,9 @@ fn test_suite_context_non_assemble_via_daemon_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"query\":\"critical regression\""));
+        .stdout(predicate::str::contains(
+            "\"query\":\"critical regression\"",
+        ));
 
     suite_cmd()
         .current_dir(dir.path())

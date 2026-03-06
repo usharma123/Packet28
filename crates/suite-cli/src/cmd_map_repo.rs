@@ -463,13 +463,8 @@ pub fn run_remote(args: RepoArgs, daemon_root: &Path) -> Result<i32> {
             .output_packets
             .first()
             .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
-        crate::cmd_common::emit_machine_envelope(
-            suite_packet_core::PACKET_TYPE_MAP_REPO,
-            &envelope,
-            profile,
-            args.pretty,
-            &PathBuf::from(&args.repo_root),
-            Some(json!({
+        let debug = args.debug.then(|| {
+            json!({
                 "kernel_audit": {
                     "map": response.audit,
                     "governed": governed.audit,
@@ -486,16 +481,19 @@ pub fn run_remote(args: RepoArgs, daemon_root: &Path) -> Result<i32> {
                     "budget_retry": budget_hint,
                 },
                 "governed_packet": final_packet.body,
-            })),
-        )?;
-    } else {
+            })
+        });
         crate::cmd_common::emit_machine_envelope(
             suite_packet_core::PACKET_TYPE_MAP_REPO,
             &envelope,
             profile,
             args.pretty,
             &PathBuf::from(&args.repo_root),
-            Some(json!({
+            debug,
+        )?;
+    } else {
+        let debug = args.debug.then(|| {
+            json!({
                 "kernel_audit": {
                     "map": response.audit,
                 },
@@ -505,7 +503,15 @@ pub fn run_remote(args: RepoArgs, daemon_root: &Path) -> Result<i32> {
                 "cache": {
                     "map": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
                 },
-            })),
+            })
+        });
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_MAP_REPO,
+            &envelope,
+            profile,
+            args.pretty,
+            &PathBuf::from(&args.repo_root),
+            debug,
         )?;
     }
     Ok(0)
