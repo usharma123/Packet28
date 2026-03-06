@@ -49,6 +49,62 @@ pub struct StoreArgs {
     pub command: StoreCommands,
 }
 
+#[derive(Args)]
+pub struct StateArgs {
+    #[command(subcommand)]
+    pub command: StateCommands,
+}
+
+#[derive(Subcommand)]
+pub enum StateCommands {
+    /// Append one task-state event packet
+    Append(StateAppendArgs),
+    /// Derive the current task-state snapshot
+    Snapshot(StateSnapshotArgs),
+}
+
+#[derive(Args)]
+pub struct StateAppendArgs {
+    /// Task identifier for the state event
+    #[arg(long)]
+    task_id: String,
+
+    /// JSON file describing one task-state event
+    #[arg(long)]
+    input: String,
+
+    /// State store root directory
+    #[arg(long, default_value = ".")]
+    root: String,
+
+    /// Emit JSON output profile
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pretty: bool,
+}
+
+#[derive(Args)]
+pub struct StateSnapshotArgs {
+    /// Task identifier to snapshot
+    #[arg(long)]
+    task_id: String,
+
+    /// State store root directory
+    #[arg(long, default_value = ".")]
+    root: String,
+
+    /// Emit JSON output profile
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pretty: bool,
+}
+
 #[derive(Subcommand)]
 pub enum StoreCommands {
     /// List cached context entries
@@ -348,6 +404,13 @@ pub fn run_store(args: StoreArgs) -> Result<i32> {
     }
 }
 
+pub fn run_state(args: StateArgs) -> Result<i32> {
+    match args.command {
+        StateCommands::Append(args) => run_state_append(args),
+        StateCommands::Snapshot(args) => run_state_snapshot(args),
+    }
+}
+
 pub fn run_recall(args: RecallArgs) -> Result<i32> {
     let cache = load_cache(&args.root)?;
     let now = current_unix();
@@ -528,6 +591,127 @@ fn load_cache(root: &str) -> Result<PacketCache> {
     Ok(PacketCache::load_from_disk(&config))
 }
 
+fn run_state_append(args: StateAppendArgs) -> Result<i32> {
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let input_text = std::fs::read_to_string(&args.input)
+        .with_context(|| format!("failed to read state input '{}'", args.input))?;
+    let mut input_value: Value = serde_json::from_str(&input_text)
+        .with_context(|| format!("invalid JSON in '{}'", args.input))?;
+    let object = input_value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("state input must be a JSON object"))?;
+    match object.get("task_id").and_then(Value::as_str) {
+        Some(existing) if existing != args.task_id => {
+            anyhow::bail!(
+                "state input task_id '{}' does not match --task-id '{}'",
+                existing,
+                args.task_id
+            );
+        }
+        Some(_) => {}
+        None => {
+            object.insert("task_id".to_string(), Value::String(args.task_id.clone()));
+        }
+    }
+
+    let kernel = build_persistent_kernel(PathBuf::from(&args.root));
+    let response = kernel.execute(context_kernel_core::KernelRequest {
+        target: "agenty.state.write".to_string(),
+        reducer_input: input_value,
+        ..context_kernel_core::KernelRequest::default()
+    })?;
+
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentStateEventPayload> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid agent state output packet: {source}"))?;
+
+    if args.json.is_some() {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_AGENT_STATE,
+            &envelope,
+            profile,
+            args.pretty,
+            &PathBuf::from(&args.root),
+            Some(json!({
+                "kernel_audit": {
+                    "state": response.audit,
+                },
+                "kernel_metadata": {
+                    "state": response.metadata,
+                },
+            })),
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "task={} event={} kind={:?}",
+        envelope.payload.task_id, envelope.payload.event_id, envelope.payload.kind
+    );
+    Ok(0)
+}
+
+fn run_state_snapshot(args: StateSnapshotArgs) -> Result<i32> {
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let kernel = build_persistent_kernel(PathBuf::from(&args.root));
+    let response = kernel.execute(context_kernel_core::KernelRequest {
+        target: "agenty.state.snapshot".to_string(),
+        reducer_input: json!({
+            "task_id": args.task_id,
+        }),
+        policy_context: json!({
+            "disable_cache": true,
+        }),
+        ..context_kernel_core::KernelRequest::default()
+    })?;
+
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentSnapshotPayload> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid agent snapshot output packet: {source}"))?;
+
+    if args.json.is_some() {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_AGENT_SNAPSHOT,
+            &envelope,
+            profile,
+            args.pretty,
+            &PathBuf::from(&args.root),
+            Some(json!({
+                "kernel_audit": {
+                    "state": response.audit,
+                },
+                "kernel_metadata": {
+                    "state": response.metadata,
+                },
+            })),
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "task={} events={} focus_paths={} open_questions={}",
+        envelope.payload.task_id,
+        envelope.payload.event_count,
+        envelope.payload.focus_paths.len(),
+        envelope.payload.open_questions.len()
+    );
+    Ok(0)
+}
+
 fn emit_json(value: &Value, pretty: bool) -> Result<()> {
     if pretty {
         println!("{}", serde_json::to_string_pretty(value)?);
@@ -545,6 +729,12 @@ fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
     }
 
     context_kernel_core::Kernel::with_v1_reducers()
+}
+
+fn build_persistent_kernel(root_dir: PathBuf) -> context_kernel_core::Kernel {
+    context_kernel_core::Kernel::with_v1_reducers_and_persistence(
+        context_kernel_core::PersistConfig::new(root_dir),
+    )
 }
 
 fn current_unix() -> u64 {

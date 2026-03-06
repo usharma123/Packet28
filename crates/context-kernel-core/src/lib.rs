@@ -310,6 +310,7 @@ pub struct ExecutionContext {
     pub budget: ExecutionBudget,
     pub policy_context: Value,
     pub reducer_input: Value,
+    memory: Arc<Mutex<PacketCache>>,
     shared: Map<String, Value>,
 }
 
@@ -325,6 +326,16 @@ impl ExecutionContext {
     pub fn shared_json(&self) -> Value {
         Value::Object(self.shared.clone())
     }
+
+    pub fn cache_entries(&self) -> Result<Vec<context_memory_core::PacketCacheEntry>, KernelError> {
+        let cache = self
+            .memory
+            .lock()
+            .map_err(|source| KernelError::CacheLock {
+                detail: source.to_string(),
+            })?;
+        Ok(cache.entries())
+    }
 }
 
 type ReducerFn = dyn Fn(&mut ExecutionContext, &[KernelPacket]) -> Result<ReducerResult, KernelError>
@@ -334,7 +345,7 @@ type ReducerFn = dyn Fn(&mut ExecutionContext, &[KernelPacket]) -> Result<Reduce
 pub struct Kernel {
     reducers: HashMap<String, Arc<ReducerFn>>,
     next_request_id: AtomicU64,
-    memory: Mutex<PacketCache>,
+    memory: Arc<Mutex<PacketCache>>,
     persist_config: Option<PersistConfig>,
 }
 
@@ -349,7 +360,7 @@ impl Kernel {
         Self {
             reducers: HashMap::new(),
             next_request_id: AtomicU64::new(1),
-            memory: Mutex::new(PacketCache::new()),
+            memory: Arc::new(Mutex::new(PacketCache::new())),
             persist_config: None,
         }
     }
@@ -364,7 +375,7 @@ impl Kernel {
         let mut kernel = Self {
             reducers: HashMap::new(),
             next_request_id: AtomicU64::new(1),
-            memory: Mutex::new(PacketCache::load_from_disk(&config)),
+            memory: Arc::new(Mutex::new(PacketCache::load_from_disk(&config))),
             persist_config: Some(config),
         };
         register_v1_reducers(&mut kernel);
@@ -434,18 +445,25 @@ impl Kernel {
 
         enforce_budget(&target, BudgetStage::Input, req.budget, input_usage)?;
 
-        let cache_input = cache_input_for_request(&req, &target, policy_guard.as_ref());
-        let cache_lookup = {
-            let cache = self
-                .memory
-                .lock()
-                .map_err(|source| KernelError::CacheLock {
-                    detail: source.to_string(),
-                })?;
-            cache.lookup_with_hooks(&target, &cache_input, hooks)
+        let cache_lookup = if cache_enabled_for_request(&target, &req.policy_context) {
+            let cache_input = cache_input_for_request(&req, &target, policy_guard.as_ref());
+            Some({
+                let cache = self
+                    .memory
+                    .lock()
+                    .map_err(|source| KernelError::CacheLock {
+                        detail: source.to_string(),
+                    })?;
+                cache.lookup_with_hooks(&target, &cache_input, hooks)
+            })
+        } else {
+            None
         };
 
-        if let Some(entry) = cache_lookup.entry.clone() {
+        if let Some(entry) = cache_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.entry.clone())
+        {
             let output_packets = entry
                 .packets
                 .into_iter()
@@ -499,7 +517,10 @@ impl Kernel {
                     json!({
                         "cache": {
                             "hit": true,
-                            "key": cache_lookup.cache_key,
+                            "key": cache_lookup
+                                .as_ref()
+                                .map(|lookup| lookup.cache_key.clone())
+                                .unwrap_or_default(),
                             "entry_age_secs": entry_age_secs,
                             "miss_reason": Value::Null,
                         }
@@ -508,14 +529,13 @@ impl Kernel {
             });
         }
 
-        let cache_lookup = Some(cache_lookup);
-
         let mut ctx = ExecutionContext {
             request_id,
             target: target.clone(),
             budget: req.budget,
             policy_context: req.policy_context.clone(),
             reducer_input: req.reducer_input,
+            memory: self.memory.clone(),
             shared: Map::new(),
         };
 
@@ -792,6 +812,8 @@ pub fn load_packet_file(path: &Path) -> Result<KernelPacket, KernelError> {
 }
 
 pub fn register_v1_reducers(kernel: &mut Kernel) {
+    kernel.register_reducer("agenty.state.write", run_agenty_state_write);
+    kernel.register_reducer("agenty.state.snapshot", run_agenty_state_snapshot);
     kernel.register_reducer("contextq.assemble", run_contextq_assemble);
     kernel.register_reducer("governed.assemble", run_governed_assemble);
     kernel.register_reducer("guardy.check", run_guardy_check);
@@ -814,6 +836,12 @@ struct ContextAssembleEnvelopePayload {
     text_blobs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debug: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct AgentSnapshotRequest {
+    task_id: String,
 }
 
 fn run_governed_assemble(
@@ -843,6 +871,212 @@ fn run_governed_assemble(
                 "config_path": config_path,
             }),
         ),
+    })
+}
+
+fn run_agenty_state_write(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let event: suite_packet_core::AgentStateEventPayload =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+    validate_agent_state_event(&event).map_err(|detail| KernelError::InvalidRequest { detail })?;
+
+    let payload_bytes = serde_json::to_vec(&event).unwrap_or_default().len();
+    let envelope = suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "agenty".to_string(),
+        kind: "agent_state".to_string(),
+        hash: String::new(),
+        summary: summarize_agent_state_event(&event),
+        files: event
+            .paths
+            .iter()
+            .map(|path| suite_packet_core::FileRef {
+                path: path.clone(),
+                relevance: Some(1.0),
+                source: Some("agenty.state.write".to_string()),
+            })
+            .collect(),
+        symbols: event
+            .symbols
+            .iter()
+            .map(|name| suite_packet_core::SymbolRef {
+                name: name.clone(),
+                file: None,
+                kind: Some("focus_symbol".to_string()),
+                relevance: Some(1.0),
+                source: Some("agenty.state.write".to_string()),
+            })
+            .collect(),
+        risk: None,
+        confidence: Some(1.0),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: vec![format!("task:{}", event.task_id)],
+            git_base: None,
+            git_head: None,
+            generated_at_unix: now_unix(),
+        },
+        payload: event.clone(),
+    }
+    .with_canonical_hash_and_real_budget();
+
+    ctx.set_shared("task_id", Value::String(event.task_id.clone()));
+    ctx.set_shared("event_id", Value::String(event.event_id.clone()));
+
+    let packet = KernelPacket {
+        packet_id: Some(format!(
+            "agenty-state-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
+        format: default_packet_format(),
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
+        metadata: json!({
+            "tool": "agenty",
+            "reducer": "state.write",
+            "kind": "agent_state",
+            "task_id": event.task_id,
+            "event_id": event.event_id,
+            "event_kind": event.kind,
+            "hash": envelope.hash,
+        }),
+    };
+
+    Ok(ReducerResult {
+        output_packets: vec![packet],
+        metadata: json!({
+            "reducer": "agenty.state.write",
+            "task_id": envelope.payload.task_id,
+            "event_kind": envelope.payload.kind,
+        }),
+    })
+}
+
+fn run_agenty_state_snapshot(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let input: AgentSnapshotRequest =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+    if input.task_id.trim().is_empty() {
+        return Err(KernelError::InvalidRequest {
+            detail: "agenty.state.snapshot requires reducer_input.task_id".to_string(),
+        });
+    }
+
+    let entries = ctx.cache_entries()?;
+    let payload = derive_agent_snapshot(&entries, &input.task_id);
+    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default().len();
+    let envelope = suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "agenty".to_string(),
+        kind: "agent_snapshot".to_string(),
+        hash: String::new(),
+        summary: format!(
+            "agent snapshot task={} events={} questions={}",
+            payload.task_id,
+            payload.event_count,
+            payload.open_questions.len()
+        ),
+        files: payload
+            .focus_paths
+            .iter()
+            .chain(payload.files_read.iter())
+            .map(|path| suite_packet_core::FileRef {
+                path: path.clone(),
+                relevance: Some(1.0),
+                source: Some("agenty.state.snapshot".to_string()),
+            })
+            .collect(),
+        symbols: payload
+            .focus_symbols
+            .iter()
+            .map(|name| suite_packet_core::SymbolRef {
+                name: name.clone(),
+                file: None,
+                kind: Some("focus_symbol".to_string()),
+                relevance: Some(1.0),
+                source: Some("agenty.state.snapshot".to_string()),
+            })
+            .collect(),
+        risk: None,
+        confidence: Some(1.0),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: vec![format!("task:{}", payload.task_id)],
+            git_base: None,
+            git_head: None,
+            generated_at_unix: now_unix(),
+        },
+        payload: payload.clone(),
+    }
+    .with_canonical_hash_and_real_budget();
+
+    ctx.set_shared("task_id", Value::String(payload.task_id.clone()));
+    ctx.set_shared(
+        "state_events",
+        Value::from(envelope.payload.event_count as u64),
+    );
+
+    let packet = KernelPacket {
+        packet_id: Some(format!(
+            "agenty-snapshot-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
+        format: default_packet_format(),
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
+        metadata: json!({
+            "tool": "agenty",
+            "reducer": "state.snapshot",
+            "kind": "agent_snapshot",
+            "task_id": payload.task_id,
+            "event_count": payload.event_count,
+            "hash": envelope.hash,
+        }),
+    };
+
+    Ok(ReducerResult {
+        output_packets: vec![packet],
+        metadata: json!({
+            "reducer": "agenty.state.snapshot",
+            "task_id": envelope.payload.task_id,
+            "event_count": envelope.payload.event_count,
+        }),
     })
 }
 
@@ -1710,10 +1944,294 @@ fn cache_policy_context_overrides(policy_context: &Value) -> Value {
     value
 }
 
+fn cache_enabled_for_request(target: &str, policy_context: &Value) -> bool {
+    if policy_context
+        .get("disable_cache")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    target != "agenty.state.snapshot"
+}
+
 fn estimate_json_bytes(value: &Value) -> usize {
     serde_json::to_string(value)
         .map(|text| text.len())
         .unwrap_or(0)
+}
+
+fn validate_agent_state_event(
+    event: &suite_packet_core::AgentStateEventPayload,
+) -> Result<(), String> {
+    if event.task_id.trim().is_empty() {
+        return Err("task_id cannot be empty".to_string());
+    }
+    if event.event_id.trim().is_empty() {
+        return Err("event_id cannot be empty".to_string());
+    }
+    if event.actor.trim().is_empty() {
+        return Err("actor cannot be empty".to_string());
+    }
+
+    match (&event.kind, &event.data) {
+        (
+            suite_packet_core::AgentStateEventKind::FocusSet,
+            suite_packet_core::AgentStateEventData::FocusSet { .. },
+        ) => {
+            if event.paths.is_empty() && event.symbols.is_empty() {
+                return Err("focus_set requires paths or symbols".to_string());
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::FocusCleared,
+            suite_packet_core::AgentStateEventData::FocusCleared { clear_all },
+        ) => {
+            if !*clear_all && event.paths.is_empty() && event.symbols.is_empty() {
+                return Err(
+                    "focus_cleared requires clear_all=true or explicit paths/symbols".to_string(),
+                );
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::FileRead,
+            suite_packet_core::AgentStateEventData::FileRead {},
+        ) => {
+            if event.paths.is_empty() {
+                return Err("file_read requires at least one path".to_string());
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::FileEdited,
+            suite_packet_core::AgentStateEventData::FileEdited { .. },
+        ) => {
+            if event.paths.is_empty() {
+                return Err("file_edited requires at least one path".to_string());
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::DecisionAdded,
+            suite_packet_core::AgentStateEventData::DecisionAdded {
+                decision_id, text, ..
+            },
+        ) => {
+            if decision_id.trim().is_empty() || text.trim().is_empty() {
+                return Err("decision_added requires non-empty decision_id and text".to_string());
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::DecisionSuperseded,
+            suite_packet_core::AgentStateEventData::DecisionSuperseded { decision_id, .. },
+        ) => {
+            if decision_id.trim().is_empty() {
+                return Err("decision_superseded requires a non-empty decision_id".to_string());
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::StepCompleted,
+            suite_packet_core::AgentStateEventData::StepCompleted { step_id },
+        ) => {
+            if step_id.trim().is_empty() {
+                return Err("step_completed requires a non-empty step_id".to_string());
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::QuestionOpened,
+            suite_packet_core::AgentStateEventData::QuestionOpened { question_id, text },
+        ) => {
+            if question_id.trim().is_empty() || text.trim().is_empty() {
+                return Err("question_opened requires non-empty question_id and text".to_string());
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::QuestionResolved,
+            suite_packet_core::AgentStateEventData::QuestionResolved { question_id },
+        ) => {
+            if question_id.trim().is_empty() {
+                return Err("question_resolved requires a non-empty question_id".to_string());
+            }
+        }
+        _ => {
+            return Err(format!(
+                "event kind '{:?}' does not match payload variant",
+                event.kind
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn summarize_agent_state_event(event: &suite_packet_core::AgentStateEventPayload) -> String {
+    match &event.data {
+        suite_packet_core::AgentStateEventData::FocusSet { .. } => format!(
+            "focus set task={} paths={} symbols={}",
+            event.task_id,
+            event.paths.len(),
+            event.symbols.len()
+        ),
+        suite_packet_core::AgentStateEventData::FocusCleared { clear_all } => format!(
+            "focus cleared task={} all={} paths={} symbols={}",
+            event.task_id,
+            clear_all,
+            event.paths.len(),
+            event.symbols.len()
+        ),
+        suite_packet_core::AgentStateEventData::FileRead {} => format!(
+            "file read task={} paths={}",
+            event.task_id,
+            event.paths.join(", ")
+        ),
+        suite_packet_core::AgentStateEventData::FileEdited { .. } => format!(
+            "file edited task={} paths={}",
+            event.task_id,
+            event.paths.join(", ")
+        ),
+        suite_packet_core::AgentStateEventData::DecisionAdded {
+            decision_id, text, ..
+        } => format!(
+            "decision added task={} id={} text={}",
+            event.task_id, decision_id, text
+        ),
+        suite_packet_core::AgentStateEventData::DecisionSuperseded { decision_id, .. } => format!(
+            "decision superseded task={} id={}",
+            event.task_id, decision_id
+        ),
+        suite_packet_core::AgentStateEventData::StepCompleted { step_id } => {
+            format!("step completed task={} step={}", event.task_id, step_id)
+        }
+        suite_packet_core::AgentStateEventData::QuestionOpened {
+            question_id, text, ..
+        } => format!(
+            "question opened task={} id={} text={}",
+            event.task_id, question_id, text
+        ),
+        suite_packet_core::AgentStateEventData::QuestionResolved { question_id } => format!(
+            "question resolved task={} id={}",
+            event.task_id, question_id
+        ),
+    }
+}
+
+fn derive_agent_snapshot(
+    entries: &[context_memory_core::PacketCacheEntry],
+    task_id: &str,
+) -> suite_packet_core::AgentSnapshotPayload {
+    let mut events = entries
+        .iter()
+        .filter_map(extract_agent_state_event)
+        .filter(|event| event.task_id == task_id)
+        .collect::<Vec<_>>();
+
+    events.sort_by(|a, b| {
+        a.occurred_at_unix
+            .cmp(&b.occurred_at_unix)
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
+
+    let mut focus_paths = std::collections::BTreeSet::new();
+    let mut focus_symbols = std::collections::BTreeSet::new();
+    let mut files_read = std::collections::BTreeSet::new();
+    let mut files_edited = std::collections::BTreeSet::new();
+    let mut decisions = std::collections::BTreeMap::<String, String>::new();
+    let mut completed_steps = std::collections::BTreeSet::new();
+    let mut open_questions = std::collections::BTreeMap::<String, String>::new();
+    let mut last_event_at_unix = None;
+
+    for event in &events {
+        last_event_at_unix = Some(event.occurred_at_unix);
+        match &event.data {
+            suite_packet_core::AgentStateEventData::FocusSet { .. } => {
+                for path in &event.paths {
+                    focus_paths.insert(path.clone());
+                }
+                for symbol in &event.symbols {
+                    focus_symbols.insert(symbol.clone());
+                }
+            }
+            suite_packet_core::AgentStateEventData::FocusCleared { clear_all } => {
+                if *clear_all {
+                    focus_paths.clear();
+                    focus_symbols.clear();
+                } else {
+                    for path in &event.paths {
+                        focus_paths.remove(path);
+                    }
+                    for symbol in &event.symbols {
+                        focus_symbols.remove(symbol);
+                    }
+                }
+            }
+            suite_packet_core::AgentStateEventData::FileRead {} => {
+                for path in &event.paths {
+                    files_read.insert(path.clone());
+                }
+            }
+            suite_packet_core::AgentStateEventData::FileEdited { .. } => {
+                for path in &event.paths {
+                    files_edited.insert(path.clone());
+                }
+            }
+            suite_packet_core::AgentStateEventData::DecisionAdded {
+                decision_id,
+                text,
+                supersedes,
+            } => {
+                if let Some(previous) = supersedes {
+                    decisions.remove(previous);
+                }
+                decisions.insert(decision_id.clone(), text.clone());
+            }
+            suite_packet_core::AgentStateEventData::DecisionSuperseded { decision_id, .. } => {
+                decisions.remove(decision_id);
+            }
+            suite_packet_core::AgentStateEventData::StepCompleted { step_id } => {
+                completed_steps.insert(step_id.clone());
+            }
+            suite_packet_core::AgentStateEventData::QuestionOpened { question_id, text } => {
+                open_questions.insert(question_id.clone(), text.clone());
+            }
+            suite_packet_core::AgentStateEventData::QuestionResolved { question_id } => {
+                open_questions.remove(question_id);
+            }
+        }
+    }
+
+    suite_packet_core::AgentSnapshotPayload {
+        task_id: task_id.to_string(),
+        focus_paths: focus_paths.into_iter().collect(),
+        focus_symbols: focus_symbols.into_iter().collect(),
+        files_read: files_read.into_iter().collect(),
+        files_edited: files_edited.into_iter().collect(),
+        active_decisions: decisions
+            .into_iter()
+            .map(|(id, text)| suite_packet_core::AgentDecision { id, text })
+            .collect(),
+        completed_steps: completed_steps.into_iter().collect(),
+        open_questions: open_questions
+            .into_iter()
+            .map(|(id, text)| suite_packet_core::AgentQuestion { id, text })
+            .collect(),
+        event_count: events.len(),
+        last_event_at_unix,
+    }
+}
+
+fn extract_agent_state_event(
+    entry: &context_memory_core::PacketCacheEntry,
+) -> Option<suite_packet_core::AgentStateEventPayload> {
+    if entry.target != "agenty.state.write" {
+        return None;
+    }
+
+    entry.packets.iter().find_map(|packet| {
+        serde_json::from_value::<
+            suite_packet_core::EnvelopeV1<suite_packet_core::AgentStateEventPayload>,
+        >(packet.body.clone())
+        .ok()
+        .map(|envelope| envelope.payload)
+    })
 }
 
 fn estimate_tokens(bytes: usize) -> u64 {
@@ -2598,6 +3116,134 @@ policy:
             .find(|step| step.id == "after")
             .unwrap();
         assert_eq!(after.status, "skipped");
+    }
+
+    #[test]
+    fn agenty_state_write_rejects_invalid_event_shape() {
+        let kernel = Kernel::with_v1_reducers();
+        let err = kernel
+            .execute(KernelRequest {
+                target: "agenty.state.write".to_string(),
+                reducer_input: json!({
+                    "task_id": "task-a",
+                    "event_id": "evt-1",
+                    "occurred_at_unix": 1,
+                    "actor": "agent",
+                    "kind": "focus_set",
+                    "data": {"type": "focus_set"}
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, KernelError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn agenty_state_snapshot_derives_current_task_state() {
+        let dir = tempdir().unwrap();
+        let kernel =
+            Kernel::with_v1_reducers_and_persistence(PersistConfig::new(dir.path().to_path_buf()));
+        let events = [
+            json!({
+                "task_id": "task-a",
+                "event_id": "evt-1",
+                "occurred_at_unix": 1,
+                "actor": "agent",
+                "kind": "focus_set",
+                "paths": ["src/time/StopWatch.java"],
+                "symbols": ["split"],
+                "data": {"type": "focus_set"}
+            }),
+            json!({
+                "task_id": "task-a",
+                "event_id": "evt-2",
+                "occurred_at_unix": 2,
+                "actor": "agent",
+                "kind": "decision_added",
+                "data": {
+                    "type": "decision_added",
+                    "decision_id": "d1",
+                    "text": "Bug is in split()",
+                    "supersedes": null
+                }
+            }),
+            json!({
+                "task_id": "task-a",
+                "event_id": "evt-3",
+                "occurred_at_unix": 3,
+                "actor": "agent",
+                "kind": "question_opened",
+                "data": {
+                    "type": "question_opened",
+                    "question_id": "q1",
+                    "text": "Does DateUtils call split()?"
+                }
+            }),
+            json!({
+                "task_id": "task-a",
+                "event_id": "evt-4",
+                "occurred_at_unix": 4,
+                "actor": "agent",
+                "kind": "question_resolved",
+                "data": {
+                    "type": "question_resolved",
+                    "question_id": "q1"
+                }
+            }),
+            json!({
+                "task_id": "task-a",
+                "event_id": "evt-5",
+                "occurred_at_unix": 5,
+                "actor": "agent",
+                "kind": "step_completed",
+                "data": {
+                    "type": "step_completed",
+                    "step_id": "read_diff"
+                }
+            }),
+        ];
+
+        for event in events {
+            kernel
+                .execute(KernelRequest {
+                    target: "agenty.state.write".to_string(),
+                    reducer_input: event,
+                    ..KernelRequest::default()
+                })
+                .unwrap();
+        }
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "agenty.state.snapshot".to_string(),
+                reducer_input: json!({
+                    "task_id": "task-a"
+                }),
+                policy_context: json!({
+                    "disable_cache": true
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        let packet = response.output_packets.first().unwrap();
+        let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentSnapshotPayload> =
+            serde_json::from_value(packet.body.clone()).unwrap();
+
+        assert_eq!(envelope.payload.task_id, "task-a");
+        assert_eq!(envelope.payload.event_count, 5);
+        assert_eq!(
+            envelope.payload.focus_paths,
+            vec!["src/time/StopWatch.java".to_string()]
+        );
+        assert_eq!(envelope.payload.focus_symbols, vec!["split".to_string()]);
+        assert_eq!(
+            envelope.payload.completed_steps,
+            vec!["read_diff".to_string()]
+        );
+        assert!(envelope.payload.open_questions.is_empty());
+        assert_eq!(envelope.payload.active_decisions.len(), 1);
+        assert_eq!(envelope.payload.active_decisions[0].id, "d1");
     }
 
     #[test]

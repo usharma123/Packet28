@@ -296,6 +296,10 @@ fn packet_debug(wrapper: &Value) -> Option<&Value> {
     packet_payload(wrapper).get("debug")
 }
 
+fn write_state_event(path: &Path, content: &str) {
+    fs::write(path, content).unwrap();
+}
+
 #[test]
 fn test_suite_cover_check_smoke() {
     let output = suite_cmd()
@@ -1885,4 +1889,81 @@ fn test_suite_map_repo_legacy_json_compat_shape() {
     );
     assert!(value.get("packet_type").is_none());
     assert!(value.get("packet").is_some());
+}
+
+#[test]
+fn test_suite_context_state_append_then_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let event_path = dir.path().join("event.json");
+    write_state_event(
+        &event_path,
+        r#"{
+  "event_id": "evt-1",
+  "occurred_at_unix": 1700000000,
+  "actor": "agent",
+  "kind": "question_opened",
+  "data": {
+    "type": "question_opened",
+    "question_id": "q1",
+    "text": "Does DateUtils call split()?"
+  }
+}"#,
+    );
+
+    let append_output = suite_cmd()
+        .args([
+            "context",
+            "state",
+            "append",
+            "--task-id",
+            "task-demo",
+            "--input",
+            event_path.to_str().unwrap(),
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let append = parse_packet_wrapper(&append_output, "suite.agent.state.v1");
+    assert_eq!(
+        packet_payload(&append)
+            .get("task_id")
+            .and_then(Value::as_str),
+        Some("task-demo")
+    );
+
+    let snapshot_output = suite_cmd()
+        .args([
+            "context",
+            "state",
+            "snapshot",
+            "--task-id",
+            "task-demo",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let snapshot = parse_packet_wrapper(&snapshot_output, "suite.agent.snapshot.v1");
+    assert_eq!(
+        packet_payload(&snapshot)
+            .get("event_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        packet_payload(&snapshot)
+            .get("open_questions")
+            .and_then(Value::as_array)
+            .map(|questions| questions.len()),
+        Some(1)
+    );
 }

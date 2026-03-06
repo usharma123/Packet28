@@ -558,6 +558,16 @@ impl PacketCache {
             })
     }
 
+    pub fn entries(&self) -> Vec<PacketCacheEntry> {
+        let mut entries = self.entries_by_hash.values().cloned().collect::<Vec<_>>();
+        entries.sort_by(|a, b| {
+            a.created_at_unix
+                .cmp(&b.created_at_unix)
+                .then_with(|| a.cache_key.cmp(&b.cache_key))
+        });
+        entries
+    }
+
     pub fn prune(&mut self, request: ContextStorePruneRequest) -> ContextStorePruneReport {
         let removed = if request.all {
             let removed = self.entries_by_hash.len();
