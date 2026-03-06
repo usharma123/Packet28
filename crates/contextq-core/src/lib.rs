@@ -103,6 +103,7 @@ pub struct PacketSymbolRef {
 #[serde(default)]
 pub struct InputPacket {
     pub packet_id: Option<String>,
+    pub summary: Option<String>,
     pub tool: Option<String>,
     pub tools: Vec<String>,
     pub reducer: Option<String>,
@@ -406,18 +407,26 @@ pub fn assemble_packets(
         token_usage: Some(final_tokens),
         runtime_ms: Some(total_runtime_ms),
         payload: payload_value,
-        tool_invocations: source_summaries,
-        reducer_invocations: vec![ReducerInvocation {
-            name: "contextq.assemble".to_string(),
-            token_usage: Some(final_tokens),
-            runtime_ms: None,
-            output: json!({
-                "sections_kept": sections_kept,
-                "refs_kept": refs_kept,
-                "truncated": truncated
-            }),
-        }],
-        text_blobs: if options.compact_assembly {
+        tool_invocations: if options.compact_assembly || options.detail_mode == DetailMode::Compact {
+            Vec::new()
+        } else {
+            source_summaries
+        },
+        reducer_invocations: if options.compact_assembly || options.detail_mode == DetailMode::Compact {
+            Vec::new()
+        } else {
+            vec![ReducerInvocation {
+                name: "contextq.assemble".to_string(),
+                token_usage: Some(final_tokens),
+                runtime_ms: None,
+                output: json!({
+                    "sections_kept": sections_kept,
+                    "refs_kept": refs_kept,
+                    "truncated": truncated
+                }),
+            }]
+        },
+        text_blobs: if options.compact_assembly || options.detail_mode == DetailMode::Compact {
             Vec::new()
         } else {
             payload
@@ -473,15 +482,25 @@ fn build_default_section(
     };
 
     let body = match &packet.payload {
-        Value::Null => "{}".to_string(),
-        Value::String(text) => text.clone(),
+        Value::Null => packet
+            .summary
+            .clone()
+            .unwrap_or_else(|| "{}".to_string()),
+        Value::String(text) => match detail_mode {
+            DetailMode::Rich => text.clone(),
+            DetailMode::Compact => packet
+                .summary
+                .clone()
+                .unwrap_or_else(|| truncate_text(text, 180)),
+        },
         other => match detail_mode {
             DetailMode::Rich => {
                 serde_json::to_string_pretty(other).unwrap_or_else(|_| "{}".to_string())
             }
-            DetailMode::Compact => {
-                serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string())
-            }
+            DetailMode::Compact => packet
+                .summary
+                .clone()
+                .unwrap_or_else(|| summarize_payload(other)),
         },
     };
 
@@ -493,6 +512,143 @@ fn build_default_section(
         relevance: None,
         source_packet: Some(packet_label.to_string()),
     }
+}
+
+fn summarize_payload(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::String(text) => truncate_text(text, 180),
+        Value::Array(items) => format!("array(len={})", items.len()),
+        Value::Object(map) => summarize_payload_object(map),
+    }
+}
+
+fn summarize_payload_object(map: &serde_json::Map<String, Value>) -> String {
+    if let Some(Value::Object(gate)) = map.get("gate_result") {
+        let passed = gate
+            .get("passed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let total = gate
+            .get("total_coverage_pct")
+            .and_then(Value::as_f64)
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let changed = gate
+            .get("changed_coverage_pct")
+            .and_then(Value::as_f64)
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "n/a".to_string());
+        return format!("gate_result: passed={passed} total={total} changed={changed}");
+    }
+
+    if let Some(Value::Object(result)) = map.get("result") {
+        let selected = result
+            .get("selected_tests")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let smoke = result
+            .get("smoke_tests")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let missing = result
+            .get("missing_mappings")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let confidence = result
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        return format!(
+            "impact_result: selected={selected} smoke={smoke} missing={missing} confidence={confidence}"
+        );
+    }
+
+    if map.contains_key("files_ranked") && map.contains_key("symbols_ranked") {
+        let files = map
+            .get("files_ranked")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let symbols = map
+            .get("symbols_ranked")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let edges = map
+            .get("edges")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        return format!("repo_map: files={files} symbols={symbols} edges={edges}");
+    }
+
+    if map.contains_key("total_failures") && map.contains_key("unique_failures") {
+        let total = map
+            .get("total_failures")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let unique = map
+            .get("unique_failures")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let duplicates = map
+            .get("duplicates_removed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        return format!(
+            "stack_failures: total={total} unique={unique} duplicates_removed={duplicates}"
+        );
+    }
+
+    if map.contains_key("total_diagnostics") && map.contains_key("unique_diagnostics") {
+        let total = map
+            .get("total_diagnostics")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let unique = map
+            .get("unique_diagnostics")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let duplicates = map
+            .get("duplicates_removed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        return format!(
+            "build_diagnostics: total={total} unique={unique} duplicates_removed={duplicates}"
+        );
+    }
+
+    let mut keys = map.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    if keys.len() > 6 {
+        keys.truncate(6);
+    }
+    format!(
+        "object(keys={}): {}",
+        map.len(),
+        keys.join(", ")
+    )
+}
+
+fn truncate_text(input: &str, cap: usize) -> String {
+    let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= cap {
+        return normalized;
+    }
+
+    let mut truncated = String::new();
+    for ch in normalized.chars().take(cap.saturating_sub(3)) {
+        truncated.push(ch);
+    }
+    truncated.push_str("...");
+    truncated
 }
 
 fn derive_refs(packet: &InputPacket, payload: &Value, packet_label: &str) -> Vec<ContextRef> {
@@ -957,6 +1113,30 @@ mod tests {
     }
 
     #[test]
+    fn default_section_body_prefers_packet_summary_in_compact_mode() {
+        let packet = InputPacket {
+            packet_id: Some("mapy".to_string()),
+            summary: Some("repo_map files=4 symbols=24 edges=0".to_string()),
+            payload: json!({
+                "files_ranked": [{"file_idx": 0, "score": 0.9}],
+                "symbols_ranked": [{"symbol_idx": 0, "score": 0.8}],
+                "edges": []
+            }),
+            ..InputPacket::default()
+        };
+
+        let assembled = assemble_packets(
+            vec![packet],
+            AssembleOptions {
+                detail_mode: DetailMode::Compact,
+                ..AssembleOptions::default()
+            },
+        );
+        let payload: AssembledPayload = serde_json::from_value(assembled.payload).unwrap();
+        assert_eq!(payload.sections[0].body, "repo_map files=4 symbols=24 edges=0");
+    }
+
+    #[test]
     fn compact_assembly_drops_duplicate_section_refs_and_text_blobs() {
         let packet = InputPacket {
             packet_id: Some("diffy".to_string()),
@@ -983,6 +1163,8 @@ mod tests {
         );
         let payload: AssembledPayload = serde_json::from_value(assembled.payload).unwrap();
         assert_eq!(assembled.text_blobs.len(), 0);
+        assert!(assembled.tool_invocations.is_empty());
+        assert!(assembled.reducer_invocations.is_empty());
         assert_eq!(payload.sections.len(), 1);
         assert!(payload.sections[0].refs.is_empty());
         assert_eq!(payload.refs.len(), 1);

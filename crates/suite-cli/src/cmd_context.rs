@@ -195,6 +195,16 @@ pub struct RecallArgs {
 }
 
 pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let detail_mode = if profile == suite_packet_core::JsonProfile::Compact {
+        "compact"
+    } else {
+        "rich"
+    };
+    let compact_assembly = profile == suite_packet_core::JsonProfile::Compact;
     let input_packets = args
         .packets
         .iter()
@@ -215,11 +225,17 @@ pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
             byte_cap: Some(args.budget_bytes),
             runtime_ms_cap: None,
         },
-        policy_context: args
-            .context_config
-            .as_ref()
-            .map(|config_path| json!({ "config_path": config_path }))
-            .unwrap_or(Value::Null),
+        policy_context: match args.context_config.as_ref() {
+            Some(config_path) => json!({
+                "config_path": config_path,
+                "detail_mode": detail_mode,
+                "compact_assembly": compact_assembly,
+            }),
+            None => json!({
+                "detail_mode": detail_mode,
+                "compact_assembly": compact_assembly,
+            }),
+        },
         ..context_kernel_core::KernelRequest::default()
     })?;
 
@@ -230,11 +246,6 @@ pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
     let envelope: suite_packet_core::EnvelopeV1<Value> =
         serde_json::from_value(assembled.body.clone())
             .map_err(|source| anyhow!("invalid context output packet: {source}"))?;
-    let profile = args
-        .json
-        .map(suite_packet_core::JsonProfile::from)
-        .unwrap_or(suite_packet_core::JsonProfile::Compact);
-
     if args.context_config.is_some() {
         let budget_hint = crate::cmd_common::budget_retry_hint(
             &response.metadata,
