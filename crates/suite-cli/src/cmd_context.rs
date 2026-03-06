@@ -853,7 +853,14 @@ pub fn run_recall(args: RecallArgs) -> Result<i32> {
             "- score={:.3} age={}s target={} key={}",
             hit.score, hit.age_secs, hit.target, hit.cache_key
         );
-        println!("  {}", hit.snippet);
+        if let Some(summary) = hit.summary.as_ref() {
+            println!("  {summary}");
+            if !hit.snippet.is_empty() && hit.snippet != *summary {
+                println!("  {}", hit.snippet);
+            }
+        } else {
+            println!("  {}", hit.snippet);
+        }
     }
 
     Ok(0)
@@ -897,7 +904,14 @@ pub fn run_recall_remote(args: RecallArgs, daemon_root: &Path) -> Result<i32> {
             "- score={:.3} age={}s target={} key={}",
             hit.score, hit.age_secs, hit.target, hit.cache_key
         );
-        println!("  {}", hit.snippet);
+        if let Some(summary) = hit.summary.as_ref() {
+            println!("  {summary}");
+            if !hit.snippet.is_empty() && hit.snippet != *summary {
+                println!("  {}", hit.snippet);
+            }
+        } else {
+            println!("  {}", hit.snippet);
+        }
     }
 
     Ok(0)

@@ -2407,6 +2407,41 @@ fn test_suite_daemon_start_status_stop_cycle() {
 
 #[test]
 #[cfg(unix)]
+fn test_suite_daemon_suppresses_disconnect_log_noise() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+    init_repo(dir.path());
+
+    suite_cmd()
+        .args(["daemon", "start", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let socket = packet28_daemon_core::socket_path(dir.path());
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    packet28_daemon_core::write_socket_message(
+        &mut stream,
+        &packet28_daemon_core::DaemonRequest::Status,
+    )
+    .unwrap();
+    drop(stream);
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let log = fs::read_to_string(dir.path().join(".packet28/daemon/packet28d.log")).unwrap();
+    assert!(!log.contains("request handling failed: Broken pipe"));
+    assert!(!log.contains("request handling failed: Connection reset"));
+    assert!(!log.contains("request handling failed: unexpected end of file"));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
 fn test_suite_diff_analyze_via_daemon_matches_packet_shape() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -2599,7 +2634,7 @@ fn test_suite_daemon_task_submit_returns_watch_id_and_watch_list() {
 
 #[test]
 #[cfg(unix)]
-fn test_suite_daemon_task_submit_autofills_step_id_and_accepts_pascal_case_watch_kind() {
+fn test_suite_daemon_task_submit_autofills_blank_and_missing_step_ids() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
     setup_changed_repo(dir.path());
@@ -2614,6 +2649,23 @@ fn test_suite_daemon_task_submit_autofills_step_id_and_accepts_pascal_case_watch
                         "id": "",
                         "target": "mapy.repo",
                         "depends_on": [],
+                        "input_packets": [],
+                        "policy_context": {
+                            "task_id": "task-autofill"
+                        },
+                        "reducer_input": {
+                            "repo_root": dir.path(),
+                            "focus_paths": [],
+                            "focus_symbols": [],
+                            "max_files": 10,
+                            "max_symbols": 20,
+                            "include_tests": false
+                        },
+                        "budget": {}
+                    },
+                    {
+                        "target": "mapy.repo",
+                        "depends_on": ["mapy-repo-0"],
                         "input_packets": [],
                         "policy_context": {
                             "task_id": "task-autofill"
@@ -2687,15 +2739,134 @@ fn test_suite_daemon_task_submit_autofills_step_id_and_accepts_pascal_case_watch
         .stdout
         .clone();
     let status: Value = serde_json::from_slice(&status_output).unwrap();
+    let step_ids = status
+        .get("sequence")
+        .and_then(|sequence| sequence.get("steps"))
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .map(|step| step.get("id").and_then(Value::as_str).unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        step_ids,
+        vec!["mapy-repo-0".to_string(), "mapy-repo-1".to_string()]
+    );
     assert_eq!(
         status
             .get("sequence")
             .and_then(|sequence| sequence.get("steps"))
             .and_then(Value::as_array)
-            .and_then(|steps| steps.first())
-            .and_then(|step| step.get("id"))
+            .and_then(|steps| steps.get(1))
+            .and_then(|step| step.get("depends_on"))
+            .and_then(Value::as_array)
+            .and_then(|depends_on| depends_on.first())
             .and_then(Value::as_str),
         Some("mapy-repo-0")
+    );
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_suite_daemon_task_submit_accepts_pascal_case_watch_kind() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+    let spec_path = dir.path().join("task-spec-watch.json");
+    fs::write(
+        &spec_path,
+        serde_json::to_string_pretty(&json!({
+            "task_id": "task-watch-kind",
+            "sequence": {
+                "steps": [
+                    {
+                        "target": "mapy.repo",
+                        "depends_on": [],
+                        "input_packets": [],
+                        "policy_context": {
+                            "task_id": "task-watch-kind"
+                        },
+                        "reducer_input": {
+                            "repo_root": dir.path(),
+                            "focus_paths": [],
+                            "focus_symbols": [],
+                            "max_files": 10,
+                            "max_symbols": 20,
+                            "include_tests": false
+                        },
+                        "budget": {}
+                    }
+                ],
+                "budget": {},
+                "reactive": {
+                    "enabled": true,
+                    "task_id": "task-watch-kind",
+                    "append_focused_map": true
+                }
+            },
+            "watches": [
+                {
+                    "kind": "File",
+                    "task_id": "task-watch-kind",
+                    "root": dir.path(),
+                    "paths": ["src"],
+                    "include_globs": ["src/**"],
+                    "exclude_globs": []
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    suite_cmd()
+        .args(["daemon", "start", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "submit",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let watches_output = suite_cmd()
+        .args([
+            "daemon",
+            "watch",
+            "list",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-watch-kind",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let watches: Value = serde_json::from_slice(&watches_output).unwrap();
+    assert_eq!(
+        watches
+            .as_array()
+            .and_then(|watches| watches.first())
+            .and_then(|watch| watch.get("spec"))
+            .and_then(|spec| spec.get("kind"))
+            .and_then(Value::as_str),
+        Some("file")
     );
 
     suite_cmd()
@@ -3094,6 +3265,84 @@ fn test_suite_recall_prefers_summary_snippet_over_target_name() {
         .and_then(Value::as_str)
         .unwrap();
     assert!(snippet.contains("critical regression"));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_suite_recall_json_surfaces_summary_field() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    let packet = dir.path().join("stack.json");
+
+    write_packet_value(
+        &packet,
+        &json!({
+            "version": "1",
+            "tool": "stacky",
+            "kind": "stack_slice",
+            "hash": "stack-hash",
+            "summary": "stack failures total=2 unique=2",
+            "files": [{"path": "src/main.rs", "relevance": 1.0}],
+            "symbols": [],
+            "budget_cost": {"est_tokens": 1, "est_bytes": 1, "runtime_ms": 1, "tool_calls": 1},
+            "provenance": {"inputs": ["stack.log"], "generated_at_unix": 1},
+            "payload": {
+                "total_failures": 2,
+                "unique_failures": 2,
+                "duplicates_removed": 0
+            }
+        }),
+    );
+
+    suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "assemble",
+            "--packet",
+            packet.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "recall",
+            "--root",
+            ".",
+            "--query",
+            "stack failures src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    let first_hit = value
+        .get("hits")
+        .and_then(Value::as_array)
+        .and_then(|hits| hits.first())
+        .unwrap();
+    assert_eq!(
+        first_hit.get("summary").and_then(Value::as_str),
+        Some("stack failures total=2 unique=2")
+    );
+    assert_eq!(
+        first_hit.get("snippet").and_then(Value::as_str),
+        Some("stack failures total=2 unique=2")
+    );
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])

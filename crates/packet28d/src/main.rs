@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use context_kernel_core::{Kernel, KernelRequest, PersistConfig};
+use context_kernel_core::{normalize_sequence_request, Kernel, KernelRequest, PersistConfig};
 use context_memory_core::{
     ContextStoreListFilter, ContextStorePaging, ContextStorePruneRequest, PacketCache,
     PersistConfig as MemoryPersistConfig, RecallOptions,
@@ -170,7 +170,7 @@ fn handle_connection(
             let response = DaemonResponse::Error {
                 message: err.to_string(),
             };
-            write_socket_message(&mut writer, &response)?;
+            write_socket_response(&mut writer, &response)?;
             return Ok(());
         }
     };
@@ -183,8 +183,32 @@ fn handle_connection(
             }
         }
     };
-    write_socket_message(&mut writer, &response)?;
+    write_socket_response(&mut writer, &response)?;
     Ok(())
+}
+
+fn write_socket_response(
+    writer: &mut BufWriter<UnixStream>,
+    response: &DaemonResponse,
+) -> Result<()> {
+    match write_socket_message(writer, response) {
+        Ok(()) => Ok(()),
+        Err(err) if is_benign_disconnect_error(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_benign_disconnect_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+                )
+            })
+    })
 }
 
 fn handle_request(
@@ -927,36 +951,7 @@ fn normalize_task_submit_spec(root: &Path, mut spec: TaskSubmitSpec) -> Result<T
     if spec.sequence.steps.is_empty() {
         anyhow::bail!("sequence must contain at least one step");
     }
-
-    let mut ids = std::collections::BTreeSet::new();
-    for (index, step) in spec.sequence.steps.iter_mut().enumerate() {
-        if step.target.trim().is_empty() {
-            anyhow::bail!("sequence step {} target cannot be empty", index);
-        }
-        if step.id.trim().is_empty() {
-            step.id = format!("{}-{}", step.target.replace('.', "-"), index);
-        }
-        if !ids.insert(step.id.clone()) {
-            anyhow::bail!("sequence step id '{}' must be unique", step.id);
-        }
-    }
-    for step in &spec.sequence.steps {
-        for dep in &step.depends_on {
-            if dep.trim().is_empty() {
-                anyhow::bail!("sequence step '{}' has an empty dependency id", step.id);
-            }
-            if dep == &step.id {
-                anyhow::bail!("sequence step '{}' cannot depend on itself", step.id);
-            }
-            if !ids.contains(dep) {
-                anyhow::bail!(
-                    "sequence step '{}' depends on unknown step '{}'",
-                    step.id,
-                    dep
-                );
-            }
-        }
-    }
+    spec.sequence = normalize_sequence_request(spec.sequence).map_err(|source| anyhow!(source))?;
 
     for watch in &mut spec.watches {
         watch.task_id = spec.task_id.clone();

@@ -137,6 +137,7 @@ pub struct RecallHit {
     pub created_at_unix: u64,
     pub age_secs: u64,
     pub score: f64,
+    pub summary: Option<String>,
     pub snippet: String,
     pub matched_tokens: Vec<String>,
 }
@@ -639,7 +640,7 @@ impl PacketCache {
             }
 
             let age_secs = now.saturating_sub(entry.created_at_unix);
-            let (score, snippet, matched_tokens) =
+            let (score, summary, snippet, matched_tokens) =
                 score_recall_entry(entry, &query_tokens, age_secs);
             if score <= 0.0 {
                 continue;
@@ -651,6 +652,7 @@ impl PacketCache {
                 created_at_unix: entry.created_at_unix,
                 age_secs,
                 score,
+                summary,
                 snippet,
                 matched_tokens,
             });
@@ -735,15 +737,20 @@ fn score_recall_entry(
     entry: &PacketCacheEntry,
     query_tokens: &[String],
     age_secs: u64,
-) -> (f64, String, Vec<String>) {
+) -> (f64, Option<String>, String, Vec<String>) {
     let mut corpus = Vec::new();
+    let mut summaries = Vec::new();
     let mut path_terms = Vec::new();
     let mut symbol_terms = Vec::new();
     for packet in &entry.packets {
+        collect_summary_texts(&packet.body, &mut summaries, 16);
+        collect_summary_texts(&packet.metadata, &mut summaries, 16);
         collect_texts_from_value(&packet.body, &mut corpus, 128);
         collect_texts_from_value(&packet.metadata, &mut corpus, 64);
         collect_ref_terms(&packet.body, &mut path_terms, &mut symbol_terms);
     }
+    collect_summary_texts(&entry.metadata, &mut summaries, 16);
+    corpus.extend(summaries.iter().cloned());
     collect_texts_from_value(&entry.metadata, &mut corpus, 64);
     corpus.push(entry.target.clone());
     corpus.push(entry.cache_key.clone());
@@ -762,7 +769,7 @@ fn score_recall_entry(
     }
 
     if matched_tokens.is_empty() {
-        return (0.0, String::new(), Vec::new());
+        return (0.0, None, String::new(), Vec::new());
     }
 
     let base = matched_tokens.len() as f64 / query_tokens.len() as f64;
@@ -784,23 +791,95 @@ fn score_recall_entry(
     };
     let recency_boost = (1.0 / (1.0 + (age_secs as f64 / 86_400.0))).min(1.0) * 0.2;
 
-    let mut snippet = corpus
+    let summary = summaries
         .iter()
         .find(|item| {
             let lower = item.to_ascii_lowercase();
             matched_tokens.iter().any(|token| lower.contains(token))
         })
         .cloned()
-        .unwrap_or_else(|| "{}".to_string());
-    if snippet.len() > 200 {
-        snippet.truncate(200);
+        .or_else(|| summaries.first().cloned())
+        .map(|item| truncate_recall_text(item, 200));
+    let mut snippet = summary.clone().unwrap_or_else(|| {
+        corpus
+            .iter()
+            .find(|item| {
+                let lower = item.to_ascii_lowercase();
+                matched_tokens.iter().any(|token| lower.contains(token))
+            })
+            .cloned()
+            .unwrap_or_else(|| "{}".to_string())
+    });
+    if summary.is_none() {
+        snippet = truncate_recall_text(snippet, 200);
     }
 
     (
         base + path_boost + symbol_boost + recency_boost,
+        summary,
         snippet,
         matched_tokens,
     )
+}
+
+fn collect_summary_texts(value: &Value, out: &mut Vec<String>, max_items: usize) {
+    if out.len() >= max_items {
+        return;
+    }
+
+    match value {
+        Value::Object(map) => {
+            if let Some(summary) = map.get("summary").and_then(Value::as_str) {
+                push_unique_text(out, summary, max_items);
+            }
+            if (map.contains_key("title") || map.contains_key("source_packet"))
+                && map
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .is_some_and(|body| !body.trim().is_empty())
+            {
+                push_unique_text(
+                    out,
+                    map.get("body").and_then(Value::as_str).unwrap_or_default(),
+                    max_items,
+                );
+            }
+            for child in map.values() {
+                collect_summary_texts(child, out, max_items);
+                if out.len() >= max_items {
+                    return;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_summary_texts(item, out, max_items);
+                if out.len() >= max_items {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_unique_text(out: &mut Vec<String>, text: &str, max_items: usize) {
+    if out.len() >= max_items {
+        return;
+    }
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() || out.iter().any(|existing| existing == trimmed) {
+        return;
+    }
+    out.push(trimmed.to_string());
+}
+
+fn truncate_recall_text(mut text: String, max_len: usize) -> String {
+    if text.len() > max_len {
+        text.truncate(max_len);
+    }
+    text
 }
 
 fn collect_texts_from_value(value: &Value, out: &mut Vec<String>, max_items: usize) {
@@ -1138,6 +1217,7 @@ mod tests {
             &lookup,
             vec![CachePacket {
                 body: serde_json::json!({
+                    "summary": "parser crash investigation for src/main.rs",
                     "sections":[{"body":"Investigated parser crash in src/main.rs"}],
                     "refs":[{"kind":"file","value":"src/main.rs"},{"kind":"symbol","value":"parse_input"}]
                 }),
@@ -1156,6 +1236,14 @@ mod tests {
         );
         assert!(!hits.is_empty());
         assert_eq!(hits[0].cache_key, stored.cache_key);
+        assert_eq!(
+            hits[0].summary.as_deref(),
+            Some("parser crash investigation for src/main.rs")
+        );
+        assert_eq!(
+            hits[0].snippet,
+            "parser crash investigation for src/main.rs"
+        );
 
         let report = cache.prune(ContextStorePruneRequest {
             all: true,

@@ -23,4 +23,5 @@ JavaTest/.packet28-bench-repo/
 hyperfine/results/packet28-javatest/
 
 # Packet28 local cache artifacts
+.packet28/
 crates/suite-cli/.packet28/
