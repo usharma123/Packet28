@@ -3,10 +3,22 @@ use predicates::prelude::*;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
 fn suite_cmd() -> Command {
     assert_cmd::cargo::cargo_bin_cmd!("Packet28")
+}
+
+fn ensure_packet28d_built() {
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "packet28d"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to build packet28d");
+    });
 }
 
 fn fixture(rel: &str) -> String {
@@ -319,6 +331,10 @@ struct Alpha;
             "change alpha",
         ],
     );
+}
+
+fn init_repo(root: &Path) {
+    git(root, &["init"]);
 }
 
 fn kernel_cache_file(root: &Path) -> PathBuf {
@@ -2322,4 +2338,645 @@ fn test_suite_context_assemble_task_id_compresses_read_section() {
         .and_then(Value::as_str)
         .unwrap();
     assert!(first_body.starts_with("Reminder: already reviewed"));
+}
+
+#[test]
+fn test_suite_daemon_start_status_stop_cycle() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+
+    suite_cmd()
+        .args(["daemon", "start", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let status_output = suite_cmd()
+        .args([
+            "daemon",
+            "status",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status_output).unwrap();
+    assert_eq!(
+        status.get("workspace_root").and_then(Value::as_str),
+        Some(dir.path().to_str().unwrap())
+    );
+    assert!(status.get("pid").and_then(Value::as_u64).unwrap() > 0);
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_suite_diff_analyze_via_daemon_matches_packet_shape() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+
+    suite_cmd()
+        .args(["daemon", "start", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let local_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "diff",
+            "analyze",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD~1",
+            "--head",
+            "HEAD",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let via_daemon_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "diff",
+            "analyze",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--no-issues-state",
+            "--base",
+            "HEAD~1",
+            "--head",
+            "HEAD",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let local = parse_packet_wrapper(&local_output, "suite.diff.analyze.v1");
+    let remote = parse_packet_wrapper(&via_daemon_output, "suite.diff.analyze.v1");
+    assert_eq!(
+        packet_payload(&local)
+            .get("gate_result")
+            .and_then(|value| value.get("passed"))
+            .and_then(Value::as_bool),
+        packet_payload(&remote)
+            .get("gate_result")
+            .and_then(|value| value.get("passed"))
+            .and_then(Value::as_bool)
+    );
+    assert_eq!(
+        packet_payload(&local).get("diffs"),
+        packet_payload(&remote).get("diffs")
+    );
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_suite_daemon_task_submit_returns_watch_id_and_watch_list() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+    let spec_path = dir.path().join("task-spec.json");
+    fs::write(
+        &spec_path,
+        serde_json::to_string_pretty(&json!({
+            "task_id": "task-watch",
+            "sequence": {
+                "steps": [
+                    {
+                        "id": "map",
+                        "target": "mapy.repo",
+                        "depends_on": [],
+                        "input_packets": [],
+                        "policy_context": {
+                            "task_id": "task-watch"
+                        },
+                        "reducer_input": {
+                            "repo_root": dir.path(),
+                            "focus_paths": [],
+                            "focus_symbols": [],
+                            "max_files": 10,
+                            "max_symbols": 20,
+                            "include_tests": false
+                        },
+                        "budget": {}
+                    }
+                ],
+                "budget": {},
+                "reactive": {
+                    "enabled": true,
+                    "task_id": "task-watch",
+                    "append_focused_map": true
+                }
+            },
+            "watches": [
+                {
+                    "kind": "file",
+                    "task_id": "task-watch",
+                    "root": dir.path(),
+                    "paths": ["src"],
+                    "include_globs": ["src/**"],
+                    "exclude_globs": []
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    suite_cmd()
+        .args(["daemon", "start", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let submit_output = suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "submit",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let submit: Value = serde_json::from_slice(&submit_output).unwrap();
+    let watch_id = submit
+        .get("watches")
+        .and_then(Value::as_array)
+        .and_then(|watches| watches.first())
+        .and_then(|watch| watch.get("watch_id"))
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let watches_output = suite_cmd()
+        .args([
+            "daemon",
+            "watch",
+            "list",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-watch",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let watches: Value = serde_json::from_slice(&watches_output).unwrap();
+    assert_eq!(
+        watches
+            .as_array()
+            .and_then(|watches| watches.first())
+            .and_then(|watch| watch.get("watch_id"))
+            .and_then(Value::as_str),
+        Some(watch_id.as_str())
+    );
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_suite_test_map_and_shard_via_daemon_auto_start() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    let manifest = dir.path().join("manifest.jsonl");
+    let testmap = dir.path().join("testmap.bin");
+    let timings = dir.path().join("testtimings.bin");
+    let tasks = dir.path().join("tasks.json");
+    write_manifest(&manifest);
+    fs::write(
+        &tasks,
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "tasks": [
+                {"id": "com.foo.BarTest", "selector": "com.foo.BarTest", "est_ms": 1200, "tags": ["unit"]},
+                {"id": "com.foo.BazTest", "selector": "com.foo.BazTest", "est_ms": 900, "tags": ["unit"]}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let map_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "test",
+            "map",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output",
+            testmap.to_str().unwrap(),
+            "--timings-output",
+            timings.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let map_value: Value = serde_json::from_slice(&map_output).unwrap();
+    assert_eq!(map_value.get("records").and_then(Value::as_u64), Some(1));
+    assert!(dir.path().join(".packet28/daemon/runtime.json").exists());
+    assert!(testmap.exists());
+    assert!(timings.exists());
+
+    let shard_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "test",
+            "shard",
+            "--shards",
+            "2",
+            "--tasks-json",
+            tasks.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let shard_value: Value = serde_json::from_slice(&shard_output).unwrap();
+    assert_eq!(
+        shard_value
+            .get("shards")
+            .and_then(Value::as_array)
+            .map(|value| value.len()),
+        Some(2)
+    );
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_suite_stack_and_build_via_daemon_emit_packet_wrappers() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    let stack_input = dir.path().join("stack.log");
+    let build_input = dir.path().join("build.log");
+    write_stack_log(&stack_input);
+    write_build_log(&build_input);
+
+    let stack_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "stack",
+            "slice",
+            "--input",
+            stack_input.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stack_value = parse_packet_wrapper(&stack_output, "suite.stack.slice.v1");
+    assert!(packet_payload(&stack_value)
+        .get("failures")
+        .and_then(Value::as_array)
+        .is_some());
+
+    let build_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "build",
+            "reduce",
+            "--input",
+            build_input.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let build_value = parse_packet_wrapper(&build_output, "suite.build.reduce.v1");
+    assert!(packet_payload(&build_value)
+        .get("groups")
+        .and_then(Value::as_array)
+        .is_some());
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_suite_context_non_assemble_via_daemon_smoke() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    let diff = dir.path().join("diff.json");
+    let impact = dir.path().join("impact.json");
+    let event = dir.path().join("event.json");
+    let packet_a = dir.path().join("a.json");
+    let packet_b = dir.path().join("b.json");
+
+    write_packet_value(
+        &diff,
+        &json!({
+            "version": "1",
+            "tool": "diffy",
+            "kind": "diff_analyze",
+            "hash": "diff-hash",
+            "summary": "changed StopWatch",
+            "files": [{"path": "src/StopWatch.java", "relevance": 1.0}],
+            "symbols": [],
+            "budget_cost": {"est_tokens": 1, "est_bytes": 1, "runtime_ms": 1, "tool_calls": 1},
+            "provenance": {"inputs": ["diff"], "generated_at_unix": 1},
+            "payload": {
+                "gate_result": {"passed": true, "violations": []},
+                "diffs": [{"path": "src/StopWatch.java", "old_path": null, "status": "Modified", "changed_lines": [10, 11]}]
+            }
+        }),
+    );
+    write_packet_value(
+        &impact,
+        &json!({
+            "version": "1",
+            "tool": "testy",
+            "kind": "test_impact",
+            "hash": "impact-hash",
+            "summary": "impact",
+            "files": [],
+            "symbols": [{"name": "StopWatchTest#testSplit", "kind": "test_id", "relevance": 1.0}],
+            "budget_cost": {"est_tokens": 1, "est_bytes": 1, "runtime_ms": 1, "tool_calls": 1},
+            "provenance": {"inputs": ["testmap.bin"], "generated_at_unix": 1},
+            "payload": {
+                "result": {
+                    "selected_tests": ["StopWatchTest#testSplit"],
+                    "smoke_tests": [],
+                    "missing_mappings": [],
+                    "confidence": 0.9,
+                    "stale": false,
+                    "escalate_full_suite": false
+                },
+                "known_tests": 1,
+                "print_command": null
+            }
+        }),
+    );
+    write_state_event(
+        &event,
+        r#"{
+  "event_id": "evt-1",
+  "occurred_at_unix": 1,
+  "actor": "tester",
+  "kind": "focus_set",
+  "paths": ["src/lib.rs"],
+  "symbols": [],
+  "data": {"type": "focus_set"}
+}"#,
+    );
+    write_context_packet(
+        &packet_a,
+        "diffy",
+        "Diff gate",
+        "critical regression in coverage",
+        "src/lib.rs",
+    );
+    write_context_packet(
+        &packet_b,
+        "testy",
+        "Impact plan",
+        "selected tests for src/lib.rs",
+        "src/lib.rs",
+    );
+
+    let correlate_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "correlate",
+            "--packet",
+            diff.to_str().unwrap(),
+            "--packet",
+            impact.to_str().unwrap(),
+            "--task-id",
+            "task-correlation",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let correlate_value = parse_packet_wrapper(&correlate_output, "suite.context.correlate.v1");
+    assert!(packet_payload(&correlate_value)
+        .get("findings")
+        .and_then(Value::as_array)
+        .is_some());
+
+    let state_append_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "state",
+            "append",
+            "--task-id",
+            "task-state",
+            "--input",
+            event.to_str().unwrap(),
+            "--root",
+            ".",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let state_append_value = parse_packet_wrapper(&state_append_output, "suite.agent.state.v1");
+    assert_eq!(
+        packet_payload(&state_append_value)
+            .get("task_id")
+            .and_then(Value::as_str),
+        Some("task-state")
+    );
+
+    let state_snapshot_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "state",
+            "snapshot",
+            "--task-id",
+            "task-state",
+            "--root",
+            ".",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let state_snapshot_value =
+        parse_packet_wrapper(&state_snapshot_output, "suite.agent.snapshot.v1");
+    assert_eq!(
+        packet_payload(&state_snapshot_value)
+            .get("task_id")
+            .and_then(Value::as_str),
+        Some("task-state")
+    );
+
+    suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "assemble",
+            "--packet",
+            packet_a.to_str().unwrap(),
+            "--packet",
+            packet_b.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let store_list_output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "store",
+            "list",
+            "--root",
+            ".",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let store_list_value: Value = serde_json::from_slice(&store_list_output).unwrap();
+    let entries = store_list_value
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap();
+    assert!(!entries.is_empty());
+
+    let key = entries[0]
+        .get("cache_key")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "store",
+            "get",
+            "--root",
+            ".",
+            "--key",
+            &key,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&key));
+
+    suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "store",
+            "stats",
+            "--root",
+            ".",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"stats\""));
+
+    suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "recall",
+            "--root",
+            ".",
+            "--query",
+            "critical regression",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"query\":\"critical regression\""));
+
+    suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "context",
+            "store",
+            "prune",
+            "--root",
+            ".",
+            "--all",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"report\""));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
 }
