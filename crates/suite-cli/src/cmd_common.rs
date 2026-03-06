@@ -1,9 +1,22 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde_json::{json, Value};
 use suite_packet_core::{CoverageData, CoverageFormat, EnvelopeV1, JsonProfile, PacketWrapperV1};
+
+pub fn parse_daemon_env_flag(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+pub fn via_daemon_env_enabled() -> bool {
+    parse_daemon_env_flag(std::env::var("PACKET28_VIA_DAEMON").ok().as_deref())
+}
 
 pub fn resolve_report_format(explicit: Option<&str>) -> String {
     match explicit {
@@ -67,8 +80,8 @@ pub fn emit_machine_envelope<T: serde::Serialize + Clone>(
 
     match profile {
         JsonProfile::Full => {
-            if let Some(debug) = debug {
-                insert_payload_debug(&mut packet, debug);
+            if let Some(ref debug) = debug {
+                insert_payload_debug(&mut packet, debug.clone());
             }
         }
         JsonProfile::Compact => {
@@ -83,8 +96,50 @@ pub fn emit_machine_envelope<T: serde::Serialize + Clone>(
         }
     }
 
-    let wrapper = PacketWrapperV1::new(packet_type.to_string(), packet);
+    refresh_packet_budget(&mut packet);
+
+    let mut wrapper = PacketWrapperV1::new(packet_type.to_string(), packet);
+    wrapper.cache_hit = debug.as_ref().and_then(extract_cache_hit).unwrap_or(false);
     emit_json(&serde_json::to_value(wrapper)?, pretty)
+}
+
+pub fn emit_machine_wrapper<T: serde::Serialize + Clone>(
+    wrapper: &PacketWrapperV1<EnvelopeV1<T>>,
+    profile: JsonProfile,
+    pretty: bool,
+    artifact_root: &Path,
+    debug: Option<Value>,
+) -> Result<()> {
+    let mut packet = serde_json::to_value(&wrapper.packet)?;
+
+    match profile {
+        JsonProfile::Full => {
+            if let Some(ref debug) = debug {
+                insert_payload_debug(&mut packet, debug.clone());
+            }
+        }
+        JsonProfile::Compact => {
+            compact_packet_payload(&wrapper.packet_type, &mut packet);
+        }
+        JsonProfile::Handle => {
+            let handle = suite_packet_core::write_packet_artifact(
+                artifact_root,
+                &wrapper.packet_type,
+                &wrapper.packet,
+            )
+            .map_err(|source| anyhow::anyhow!(source.to_string()))?;
+            compact_packet_payload(&wrapper.packet_type, &mut packet);
+            attach_artifact_handle(&mut packet, serde_json::to_value(handle)?);
+        }
+    }
+
+    refresh_packet_budget(&mut packet);
+
+    let mut output = PacketWrapperV1::new(wrapper.packet_type.clone(), packet);
+    output.schema_version = wrapper.schema_version.clone();
+    output.cache_hit =
+        wrapper.cache_hit || debug.as_ref().and_then(extract_cache_hit).unwrap_or(false);
+    emit_json(&serde_json::to_value(output)?, pretty)
 }
 
 pub fn emit_json(value: &Value, pretty: bool) -> Result<()> {
@@ -96,11 +151,68 @@ pub fn emit_json(value: &Value, pretty: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn emit_machine_error(
+    command: &str,
+    error: &anyhow::Error,
+    pretty: bool,
+    target: Option<&str>,
+    retry_hint: Option<Value>,
+) -> Result<()> {
+    let causes = error
+        .chain()
+        .skip(1)
+        .map(|cause| Value::String(cause.to_string()))
+        .collect::<Vec<_>>();
+    emit_json(
+        &json!({
+            "schema_version": "suite.error.v1",
+            "command": command,
+            "message": error.to_string(),
+            "target": target,
+            "retry_hint": retry_hint,
+            "causes": causes,
+        }),
+        pretty,
+    )
+}
+
 pub fn resolve_artifact_root(explicit_root: Option<&Path>) -> PathBuf {
     if let Some(root) = explicit_root {
         return root.to_path_buf();
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn caller_cwd() -> Result<PathBuf> {
+    std::env::current_dir().context("failed to resolve current directory")
+}
+
+pub fn resolve_path_from_cwd(value: &str, cwd: &Path) -> String {
+    if value.trim().is_empty() {
+        return value.to_string();
+    }
+    let path = PathBuf::from(value);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    absolute
+        .canonicalize()
+        .unwrap_or(absolute)
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub fn resolve_optional_path_from_cwd(value: Option<&str>, cwd: &Path) -> Option<String> {
+    value.map(|value| resolve_path_from_cwd(value, cwd))
+}
+
+pub fn resolve_paths_from_cwd(values: &[String], cwd: &Path) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| resolve_path_from_cwd(value, cwd))
+        .collect()
 }
 
 fn insert_payload_debug(packet: &mut Value, debug: Value) {
@@ -113,6 +225,94 @@ fn insert_payload_debug(packet: &mut Value, debug: Value) {
     map.insert("debug".to_string(), debug);
 }
 
+fn refresh_packet_budget(packet: &mut Value) {
+    for _ in 0..5 {
+        let payload_bytes = packet
+            .get("payload")
+            .and_then(|payload| serde_json::to_vec(payload).ok())
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        let packet_bytes = serde_json::to_vec(&*packet)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        let payload_tokens = suite_packet_core::estimate_tokens_from_bytes(payload_bytes);
+        let packet_tokens = suite_packet_core::estimate_tokens_from_bytes(packet_bytes);
+
+        let Some(budget_cost) = packet.get_mut("budget_cost").and_then(Value::as_object_mut) else {
+            return;
+        };
+
+        let current_packet_bytes = budget_cost
+            .get("est_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let current_packet_tokens = budget_cost
+            .get("est_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let current_payload_bytes = budget_cost
+            .get("payload_est_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let current_payload_tokens = budget_cost
+            .get("payload_est_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        budget_cost.insert("est_bytes".to_string(), Value::from(packet_bytes as u64));
+        budget_cost.insert("est_tokens".to_string(), Value::from(packet_tokens));
+        budget_cost.insert(
+            "payload_est_bytes".to_string(),
+            Value::from(payload_bytes as u64),
+        );
+        budget_cost.insert(
+            "payload_est_tokens".to_string(),
+            Value::from(payload_tokens),
+        );
+
+        if current_packet_bytes == packet_bytes
+            && current_packet_tokens == packet_tokens
+            && current_payload_bytes == payload_bytes
+            && current_payload_tokens == payload_tokens
+        {
+            break;
+        }
+    }
+}
+
+fn extract_cache_hit(debug: &Value) -> Option<bool> {
+    match debug {
+        Value::Object(map) => {
+            if let Some(cache) = map.get("cache") {
+                if let Some(hit) = find_cache_hit(cache) {
+                    return Some(hit);
+                }
+            }
+            for value in map.values() {
+                if let Some(hit) = extract_cache_hit(value) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(extract_cache_hit),
+        _ => None,
+    }
+}
+
+fn find_cache_hit(value: &Value) -> Option<bool> {
+    match value {
+        Value::Object(map) => {
+            if let Some(hit) = map.get("hit").and_then(Value::as_bool) {
+                return Some(hit);
+            }
+            map.values().find_map(find_cache_hit)
+        }
+        Value::Array(values) => values.iter().find_map(find_cache_hit),
+        _ => None,
+    }
+}
+
 fn compact_packet_payload(packet_type: &str, packet: &mut Value) {
     let mut stats = CompactStats::default();
     {
@@ -123,7 +323,9 @@ fn compact_packet_payload(packet_type: &str, packet: &mut Value) {
             suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE => {
                 compact_context_assemble_payload(payload, &mut stats)
             }
-            suite_packet_core::PACKET_TYPE_DIFF_ANALYZE => compact_diff_payload(payload, &mut stats),
+            suite_packet_core::PACKET_TYPE_DIFF_ANALYZE => {
+                compact_diff_payload(payload, &mut stats)
+            }
             suite_packet_core::PACKET_TYPE_TEST_IMPACT => {
                 compact_test_impact_payload(payload, &mut stats)
             }
@@ -133,7 +335,9 @@ fn compact_packet_payload(packet_type: &str, packet: &mut Value) {
             suite_packet_core::PACKET_TYPE_BUILD_REDUCE => {
                 compact_build_reduce_payload(payload, &mut stats)
             }
-            suite_packet_core::PACKET_TYPE_MAP_REPO => compact_map_repo_payload(payload, &mut stats),
+            suite_packet_core::PACKET_TYPE_MAP_REPO => {
+                compact_map_repo_payload(payload, &mut stats)
+            }
             suite_packet_core::PACKET_TYPE_PROXY_RUN => compact_proxy_payload(payload, &mut stats),
             suite_packet_core::PACKET_TYPE_GUARD_CHECK => {
                 compact_guard_check_payload(payload, &mut stats)
@@ -423,7 +627,9 @@ fn compact_map_repo_payload(payload: &mut Value, stats: &mut CompactStats) {
         }
     }
     if let Some(Value::Object(truncation)) = map.get_mut("truncation") {
-        let all_zero = truncation.values().all(|value| value.as_u64().unwrap_or_default() == 0);
+        let all_zero = truncation
+            .values()
+            .all(|value| value.as_u64().unwrap_or_default() == 0);
         if all_zero {
             map.remove("truncation");
             stats.truncated = true;
@@ -745,7 +951,10 @@ mod tests {
         assert!(payload.get("tool_invocations").is_none());
         assert!(payload.get("reducer_invocations").is_none());
         assert!(payload.get("debug").is_none());
-        assert!(payload.get("truncated").and_then(Value::as_bool).unwrap_or(false));
+        assert!(payload
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false));
 
         let section = payload
             .get("sections")

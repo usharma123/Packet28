@@ -47,6 +47,20 @@ pub struct AssembleArgs {
     pretty: bool,
 }
 
+impl AssembleArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some() || self.legacy_json
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+
+    pub(crate) fn governed_requested(&self) -> bool {
+        self.context_config.is_some()
+    }
+}
+
 #[derive(Args)]
 pub struct CorrelateArgs {
     /// Path(s) to reducer packet JSON files.
@@ -64,6 +78,16 @@ pub struct CorrelateArgs {
     /// Pretty-print JSON output
     #[arg(long)]
     pretty: bool,
+}
+
+impl CorrelateArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some()
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
 }
 
 #[derive(Args)]
@@ -109,6 +133,16 @@ pub struct StateAppendArgs {
     pretty: bool,
 }
 
+impl StateAppendArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some()
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+}
+
 #[derive(Args)]
 pub struct StateSnapshotArgs {
     /// Task identifier to snapshot
@@ -126,6 +160,16 @@ pub struct StateSnapshotArgs {
     /// Pretty-print JSON output
     #[arg(long)]
     pretty: bool,
+}
+
+impl StateSnapshotArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some()
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
 }
 
 #[derive(Subcommand)]
@@ -181,6 +225,16 @@ pub struct StoreListArgs {
     pretty: bool,
 }
 
+impl StoreListArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+}
+
 #[derive(Args)]
 pub struct StoreGetArgs {
     /// Store root directory (uses <root>/.packet28/packet-cache-v1.bin)
@@ -198,6 +252,16 @@ pub struct StoreGetArgs {
     /// Pretty-print JSON output
     #[arg(long)]
     pretty: bool,
+}
+
+impl StoreGetArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
 }
 
 #[derive(Args)]
@@ -223,6 +287,16 @@ pub struct StorePruneArgs {
     pretty: bool,
 }
 
+impl StorePruneArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+}
+
 #[derive(Args)]
 pub struct StoreStatsArgs {
     /// Store root directory (uses <root>/.packet28/packet-cache-v1.bin)
@@ -236,6 +310,16 @@ pub struct StoreStatsArgs {
     /// Pretty-print JSON output
     #[arg(long)]
     pretty: bool,
+}
+
+impl StoreStatsArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
 }
 
 #[derive(Args)]
@@ -271,6 +355,16 @@ pub struct RecallArgs {
     /// Pretty-print JSON output
     #[arg(long)]
     pretty: bool,
+}
+
+impl RecallArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
 }
 
 pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
@@ -423,6 +517,157 @@ pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
     Ok(0)
 }
 
+pub fn run_assemble_remote(args: AssembleArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_context_config =
+        crate::cmd_common::resolve_optional_path_from_cwd(args.context_config.as_deref(), &cwd);
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let detail_mode = if profile == suite_packet_core::JsonProfile::Compact {
+        "compact"
+    } else {
+        "rich"
+    };
+    let compact_assembly = profile == suite_packet_core::JsonProfile::Compact;
+    let input_packets = args
+        .packets
+        .iter()
+        .map(|path| context_kernel_core::load_packet_file(Path::new(path)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let target = if resolved_context_config.is_some() {
+        "governed.assemble"
+    } else {
+        "contextq.assemble"
+    };
+    let response = crate::cmd_daemon::send_kernel_request(
+        daemon_root,
+        context_kernel_core::KernelRequest {
+            target: target.to_string(),
+            input_packets,
+            budget: context_kernel_core::ExecutionBudget {
+                token_cap: Some(args.budget_tokens),
+                byte_cap: Some(args.budget_bytes),
+                runtime_ms_cap: None,
+            },
+            policy_context: match resolved_context_config.as_ref() {
+                Some(config_path) => json!({
+                    "config_path": config_path,
+                    "detail_mode": detail_mode,
+                    "compact_assembly": compact_assembly,
+                    "task_id": args.task_id,
+                    "disable_cache": args.task_id.is_some(),
+                }),
+                None => json!({
+                    "detail_mode": detail_mode,
+                    "compact_assembly": compact_assembly,
+                    "task_id": args.task_id,
+                    "disable_cache": args.task_id.is_some(),
+                }),
+            },
+            ..context_kernel_core::KernelRequest::default()
+        },
+    )?;
+    let assembled = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<Value> =
+        serde_json::from_value(assembled.body.clone())
+            .map_err(|source| anyhow!("invalid context output packet: {source}"))?;
+    if resolved_context_config.is_some() {
+        let budget_hint = crate::cmd_common::budget_retry_hint(
+            &response.metadata,
+            args.budget_tokens,
+            args.budget_bytes,
+            "Packet28 context assemble --context-config <context.yaml>",
+        );
+        if args.legacy_json {
+            crate::cmd_common::emit_json(
+                &json!({
+                    "schema_version": "suite.context.assemble.v1",
+                    "final_packet": assembled.body,
+                    "kernel_audit": {
+                        "governed": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "governed": response.metadata,
+                    },
+                    "cache": {
+                        "governed": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                    "hints": {
+                        "budget_retry": budget_hint,
+                    },
+                }),
+                args.pretty,
+            )?;
+        } else {
+            crate::cmd_common::emit_machine_envelope(
+                suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE,
+                &envelope,
+                profile,
+                args.pretty,
+                &crate::cmd_common::resolve_artifact_root(None),
+                Some(json!({
+                    "kernel_audit": {
+                        "governed": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "governed": response.metadata,
+                    },
+                    "cache": {
+                        "governed": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                    "hints": {
+                        "budget_retry": budget_hint,
+                    },
+                })),
+            )?;
+        }
+    } else {
+        if args.legacy_json {
+            crate::cmd_common::emit_json(
+                &json!({
+                    "schema_version": "suite.context.assemble.v1",
+                    "packet": assembled.body,
+                    "kernel_audit": {
+                        "context": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "context": response.metadata,
+                    },
+                    "cache": {
+                        "context": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                }),
+                args.pretty,
+            )?;
+        } else {
+            crate::cmd_common::emit_machine_envelope(
+                suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE,
+                &envelope,
+                profile,
+                args.pretty,
+                &crate::cmd_common::resolve_artifact_root(None),
+                Some(json!({
+                    "kernel_audit": {
+                        "context": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "context": response.metadata,
+                    },
+                    "cache": {
+                        "context": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                })),
+            )?;
+        }
+    }
+    Ok(0)
+}
+
 pub fn run_correlate(args: CorrelateArgs) -> Result<i32> {
     let profile = args
         .json
@@ -481,6 +726,65 @@ pub fn run_correlate(args: CorrelateArgs) -> Result<i32> {
     Ok(0)
 }
 
+pub fn run_correlate_remote(args: CorrelateArgs, daemon_root: &Path) -> Result<i32> {
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let input_packets = args
+        .packets
+        .iter()
+        .map(|path| context_kernel_core::load_packet_file(Path::new(path)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| anyhow!("{source}"))?;
+
+    let response = crate::cmd_daemon::send_kernel_request(
+        daemon_root,
+        context_kernel_core::KernelRequest {
+            target: "contextq.correlate".to_string(),
+            input_packets,
+            policy_context: json!({
+                "task_id": args.task_id,
+                "disable_cache": true,
+            }),
+            ..context_kernel_core::KernelRequest::default()
+        },
+    )?;
+
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextCorrelationPayload> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid correlation output packet: {source}"))?;
+
+    if args.json.is_some() {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_CONTEXT_CORRELATE,
+            &envelope,
+            profile,
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            Some(json!({
+                "kernel_metadata": {
+                    "correlate": response.metadata,
+                },
+            })),
+        )?;
+        return Ok(0);
+    }
+
+    println!("findings: {}", envelope.payload.finding_count);
+    for finding in &envelope.payload.findings {
+        println!(
+            "- [{}] {} ({:.2})",
+            finding.relation, finding.summary, finding.confidence
+        );
+    }
+    Ok(0)
+}
+
 pub fn run_store(args: StoreArgs) -> Result<i32> {
     match args.command {
         StoreCommands::List(args) => run_store_list(args),
@@ -490,10 +794,26 @@ pub fn run_store(args: StoreArgs) -> Result<i32> {
     }
 }
 
+pub fn run_store_remote(args: StoreArgs, daemon_root: &Path) -> Result<i32> {
+    match args.command {
+        StoreCommands::List(args) => run_store_list_remote(args, daemon_root),
+        StoreCommands::Get(args) => run_store_get_remote(args, daemon_root),
+        StoreCommands::Prune(args) => run_store_prune_remote(args, daemon_root),
+        StoreCommands::Stats(args) => run_store_stats_remote(args, daemon_root),
+    }
+}
+
 pub fn run_state(args: StateArgs) -> Result<i32> {
     match args.command {
         StateCommands::Append(args) => run_state_append(args),
         StateCommands::Snapshot(args) => run_state_snapshot(args),
+    }
+}
+
+pub fn run_state_remote(args: StateArgs, daemon_root: &Path) -> Result<i32> {
+    match args.command {
+        StateCommands::Append(args) => run_state_append_remote(args, daemon_root),
+        StateCommands::Snapshot(args) => run_state_snapshot_remote(args, daemon_root),
     }
 }
 
@@ -529,6 +849,50 @@ pub fn run_recall(args: RecallArgs) -> Result<i32> {
     }
 
     for hit in hits {
+        println!(
+            "- score={:.3} age={}s target={} key={}",
+            hit.score, hit.age_secs, hit.target, hit.cache_key
+        );
+        println!("  {}", hit.snippet);
+    }
+
+    Ok(0)
+}
+
+pub fn run_recall_remote(args: RecallArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_root = crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd);
+    let since_default = current_unix().saturating_sub(86_400);
+    let response = crate::cmd_daemon::execute_context_recall(
+        daemon_root,
+        packet28_daemon_core::ContextRecallRequest {
+            query: args.query.clone(),
+            root: resolved_root,
+            limit: args.limit,
+            since: args.since.or(Some(since_default)),
+            until: args.until,
+            target: args.target.clone(),
+        },
+    )?;
+
+    if args.json {
+        emit_json(
+            &json!({
+                "schema_version": "suite.context.recall.v1",
+                "query": response.query,
+                "hits": response.hits,
+            }),
+            args.pretty,
+        )?;
+        return Ok(0);
+    }
+
+    if response.hits.is_empty() {
+        println!("(no recall hits)");
+        return Ok(0);
+    }
+
+    for hit in response.hits {
         println!(
             "- score={:.3} age={}s target={} key={}",
             hit.score, hit.age_secs, hit.target, hit.cache_key
@@ -580,9 +944,85 @@ fn run_store_list(args: StoreListArgs) -> Result<i32> {
     Ok(0)
 }
 
+fn run_store_list_remote(args: StoreListArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let response = crate::cmd_daemon::execute_context_store_list(
+        daemon_root,
+        packet28_daemon_core::ContextStoreListRequest {
+            root: crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd),
+            target: args.target.clone(),
+            query: args.query.clone(),
+            created_after: args.created_after,
+            created_before: args.created_before,
+            offset: args.offset,
+            limit: args.limit,
+        },
+    )?;
+
+    if args.json {
+        emit_json(
+            &json!({
+                "schema_version": "suite.context.store.list.v1",
+                "entries": response.entries,
+            }),
+            args.pretty,
+        )?;
+        return Ok(0);
+    }
+
+    if response.entries.is_empty() {
+        println!("(empty context store)");
+        return Ok(0);
+    }
+
+    for entry in response.entries {
+        println!(
+            "- key={} target={} age={}s packets={}",
+            entry.cache_key, entry.target, entry.age_secs, entry.packet_count
+        );
+    }
+
+    Ok(0)
+}
+
 fn run_store_get(args: StoreGetArgs) -> Result<i32> {
     let cache = load_cache(&args.root)?;
     let Some(detail) = cache.get_entry(&args.key) else {
+        anyhow::bail!("cache entry not found for key '{}'", args.key);
+    };
+
+    if args.json {
+        emit_json(
+            &json!({
+                "schema_version": "suite.context.store.get.v1",
+                "entry": detail,
+            }),
+            args.pretty,
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "key={} target={} age={}s packets={}",
+        detail.entry.cache_key,
+        detail.entry.target,
+        detail.age_secs,
+        detail.entry.packets.len()
+    );
+
+    Ok(0)
+}
+
+fn run_store_get_remote(args: StoreGetArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let response = crate::cmd_daemon::execute_context_store_get(
+        daemon_root,
+        packet28_daemon_core::ContextStoreGetRequest {
+            root: crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd),
+            key: args.key.clone(),
+        },
+    )?;
+    let Some(detail) = response.entry else {
         anyhow::bail!("cache entry not found for key '{}'", args.key);
     };
 
@@ -641,6 +1081,42 @@ fn run_store_prune(args: StorePruneArgs) -> Result<i32> {
     Ok(0)
 }
 
+fn run_store_prune_remote(args: StorePruneArgs, daemon_root: &Path) -> Result<i32> {
+    if !args.all && args.ttl_secs.is_none() {
+        anyhow::bail!("set --all or --ttl-secs for prune");
+    }
+    let cwd = crate::cmd_common::caller_cwd()?;
+
+    let response = crate::cmd_daemon::execute_context_store_prune(
+        daemon_root,
+        packet28_daemon_core::ContextStorePruneDaemonRequest {
+            root: crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd),
+            all: args.all,
+            ttl_secs: args.ttl_secs,
+        },
+    )?;
+
+    if args.json {
+        emit_json(
+            &json!({
+                "schema_version": "suite.context.store.prune.v1",
+                "report": response.report,
+            }),
+            args.pretty,
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "pruned={} remaining={} manual={} expired={}",
+        response.report.removed,
+        response.report.remaining,
+        response.report.reasons.manual_prune,
+        response.report.reasons.expired_ttl
+    );
+    Ok(0)
+}
+
 fn run_store_stats(args: StoreStatsArgs) -> Result<i32> {
     let cache = load_cache(&args.root)?;
     let stats = cache.stats();
@@ -666,6 +1142,43 @@ fn run_store_stats(args: StoreStatsArgs) -> Result<i32> {
         stats.evictions.manual_prune,
         stats.evictions.version_mismatch,
         stats.evictions.corrupt_load_recovery
+    );
+
+    Ok(0)
+}
+
+fn run_store_stats_remote(args: StoreStatsArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let response = crate::cmd_daemon::execute_context_store_stats(
+        daemon_root,
+        packet28_daemon_core::ContextStoreStatsRequest {
+            root: crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd),
+        },
+    )?;
+
+    if args.json {
+        emit_json(
+            &json!({
+                "schema_version": "suite.context.store.stats.v1",
+                "stats": response.stats,
+            }),
+            args.pretty,
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "entries={} oldest={:?} newest={:?}",
+        response.stats.entries,
+        response.stats.oldest_created_at_unix,
+        response.stats.newest_created_at_unix
+    );
+    println!(
+        "evictions: expired={} manual={} version_mismatch={} corrupt_load={}",
+        response.stats.evictions.expired_ttl,
+        response.stats.evictions.manual_prune,
+        response.stats.evictions.version_mismatch,
+        response.stats.evictions.corrupt_load_recovery
     );
 
     Ok(0)
@@ -744,6 +1257,80 @@ fn run_state_append(args: StateAppendArgs) -> Result<i32> {
     Ok(0)
 }
 
+fn run_state_append_remote(args: StateAppendArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_root = crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd);
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let input_text = std::fs::read_to_string(&args.input)
+        .with_context(|| format!("failed to read state input '{}'", args.input))?;
+    let mut input_value: Value = serde_json::from_str(&input_text)
+        .with_context(|| format!("invalid JSON in '{}'", args.input))?;
+    let object = input_value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("state input must be a JSON object"))?;
+    match object.get("task_id").and_then(Value::as_str) {
+        Some(existing) if existing != args.task_id => {
+            anyhow::bail!(
+                "state input task_id '{}' does not match --task-id '{}'",
+                existing,
+                args.task_id
+            );
+        }
+        Some(_) => {}
+        None => {
+            object.insert("task_id".to_string(), Value::String(args.task_id.clone()));
+        }
+    }
+
+    let response = crate::cmd_daemon::send_kernel_request(
+        daemon_root,
+        context_kernel_core::KernelRequest {
+            target: "agenty.state.write".to_string(),
+            reducer_input: input_value,
+            policy_context: json!({
+                "persist_root": resolved_root,
+            }),
+            ..context_kernel_core::KernelRequest::default()
+        },
+    )?;
+
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentStateEventPayload> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid agent state output packet: {source}"))?;
+
+    if args.json.is_some() {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_AGENT_STATE,
+            &envelope,
+            profile,
+            args.pretty,
+            &PathBuf::from(&resolved_root),
+            Some(json!({
+                "kernel_audit": {
+                    "state": response.audit,
+                },
+                "kernel_metadata": {
+                    "state": response.metadata,
+                },
+            })),
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "task={} event={} kind={:?}",
+        envelope.payload.task_id, envelope.payload.event_id, envelope.payload.kind
+    );
+    Ok(0)
+}
+
 fn run_state_snapshot(args: StateSnapshotArgs) -> Result<i32> {
     let profile = args
         .json
@@ -776,6 +1363,65 @@ fn run_state_snapshot(args: StateSnapshotArgs) -> Result<i32> {
             profile,
             args.pretty,
             &PathBuf::from(&args.root),
+            Some(json!({
+                "kernel_audit": {
+                    "state": response.audit,
+                },
+                "kernel_metadata": {
+                    "state": response.metadata,
+                },
+            })),
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "task={} events={} focus_paths={} open_questions={}",
+        envelope.payload.task_id,
+        envelope.payload.event_count,
+        envelope.payload.focus_paths.len(),
+        envelope.payload.open_questions.len()
+    );
+    Ok(0)
+}
+
+fn run_state_snapshot_remote(args: StateSnapshotArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_root = crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd);
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let response = crate::cmd_daemon::send_kernel_request(
+        daemon_root,
+        context_kernel_core::KernelRequest {
+            target: "agenty.state.snapshot".to_string(),
+            reducer_input: json!({
+                "task_id": args.task_id,
+            }),
+            policy_context: json!({
+                "disable_cache": true,
+                "persist_root": resolved_root,
+            }),
+            ..context_kernel_core::KernelRequest::default()
+        },
+    )?;
+
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentSnapshotPayload> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid agent snapshot output packet: {source}"))?;
+
+    if args.json.is_some() {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_AGENT_SNAPSHOT,
+            &envelope,
+            profile,
+            args.pretty,
+            &PathBuf::from(&resolved_root),
             Some(json!({
                 "kernel_audit": {
                     "state": response.audit,

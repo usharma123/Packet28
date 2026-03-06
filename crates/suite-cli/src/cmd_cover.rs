@@ -108,6 +108,18 @@ pub struct CheckArgs {
     show_missing: bool,
 }
 
+impl CheckArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some()
+            || self.legacy_json
+            || matches!(self.report.as_deref(), Some(report) if report.eq_ignore_ascii_case("json"))
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+}
+
 pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
     let machine_profile =
@@ -300,6 +312,62 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     }
 
     Ok(if output.gate_result.passed { 0 } else { 1 })
+}
+
+pub fn run_remote(args: CheckArgs, config_path: &str, daemon_root: &Path) -> Result<i32> {
+    let machine_profile =
+        crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
+    if machine_profile.is_none() || args.legacy_json || args.stdin {
+        return run(args, config_path);
+    }
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_config_path = crate::cmd_common::resolve_path_from_cwd(config_path, &cwd);
+
+    let response = crate::cmd_daemon::send_cover_check(
+        daemon_root,
+        packet28_daemon_core::CoverCheckRequest {
+            coverage: crate::cmd_common::resolve_paths_from_cwd(&args.coverage, &cwd),
+            paths: crate::cmd_common::resolve_paths_from_cwd(&args.paths, &cwd),
+            format: args.format,
+            issues: crate::cmd_common::resolve_paths_from_cwd(&args.issues, &cwd),
+            issues_state: crate::cmd_common::resolve_optional_path_from_cwd(
+                args.issues_state.as_deref(),
+                &cwd,
+            ),
+            no_issues_state: args.no_issues_state,
+            base: args.base,
+            head: args.head,
+            fail_under_total: args.fail_under_total,
+            fail_under_changed: args.fail_under_changed,
+            fail_under_new: args.fail_under_new,
+            max_new_errors: args.max_new_errors,
+            max_new_warnings: args.max_new_warnings,
+            input: crate::cmd_common::resolve_optional_path_from_cwd(args.input.as_deref(), &cwd),
+            strip_prefix: args.strip_prefix,
+            source_root: crate::cmd_common::resolve_optional_path_from_cwd(
+                args.source_root.as_deref(),
+                &cwd,
+            ),
+            show_missing: args.show_missing,
+            config_path: resolved_config_path,
+        },
+    )?;
+
+    let mut effective_profile = machine_profile.unwrap_or(suite_packet_core::JsonProfile::Compact);
+    if effective_profile == suite_packet_core::JsonProfile::Compact
+        && args.packet_detail == PacketDetailArg::Rich
+    {
+        effective_profile = suite_packet_core::JsonProfile::Full;
+    }
+    crate::cmd_common::emit_machine_envelope(
+        &response.packet_type,
+        &response.envelope,
+        effective_profile,
+        args.pretty,
+        &crate::cmd_common::resolve_artifact_root(None),
+        None,
+    )?;
+    Ok(response.exit_code)
 }
 
 fn parse_format(s: &str) -> Result<Option<CoverageFormat>> {

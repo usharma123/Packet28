@@ -216,8 +216,8 @@ pub fn build_testmap_artifacts(
             let normalized_files = if let Some(files) = coverage_cache.get(coverage_path) {
                 files.clone()
             } else {
-                let mut coverage =
-                    (adapters.ingest_coverage)(Path::new(coverage_path)).with_context(|| {
+                let mut coverage = (adapters.ingest_coverage)(Path::new(coverage_path))
+                    .with_context(|| {
                         format!(
                             "Failed to ingest coverage report '{}' for test '{}'",
                             coverage_path, rec.test_id

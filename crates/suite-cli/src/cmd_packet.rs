@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Args)]
 pub struct PacketArgs {
@@ -58,5 +59,27 @@ pub fn run_fetch(args: FetchArgs) -> Result<i32> {
         None,
     )?;
 
+    Ok(0)
+}
+
+pub fn run_fetch_remote(args: FetchArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_root = crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd);
+    let root = std::path::PathBuf::from(&resolved_root);
+    let response = crate::cmd_daemon::send_packet_fetch(
+        daemon_root,
+        packet28_daemon_core::PacketFetchRequest {
+            handle: args.handle.clone(),
+            root: resolved_root,
+        },
+    )?;
+    let mut profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Full);
+    if profile == suite_packet_core::JsonProfile::Handle {
+        profile = suite_packet_core::JsonProfile::Full;
+    }
+    crate::cmd_common::emit_machine_wrapper(&response.wrapper, profile, args.pretty, &root, None)?;
     Ok(0)
 }

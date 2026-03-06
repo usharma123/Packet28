@@ -50,6 +50,7 @@ impl FromStr for JsonProfile {
 pub struct PacketWrapperV1<T> {
     pub schema_version: String,
     pub packet_type: String,
+    pub cache_hit: bool,
     pub packet: T,
 }
 
@@ -58,6 +59,7 @@ impl<T: Default> Default for PacketWrapperV1<T> {
         Self {
             schema_version: MACHINE_SCHEMA_VERSION.to_string(),
             packet_type: String::new(),
+            cache_hit: false,
             packet: T::default(),
         }
     }
@@ -68,6 +70,7 @@ impl<T> PacketWrapperV1<T> {
         Self {
             schema_version: MACHINE_SCHEMA_VERSION.to_string(),
             packet_type: packet_type.into(),
+            cache_hit: false,
             packet,
         }
     }

@@ -737,11 +737,6 @@ fn score_recall_entry(
     age_secs: u64,
 ) -> (f64, String, Vec<String>) {
     let mut corpus = Vec::new();
-    corpus.push(entry.target.clone());
-    corpus.push(entry.cache_key.clone());
-    corpus.push(entry.input_hash.clone());
-    collect_texts_from_value(&entry.metadata, &mut corpus, 64);
-
     let mut path_terms = Vec::new();
     let mut symbol_terms = Vec::new();
     for packet in &entry.packets {
@@ -749,6 +744,10 @@ fn score_recall_entry(
         collect_texts_from_value(&packet.metadata, &mut corpus, 64);
         collect_ref_terms(&packet.body, &mut path_terms, &mut symbol_terms);
     }
+    collect_texts_from_value(&entry.metadata, &mut corpus, 64);
+    corpus.push(entry.target.clone());
+    corpus.push(entry.cache_key.clone());
+    corpus.push(entry.input_hash.clone());
 
     let corpus_lower = corpus
         .iter()

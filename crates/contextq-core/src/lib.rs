@@ -364,7 +364,8 @@ pub fn assemble_packets(
         for reference in &mut refs_ranked {
             let base = reference.relevance.unwrap_or(0.0);
             reference.relevance = Some(
-                base + ref_focus_boost(reference, snapshot) + ref_question_boost(reference, &question_tokens),
+                base + ref_focus_boost(reference, snapshot)
+                    + ref_question_boost(reference, &question_tokens),
             );
         }
     }
@@ -432,12 +433,15 @@ pub fn assemble_packets(
         token_usage: Some(final_tokens),
         runtime_ms: Some(total_runtime_ms),
         payload: payload_value,
-        tool_invocations: if options.compact_assembly || options.detail_mode == DetailMode::Compact {
+        tool_invocations: if options.compact_assembly || options.detail_mode == DetailMode::Compact
+        {
             Vec::new()
         } else {
             source_summaries
         },
-        reducer_invocations: if options.compact_assembly || options.detail_mode == DetailMode::Compact {
+        reducer_invocations: if options.compact_assembly
+            || options.detail_mode == DetailMode::Compact
+        {
             Vec::new()
         } else {
             vec![ReducerInvocation {
@@ -507,10 +511,7 @@ fn build_default_section(
     };
 
     let body = match &packet.payload {
-        Value::Null => packet
-            .summary
-            .clone()
-            .unwrap_or_else(|| "{}".to_string()),
+        Value::Null => packet.summary.clone().unwrap_or_else(|| "{}".to_string()),
         Value::String(text) => match detail_mode {
             DetailMode::Rich => text.clone(),
             DetailMode::Compact => packet
@@ -552,10 +553,7 @@ fn summarize_payload(value: &Value) -> String {
 
 fn summarize_payload_object(map: &serde_json::Map<String, Value>) -> String {
     if let Some(Value::Object(gate)) = map.get("gate_result") {
-        let passed = gate
-            .get("passed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let passed = gate.get("passed").and_then(Value::as_bool).unwrap_or(false);
         let total = gate
             .get("total_coverage_pct")
             .and_then(Value::as_f64)
@@ -655,11 +653,7 @@ fn summarize_payload_object(map: &serde_json::Map<String, Value>) -> String {
     if keys.len() > 6 {
         keys.truncate(6);
     }
-    format!(
-        "object(keys={}): {}",
-        map.len(),
-        keys.join(", ")
-    )
+    format!("object(keys={}): {}", map.len(), keys.join(", "))
 }
 
 fn truncate_text(input: &str, cap: usize) -> String {
@@ -995,7 +989,9 @@ fn symbol_matches_any(symbol: &str, candidates: &[String]) -> bool {
     let normalized = symbol.to_ascii_lowercase();
     candidates.iter().any(|candidate| {
         let candidate = candidate.to_ascii_lowercase();
-        normalized == candidate || normalized.contains(&candidate) || candidate.contains(&normalized)
+        normalized == candidate
+            || normalized.contains(&candidate)
+            || candidate.contains(&normalized)
     })
 }
 
@@ -1359,7 +1355,10 @@ mod tests {
             },
         );
         let payload: AssembledPayload = serde_json::from_value(assembled.payload).unwrap();
-        assert_eq!(payload.sections[0].body, "repo_map files=4 symbols=24 edges=0");
+        assert_eq!(
+            payload.sections[0].body,
+            "repo_map files=4 symbols=24 edges=0"
+        );
     }
 
     #[test]

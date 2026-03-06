@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Args;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Args)]
 pub struct ImpactArgs {
@@ -55,15 +55,14 @@ pub struct ImpactArgs {
 }
 
 pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
-    let governed_context_config = args.context_config.clone();
-    let governed_budget_tokens = args.context_budget_tokens;
-    let governed_budget_bytes = args.context_budget_bytes;
-    let cwd = std::env::current_dir()?;
-    let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(
-        &cwd,
-        &[cwd.join(&args.testmap)],
-    );
-    let policy_context = match (governed_context_config.as_ref(), args.task_id.as_ref()) {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_testmap = crate::cmd_common::resolve_path_from_cwd(&args.testmap, &cwd);
+    let resolved_config_path = crate::cmd_common::resolve_path_from_cwd(config_path, &cwd);
+    let resolved_context_config =
+        crate::cmd_common::resolve_optional_path_from_cwd(args.context_config.as_deref(), &cwd);
+    let cache_fingerprint =
+        crate::cmd_common::repo_cache_fingerprint(&cwd, &[PathBuf::from(&resolved_testmap)]);
+    let policy_context = match (resolved_context_config.as_ref(), args.task_id.as_ref()) {
         (Some(config_path), Some(task_id)) => json!({
             "config_path": config_path,
             "task_id": task_id,
@@ -86,22 +85,22 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         && !args.legacy_json
         && !args.cache
         && args.task_id.is_none()
-        && governed_context_config.is_none()
+        && resolved_context_config.is_none()
     {
         let adapters = testy_cli_common::adapters::default_impact_adapters();
         let output = testy_core::command_impact::run_legacy_impact(
             testy_core::command_impact::LegacyImpactArgs {
                 base: args.base.clone(),
                 head: args.head.clone(),
-                testmap: args.testmap.clone(),
+                testmap: resolved_testmap.clone(),
                 print_command: args.print_command,
             },
-            config_path,
+            &resolved_config_path,
             &adapters,
         )?;
         let envelope = context_kernel_core::build_test_impact_envelope(
             &output,
-            &args.testmap,
+            &resolved_testmap,
             args.base.as_deref(),
             args.head.as_deref(),
         );
@@ -122,11 +121,11 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "testy.impact".to_string(),
         reducer_input: serde_json::to_value(context_kernel_core::ImpactKernelInput {
-            base: args.base,
-            head: args.head,
-            testmap: args.testmap,
+            base: args.base.clone(),
+            head: args.head.clone(),
+            testmap: resolved_testmap,
             print_command: args.print_command,
-            config_path: config_path.to_string(),
+            config_path: resolved_config_path,
         })?,
         policy_context: policy_context.clone(),
         ..context_kernel_core::KernelRequest::default()
@@ -136,21 +135,16 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let envelope: suite_packet_core::EnvelopeV1<context_kernel_core::ImpactKernelOutput> =
-        serde_json::from_value(output_packet.body.clone())
-            .map_err(|source| anyhow!("invalid impact output packet: {source}"))?;
-    let output = envelope.payload.clone();
-
-    let governed_response = if governed_context_config.is_some() {
+    let governed_response = if resolved_context_config.is_some() {
         Some(kernel.execute(context_kernel_core::KernelRequest {
             target: "governed.assemble".to_string(),
             input_packets: vec![output_packet.clone()],
             budget: context_kernel_core::ExecutionBudget {
-                token_cap: Some(governed_budget_tokens),
-                byte_cap: Some(governed_budget_bytes),
+                token_cap: Some(args.context_budget_tokens),
+                byte_cap: Some(args.context_budget_bytes),
                 runtime_ms_cap: None,
             },
-            policy_context: match (governed_context_config.as_ref(), args.task_id.as_ref()) {
+            policy_context: match (resolved_context_config.as_ref(), args.task_id.as_ref()) {
                 (Some(config_path), Some(task_id)) => json!({
                     "config_path": config_path,
                     "task_id": task_id,
@@ -167,13 +161,112 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         None
     };
 
-    if let Some(profile_arg) = args.json {
-        let profile: suite_packet_core::JsonProfile = profile_arg.into();
+    handle_impact_response(&args, response, governed_response)
+}
+
+pub fn run_remote(args: ImpactArgs, config_path: &str, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_testmap = crate::cmd_common::resolve_path_from_cwd(&args.testmap, &cwd);
+    let resolved_config_path = crate::cmd_common::resolve_path_from_cwd(config_path, &cwd);
+    let resolved_context_config =
+        crate::cmd_common::resolve_optional_path_from_cwd(args.context_config.as_deref(), &cwd);
+    let cache_fingerprint =
+        crate::cmd_common::repo_cache_fingerprint(&cwd, &[PathBuf::from(&resolved_testmap)]);
+    let policy_context = match (resolved_context_config.as_ref(), args.task_id.as_ref()) {
+        (Some(config_path), Some(task_id)) => json!({
+            "config_path": config_path,
+            "task_id": task_id,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (Some(config_path), None) => json!({
+            "config_path": config_path,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (None, Some(task_id)) => json!({
+            "task_id": task_id,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (None, None) => json!({
+            "cache_fingerprint": cache_fingerprint,
+        }),
+    };
+
+    let response = crate::cmd_daemon::send_kernel_request(
+        daemon_root,
+        context_kernel_core::KernelRequest {
+            target: "testy.impact".to_string(),
+            reducer_input: serde_json::to_value(context_kernel_core::ImpactKernelInput {
+                base: args.base.clone(),
+                head: args.head.clone(),
+                testmap: resolved_testmap,
+                print_command: args.print_command,
+                config_path: resolved_config_path,
+            })?,
+            policy_context: policy_context.clone(),
+            ..context_kernel_core::KernelRequest::default()
+        },
+    )?;
+
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+
+    let governed_response = if resolved_context_config.is_some() {
+        Some(crate::cmd_daemon::send_kernel_request(
+            daemon_root,
+            context_kernel_core::KernelRequest {
+                target: "governed.assemble".to_string(),
+                input_packets: vec![output_packet.clone()],
+                budget: context_kernel_core::ExecutionBudget {
+                    token_cap: Some(args.context_budget_tokens),
+                    byte_cap: Some(args.context_budget_bytes),
+                    runtime_ms_cap: None,
+                },
+                policy_context: match (resolved_context_config.as_ref(), args.task_id.as_ref()) {
+                    (Some(config_path), Some(task_id)) => json!({
+                        "config_path": config_path,
+                        "task_id": task_id,
+                        "disable_cache": true,
+                    }),
+                    (Some(config_path), None) => json!({
+                        "config_path": config_path,
+                    }),
+                    _ => Value::Null,
+                },
+                ..context_kernel_core::KernelRequest::default()
+            },
+        )?)
+    } else {
+        None
+    };
+
+    handle_impact_response(&args, response, governed_response)
+}
+
+fn handle_impact_response(
+    args: &ImpactArgs,
+    response: context_kernel_core::KernelResponse,
+    governed_response: Option<context_kernel_core::KernelResponse>,
+) -> Result<i32> {
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<context_kernel_core::ImpactKernelOutput> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid impact output packet: {source}"))?;
+    let output = envelope.payload.clone();
+    let machine_profile = args.json.map(suite_packet_core::JsonProfile::from).or(args
+        .legacy_json
+        .then_some(suite_packet_core::JsonProfile::Compact));
+
+    if let Some(profile) = machine_profile {
         if let Some(governed) = governed_response {
             let budget_hint = crate::cmd_common::budget_retry_hint(
                 &governed.metadata,
-                governed_budget_tokens,
-                governed_budget_bytes,
+                args.context_budget_tokens,
+                args.context_budget_bytes,
                 "Packet28 test impact --context-config <context.yaml>",
             );
             let final_packet = governed
@@ -233,46 +326,44 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
                     })),
                 )?;
             }
+        } else if args.legacy_json {
+            crate::cmd_common::emit_json(
+                &json!({
+                    "schema_version": "suite.test.impact.v1",
+                    "impact_result": output.result,
+                    "known_tests": output.known_tests,
+                    "print_command": output.print_command,
+                    "kernel_audit": {
+                        "impact": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "impact": response.metadata,
+                    },
+                    "cache": {
+                        "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                }),
+                args.pretty,
+            )?;
         } else {
-            if args.legacy_json {
-                crate::cmd_common::emit_json(
-                    &json!({
-                        "schema_version": "suite.test.impact.v1",
-                        "impact_result": output.result,
-                        "known_tests": output.known_tests,
-                        "print_command": output.print_command,
-                        "kernel_audit": {
-                            "impact": response.audit,
-                        },
-                        "kernel_metadata": {
-                            "impact": response.metadata,
-                        },
-                        "cache": {
-                            "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        },
-                    }),
-                    args.pretty,
-                )?;
-            } else {
-                crate::cmd_common::emit_machine_envelope(
-                    suite_packet_core::PACKET_TYPE_TEST_IMPACT,
-                    &envelope,
-                    profile,
-                    args.pretty,
-                    &crate::cmd_common::resolve_artifact_root(None),
-                    Some(json!({
-                        "kernel_audit": {
-                            "impact": response.audit,
-                        },
-                        "kernel_metadata": {
-                            "impact": response.metadata,
-                        },
-                        "cache": {
-                            "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
-                        },
-                    })),
-                )?;
-            }
+            crate::cmd_common::emit_machine_envelope(
+                suite_packet_core::PACKET_TYPE_TEST_IMPACT,
+                &envelope,
+                profile,
+                args.pretty,
+                &crate::cmd_common::resolve_artifact_root(None),
+                Some(json!({
+                    "kernel_audit": {
+                        "impact": response.audit,
+                    },
+                    "kernel_metadata": {
+                        "impact": response.metadata,
+                    },
+                    "cache": {
+                        "impact": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    },
+                })),
+            )?;
         }
         return Ok(0);
     }
@@ -309,8 +400,8 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         }
         if let Some(hint) = crate::cmd_common::budget_retry_hint(
             &governed.metadata,
-            governed_budget_tokens,
-            governed_budget_bytes,
+            args.context_budget_tokens,
+            args.context_budget_bytes,
             "Packet28 test impact --context-config <context.yaml>",
         ) {
             if let Some(retry) = hint.get("retry_command").and_then(Value::as_str) {

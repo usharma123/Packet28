@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Args;
+use std::path::Path;
 
 pub use testy_cli_common::shard::PlannerAlgorithmArg;
 
@@ -77,4 +78,43 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
         },
         config_path,
     )
+}
+
+pub fn run_remote(args: ShardArgs, config_path: &str, daemon_root: &Path) -> Result<i32> {
+    let response = crate::cmd_daemon::execute_test_shard(
+        daemon_root,
+        packet28_daemon_core::TestShardRequest {
+            shards: args.shards,
+            tasks_json: args.tasks_json,
+            tier: args.tier,
+            include_tag: args.include_tag,
+            exclude_tag: args.exclude_tag,
+            tests_file: args.tests_file,
+            impact_json: args.impact_json,
+            timings: args.timings,
+            unknown_test_seconds: args.unknown_test_seconds,
+            algorithm: args.algorithm.map(|value| match value {
+                PlannerAlgorithmArg::Lpt => "lpt".to_string(),
+                PlannerAlgorithmArg::WhaleLpt => "whale-lpt".to_string(),
+            }),
+            write_files: args.write_files,
+            schema: args.schema,
+            config_path: config_path.to_string(),
+        },
+    )?;
+
+    if let Some(schema) = response.schema {
+        println!("{schema}");
+        return Ok(0);
+    }
+
+    let plan = response
+        .plan
+        .ok_or_else(|| anyhow::anyhow!("daemon returned no shard plan"))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        print!("{}", testy_core::command_shard::render_text(&plan));
+    }
+    Ok(0)
 }

@@ -85,6 +85,22 @@ pub struct AnalyzeArgs {
     context_budget_bytes: usize,
 }
 
+impl AnalyzeArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some()
+            || self.legacy_json
+            || matches!(self.report.as_deref(), Some(report) if report.eq_ignore_ascii_case("json"))
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+
+    pub(crate) fn governed_requested(&self) -> bool {
+        self.context_config.is_some()
+    }
+}
+
 pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     let governed_context_config = args.context_config.clone();
     let governed_budget_tokens = args.context_budget_tokens;
@@ -351,6 +367,166 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                 );
             }
         }
+    }
+
+    Ok(if gate_passed { 0 } else { 1 })
+}
+
+pub fn run_remote(args: AnalyzeArgs, config_path: &str, daemon_root: &Path) -> Result<i32> {
+    let machine_profile =
+        crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
+    if machine_profile.is_none() || args.legacy_json {
+        return run(args, config_path);
+    }
+
+    let governed_context_config = args.context_config.clone();
+    let governed_budget_tokens = args.context_budget_tokens;
+    let governed_budget_bytes = args.context_budget_bytes;
+    let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let base = args.base.as_deref().unwrap_or(&config.diff.base);
+    let head = args.head.as_deref().unwrap_or(&config.diff.head);
+    let resolved_context_config =
+        crate::cmd_common::resolve_optional_path_from_cwd(governed_context_config.as_deref(), &cwd);
+
+    let kernel_input = context_kernel_core::DiffAnalyzeKernelInput {
+        base: base.to_string(),
+        head: head.to_string(),
+        fail_under_changed: args.fail_under_changed.or(config.gate.fail_under_changed),
+        fail_under_total: args.fail_under_total.or(config.gate.fail_under_total),
+        fail_under_new: args.fail_under_new.or(config.gate.fail_under_new),
+        max_new_errors: config.gate.issues.max_new_errors,
+        max_new_warnings: config.gate.issues.max_new_warnings,
+        max_new_issues: config.gate.issues.max_new_issues,
+        issues: crate::cmd_common::resolve_paths_from_cwd(&args.issues, &cwd),
+        issues_state: crate::cmd_common::resolve_optional_path_from_cwd(
+            args.issues_state.as_deref(),
+            &cwd,
+        ),
+        no_issues_state: args.no_issues_state,
+        coverage: crate::cmd_common::resolve_paths_from_cwd(&args.coverage, &cwd),
+        input: crate::cmd_common::resolve_optional_path_from_cwd(args.input.as_deref(), &cwd),
+    };
+    let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(
+        &cwd,
+        &diff_cache_fingerprint_paths(&kernel_input, &cwd),
+    );
+    let policy_context = match (resolved_context_config.as_ref(), args.task_id.as_ref()) {
+        (Some(config_path), Some(task_id)) => json!({
+            "config_path": config_path,
+            "task_id": task_id,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (Some(config_path), None) => json!({
+            "config_path": config_path,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (None, Some(task_id)) => json!({
+            "task_id": task_id,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (None, None) => json!({
+            "cache_fingerprint": cache_fingerprint,
+        }),
+    };
+
+    let response = crate::cmd_daemon::send_kernel_request(
+        daemon_root,
+        context_kernel_core::KernelRequest {
+            target: "diffy.analyze".to_string(),
+            reducer_input: serde_json::to_value(kernel_input)?,
+            policy_context: policy_context.clone(),
+            ..context_kernel_core::KernelRequest::default()
+        },
+    )?;
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<context_kernel_core::DiffAnalyzeKernelOutput> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid diff analyze output packet: {source}"))?;
+    let gate_passed = envelope.payload.gate_result.passed;
+
+    let governed_response = if let Some(context_config) = resolved_context_config {
+        Some(crate::cmd_daemon::send_kernel_request(
+            daemon_root,
+            context_kernel_core::KernelRequest {
+                target: "governed.assemble".to_string(),
+                input_packets: vec![output_packet.clone()],
+                budget: context_kernel_core::ExecutionBudget {
+                    token_cap: Some(governed_budget_tokens),
+                    byte_cap: Some(governed_budget_bytes),
+                    runtime_ms_cap: None,
+                },
+                policy_context: json!({
+                    "config_path": context_config,
+                    "task_id": args.task_id,
+                    "disable_cache": args.task_id.is_some(),
+                }),
+                ..context_kernel_core::KernelRequest::default()
+            },
+        )?)
+    } else {
+        None
+    };
+
+    let profile = machine_profile.unwrap_or(suite_packet_core::JsonProfile::Compact);
+    if let Some(governed) = governed_response {
+        let budget_hint = crate::cmd_common::budget_retry_hint(
+            &governed.metadata,
+            governed_budget_tokens,
+            governed_budget_bytes,
+            "Packet28 diff analyze --context-config <context.yaml>",
+        );
+        let final_packet = governed
+            .output_packets
+            .first()
+            .ok_or_else(|| anyhow!("kernel returned no output packets for governed flow"))?;
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_DIFF_ANALYZE,
+            &envelope,
+            profile,
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            Some(json!({
+                "kernel_audit": {
+                    "diff": response.audit,
+                    "governed": governed.audit,
+                },
+                "kernel_metadata": {
+                    "diff": response.metadata,
+                    "governed": governed.metadata,
+                },
+                "cache": {
+                    "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                    "governed": governed.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                },
+                "hints": {
+                    "budget_retry": budget_hint,
+                },
+                "governed_packet": final_packet.body,
+            })),
+        )?;
+    } else {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_DIFF_ANALYZE,
+            &envelope,
+            profile,
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            Some(json!({
+                "kernel_audit": {
+                    "diff": response.audit,
+                },
+                "kernel_metadata": {
+                    "diff": response.metadata,
+                },
+                "cache": {
+                    "diff": response.metadata.get("cache").cloned().unwrap_or(Value::Null),
+                },
+            })),
+        )?;
     }
 
     Ok(if gate_passed { 0 } else { 1 })
