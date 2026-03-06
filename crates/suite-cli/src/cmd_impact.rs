@@ -80,6 +80,32 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         })
         .unwrap_or(Value::Null);
 
+    if args.json.is_some() && !args.legacy_json && !args.cache && governed_context_config.is_none() {
+        let adapters = testy_cli_common::adapters::default_impact_adapters();
+        let output = testy_core::command_impact::run_legacy_impact(
+            testy_core::command_impact::LegacyImpactArgs {
+                base: args.base.clone(),
+                head: args.head.clone(),
+                testmap: args.testmap.clone(),
+                print_command: args.print_command,
+            },
+            config_path,
+            &adapters,
+        )?;
+        let envelope = build_impact_envelope(&output, &args.testmap, args.base.as_deref(), args.head.as_deref());
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_TEST_IMPACT,
+            &envelope,
+            args.json
+                .map(suite_packet_core::JsonProfile::from)
+                .unwrap_or(suite_packet_core::JsonProfile::Compact),
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            None,
+        )?;
+        return Ok(0);
+    }
+
     let mut kernel = build_kernel(args.cache, std::env::current_dir()?);
     kernel.register_reducer("testy.impact", run_test_impact_reducer);
     let response = kernel.execute(context_kernel_core::KernelRequest {
@@ -314,6 +340,87 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
+fn build_impact_envelope(
+    output: &testy_core::command_impact::ImpactLegacyOutput,
+    testmap_path: &str,
+    git_base: Option<&str>,
+    git_head: Option<&str>,
+) -> suite_packet_core::EnvelopeV1<ImpactKernelOutput> {
+    let impact_output = ImpactKernelOutput {
+        result: output.result.clone(),
+        known_tests: output.known_tests,
+        print_command: output.print_command.clone(),
+    };
+
+    let mut paths = output.result.missing_mappings.clone();
+    paths.sort();
+    paths.dedup();
+
+    let mut symbol_refs = output.result.selected_tests.clone();
+    symbol_refs.extend(output.result.smoke_tests.clone());
+    symbol_refs.sort();
+    symbol_refs.dedup();
+
+    let summary = format!(
+        "selected: {}\nknown: {}\nmissing: {}\nconfidence: {:.2}\nstale: {}\nescalate_full_suite: {}",
+        output.result.selected_tests.len(),
+        output.known_tests,
+        output.result.missing_mappings.len(),
+        output.result.confidence,
+        output.result.stale,
+        output.result.escalate_full_suite,
+    );
+
+    let files = paths
+        .iter()
+        .map(|path: &String| suite_packet_core::FileRef {
+            path: path.clone(),
+            relevance: Some(0.8),
+            source: Some("testy.impact".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let symbols = symbol_refs
+        .iter()
+        .map(|symbol: &String| suite_packet_core::SymbolRef {
+            name: symbol.clone(),
+            file: None,
+            kind: Some("test_id".to_string()),
+            relevance: Some(0.8),
+            source: Some("testy.impact".to_string()),
+        })
+        .collect::<Vec<_>>();
+
+    let payload_bytes = serde_json::to_vec(&impact_output).unwrap_or_default().len();
+
+    suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "testy".to_string(),
+        kind: "test_impact".to_string(),
+        hash: String::new(),
+        summary,
+        files,
+        symbols,
+        risk: None,
+        confidence: Some(output.result.confidence.clamp(0.0, 1.0)),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: vec![testmap_path.to_string()],
+            git_base: git_base.map(ToOwned::to_owned),
+            git_head: git_head.map(ToOwned::to_owned),
+            generated_at_unix: now_unix(),
+        },
+        payload: impact_output,
+    }
+    .with_canonical_hash_and_real_budget()
+}
+
 fn run_test_impact_reducer(
     ctx: &mut context_kernel_core::ExecutionContext,
     _input_packets: &[context_kernel_core::KernelPacket],
@@ -345,78 +452,7 @@ fn run_test_impact_reducer(
         detail: source.to_string(),
     })?;
 
-    let impact_output = ImpactKernelOutput {
-        result: output.result.clone(),
-        known_tests: output.known_tests,
-        print_command: output.print_command.clone(),
-    };
-
-    let mut paths = output.result.missing_mappings.clone();
-    paths.sort();
-    paths.dedup();
-
-    let mut symbol_refs = output.result.selected_tests.clone();
-    symbol_refs.extend(output.result.smoke_tests.clone());
-    symbol_refs.sort();
-    symbol_refs.dedup();
-
-    let summary = format!(
-        "selected: {}\nknown: {}\nmissing: {}\nconfidence: {:.2}\nstale: {}\nescalate_full_suite: {}",
-        output.result.selected_tests.len(),
-        output.known_tests,
-        output.result.missing_mappings.len(),
-        output.result.confidence,
-        output.result.stale,
-        output.result.escalate_full_suite,
-    );
-
-    let files = paths
-        .iter()
-        .map(|path| suite_packet_core::FileRef {
-            path: path.clone(),
-            relevance: Some(0.8),
-            source: Some("testy.impact".to_string()),
-        })
-        .collect::<Vec<_>>();
-    let symbols = symbol_refs
-        .iter()
-        .map(|symbol| suite_packet_core::SymbolRef {
-            name: symbol.clone(),
-            file: None,
-            kind: Some("test_id".to_string()),
-            relevance: Some(0.8),
-            source: Some("testy.impact".to_string()),
-        })
-        .collect::<Vec<_>>();
-
-    let payload_bytes = serde_json::to_vec(&impact_output).unwrap_or_default().len();
-    let envelope = suite_packet_core::EnvelopeV1 {
-        version: "1".to_string(),
-        tool: "testy".to_string(),
-        kind: "test_impact".to_string(),
-        hash: String::new(),
-        summary,
-        files,
-        symbols,
-        risk: None,
-        confidence: Some(output.result.confidence.clamp(0.0, 1.0)),
-        budget_cost: suite_packet_core::BudgetCost {
-            est_tokens: 0,
-            est_bytes: 0,
-            runtime_ms: 0,
-            tool_calls: 1,
-            payload_est_tokens: Some((payload_bytes / 4) as u64),
-            payload_est_bytes: Some(payload_bytes),
-        },
-        provenance: suite_packet_core::Provenance {
-            inputs: vec![testmap_path],
-            git_base,
-            git_head,
-            generated_at_unix: now_unix(),
-        },
-        payload: impact_output,
-    }
-    .with_canonical_hash_and_real_budget();
+    let envelope = build_impact_envelope(&output, &testmap_path, git_base.as_deref(), git_head.as_deref());
 
     Ok(context_kernel_core::ReducerResult {
         output_packets: vec![context_kernel_core::KernelPacket {

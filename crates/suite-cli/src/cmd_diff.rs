@@ -204,6 +204,23 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         input: args.input,
     };
 
+    if machine_profile.is_some() && !args.legacy_json && !args.cache && governed_context_config.is_none()
+    {
+        let request = build_pipeline_request(&kernel_input);
+        let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
+        let output = diffy_core::pipeline::run_analysis(request, &adapters)?;
+        let envelope = build_diff_envelope(&output, base, head);
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_DIFF_ANALYZE,
+            &envelope,
+            machine_profile.unwrap_or(suite_packet_core::JsonProfile::Compact),
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            None,
+        )?;
+        return Ok(if output.gate_result.passed { 0 } else { 1 });
+    }
+
     let mut kernel = build_kernel(args.cache, std::env::current_dir()?);
     kernel.register_reducer("diffy.analyze", run_diff_analyze_reducer);
     let response = kernel.execute(context_kernel_core::KernelRequest {
@@ -306,10 +323,8 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
                 }
             } else {
                 if args.legacy_json {
-                    let mut value: Value = serde_json::from_str(
-                        &diffy_core::report::render_gate_json(&output.gate_result),
-                    )
-                    .map_err(|source| anyhow!("failed to parse gate json: {source}"))?;
+                    let mut value: Value = serde_json::to_value(&output.gate_result)
+                        .map_err(|source| anyhow!("failed to serialize gate json: {source}"))?;
                     if let Some(obj) = value.as_object_mut() {
                         obj.insert(
                             "kernel_metadata".to_string(),
@@ -416,29 +431,16 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn run_diff_analyze_reducer(
-    ctx: &mut context_kernel_core::ExecutionContext,
-    _input_packets: &[context_kernel_core::KernelPacket],
-) -> Result<context_kernel_core::ReducerResult, context_kernel_core::KernelError> {
-    let input: DiffAnalyzeKernelInput =
-        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
-            context_kernel_core::KernelError::ReducerFailed {
-                target: ctx.target.clone(),
-                detail: format!("invalid reducer input: {source}"),
-            }
-        })?;
-
-    let git_base = input.base.clone();
-    let git_head = input.head.clone();
-    let request = diffy_core::pipeline::PipelineRequest {
+fn build_pipeline_request(input: &DiffAnalyzeKernelInput) -> diffy_core::pipeline::PipelineRequest {
+    diffy_core::pipeline::PipelineRequest {
         base: input.base.clone(),
         head: input.head.clone(),
         source_root: None,
         coverage: diffy_core::pipeline::PipelineCoverageInput {
-            paths: input.coverage,
+            paths: input.coverage.clone(),
             format: None,
             stdin: false,
-            input_state_path: input.input,
+            input_state_path: input.input.clone(),
             default_input_state_path: Some(".covy/state/latest.bin".to_string()),
             strip_prefixes: Vec::new(),
             reject_paths_with_input: false,
@@ -446,8 +448,8 @@ fn run_diff_analyze_reducer(
                 .to_string(),
         },
         diagnostics: diffy_core::pipeline::PipelineDiagnosticsInput {
-            issue_patterns: input.issues,
-            issues_state_path: input.issues_state,
+            issue_patterns: input.issues.clone(),
+            issues_state_path: input.issues_state.clone(),
             no_issues_state: input.no_issues_state,
             default_issues_state_path: ".covy/state/issues.bin".to_string(),
         },
@@ -461,16 +463,14 @@ fn run_diff_analyze_reducer(
                 max_new_issues: input.max_new_issues,
             },
         },
-    };
+    }
+}
 
-    let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
-    let output = diffy_core::pipeline::run_analysis(request, &adapters).map_err(|source| {
-        context_kernel_core::KernelError::ReducerFailed {
-            target: ctx.target.clone(),
-            detail: source.to_string(),
-        }
-    })?;
-
+fn build_diff_envelope(
+    output: &diffy_core::pipeline::PipelineOutput,
+    base: &str,
+    head: &str,
+) -> suite_packet_core::EnvelopeV1<DiffAnalyzeKernelOutput> {
     let kernel_output = DiffAnalyzeKernelOutput {
         gate_result: output.gate_result.clone(),
         diagnostics: output.diagnostics.clone(),
@@ -518,7 +518,8 @@ fn run_diff_analyze_reducer(
         })
         .collect::<Vec<_>>();
     let payload_bytes = serde_json::to_vec(&kernel_output).unwrap_or_default().len();
-    let envelope = suite_packet_core::EnvelopeV1 {
+
+    suite_packet_core::EnvelopeV1 {
         version: "1".to_string(),
         tool: "diffy".to_string(),
         kind: "diff_analyze".to_string(),
@@ -538,13 +539,38 @@ fn run_diff_analyze_reducer(
         },
         provenance: suite_packet_core::Provenance {
             inputs: changed_paths,
-            git_base: Some(git_base),
-            git_head: Some(git_head),
+            git_base: Some(base.to_string()),
+            git_head: Some(head.to_string()),
             generated_at_unix: now_unix(),
         },
         payload: kernel_output,
     }
-    .with_canonical_hash_and_real_budget();
+    .with_canonical_hash_and_real_budget()
+}
+
+fn run_diff_analyze_reducer(
+    ctx: &mut context_kernel_core::ExecutionContext,
+    _input_packets: &[context_kernel_core::KernelPacket],
+) -> Result<context_kernel_core::ReducerResult, context_kernel_core::KernelError> {
+    let input: DiffAnalyzeKernelInput =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            context_kernel_core::KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+
+    let git_base = input.base.clone();
+    let git_head = input.head.clone();
+    let request = build_pipeline_request(&input);
+    let adapters = crate::cmd_common::default_pipeline_ingest_adapters();
+    let output = diffy_core::pipeline::run_analysis(request, &adapters).map_err(|source| {
+        context_kernel_core::KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        }
+    })?;
+    let envelope = build_diff_envelope(&output, &git_base, &git_head);
 
     Ok(context_kernel_core::ReducerResult {
         output_packets: vec![context_kernel_core::KernelPacket {

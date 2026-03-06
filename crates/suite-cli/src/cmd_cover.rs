@@ -178,8 +178,8 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
 
     match report.as_str() {
         "json" => {
-            let json = diffy_core::report::render_gate_json(&output.gate_result);
-            let gate_json: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+            let gate_json = serde_json::to_value(&output.gate_result).unwrap_or_default();
+            let gate_json_bytes = serde_json::to_vec(&gate_json).unwrap_or_default();
 
             let mut changed_paths = output
                 .changed_line_context
@@ -217,8 +217,8 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
                     est_bytes: 0,
                     runtime_ms: 0,
                     tool_calls: 1,
-                    payload_est_tokens: Some((json.len() / 4) as u64),
-                    payload_est_bytes: Some(json.len()),
+                    payload_est_tokens: Some((gate_json_bytes.len() / 4) as u64),
+                    payload_est_bytes: Some(gate_json_bytes.len()),
                 },
                 provenance: Provenance {
                     inputs: changed_paths,

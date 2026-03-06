@@ -209,20 +209,27 @@ pub fn build_testmap_artifacts(
 
     let mut test_to_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut map_records: BTreeMap<String, TestMapRecord> = BTreeMap::new();
+    let mut coverage_cache: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for rec in records {
         let mut covered_files = BTreeSet::new();
         for coverage_path in rec.coverage_paths() {
-            let mut coverage =
-                (adapters.ingest_coverage)(Path::new(coverage_path)).with_context(|| {
-                    format!(
-                        "Failed to ingest coverage report '{}' for test '{}'",
-                        coverage_path, rec.test_id
-                    )
-                })?;
-            suite_foundation_core::pathmap::auto_normalize_paths(&mut coverage, None);
-            for file in coverage.files.keys() {
-                covered_files.insert(file.clone());
-            }
+            let normalized_files = if let Some(files) = coverage_cache.get(coverage_path) {
+                files.clone()
+            } else {
+                let mut coverage =
+                    (adapters.ingest_coverage)(Path::new(coverage_path)).with_context(|| {
+                        format!(
+                            "Failed to ingest coverage report '{}' for test '{}'",
+                            coverage_path, rec.test_id
+                        )
+                    })?;
+                suite_foundation_core::pathmap::auto_normalize_paths(&mut coverage, None);
+                let files = coverage.files.keys().cloned().collect::<BTreeSet<_>>();
+                coverage_cache.insert(coverage_path.to_string(), files.clone());
+                files
+            };
+
+            covered_files.extend(normalized_files);
         }
 
         let language = resolve_language(rec)?;
@@ -355,6 +362,7 @@ fn infer_language_from_test_id(test_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn fake_ingest(path: &Path) -> Result<crate::model::CoverageData> {
         let mut coverage = crate::model::CoverageData::new();
@@ -373,6 +381,13 @@ mod tests {
         TestMapAdapters {
             ingest_coverage: fake_ingest,
         }
+    }
+
+    static INGEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_ingest(path: &Path) -> Result<crate::model::CoverageData> {
+        INGEST_CALLS.fetch_add(1, Ordering::SeqCst);
+        fake_ingest(path)
     }
 
     #[test]
@@ -449,6 +464,38 @@ mod tests {
             artifacts.index.test_language["tests/test_a.py::test_x"],
             "python"
         );
+    }
+
+    #[test]
+    fn test_build_artifacts_reuses_cached_coverage_report_ingest() {
+        INGEST_CALLS.store(0, Ordering::SeqCst);
+        let records = vec![
+            TestMapManifestRecord {
+                test_id: "com.foo.FirstTest".to_string(),
+                language: Some("java".to_string()),
+                duration_ms: Some(10),
+                coverage_report: Some("reports/shared.info".to_string()),
+                coverage_reports: Vec::new(),
+            },
+            TestMapManifestRecord {
+                test_id: "com.foo.SecondTest".to_string(),
+                language: Some("java".to_string()),
+                duration_ms: Some(20),
+                coverage_report: Some("reports/shared.info".to_string()),
+                coverage_reports: Vec::new(),
+            },
+        ];
+
+        let artifacts = build_testmap_artifacts(
+            &records,
+            &TestMapAdapters {
+                ingest_coverage: counting_ingest,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(artifacts.index.test_to_files.len(), 2);
+        assert_eq!(INGEST_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
