@@ -665,18 +665,11 @@ fn install_watch(
         watch.active = true;
         watch.last_error = None;
     }
-    guard.watcher_handles.insert(watch_id, watcher);
+    guard.watcher_handles.insert(watch_id.clone(), watcher);
     persist_state(&guard)?;
     daemon_log(&format!(
-        "installed watch watch_id={} task_id={} kind={:?}",
-        guard
-            .watches
-            .watches
-            .last()
-            .map(|watch| watch.watch_id.as_str())
-            .unwrap_or("unknown"),
-        spec.task_id,
-        spec.kind
+        "installed watch watch_id={watch_id} task_id={} kind={:?}",
+        spec.task_id, spec.kind
     ));
     Ok(())
 }
