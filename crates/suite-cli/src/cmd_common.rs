@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde_json::{json, Value};
 use suite_packet_core::{CoverageData, CoverageFormat, EnvelopeV1, JsonProfile, PacketWrapperV1};
@@ -103,6 +103,45 @@ pub fn emit_machine_envelope<T: serde::Serialize + Clone>(
     emit_json(&serde_json::to_value(wrapper)?, pretty)
 }
 
+pub fn emit_machine_wrapper<T: serde::Serialize + Clone>(
+    wrapper: &PacketWrapperV1<EnvelopeV1<T>>,
+    profile: JsonProfile,
+    pretty: bool,
+    artifact_root: &Path,
+    debug: Option<Value>,
+) -> Result<()> {
+    let mut packet = serde_json::to_value(&wrapper.packet)?;
+
+    match profile {
+        JsonProfile::Full => {
+            if let Some(ref debug) = debug {
+                insert_payload_debug(&mut packet, debug.clone());
+            }
+        }
+        JsonProfile::Compact => {
+            compact_packet_payload(&wrapper.packet_type, &mut packet);
+        }
+        JsonProfile::Handle => {
+            let handle = suite_packet_core::write_packet_artifact(
+                artifact_root,
+                &wrapper.packet_type,
+                &wrapper.packet,
+            )
+            .map_err(|source| anyhow::anyhow!(source.to_string()))?;
+            compact_packet_payload(&wrapper.packet_type, &mut packet);
+            attach_artifact_handle(&mut packet, serde_json::to_value(handle)?);
+        }
+    }
+
+    refresh_packet_budget(&mut packet);
+
+    let mut output = PacketWrapperV1::new(wrapper.packet_type.clone(), packet);
+    output.schema_version = wrapper.schema_version.clone();
+    output.cache_hit =
+        wrapper.cache_hit || debug.as_ref().and_then(extract_cache_hit).unwrap_or(false);
+    emit_json(&serde_json::to_value(output)?, pretty)
+}
+
 pub fn emit_json(value: &Value, pretty: bool) -> Result<()> {
     if pretty {
         println!("{}", serde_json::to_string_pretty(value)?);
@@ -142,6 +181,38 @@ pub fn resolve_artifact_root(explicit_root: Option<&Path>) -> PathBuf {
         return root.to_path_buf();
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn caller_cwd() -> Result<PathBuf> {
+    std::env::current_dir().context("failed to resolve current directory")
+}
+
+pub fn resolve_path_from_cwd(value: &str, cwd: &Path) -> String {
+    if value.trim().is_empty() {
+        return value.to_string();
+    }
+    let path = PathBuf::from(value);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    absolute
+        .canonicalize()
+        .unwrap_or(absolute)
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub fn resolve_optional_path_from_cwd(value: Option<&str>, cwd: &Path) -> Option<String> {
+    value.map(|value| resolve_path_from_cwd(value, cwd))
+}
+
+pub fn resolve_paths_from_cwd(values: &[String], cwd: &Path) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| resolve_path_from_cwd(value, cwd))
+        .collect()
 }
 
 fn insert_payload_debug(packet: &mut Value, debug: Value) {

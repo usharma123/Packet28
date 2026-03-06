@@ -97,9 +97,21 @@ pub struct RunArgs {
 
 pub fn run(args: RunArgs) -> Result<i32> {
     let persist_root = persistence_root(&args)?;
+    let caller_cwd = crate::cmd_common::caller_cwd()?;
     let machine_profile = args
         .json
-        .map(|profile| suite_packet_core::JsonProfile::from(profile));
+        .map(|profile| suite_packet_core::JsonProfile::from(profile))
+        .or(args
+            .legacy_json
+            .then_some(suite_packet_core::JsonProfile::Compact));
+    let resolved_cwd = Some(match args.cwd.as_deref() {
+        Some(path) => crate::cmd_common::resolve_path_from_cwd(path, &caller_cwd),
+        None => caller_cwd.to_string_lossy().into_owned(),
+    });
+    let resolved_context_config = crate::cmd_common::resolve_optional_path_from_cwd(
+        args.context_config.as_deref(),
+        &caller_cwd,
+    );
     let detail_mode = if args.packet_detail == PacketDetailArg::Rich {
         PacketDetailArg::Rich
     } else {
@@ -107,7 +119,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
     };
     let input = suite_proxy_core::ProxyRunRequest {
         argv: args.command_argv.clone(),
-        cwd: args.cwd.clone(),
+        cwd: resolved_cwd.clone(),
         env_allowlist: args.env_allowlist.clone(),
         max_output_bytes: args.max_output_bytes,
         max_lines: args.max_lines,
@@ -115,7 +127,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         detail: detail_mode.into(),
     };
 
-    let use_kernel = args.cache || args.context_config.is_some();
+    let use_kernel = args.cache || resolved_context_config.is_some();
     if !use_kernel {
         let envelope = suite_proxy_core::run_and_reduce(input)?;
         if let Some(profile) = machine_profile {
@@ -151,8 +163,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "proxy.run".to_string(),
         reducer_input: serde_json::to_value(input)?,
-        policy_context: args
-            .context_config
+        policy_context: resolved_context_config
             .as_ref()
             .map(|path| json!({"config_path": path}))
             .unwrap_or(Value::Null),
@@ -164,7 +175,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
 
-    let governed_response = if let Some(context_config) = args.context_config.clone() {
+    let governed_response = if let Some(context_config) = resolved_context_config.clone() {
         Some(kernel.execute(context_kernel_core::KernelRequest {
             target: "governed.assemble".to_string(),
             input_packets: vec![output_packet.clone()],
@@ -192,14 +203,23 @@ pub fn run(args: RunArgs) -> Result<i32> {
 
 pub fn run_remote(args: RunArgs, daemon_root: &Path) -> Result<i32> {
     let persist_root = persistence_root(&args)?;
+    let caller_cwd = crate::cmd_common::caller_cwd()?;
     let detail_mode = if args.packet_detail == PacketDetailArg::Rich {
         PacketDetailArg::Rich
     } else {
         PacketDetailArg::Compact
     };
+    let resolved_cwd = Some(match args.cwd.as_deref() {
+        Some(path) => crate::cmd_common::resolve_path_from_cwd(path, &caller_cwd),
+        None => caller_cwd.to_string_lossy().into_owned(),
+    });
+    let resolved_context_config = crate::cmd_common::resolve_optional_path_from_cwd(
+        args.context_config.as_deref(),
+        &caller_cwd,
+    );
     let input = suite_proxy_core::ProxyRunRequest {
         argv: args.command_argv.clone(),
-        cwd: args.cwd.clone(),
+        cwd: resolved_cwd,
         env_allowlist: args.env_allowlist.clone(),
         max_output_bytes: args.max_output_bytes,
         max_lines: args.max_lines,
@@ -211,8 +231,7 @@ pub fn run_remote(args: RunArgs, daemon_root: &Path) -> Result<i32> {
         context_kernel_core::KernelRequest {
             target: "proxy.run".to_string(),
             reducer_input: serde_json::to_value(input)?,
-            policy_context: args
-                .context_config
+            policy_context: resolved_context_config
                 .as_ref()
                 .map(|path| json!({"config_path": path}))
                 .unwrap_or(Value::Null),
@@ -223,7 +242,7 @@ pub fn run_remote(args: RunArgs, daemon_root: &Path) -> Result<i32> {
         .output_packets
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
-    let governed_response = if let Some(context_config) = args.context_config.clone() {
+    let governed_response = if let Some(context_config) = resolved_context_config {
         Some(crate::cmd_daemon::send_kernel_request(
             daemon_root,
             context_kernel_core::KernelRequest {
@@ -259,7 +278,10 @@ fn handle_kernel_response(
 ) -> Result<i32> {
     let machine_profile = args
         .json
-        .map(|profile| suite_packet_core::JsonProfile::from(profile));
+        .map(|profile| suite_packet_core::JsonProfile::from(profile))
+        .or(args
+            .legacy_json
+            .then_some(suite_packet_core::JsonProfile::Compact));
     let output_packet = response
         .output_packets
         .first()

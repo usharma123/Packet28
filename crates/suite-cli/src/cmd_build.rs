@@ -45,6 +45,20 @@ pub struct ReduceArgs {
     context_budget_bytes: usize,
 }
 
+impl ReduceArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some() || self.legacy_json
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+
+    pub(crate) fn governed_requested(&self) -> bool {
+        self.context_config.is_some()
+    }
+}
+
 pub fn run(args: ReduceArgs) -> Result<i32> {
     let input_text = read_input_text(args.input.as_deref())?;
 
@@ -91,6 +105,9 @@ pub fn run(args: ReduceArgs) -> Result<i32> {
 }
 
 pub fn run_remote(args: ReduceArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_context_config =
+        crate::cmd_common::resolve_optional_path_from_cwd(args.context_config.as_deref(), &cwd);
     let input_text = read_input_text(args.input.as_deref())?;
     let response = crate::cmd_daemon::send_kernel_request(
         daemon_root,
@@ -101,8 +118,7 @@ pub fn run_remote(args: ReduceArgs, daemon_root: &Path) -> Result<i32> {
                 source: args.input.clone(),
                 max_diagnostics: args.max_diagnostics,
             })?,
-            policy_context: args
-                .context_config
+            policy_context: resolved_context_config
                 .as_ref()
                 .map(|path| json!({"config_path": path}))
                 .unwrap_or(Value::Null),
@@ -115,7 +131,7 @@ pub fn run_remote(args: ReduceArgs, daemon_root: &Path) -> Result<i32> {
         .first()
         .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
 
-    let governed_response = if let Some(context_config) = args.context_config.clone() {
+    let governed_response = if let Some(context_config) = resolved_context_config {
         Some(crate::cmd_daemon::send_kernel_request(
             daemon_root,
             context_kernel_core::KernelRequest {
@@ -152,8 +168,10 @@ fn handle_reduce_response(
         serde_json::from_value(output_packet.body.clone())
             .map_err(|source| anyhow!("invalid buildy output packet: {source}"))?;
 
-    if let Some(profile_arg) = args.json {
-        let profile: suite_packet_core::JsonProfile = profile_arg.into();
+    let machine_profile = args.json.map(suite_packet_core::JsonProfile::from).or(args
+        .legacy_json
+        .then_some(suite_packet_core::JsonProfile::Compact));
+    if let Some(profile) = machine_profile {
         if let Some(governed) = governed_response {
             let budget_hint = crate::cmd_common::budget_retry_hint(
                 &governed.metadata,

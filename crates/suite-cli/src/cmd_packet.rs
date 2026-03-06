@@ -63,12 +63,14 @@ pub fn run_fetch(args: FetchArgs) -> Result<i32> {
 }
 
 pub fn run_fetch_remote(args: FetchArgs, daemon_root: &Path) -> Result<i32> {
-    let root = std::path::PathBuf::from(&args.root);
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_root = crate::cmd_common::resolve_path_from_cwd(&args.root, &cwd);
+    let root = std::path::PathBuf::from(&resolved_root);
     let response = crate::cmd_daemon::send_packet_fetch(
         daemon_root,
         packet28_daemon_core::PacketFetchRequest {
             handle: args.handle.clone(),
-            root: args.root.clone(),
+            root: resolved_root,
         },
     )?;
     let mut profile = args
@@ -78,13 +80,6 @@ pub fn run_fetch_remote(args: FetchArgs, daemon_root: &Path) -> Result<i32> {
     if profile == suite_packet_core::JsonProfile::Handle {
         profile = suite_packet_core::JsonProfile::Full;
     }
-    crate::cmd_common::emit_machine_envelope(
-        &response.wrapper.packet_type,
-        &response.wrapper.packet,
-        profile,
-        args.pretty,
-        &root,
-        None,
-    )?;
+    crate::cmd_common::emit_machine_wrapper(&response.wrapper, profile, args.pretty, &root, None)?;
     Ok(0)
 }

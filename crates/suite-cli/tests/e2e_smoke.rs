@@ -2359,6 +2359,7 @@ fn test_suite_context_assemble_task_id_compresses_read_section() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_daemon_start_status_stop_cycle() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -2405,6 +2406,7 @@ fn test_suite_daemon_start_status_stop_cycle() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_diff_analyze_via_daemon_matches_packet_shape() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -2479,6 +2481,7 @@ fn test_suite_diff_analyze_via_daemon_matches_packet_shape() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_daemon_task_submit_returns_watch_id_and_watch_list() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -2595,6 +2598,7 @@ fn test_suite_daemon_task_submit_returns_watch_id_and_watch_list() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_daemon_task_submit_autofills_step_id_and_accepts_pascal_case_watch_kind() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -2701,6 +2705,7 @@ fn test_suite_daemon_task_submit_autofills_step_id_and_accepts_pascal_case_watch
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_daemon_failed_submit_cleans_up_task_and_watches() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -2808,6 +2813,7 @@ fn test_suite_daemon_failed_submit_cleans_up_task_and_watches() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_via_daemon_uses_explicit_daemon_root_for_map_repo() {
     ensure_packet28d_built();
     let daemon_root = TempDir::new().unwrap();
@@ -2856,6 +2862,7 @@ fn test_suite_via_daemon_uses_explicit_daemon_root_for_map_repo() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_via_daemon_honors_daemon_root_env() {
     ensure_packet28d_built();
     let daemon_root = TempDir::new().unwrap();
@@ -2956,6 +2963,7 @@ fn test_suite_context_assemble_machine_failure_emits_suite_error_v1() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_via_daemon_diff_wrapper_surfaces_cache_hit() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -3094,6 +3102,7 @@ fn test_suite_recall_prefers_summary_snippet_over_target_name() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_test_map_and_shard_via_daemon_auto_start() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -3174,6 +3183,7 @@ fn test_suite_test_map_and_shard_via_daemon_auto_start() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_stack_and_build_via_daemon_emit_packet_wrappers() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -3232,6 +3242,7 @@ fn test_suite_stack_and_build_via_daemon_emit_packet_wrappers() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_suite_context_non_assemble_via_daemon_smoke() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();

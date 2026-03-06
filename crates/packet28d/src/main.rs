@@ -32,7 +32,7 @@ use packet28_daemon_core::{
     TestMapResponse, TestMapSummary, TestShardRequest, TestShardResponse, WatchKind,
     WatchRegistration, WatchRegistry, WatchSpec,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(name = "packet28d", version, about = "Packet28 local daemon")]
@@ -194,7 +194,7 @@ fn handle_request(
 ) -> Result<DaemonResponse> {
     match request {
         DaemonRequest::Execute { request } => {
-            let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+            let kernel = kernel_for_request(&state, &request)?;
             let response = kernel.execute(request)?;
             Ok(DaemonResponse::Execute { response })
         }
@@ -334,6 +334,31 @@ fn handle_request(
             Ok(DaemonResponse::ContextRecall { response })
         }
     }
+}
+
+fn kernel_for_request(state: &Arc<Mutex<DaemonState>>, request: &KernelRequest) -> Result<Kernel> {
+    if let Some(root) = persist_root_override(&request.target, &request.policy_context) {
+        return Ok(Kernel::with_v1_reducers_and_persistence(
+            PersistConfig::new(resolve_root(Path::new(&root))),
+        ));
+    }
+
+    Ok(Kernel::with_v1_reducers_and_persistence(
+        PersistConfig::new(state.lock().map_err(lock_err)?.root.clone()),
+    ))
+}
+
+fn persist_root_override(target: &str, policy_context: &Value) -> Option<String> {
+    if !matches!(target, "agenty.state.write" | "agenty.state.snapshot") {
+        return None;
+    }
+
+    policy_context
+        .get("persist_root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn build_status(state: &DaemonState) -> Result<DaemonStatus> {

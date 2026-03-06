@@ -49,6 +49,20 @@ pub struct SliceArgs {
     context_budget_bytes: usize,
 }
 
+impl SliceArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some() || self.legacy_json
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+
+    pub(crate) fn governed_requested(&self) -> bool {
+        self.context_config.is_some()
+    }
+}
+
 pub fn run(args: SliceArgs) -> Result<i32> {
     let input_text = read_input_text(args.input.as_deref())?;
 
@@ -277,6 +291,9 @@ pub fn run(args: SliceArgs) -> Result<i32> {
 }
 
 pub fn run_remote(args: SliceArgs, daemon_root: &Path) -> Result<i32> {
+    let cwd = crate::cmd_common::caller_cwd()?;
+    let resolved_context_config =
+        crate::cmd_common::resolve_optional_path_from_cwd(args.context_config.as_deref(), &cwd);
     let input_text = read_input_text(args.input.as_deref())?;
     let response = crate::cmd_daemon::send_kernel_request(
         daemon_root,
@@ -287,7 +304,7 @@ pub fn run_remote(args: SliceArgs, daemon_root: &Path) -> Result<i32> {
                 source: args.input.clone(),
                 max_failures: args.max_failures,
             })?,
-            policy_context: match (args.context_config.as_ref(), args.task_id.as_ref()) {
+            policy_context: match (resolved_context_config.as_ref(), args.task_id.as_ref()) {
                 (Some(path), Some(task_id)) => json!({
                     "config_path": path,
                     "task_id": task_id,
@@ -312,7 +329,7 @@ pub fn run_remote(args: SliceArgs, daemon_root: &Path) -> Result<i32> {
         serde_json::from_value(output_packet.body.clone())
             .map_err(|source| anyhow!("invalid stacky output packet: {source}"))?;
 
-    let governed_response = if let Some(context_config) = args.context_config.clone() {
+    let governed_response = if let Some(context_config) = resolved_context_config {
         Some(crate::cmd_daemon::send_kernel_request(
             daemon_root,
             context_kernel_core::KernelRequest {

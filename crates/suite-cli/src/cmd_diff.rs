@@ -85,6 +85,22 @@ pub struct AnalyzeArgs {
     context_budget_bytes: usize,
 }
 
+impl AnalyzeArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some()
+            || self.legacy_json
+            || matches!(self.report.as_deref(), Some(report) if report.eq_ignore_ascii_case("json"))
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
+
+    pub(crate) fn governed_requested(&self) -> bool {
+        self.context_config.is_some()
+    }
+}
+
 pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     let governed_context_config = args.context_config.clone();
     let governed_budget_tokens = args.context_budget_tokens;
@@ -367,9 +383,11 @@ pub fn run_remote(args: AnalyzeArgs, config_path: &str, daemon_root: &Path) -> R
     let governed_budget_tokens = args.context_budget_tokens;
     let governed_budget_bytes = args.context_budget_bytes;
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
-    let cwd = std::env::current_dir()?;
+    let cwd = crate::cmd_common::caller_cwd()?;
     let base = args.base.as_deref().unwrap_or(&config.diff.base);
     let head = args.head.as_deref().unwrap_or(&config.diff.head);
+    let resolved_context_config =
+        crate::cmd_common::resolve_optional_path_from_cwd(governed_context_config.as_deref(), &cwd);
 
     let kernel_input = context_kernel_core::DiffAnalyzeKernelInput {
         base: base.to_string(),
@@ -380,17 +398,20 @@ pub fn run_remote(args: AnalyzeArgs, config_path: &str, daemon_root: &Path) -> R
         max_new_errors: config.gate.issues.max_new_errors,
         max_new_warnings: config.gate.issues.max_new_warnings,
         max_new_issues: config.gate.issues.max_new_issues,
-        issues: args.issues,
-        issues_state: args.issues_state,
+        issues: crate::cmd_common::resolve_paths_from_cwd(&args.issues, &cwd),
+        issues_state: crate::cmd_common::resolve_optional_path_from_cwd(
+            args.issues_state.as_deref(),
+            &cwd,
+        ),
         no_issues_state: args.no_issues_state,
-        coverage: args.coverage,
-        input: args.input,
+        coverage: crate::cmd_common::resolve_paths_from_cwd(&args.coverage, &cwd),
+        input: crate::cmd_common::resolve_optional_path_from_cwd(args.input.as_deref(), &cwd),
     };
     let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(
         &cwd,
         &diff_cache_fingerprint_paths(&kernel_input, &cwd),
     );
-    let policy_context = match (governed_context_config.as_ref(), args.task_id.as_ref()) {
+    let policy_context = match (resolved_context_config.as_ref(), args.task_id.as_ref()) {
         (Some(config_path), Some(task_id)) => json!({
             "config_path": config_path,
             "task_id": task_id,
@@ -427,7 +448,7 @@ pub fn run_remote(args: AnalyzeArgs, config_path: &str, daemon_root: &Path) -> R
             .map_err(|source| anyhow!("invalid diff analyze output packet: {source}"))?;
     let gate_passed = envelope.payload.gate_result.passed;
 
-    let governed_response = if let Some(context_config) = governed_context_config {
+    let governed_response = if let Some(context_config) = resolved_context_config {
         Some(crate::cmd_daemon::send_kernel_request(
             daemon_root,
             context_kernel_core::KernelRequest {
