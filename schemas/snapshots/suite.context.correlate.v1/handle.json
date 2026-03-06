@@ -1,0 +1,49 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.context.correlate.v1",
+  "packet": {
+    "version": "1",
+    "tool": "contextq",
+    "kind": "suite.context.correlate.v1",
+    "hash": "hash-handle-example",
+    "summary": "suite.context.correlate.v1 handle snapshot",
+    "budget_cost": {
+      "est_tokens": 60,
+      "est_bytes": 240,
+      "runtime_ms": 8,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["task:example"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-example",
+      "finding_count": 1,
+      "findings": [
+        {
+          "rule": "diff_vs_build",
+          "relation": "pre_existing_or_unrelated",
+          "confidence": 0.84,
+          "summary": "Build diagnostics touch untouched files: src/CharUtils.java",
+          "evidence_refs": [
+            {
+              "packet_id": "build",
+              "packet_type": "suite.build.reduce.v1",
+              "kind": "file",
+              "value": "src/CharUtils.java"
+            }
+          ]
+        }
+      ],
+      "artifact_handle": {
+        "handle_id": "handle-suite.context.correlate.v1",
+        "packet_type": "suite.context.correlate.v1",
+        "packet_hash": "hash-handle",
+        "artifact_sha256": "sha256-example",
+        "path": ".packet28/artifacts/handle-suite.context.correlate.v1.json",
+        "created_at_unix": 1700000000
+      }
+    }
+  }
+}

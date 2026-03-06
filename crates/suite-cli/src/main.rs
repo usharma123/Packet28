@@ -128,6 +128,8 @@ enum ContextCommands {
     /// Merge multiple reducer packets into a bounded final packet
     #[command(alias = "merge")]
     Assemble(cmd_context::AssembleArgs),
+    /// Correlate multiple packets into a synthesized insight packet
+    Correlate(cmd_context::CorrelateArgs),
     /// Write and inspect agent task state
     State(cmd_context::StateArgs),
     /// Query and manage persisted context store entries
@@ -197,6 +199,7 @@ fn main() {
         },
         Commands::Context(context) => match context.command {
             ContextCommands::Assemble(args) => cmd_context::run_assemble(args),
+            ContextCommands::Correlate(args) => cmd_context::run_correlate(args),
             ContextCommands::State(args) => cmd_context::run_state(args),
             ContextCommands::Store(args) => cmd_context::run_store(args),
             ContextCommands::Recall(args) => cmd_context::run_recall(args),

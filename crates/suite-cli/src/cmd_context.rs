@@ -48,6 +48,25 @@ pub struct AssembleArgs {
 }
 
 #[derive(Args)]
+pub struct CorrelateArgs {
+    /// Path(s) to reducer packet JSON files.
+    #[arg(long = "packet", alias = "input", required = true)]
+    packets: Vec<String>,
+
+    /// Task identifier for correlation context
+    #[arg(long)]
+    task_id: String,
+
+    /// Emit JSON output profile
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pretty: bool,
+}
+
+#[derive(Args)]
 pub struct StoreArgs {
     #[command(subcommand)]
     pub command: StoreCommands,
@@ -401,6 +420,64 @@ pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
         }
     }
 
+    Ok(0)
+}
+
+pub fn run_correlate(args: CorrelateArgs) -> Result<i32> {
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let cwd = std::env::current_dir()?;
+    let kernel = build_kernel(true, cwd.clone());
+    let input_packets = args
+        .packets
+        .iter()
+        .map(|path| context_kernel_core::load_packet_file(Path::new(path)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| anyhow!("{source}"))?;
+
+    let response = kernel.execute(context_kernel_core::KernelRequest {
+        target: "contextq.correlate".to_string(),
+        input_packets,
+        policy_context: json!({
+            "task_id": args.task_id,
+            "disable_cache": true,
+        }),
+        ..context_kernel_core::KernelRequest::default()
+    })?;
+
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextCorrelationPayload> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid correlation output packet: {source}"))?;
+
+    if args.json.is_some() {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_CONTEXT_CORRELATE,
+            &envelope,
+            profile,
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            Some(json!({
+                "kernel_metadata": {
+                    "correlate": response.metadata,
+                },
+            })),
+        )?;
+        return Ok(0);
+    }
+
+    println!("findings: {}", envelope.payload.finding_count);
+    for finding in &envelope.payload.findings {
+        println!(
+            "- [{}] {} ({:.2})",
+            finding.relation, finding.summary, finding.confidence
+        );
+    }
     Ok(0)
 }
 

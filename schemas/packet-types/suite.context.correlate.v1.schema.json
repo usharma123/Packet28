@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.context.correlate.v1.schema.json",
+  "title": "Packet Type Contract: suite.context.correlate.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.context.correlate.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["finding_count", "findings"],
+          "properties": {
+            "task_id": {},
+            "debug": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["finding_count", "findings"],
+  "x-optional_payload_fields": ["task_id", "debug", "artifact_handle"],
+  "x-boundedness_rules": ["finding list bounded by deterministic rule set"],
+  "x-compatibility_notes": ["v1 deterministic cross-packet correlation contract"]
+}

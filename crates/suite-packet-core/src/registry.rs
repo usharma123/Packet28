@@ -6,6 +6,7 @@ pub const PACKET_TYPE_DIFF_ANALYZE: &str = "suite.diff.analyze.v1";
 pub const PACKET_TYPE_TEST_IMPACT: &str = "suite.test.impact.v1";
 pub const PACKET_TYPE_AGENT_STATE: &str = "suite.agent.state.v1";
 pub const PACKET_TYPE_AGENT_SNAPSHOT: &str = "suite.agent.snapshot.v1";
+pub const PACKET_TYPE_CONTEXT_CORRELATE: &str = "suite.context.correlate.v1";
 pub const PACKET_TYPE_STACK_SLICE: &str = "suite.stack.slice.v1";
 pub const PACKET_TYPE_BUILD_REDUCE: &str = "suite.build.reduce.v1";
 pub const PACKET_TYPE_MAP_REPO: &str = "suite.map.repo.v1";
@@ -107,6 +108,13 @@ static CONTRACTS: &[PacketTypeContract] = &[
             "compact mode keeps bounded payload",
         ],
         compatibility_notes: &["v1 derived task-state snapshot contract"],
+    },
+    PacketTypeContract {
+        packet_type: PACKET_TYPE_CONTEXT_CORRELATE,
+        required_payload_fields: &["finding_count", "findings"],
+        optional_payload_fields: &["task_id", "debug", "artifact_handle"],
+        boundedness_rules: &["finding list bounded by deterministic rule set"],
+        compatibility_notes: &["v1 deterministic cross-packet correlation contract"],
     },
     PacketTypeContract {
         packet_type: PACKET_TYPE_STACK_SLICE,
@@ -268,6 +276,7 @@ mod tests {
             PACKET_TYPE_TEST_IMPACT,
             PACKET_TYPE_AGENT_STATE,
             PACKET_TYPE_AGENT_SNAPSHOT,
+            PACKET_TYPE_CONTEXT_CORRELATE,
             PACKET_TYPE_STACK_SLICE,
             PACKET_TYPE_BUILD_REDUCE,
             PACKET_TYPE_MAP_REPO,
@@ -350,6 +359,9 @@ mod tests {
             PACKET_TYPE_COVER_CHECK,
             PACKET_TYPE_DIFF_ANALYZE,
             PACKET_TYPE_TEST_IMPACT,
+            PACKET_TYPE_AGENT_STATE,
+            PACKET_TYPE_AGENT_SNAPSHOT,
+            PACKET_TYPE_CONTEXT_CORRELATE,
             PACKET_TYPE_STACK_SLICE,
             PACKET_TYPE_BUILD_REDUCE,
             PACKET_TYPE_MAP_REPO,

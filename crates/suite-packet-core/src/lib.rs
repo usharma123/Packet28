@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod context;
 pub mod coverage;
 pub mod diagnostics;
 pub mod diff;
@@ -12,6 +13,7 @@ pub mod shard;
 pub mod testmap;
 
 pub use agent::*;
+pub use context::*;
 pub use coverage::*;
 pub use diagnostics::*;
 pub use envelope::*;

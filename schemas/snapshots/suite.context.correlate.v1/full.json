@@ -1,0 +1,61 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.context.correlate.v1",
+  "packet": {
+    "version": "1",
+    "tool": "contextq",
+    "kind": "suite.context.correlate.v1",
+    "hash": "hash-full-example",
+    "summary": "suite.context.correlate.v1 full snapshot",
+    "budget_cost": {
+      "est_tokens": 120,
+      "est_bytes": 480,
+      "runtime_ms": 10,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["task:example"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-example",
+      "finding_count": 2,
+      "findings": [
+        {
+          "rule": "diff_vs_stack",
+          "relation": "unrelated",
+          "confidence": 0.86,
+          "summary": "Stack failures in src/ArrayUtils.java appear unrelated to diff in src/StopWatch.java",
+          "evidence_refs": [
+            {
+              "packet_id": "diff",
+              "packet_type": "suite.diff.analyze.v1",
+              "kind": "file",
+              "value": "src/StopWatch.java"
+            },
+            {
+              "packet_id": "stack",
+              "packet_type": "suite.stack.slice.v1",
+              "kind": "file",
+              "value": "src/ArrayUtils.java"
+            }
+          ]
+        },
+        {
+          "rule": "diff_vs_impact",
+          "relation": "supports",
+          "confidence": 0.78,
+          "summary": "Test impact selected 2 tests for changed files src/StopWatch.java",
+          "evidence_refs": [
+            {
+              "packet_id": "impact",
+              "packet_type": "suite.test.impact.v1",
+              "kind": "test",
+              "value": "StopWatchTest#testSplit"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

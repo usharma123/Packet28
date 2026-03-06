@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use roaring::RoaringBitmap;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -815,6 +816,7 @@ pub fn load_packet_file(path: &Path) -> Result<KernelPacket, KernelError> {
 pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("agenty.state.write", run_agenty_state_write);
     kernel.register_reducer("agenty.state.snapshot", run_agenty_state_snapshot);
+    kernel.register_reducer("contextq.correlate", run_contextq_correlate);
     kernel.register_reducer("contextq.assemble", run_contextq_assemble);
     kernel.register_reducer("governed.assemble", run_governed_assemble);
     kernel.register_reducer("guardy.check", run_guardy_check);
@@ -1175,6 +1177,385 @@ pub fn build_test_impact_envelope(
     .with_canonical_hash_and_real_budget()
 }
 
+fn build_context_correlation_packet(
+    target: &str,
+    task_id: Option<String>,
+    findings: Vec<suite_packet_core::ContextCorrelationFinding>,
+) -> Result<
+    (
+        suite_packet_core::EnvelopeV1<suite_packet_core::ContextCorrelationPayload>,
+        KernelPacket,
+    ),
+    KernelError,
+> {
+    let payload = suite_packet_core::ContextCorrelationPayload {
+        task_id,
+        finding_count: findings.len(),
+        findings,
+    };
+    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default().len();
+    let mut files = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    for finding in &payload.findings {
+        for evidence in &finding.evidence_refs {
+            if evidence.kind == "file" {
+                files.insert(evidence.value.clone());
+            } else {
+                symbols.insert((evidence.kind.clone(), evidence.value.clone()));
+            }
+        }
+    }
+
+    let summary = if payload.findings.is_empty() {
+        "correlation findings=0".to_string()
+    } else {
+        let preview = payload
+            .findings
+            .iter()
+            .take(3)
+            .map(|finding| finding.summary.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("correlation findings={} :: {preview}", payload.findings.len())
+    };
+
+    let envelope = suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "contextq".to_string(),
+        kind: "context_correlate".to_string(),
+        hash: String::new(),
+        summary,
+        files: files
+            .into_iter()
+            .map(|path| suite_packet_core::FileRef {
+                path,
+                relevance: Some(1.0),
+                source: Some("contextq.correlate".to_string()),
+            })
+            .collect(),
+        symbols: symbols
+            .into_iter()
+            .map(|(kind, name)| suite_packet_core::SymbolRef {
+                name,
+                file: None,
+                kind: Some(kind),
+                relevance: Some(1.0),
+                source: Some("contextq.correlate".to_string()),
+            })
+            .collect(),
+        risk: None,
+        confidence: Some(if payload.findings.is_empty() { 1.0 } else { 0.85 }),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: payload
+                .task_id
+                .as_ref()
+                .map(|task_id| vec![format!("task:{task_id}")])
+                .unwrap_or_default(),
+            git_base: None,
+            git_head: None,
+            generated_at_unix: now_unix(),
+        },
+        payload,
+    }
+    .with_canonical_hash_and_real_budget();
+
+    let packet = KernelPacket {
+        packet_id: Some(format!(
+            "contextq-correlate-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
+        format: default_packet_format(),
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+            target: target.to_string(),
+            detail: source.to_string(),
+        })?,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
+        metadata: json!({
+            "reducer": "contextq.correlate",
+            "kind": "context_correlate",
+            "hash": envelope.hash,
+            "finding_count": envelope.payload.finding_count,
+        }),
+    };
+
+    Ok((envelope, packet))
+}
+
+#[derive(Clone)]
+struct CorrelatablePacket<T> {
+    packet_id: Option<String>,
+    packet_type: &'static str,
+    envelope: suite_packet_core::EnvelopeV1<T>,
+}
+
+fn parse_correlatable_packet<T: DeserializeOwned + Default>(
+    packet: &KernelPacket,
+    packet_type: &'static str,
+    tool: &str,
+    kind: &str,
+) -> Option<CorrelatablePacket<T>> {
+    let value = extract_packet_value(&packet.body);
+    let envelope = serde_json::from_value::<suite_packet_core::EnvelopeV1<T>>(value).ok()?;
+    (envelope.tool == tool && envelope.kind == kind).then_some(CorrelatablePacket {
+        packet_id: packet.packet_id.clone(),
+        packet_type,
+        envelope,
+    })
+}
+
+fn diff_changed_files(
+    packet: &CorrelatablePacket<DiffAnalyzeKernelOutput>,
+) -> BTreeSet<String> {
+    let from_payload = packet
+        .envelope
+        .payload
+        .diffs
+        .iter()
+        .map(|diff| diff.path.clone())
+        .collect::<BTreeSet<_>>();
+    if from_payload.is_empty() {
+        packet
+            .envelope
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect()
+    } else {
+        from_payload
+    }
+}
+
+fn packet_files<T>(packet: &CorrelatablePacket<T>) -> BTreeSet<String> {
+    packet
+        .envelope
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+fn map_has_edge(
+    packet: &CorrelatablePacket<mapy_core::RepoMapPayload>,
+    left: &BTreeSet<String>,
+    right: &BTreeSet<String>,
+) -> bool {
+    packet.envelope.payload.edges.iter().any(|edge| {
+        let Some(from) = packet.envelope.files.get(edge.from_file_idx).map(|file| &file.path) else {
+            return false;
+        };
+        let Some(to) = packet.envelope.files.get(edge.to_file_idx).map(|file| &file.path) else {
+            return false;
+        };
+        (left.contains(from) && right.contains(to)) || (left.contains(to) && right.contains(from))
+    })
+}
+
+fn evidence_file_refs(
+    packet_id: &Option<String>,
+    packet_type: &'static str,
+    values: impl IntoIterator<Item = String>,
+) -> Vec<suite_packet_core::CorrelationEvidenceRef> {
+    values
+        .into_iter()
+        .map(|value| suite_packet_core::CorrelationEvidenceRef {
+            packet_id: packet_id.clone(),
+            packet_type: packet_type.to_string(),
+            kind: "file".to_string(),
+            value,
+        })
+        .collect()
+}
+
+fn correlate_packets(
+    input_packets: &[KernelPacket],
+    task_id: Option<String>,
+) -> Vec<suite_packet_core::ContextCorrelationFinding> {
+    let diffs = input_packets
+        .iter()
+        .filter_map(|packet| {
+            parse_correlatable_packet::<DiffAnalyzeKernelOutput>(
+                packet,
+                suite_packet_core::PACKET_TYPE_DIFF_ANALYZE,
+                "diffy",
+                "diff_analyze",
+            )
+        })
+        .collect::<Vec<_>>();
+    let impacts = input_packets
+        .iter()
+        .filter_map(|packet| {
+            parse_correlatable_packet::<ImpactKernelOutput>(
+                packet,
+                suite_packet_core::PACKET_TYPE_TEST_IMPACT,
+                "testy",
+                "test_impact",
+            )
+        })
+        .collect::<Vec<_>>();
+    let stacks = input_packets
+        .iter()
+        .filter_map(|packet| {
+            parse_correlatable_packet::<stacky_core::StackSliceOutput>(
+                packet,
+                suite_packet_core::PACKET_TYPE_STACK_SLICE,
+                "stacky",
+                "stack_slice",
+            )
+        })
+        .collect::<Vec<_>>();
+    let builds = input_packets
+        .iter()
+        .filter_map(|packet| {
+            parse_correlatable_packet::<buildy_core::BuildReduceOutput>(
+                packet,
+                suite_packet_core::PACKET_TYPE_BUILD_REDUCE,
+                "buildy",
+                "build_reduce",
+            )
+        })
+        .collect::<Vec<_>>();
+    let maps = input_packets
+        .iter()
+        .filter_map(|packet| {
+            parse_correlatable_packet::<mapy_core::RepoMapPayload>(
+                packet,
+                suite_packet_core::PACKET_TYPE_MAP_REPO,
+                "mapy",
+                "repo_map",
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut findings = Vec::new();
+
+    for diff in &diffs {
+        let changed = diff_changed_files(diff);
+        if changed.is_empty() {
+            continue;
+        }
+
+        for stack in &stacks {
+            let stack_files = packet_files(stack);
+            if stack_files.is_empty() {
+                continue;
+            }
+            let overlap = changed.intersection(&stack_files).cloned().collect::<Vec<_>>();
+            let map_connected = maps.iter().any(|map| map_has_edge(map, &changed, &stack_files));
+            let relation = if !overlap.is_empty() {
+                "related"
+            } else if !map_connected && !maps.is_empty() {
+                "unrelated"
+            } else {
+                "possibly_related"
+            };
+            let summary = if !overlap.is_empty() {
+                format!("Stack failures touch changed files: {}", overlap.join(", "))
+            } else if relation == "unrelated" {
+                format!(
+                    "Stack failures in {} appear unrelated to diff in {}",
+                    stack_files.iter().cloned().collect::<Vec<_>>().join(", "),
+                    changed.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            } else {
+                format!(
+                    "Stack failures in {} may relate indirectly to diff in {}",
+                    stack_files.iter().cloned().collect::<Vec<_>>().join(", "),
+                    changed.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
+            let mut evidence_refs = evidence_file_refs(&diff.packet_id, diff.packet_type, changed.clone());
+            evidence_refs.extend(evidence_file_refs(
+                &stack.packet_id,
+                stack.packet_type,
+                stack_files.clone(),
+            ));
+            findings.push(suite_packet_core::ContextCorrelationFinding {
+                rule: "diff_vs_stack".to_string(),
+                relation: relation.to_string(),
+                confidence: if relation == "related" { 0.92 } else if relation == "unrelated" { 0.86 } else { 0.62 },
+                summary,
+                evidence_refs,
+            });
+        }
+
+        for impact in &impacts {
+            if impact.envelope.payload.result.selected_tests.is_empty() {
+                continue;
+            }
+            let mut evidence_refs =
+                evidence_file_refs(&diff.packet_id, diff.packet_type, changed.clone());
+            evidence_refs.extend(
+                impact
+                    .envelope
+                    .payload
+                    .result
+                    .selected_tests
+                    .iter()
+                    .map(|test_id: &String| suite_packet_core::CorrelationEvidenceRef {
+                        packet_id: impact.packet_id.clone(),
+                        packet_type: impact.packet_type.to_string(),
+                        kind: "test".to_string(),
+                        value: test_id.clone(),
+                    }),
+            );
+            findings.push(suite_packet_core::ContextCorrelationFinding {
+                rule: "diff_vs_impact".to_string(),
+                relation: "supports".to_string(),
+                confidence: 0.78,
+                summary: format!(
+                    "Test impact selected {} tests for changed files {}",
+                    impact.envelope.payload.result.selected_tests.len(),
+                    changed.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
+                evidence_refs,
+            });
+        }
+
+        for build in &builds {
+            let build_files = packet_files(build);
+            let untouched = build_files
+                .difference(&changed)
+                .cloned()
+                .collect::<Vec<_>>();
+            if untouched.is_empty() {
+                continue;
+            }
+            let mut evidence_refs =
+                evidence_file_refs(&diff.packet_id, diff.packet_type, changed.clone());
+            evidence_refs.extend(evidence_file_refs(
+                &build.packet_id,
+                build.packet_type,
+                untouched.clone(),
+            ));
+            findings.push(suite_packet_core::ContextCorrelationFinding {
+                rule: "diff_vs_build".to_string(),
+                relation: "pre_existing_or_unrelated".to_string(),
+                confidence: 0.84,
+                summary: format!(
+                    "Build diagnostics touch untouched files: {}",
+                    untouched.join(", ")
+                ),
+                evidence_refs,
+            });
+        }
+    }
+
+    if findings.is_empty() && task_id.is_some() {
+        Vec::new()
+    } else {
+        findings
+    }
+}
+
 fn run_governed_assemble(
     ctx: &mut ExecutionContext,
     input_packets: &[KernelPacket],
@@ -1442,6 +1823,34 @@ fn load_agent_snapshot(
     Ok(Some(derive_agent_snapshot(&entries, task_id)))
 }
 
+fn run_contextq_correlate(
+    ctx: &mut ExecutionContext,
+    input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let task_id = ctx
+        .policy_context
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let findings = correlate_packets(input_packets, task_id.clone());
+    let (envelope, packet) = build_context_correlation_packet(&ctx.target, task_id.clone(), findings)?;
+
+    if let Some(task_id) = task_id {
+        ctx.set_shared("task_id", Value::String(task_id));
+    }
+    ctx.set_shared("correlation_findings", Value::from(envelope.payload.finding_count as u64));
+
+    Ok(ReducerResult {
+        output_packets: vec![packet],
+        metadata: json!({
+            "reducer": "contextq.correlate",
+            "kind": "context_correlate",
+            "finding_count": envelope.payload.finding_count,
+        }),
+    })
+}
+
 fn run_contextq_assemble(
     ctx: &mut ExecutionContext,
     input_packets: &[KernelPacket],
@@ -1472,7 +1881,30 @@ fn run_contextq_assemble(
         agent_snapshot: agent_snapshot.clone(),
     };
 
-    let packets: Vec<contextq_core::InputPacket> = input_packets
+    let mut assemble_packets = input_packets.to_vec();
+    if ctx
+        .policy_context
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.trim().is_empty())
+        .is_some()
+        && input_packets.len() > 1
+    {
+        let correlation = run_contextq_correlate(ctx, input_packets)?;
+        if let Some(packet) = correlation.output_packets.first() {
+            let finding_count = packet
+                .body
+                .get("payload")
+                .and_then(|payload| payload.get("finding_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if finding_count > 0 {
+                assemble_packets.push(packet.clone());
+            }
+        }
+    }
+
+    let packets: Vec<contextq_core::InputPacket> = assemble_packets
         .iter()
         .enumerate()
         .map(|(idx, packet)| {
@@ -3998,6 +4430,157 @@ policy:
             .completed_steps
             .iter()
             .any(|step| step == "diff.analyze"));
+    }
+
+    #[test]
+    fn contextq_assemble_includes_correlation_findings_for_task() {
+        let kernel = Kernel::with_v1_reducers();
+
+        let diff_packet = KernelPacket::from_value(
+            serde_json::to_value(
+                suite_packet_core::EnvelopeV1 {
+                    version: "1".to_string(),
+                    tool: "diffy".to_string(),
+                    kind: "diff_analyze".to_string(),
+                    hash: String::new(),
+                    summary: "changed StopWatch".to_string(),
+                    files: vec![suite_packet_core::FileRef {
+                        path: "src/StopWatch.java".to_string(),
+                        relevance: Some(1.0),
+                        source: Some("diffy.analyze".to_string()),
+                    }],
+                    symbols: Vec::new(),
+                    risk: None,
+                    confidence: Some(1.0),
+                    budget_cost: suite_packet_core::BudgetCost::default(),
+                    provenance: suite_packet_core::Provenance {
+                        inputs: vec!["diff".to_string()],
+                        git_base: Some("HEAD~1".to_string()),
+                        git_head: Some("HEAD".to_string()),
+                        generated_at_unix: 1,
+                    },
+                    payload: DiffAnalyzeKernelOutput {
+                        gate_result: suite_packet_core::QualityGateResult {
+                            passed: true,
+                            total_coverage_pct: None,
+                            changed_coverage_pct: None,
+                            new_file_coverage_pct: None,
+                            violations: Vec::new(),
+                            issue_counts: None,
+                        },
+                        diagnostics: None,
+                        diffs: vec![SerializableFileDiff {
+                            path: "src/StopWatch.java".to_string(),
+                            old_path: None,
+                            status: suite_packet_core::DiffStatus::Modified,
+                            changed_lines: vec![10, 11],
+                        }],
+                    },
+                }
+                .with_canonical_hash_and_real_budget(),
+            )
+            .unwrap(),
+            Some("diff".to_string()),
+        );
+
+        let stack_packet = KernelPacket::from_value(
+            serde_json::to_value(stacky_core::slice_to_envelope(stacky_core::StackSliceRequest {
+                log_text: r#"
+java.lang.IllegalStateException: boom
+  at org.example.ArrayUtils.run(src/ArrayUtils.java:42)
+"#
+                .to_string(),
+                source: Some("stack.log".to_string()),
+                max_failures: None,
+            }))
+            .unwrap(),
+            Some("stack".to_string()),
+        );
+
+        let map_packet = KernelPacket::from_value(
+            serde_json::to_value(
+                suite_packet_core::EnvelopeV1 {
+                    version: "1".to_string(),
+                    tool: "mapy".to_string(),
+                    kind: "repo_map".to_string(),
+                    hash: String::new(),
+                    summary: "repo map".to_string(),
+                    files: vec![
+                        suite_packet_core::FileRef {
+                            path: "src/StopWatch.java".to_string(),
+                            relevance: Some(1.0),
+                            source: Some("mapy.repo".to_string()),
+                        },
+                        suite_packet_core::FileRef {
+                            path: "src/ArrayUtils.java".to_string(),
+                            relevance: Some(0.8),
+                            source: Some("mapy.repo".to_string()),
+                        },
+                    ],
+                    symbols: Vec::new(),
+                    risk: None,
+                    confidence: Some(1.0),
+                    budget_cost: suite_packet_core::BudgetCost::default(),
+                    provenance: suite_packet_core::Provenance {
+                        inputs: vec!["repo".to_string()],
+                        git_base: None,
+                        git_head: None,
+                        generated_at_unix: 1,
+                    },
+                    payload: mapy_core::RepoMapPayload {
+                        files_ranked: vec![
+                            mapy_core::RankedFile {
+                                file_idx: 0,
+                                score: 1.0,
+                                symbol_count: 1,
+                                import_count: 0,
+                            },
+                            mapy_core::RankedFile {
+                                file_idx: 1,
+                                score: 0.8,
+                                symbol_count: 1,
+                                import_count: 0,
+                            },
+                        ],
+                        symbols_ranked: Vec::new(),
+                        edges: Vec::new(),
+                        focus_hits: Vec::new(),
+                        truncation: mapy_core::TruncationSummary::default(),
+                    },
+                }
+                .with_canonical_hash_and_real_budget(),
+            )
+            .unwrap(),
+            Some("map".to_string()),
+        );
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "contextq.assemble".to_string(),
+                input_packets: vec![diff_packet, stack_packet, map_packet],
+                budget: ExecutionBudget {
+                    token_cap: Some(1500),
+                    byte_cap: Some(100_000),
+                    runtime_ms_cap: None,
+                },
+                policy_context: json!({
+                    "task_id": "task-correlation",
+                    "disable_cache": true
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        let envelope: suite_packet_core::EnvelopeV1<ContextAssembleEnvelopePayload> =
+            serde_json::from_value(response.output_packets[0].body.clone()).unwrap();
+        let bodies = envelope
+            .payload
+            .sections
+            .iter()
+            .map(|section| section.body.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bodies.contains("appear unrelated to diff"));
     }
 
     #[test]
