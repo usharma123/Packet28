@@ -45,6 +45,26 @@ pub struct ScheduleResult {
     pub budget_exhausted: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ScheduleMutation {
+    Cancel { step_id: String, reason: String },
+    Replace { step: ScheduleStep, reason: String },
+    Append { step: ScheduleStep, reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppliedMutation {
+    pub kind: String,
+    pub step_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MutationResult {
+    pub steps: Vec<ScheduleStep>,
+    pub applied: Vec<AppliedMutation>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ScheduleError {
     #[error("step id cannot be empty")]
@@ -116,6 +136,72 @@ pub fn schedule(request: ScheduleRequest) -> Result<ScheduleResult, ScheduleErro
         skipped_steps,
         estimated_usage: usage,
         budget_exhausted,
+    })
+}
+
+pub fn apply_mutations(
+    steps: &[ScheduleStep],
+    mutations: &[ScheduleMutation],
+) -> Result<MutationResult, ScheduleError> {
+    let mut by_id = steps
+        .iter()
+        .cloned()
+        .map(|step| (step.id.clone(), step))
+        .collect::<HashMap<_, _>>();
+    let mut order = steps.iter().map(|step| step.id.clone()).collect::<Vec<_>>();
+    let mut applied = Vec::new();
+
+    for mutation in mutations {
+        match mutation {
+            ScheduleMutation::Cancel { step_id, reason } => {
+                if by_id.remove(step_id).is_some() {
+                    order.retain(|id| id != step_id);
+                    for step in by_id.values_mut() {
+                        step.depends_on.retain(|dep| dep != step_id);
+                    }
+                    applied.push(AppliedMutation {
+                        kind: "cancel".to_string(),
+                        step_id: step_id.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+            }
+            ScheduleMutation::Replace { step, reason } => {
+                if by_id.contains_key(&step.id) {
+                    by_id.insert(step.id.clone(), step.clone());
+                    applied.push(AppliedMutation {
+                        kind: "replace".to_string(),
+                        step_id: step.id.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+            }
+            ScheduleMutation::Append { step, reason } => {
+                if !by_id.contains_key(&step.id) {
+                    order.push(step.id.clone());
+                    by_id.insert(step.id.clone(), step.clone());
+                    applied.push(AppliedMutation {
+                        kind: "append".to_string(),
+                        step_id: step.id.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    let result_steps = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect::<Vec<_>>();
+    validate_request(&ScheduleRequest {
+        steps: result_steps.clone(),
+        budget: ScheduleBudget::default(),
+    })?;
+
+    Ok(MutationResult {
+        steps: result_steps,
+        applied,
     })
 }
 
@@ -297,5 +383,46 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, ScheduleError::DependencyCycle);
+    }
+
+    #[test]
+    fn apply_mutations_supports_cancel_replace_and_append() {
+        let steps = vec![step("a", &[], 1), step("b", &["a"], 1)];
+        let result = apply_mutations(
+            &steps,
+            &[
+                ScheduleMutation::Cancel {
+                    step_id: "a".to_string(),
+                    reason: "done".to_string(),
+                },
+                ScheduleMutation::Replace {
+                    step: ScheduleStep {
+                        id: "b".to_string(),
+                        target: "b.focused".to_string(),
+                        depends_on: Vec::new(),
+                        estimate: StepEstimate {
+                            tokens: 2,
+                            bytes: 0,
+                            runtime_ms: 0,
+                        },
+                    },
+                    reason: "focus".to_string(),
+                },
+                ScheduleMutation::Append {
+                    step: step("c", &["b"], 1),
+                    reason: "followup".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let ids = result
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["b", "c"]);
+        assert_eq!(result.steps[0].target, "b.focused");
+        assert_eq!(result.applied.len(), 3);
     }
 }

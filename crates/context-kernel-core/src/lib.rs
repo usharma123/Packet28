@@ -110,6 +110,15 @@ pub struct KernelStepRequest {
 pub struct KernelSequenceRequest {
     pub budget: ExecutionBudget,
     pub steps: Vec<KernelStepRequest>,
+    pub reactive: ReactiveSequenceConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ReactiveSequenceConfig {
+    pub enabled: bool,
+    pub task_id: Option<String>,
+    pub append_focused_map: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -648,9 +657,8 @@ impl Kernel {
         req: KernelSequenceRequest,
     ) -> Result<KernelSequenceResponse, KernelError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let mut scheduler_steps = Vec::with_capacity(req.steps.len());
-        let mut by_id = HashMap::new();
-
+        let task_id = resolve_sequence_task_id(&req);
+        let mut original_steps = Vec::with_capacity(req.steps.len());
         for step in req.steps {
             let id = step.id.trim().to_string();
             if id.is_empty() {
@@ -658,60 +666,115 @@ impl Kernel {
                     detail: "sequence step id cannot be empty".to_string(),
                 });
             }
-
-            let estimate = usage_for_packets(&step.input_packets);
-            scheduler_steps.push(context_scheduler_core::ScheduleStep {
-                id: id.clone(),
-                target: step.target.clone(),
-                depends_on: step.depends_on.clone(),
-                estimate: context_scheduler_core::StepEstimate {
-                    tokens: estimate.tokens,
-                    bytes: estimate.bytes,
-                    runtime_ms: estimate.runtime_ms,
-                },
-            });
-            by_id.insert(id, step);
+            let mut normalized = step;
+            normalized.id = id;
+            original_steps.push(normalized);
         }
 
-        let schedule = context_scheduler_core::schedule(context_scheduler_core::ScheduleRequest {
-            steps: scheduler_steps,
-            budget: context_scheduler_core::ScheduleBudget {
-                token_cap: req.budget.token_cap,
-                byte_cap: req.budget.byte_cap,
-                runtime_ms_cap: req.budget.runtime_ms_cap,
-            },
-        })
-        .map_err(|source| KernelError::SchedulerFailed {
-            detail: source.to_string(),
-        })?;
-
+        let mut remaining = original_steps.clone();
         let mut step_results = Vec::new();
         let mut scheduled = Vec::new();
-        let mut completed = HashMap::<String, bool>::new();
-        for scheduled_step in &schedule.ordered_steps {
-            let Some(original) = by_id.get(&scheduled_step.id) else {
-                continue;
+        let mut skipped = Vec::new();
+        let mut consumed_estimate = context_scheduler_core::StepEstimate::default();
+        let mut budget_exhausted = false;
+        let mut completed_success = BTreeSet::<String>::new();
+        let mut last_event_count = 0usize;
+        let mut replans = Vec::<Value>::new();
+
+        if req.reactive.enabled {
+            if let Some(task_id) = task_id.as_deref() {
+                let snapshot = load_agent_snapshot_for_task(self, task_id)?;
+                last_event_count = snapshot.event_count;
+                let mutations = build_reactive_kernel_mutations(
+                    &remaining,
+                    &original_steps,
+                    &snapshot,
+                    &completed_success,
+                    req.reactive.append_focused_map,
+                    None,
+                );
+                if !mutations.is_empty() {
+                    let schedule_mutations = to_schedule_mutations(&mutations);
+                    let applied = context_scheduler_core::apply_mutations(
+                        &remaining
+                            .iter()
+                            .map(schedule_step_from_kernel)
+                            .collect::<Vec<_>>(),
+                        &schedule_mutations,
+                    )
+                    .map_err(|source| KernelError::SchedulerFailed {
+                        detail: source.to_string(),
+                    })?;
+                    record_replan_cancellations(
+                        &remaining,
+                        &applied.applied,
+                        &mut skipped,
+                        &mut step_results,
+                    );
+                    remaining = apply_kernel_mutations(&remaining, &mutations);
+                    replans.push(json!({
+                        "trigger": "initial_state",
+                        "event_count": snapshot.event_count,
+                        "applied_mutations": applied.applied,
+                    }));
+                }
+            }
+        }
+
+        while !remaining.is_empty() {
+            let schedule =
+                context_scheduler_core::schedule(context_scheduler_core::ScheduleRequest {
+                    steps: remaining
+                        .iter()
+                        .map(schedule_step_from_kernel)
+                        .collect::<Vec<_>>(),
+                    budget: schedule_budget_remaining(req.budget, consumed_estimate),
+                })
+                .map_err(|source| KernelError::SchedulerFailed {
+                    detail: source.to_string(),
+                })?;
+
+            let Some(next_step_id) = schedule.ordered_steps.first().map(|step| step.id.clone())
+            else {
+                budget_exhausted = schedule.budget_exhausted;
+                for step in remaining.drain(..) {
+                    skipped.push(step.id.clone());
+                    step_results.push(KernelStepResponse {
+                        id: step.id,
+                        target: step.target,
+                        status: "skipped".to_string(),
+                        response: None,
+                        failure: Some(KernelFailure {
+                            code: if budget_exhausted {
+                                "budget_exceeded".to_string()
+                            } else {
+                                "dependency_not_satisfied".to_string()
+                            },
+                            message: if budget_exhausted {
+                                "step skipped: budget_exceeded".to_string()
+                            } else {
+                                "step skipped: dependency_not_satisfied".to_string()
+                            },
+                            target: None,
+                        }),
+                    });
+                }
+                break;
             };
 
-            if original
-                .depends_on
+            let next_idx = remaining
                 .iter()
-                .any(|dep| !completed.get(dep).copied().unwrap_or(false))
-            {
-                completed.insert(scheduled_step.id.clone(), false);
-                step_results.push(KernelStepResponse {
-                    id: scheduled_step.id.clone(),
-                    target: original.target.clone(),
-                    status: "skipped".to_string(),
-                    response: None,
-                    failure: Some(KernelFailure {
-                        code: "dependency_failed".to_string(),
-                        message: "step skipped due to failed dependency".to_string(),
-                        target: Some(original.target.clone()),
-                    }),
-                });
-                continue;
-            }
+                .position(|step| step.id == next_step_id)
+                .expect("scheduled step must exist in remaining plan");
+            let original = remaining.remove(next_idx);
+            let estimate = kernel_step_estimate(&original);
+            consumed_estimate = context_scheduler_core::StepEstimate {
+                tokens: consumed_estimate.tokens.saturating_add(estimate.tokens),
+                bytes: consumed_estimate.bytes.saturating_add(estimate.bytes),
+                runtime_ms: consumed_estimate
+                    .runtime_ms
+                    .saturating_add(estimate.runtime_ms),
+            };
 
             let response = self.execute(KernelRequest {
                 target: original.target.clone(),
@@ -721,53 +784,93 @@ impl Kernel {
                 } else {
                     original.budget
                 },
-                policy_context: original.policy_context.clone(),
+                policy_context: policy_context_with_task_id(
+                    original.policy_context.clone(),
+                    task_id.as_deref(),
+                ),
                 reducer_input: original.reducer_input.clone(),
             });
 
             match response {
                 Ok(response) => {
-                    scheduled.push(scheduled_step.id.clone());
-                    completed.insert(scheduled_step.id.clone(), true);
+                    scheduled.push(original.id.clone());
+                    completed_success.insert(original.id.clone());
+                    remove_satisfied_dependency(&mut remaining, &original.id);
                     step_results.push(KernelStepResponse {
-                        id: scheduled_step.id.clone(),
+                        id: original.id.clone(),
                         target: original.target.clone(),
                         status: "ok".to_string(),
                         response: Some(response),
                         failure: None,
                     });
+
+                    if req.reactive.enabled {
+                        if let Some(task_id) = task_id.as_deref() {
+                            let snapshot = load_agent_snapshot_for_task(self, task_id)?;
+                            if snapshot.event_count > last_event_count {
+                                let mutations = build_reactive_kernel_mutations(
+                                    &remaining,
+                                    &original_steps,
+                                    &snapshot,
+                                    &completed_success,
+                                    req.reactive.append_focused_map,
+                                    Some(&original.id),
+                                );
+                                if !mutations.is_empty() {
+                                    let schedule_mutations = to_schedule_mutations(&mutations);
+                                    let applied = context_scheduler_core::apply_mutations(
+                                        &remaining
+                                            .iter()
+                                            .map(schedule_step_from_kernel)
+                                            .collect::<Vec<_>>(),
+                                        &schedule_mutations,
+                                    )
+                                    .map_err(|source| KernelError::SchedulerFailed {
+                                        detail: source.to_string(),
+                                    })?;
+                                    record_replan_cancellations(
+                                        &remaining,
+                                        &applied.applied,
+                                        &mut skipped,
+                                        &mut step_results,
+                                    );
+                                    remaining = apply_kernel_mutations(&remaining, &mutations);
+                                    replans.push(json!({
+                                        "trigger": "task_state_update",
+                                        "after_step": original.id,
+                                        "event_count": snapshot.event_count,
+                                        "applied_mutations": applied.applied,
+                                    }));
+                                }
+                                last_event_count = snapshot.event_count;
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
-                    completed.insert(scheduled_step.id.clone(), false);
+                    let failed_dependents = remove_failed_dependents(&mut remaining, &original.id);
                     step_results.push(KernelStepResponse {
-                        id: scheduled_step.id.clone(),
+                        id: original.id.clone(),
                         target: original.target.clone(),
                         status: "failed".to_string(),
                         response: None,
                         failure: Some(err.structured()),
                     });
+                    for skipped_step in failed_dependents {
+                        skipped.push(skipped_step.id.clone());
+                        step_results.push(KernelStepResponse {
+                            id: skipped_step.id,
+                            target: skipped_step.target,
+                            status: "skipped".to_string(),
+                            response: None,
+                            failure: Some(KernelFailure {
+                                code: "dependency_failed".to_string(),
+                                message: "step skipped due to failed dependency".to_string(),
+                                target: None,
+                            }),
+                        });
+                    }
                 }
-            }
-        }
-
-        let skipped = schedule
-            .skipped_steps
-            .iter()
-            .map(|s| s.id.clone())
-            .collect::<Vec<_>>();
-        for skipped_step in &schedule.skipped_steps {
-            if let Some(step) = by_id.get(&skipped_step.id) {
-                step_results.push(KernelStepResponse {
-                    id: step.id.clone(),
-                    target: step.target.clone(),
-                    status: "skipped".to_string(),
-                    response: None,
-                    failure: Some(KernelFailure {
-                        code: skipped_step.reason.clone(),
-                        message: format!("step skipped: {}", skipped_step.reason),
-                        target: Some(step.target.clone()),
-                    }),
-                });
             }
         }
 
@@ -775,13 +878,18 @@ impl Kernel {
             request_id,
             scheduled,
             skipped,
-            budget_exhausted: schedule.budget_exhausted,
+            budget_exhausted,
             step_results,
             metadata: json!({
                 "estimated_usage": {
-                    "tokens": schedule.estimated_usage.tokens,
-                    "bytes": schedule.estimated_usage.bytes,
-                    "runtime_ms": schedule.estimated_usage.runtime_ms,
+                    "tokens": consumed_estimate.tokens,
+                    "bytes": consumed_estimate.bytes,
+                    "runtime_ms": consumed_estimate.runtime_ms,
+                },
+                "reactive": {
+                    "enabled": req.reactive.enabled,
+                    "task_id": task_id,
+                    "replans": replans,
                 }
             }),
         })
@@ -971,9 +1079,7 @@ fn ingest_coverage_stdin(
     covy_ingest::ingest_reader(std::io::stdin().lock(), format).map_err(Into::into)
 }
 
-fn ingest_diagnostics(
-    path: &Path,
-) -> anyhow::Result<diffy_core::diagnostics::DiagnosticsData> {
+fn ingest_diagnostics(path: &Path) -> anyhow::Result<diffy_core::diagnostics::DiagnosticsData> {
     covy_ingest::ingest_diagnostics_path(path).map_err(Into::into)
 }
 
@@ -1216,7 +1322,10 @@ fn build_context_correlation_packet(
             .map(|finding| finding.summary.clone())
             .collect::<Vec<_>>()
             .join(" | ");
-        format!("correlation findings={} :: {preview}", payload.findings.len())
+        format!(
+            "correlation findings={} :: {preview}",
+            payload.findings.len()
+        )
     };
 
     let envelope = suite_packet_core::EnvelopeV1 {
@@ -1244,7 +1353,11 @@ fn build_context_correlation_packet(
             })
             .collect(),
         risk: None,
-        confidence: Some(if payload.findings.is_empty() { 1.0 } else { 0.85 }),
+        confidence: Some(if payload.findings.is_empty() {
+            1.0
+        } else {
+            0.85
+        }),
         budget_cost: suite_packet_core::BudgetCost {
             est_tokens: 0,
             est_bytes: 0,
@@ -1312,9 +1425,7 @@ fn parse_correlatable_packet<T: DeserializeOwned + Default>(
     })
 }
 
-fn diff_changed_files(
-    packet: &CorrelatablePacket<DiffAnalyzeKernelOutput>,
-) -> BTreeSet<String> {
+fn diff_changed_files(packet: &CorrelatablePacket<DiffAnalyzeKernelOutput>) -> BTreeSet<String> {
     let from_payload = packet
         .envelope
         .payload
@@ -1349,10 +1460,20 @@ fn map_has_edge(
     right: &BTreeSet<String>,
 ) -> bool {
     packet.envelope.payload.edges.iter().any(|edge| {
-        let Some(from) = packet.envelope.files.get(edge.from_file_idx).map(|file| &file.path) else {
+        let Some(from) = packet
+            .envelope
+            .files
+            .get(edge.from_file_idx)
+            .map(|file| &file.path)
+        else {
             return false;
         };
-        let Some(to) = packet.envelope.files.get(edge.to_file_idx).map(|file| &file.path) else {
+        let Some(to) = packet
+            .envelope
+            .files
+            .get(edge.to_file_idx)
+            .map(|file| &file.path)
+        else {
             return false;
         };
         (left.contains(from) && right.contains(to)) || (left.contains(to) && right.contains(from))
@@ -1448,8 +1569,13 @@ fn correlate_packets(
             if stack_files.is_empty() {
                 continue;
             }
-            let overlap = changed.intersection(&stack_files).cloned().collect::<Vec<_>>();
-            let map_connected = maps.iter().any(|map| map_has_edge(map, &changed, &stack_files));
+            let overlap = changed
+                .intersection(&stack_files)
+                .cloned()
+                .collect::<Vec<_>>();
+            let map_connected = maps
+                .iter()
+                .any(|map| map_has_edge(map, &changed, &stack_files));
             let relation = if !overlap.is_empty() {
                 "related"
             } else if !map_connected && !maps.is_empty() {
@@ -1472,7 +1598,8 @@ fn correlate_packets(
                     changed.iter().cloned().collect::<Vec<_>>().join(", ")
                 )
             };
-            let mut evidence_refs = evidence_file_refs(&diff.packet_id, diff.packet_type, changed.clone());
+            let mut evidence_refs =
+                evidence_file_refs(&diff.packet_id, diff.packet_type, changed.clone());
             evidence_refs.extend(evidence_file_refs(
                 &stack.packet_id,
                 stack.packet_type,
@@ -1481,7 +1608,13 @@ fn correlate_packets(
             findings.push(suite_packet_core::ContextCorrelationFinding {
                 rule: "diff_vs_stack".to_string(),
                 relation: relation.to_string(),
-                confidence: if relation == "related" { 0.92 } else if relation == "unrelated" { 0.86 } else { 0.62 },
+                confidence: if relation == "related" {
+                    0.92
+                } else if relation == "unrelated" {
+                    0.86
+                } else {
+                    0.62
+                },
                 summary,
                 evidence_refs,
             });
@@ -1493,20 +1626,14 @@ fn correlate_packets(
             }
             let mut evidence_refs =
                 evidence_file_refs(&diff.packet_id, diff.packet_type, changed.clone());
-            evidence_refs.extend(
-                impact
-                    .envelope
-                    .payload
-                    .result
-                    .selected_tests
-                    .iter()
-                    .map(|test_id: &String| suite_packet_core::CorrelationEvidenceRef {
-                        packet_id: impact.packet_id.clone(),
-                        packet_type: impact.packet_type.to_string(),
-                        kind: "test".to_string(),
-                        value: test_id.clone(),
-                    }),
-            );
+            evidence_refs.extend(impact.envelope.payload.result.selected_tests.iter().map(
+                |test_id: &String| suite_packet_core::CorrelationEvidenceRef {
+                    packet_id: impact.packet_id.clone(),
+                    packet_type: impact.packet_type.to_string(),
+                    kind: "test".to_string(),
+                    value: test_id.clone(),
+                },
+            ));
             findings.push(suite_packet_core::ContextCorrelationFinding {
                 rule: "diff_vs_impact".to_string(),
                 relation: "supports".to_string(),
@@ -1834,12 +1961,16 @@ fn run_contextq_correlate(
         .filter(|task_id| !task_id.trim().is_empty())
         .map(ToOwned::to_owned);
     let findings = correlate_packets(input_packets, task_id.clone());
-    let (envelope, packet) = build_context_correlation_packet(&ctx.target, task_id.clone(), findings)?;
+    let (envelope, packet) =
+        build_context_correlation_packet(&ctx.target, task_id.clone(), findings)?;
 
     if let Some(task_id) = task_id {
         ctx.set_shared("task_id", Value::String(task_id));
     }
-    ctx.set_shared("correlation_findings", Value::from(envelope.payload.finding_count as u64));
+    ctx.set_shared(
+        "correlation_findings",
+        Value::from(envelope.payload.finding_count as u64),
+    );
 
     Ok(ReducerResult {
         output_packets: vec![packet],
@@ -2326,8 +2457,12 @@ fn run_testy_impact_reducer(
         detail: source.to_string(),
     })?;
 
-    let envelope =
-        build_test_impact_envelope(&output, &testmap_path, git_base.as_deref(), git_head.as_deref());
+    let envelope = build_test_impact_envelope(
+        &output,
+        &testmap_path,
+        git_base.as_deref(),
+        git_head.as_deref(),
+    );
 
     Ok(ReducerResult {
         output_packets: vec![KernelPacket {
@@ -2336,11 +2471,9 @@ fn run_testy_impact_reducer(
                 envelope.hash.chars().take(12).collect::<String>()
             )),
             format: "packet-json".to_string(),
-            body: serde_json::to_value(&envelope).map_err(|source| {
-                KernelError::ReducerFailed {
-                    target: ctx.target.clone(),
-                    detail: source.to_string(),
-                }
+            body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: source.to_string(),
             })?,
             token_usage: Some(envelope.budget_cost.est_tokens),
             runtime_ms: Some(envelope.budget_cost.runtime_ms),
@@ -2539,7 +2672,11 @@ fn run_mapy_repo(
             }
         }
         for symbol in snapshot.focus_symbols {
-            if !input.focus_symbols.iter().any(|existing| existing == &symbol) {
+            if !input
+                .focus_symbols
+                .iter()
+                .any(|existing| existing == &symbol)
+            {
                 input.focus_symbols.push(symbol);
             }
         }
@@ -3265,6 +3402,328 @@ fn extract_agent_state_events(
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+enum KernelPlanMutation {
+    Cancel {
+        step_id: String,
+        reason: String,
+    },
+    Replace {
+        step: KernelStepRequest,
+        reason: String,
+    },
+    Append {
+        step: KernelStepRequest,
+        reason: String,
+    },
+}
+
+fn policy_context_with_task_id(mut policy_context: Value, task_id: Option<&str>) -> Value {
+    let Some(task_id) = task_id.filter(|task_id| !task_id.trim().is_empty()) else {
+        return policy_context;
+    };
+    match &mut policy_context {
+        Value::Object(map) => {
+            map.entry("task_id".to_string())
+                .or_insert_with(|| Value::String(task_id.to_string()));
+            policy_context
+        }
+        Value::Null => json!({ "task_id": task_id }),
+        other => json!({
+            "task_id": task_id,
+            "sequence_policy_context": other.clone(),
+        }),
+    }
+}
+
+fn kernel_step_estimate(step: &KernelStepRequest) -> context_scheduler_core::StepEstimate {
+    let usage = usage_for_packets(&step.input_packets);
+    context_scheduler_core::StepEstimate {
+        tokens: usage.tokens,
+        bytes: usage.bytes,
+        runtime_ms: usage.runtime_ms,
+    }
+}
+
+fn schedule_step_from_kernel(step: &KernelStepRequest) -> context_scheduler_core::ScheduleStep {
+    context_scheduler_core::ScheduleStep {
+        id: step.id.clone(),
+        target: step.target.clone(),
+        depends_on: step.depends_on.clone(),
+        estimate: kernel_step_estimate(step),
+    }
+}
+
+fn schedule_budget_remaining(
+    budget: ExecutionBudget,
+    consumed: context_scheduler_core::StepEstimate,
+) -> context_scheduler_core::ScheduleBudget {
+    context_scheduler_core::ScheduleBudget {
+        token_cap: budget
+            .token_cap
+            .map(|cap| cap.saturating_sub(consumed.tokens)),
+        byte_cap: budget
+            .byte_cap
+            .map(|cap| cap.saturating_sub(consumed.bytes)),
+        runtime_ms_cap: budget
+            .runtime_ms_cap
+            .map(|cap| cap.saturating_sub(consumed.runtime_ms)),
+    }
+}
+
+fn load_agent_snapshot_for_task(
+    kernel: &Kernel,
+    task_id: &str,
+) -> Result<suite_packet_core::AgentSnapshotPayload, KernelError> {
+    let entries = kernel
+        .memory
+        .lock()
+        .map_err(|source| KernelError::CacheLock {
+            detail: source.to_string(),
+        })?
+        .entries();
+    Ok(derive_agent_snapshot(&entries, task_id))
+}
+
+fn merge_focus_into_map_step(
+    step: &KernelStepRequest,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> Option<KernelStepRequest> {
+    if step.target != "mapy.repo"
+        || (snapshot.focus_paths.is_empty() && snapshot.focus_symbols.is_empty())
+    {
+        return None;
+    }
+
+    let mut request: mapy_core::RepoMapRequest =
+        serde_json::from_value(step.reducer_input.clone()).ok()?;
+    let mut changed = false;
+    for path in &snapshot.focus_paths {
+        if !request.focus_paths.iter().any(|existing| existing == path) {
+            request.focus_paths.push(path.clone());
+            changed = true;
+        }
+    }
+    for symbol in &snapshot.focus_symbols {
+        if !request
+            .focus_symbols
+            .iter()
+            .any(|existing| existing == symbol)
+        {
+            request.focus_symbols.push(symbol.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+
+    let mut replaced = step.clone();
+    replaced.reducer_input = serde_json::to_value(request).ok()?;
+    Some(replaced)
+}
+
+fn build_reactive_kernel_mutations(
+    remaining: &[KernelStepRequest],
+    original_steps: &[KernelStepRequest],
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    completed_success: &BTreeSet<String>,
+    append_focused_map: bool,
+    anchor_step_id: Option<&str>,
+) -> Vec<KernelPlanMutation> {
+    let mut mutations = Vec::new();
+
+    for step in remaining {
+        if snapshot
+            .completed_steps
+            .iter()
+            .any(|completed| completed == &step.id)
+        {
+            mutations.push(KernelPlanMutation::Cancel {
+                step_id: step.id.clone(),
+                reason: "completed_step".to_string(),
+            });
+            continue;
+        }
+        if let Some(replaced) = merge_focus_into_map_step(step, snapshot) {
+            mutations.push(KernelPlanMutation::Replace {
+                step: replaced,
+                reason: "focus_narrowed".to_string(),
+            });
+        }
+    }
+
+    if append_focused_map
+        && (!snapshot.focus_paths.is_empty() || !snapshot.focus_symbols.is_empty())
+        && !remaining.iter().any(|step| step.target == "mapy.repo")
+    {
+        if let Some(template) = original_steps
+            .iter()
+            .find(|step| step.target == "mapy.repo")
+        {
+            let appended_id = format!("{}__reactive_focus", template.id);
+            if !remaining.iter().any(|step| step.id == appended_id)
+                && !completed_success.contains(&appended_id)
+                && !snapshot
+                    .completed_steps
+                    .iter()
+                    .any(|step_id| step_id == &appended_id)
+            {
+                let mut appended = template.clone();
+                appended.id = appended_id;
+                appended.depends_on = anchor_step_id
+                    .map(|id| vec![id.to_string()])
+                    .unwrap_or_default();
+                if let Some(replaced) = merge_focus_into_map_step(&appended, snapshot) {
+                    mutations.push(KernelPlanMutation::Append {
+                        step: replaced,
+                        reason: "focus_followup".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    mutations
+}
+
+fn to_schedule_mutations(
+    mutations: &[KernelPlanMutation],
+) -> Vec<context_scheduler_core::ScheduleMutation> {
+    mutations
+        .iter()
+        .map(|mutation| match mutation {
+            KernelPlanMutation::Cancel { step_id, reason } => {
+                context_scheduler_core::ScheduleMutation::Cancel {
+                    step_id: step_id.clone(),
+                    reason: reason.clone(),
+                }
+            }
+            KernelPlanMutation::Replace { step, reason } => {
+                context_scheduler_core::ScheduleMutation::Replace {
+                    step: schedule_step_from_kernel(step),
+                    reason: reason.clone(),
+                }
+            }
+            KernelPlanMutation::Append { step, reason } => {
+                context_scheduler_core::ScheduleMutation::Append {
+                    step: schedule_step_from_kernel(step),
+                    reason: reason.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+fn apply_kernel_mutations(
+    steps: &[KernelStepRequest],
+    mutations: &[KernelPlanMutation],
+) -> Vec<KernelStepRequest> {
+    let mut by_id = steps
+        .iter()
+        .cloned()
+        .map(|step| (step.id.clone(), step))
+        .collect::<HashMap<_, _>>();
+    let mut order = steps.iter().map(|step| step.id.clone()).collect::<Vec<_>>();
+
+    for mutation in mutations {
+        match mutation {
+            KernelPlanMutation::Cancel { step_id, .. } => {
+                if by_id.remove(step_id).is_some() {
+                    order.retain(|id| id != step_id);
+                    for step in by_id.values_mut() {
+                        step.depends_on.retain(|dep| dep != step_id);
+                    }
+                }
+            }
+            KernelPlanMutation::Replace { step, .. } => {
+                if by_id.contains_key(&step.id) {
+                    by_id.insert(step.id.clone(), step.clone());
+                }
+            }
+            KernelPlanMutation::Append { step, .. } => {
+                if !by_id.contains_key(&step.id) {
+                    order.push(step.id.clone());
+                    by_id.insert(step.id.clone(), step.clone());
+                }
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
+
+fn remove_satisfied_dependency(remaining: &mut [KernelStepRequest], completed_id: &str) {
+    for step in remaining {
+        step.depends_on.retain(|dep| dep != completed_id);
+    }
+}
+
+fn remove_failed_dependents(
+    remaining: &mut Vec<KernelStepRequest>,
+    failed_id: &str,
+) -> Vec<KernelStepRequest> {
+    let mut removed = Vec::new();
+    let mut failed = vec![failed_id.to_string()];
+    while let Some(dep_id) = failed.pop() {
+        let (mut newly_removed, kept): (Vec<_>, Vec<_>) = remaining
+            .drain(..)
+            .partition(|step| step.depends_on.iter().any(|dep| dep == &dep_id));
+        for step in &newly_removed {
+            failed.push(step.id.clone());
+        }
+        removed.append(&mut newly_removed);
+        *remaining = kept;
+    }
+    removed
+}
+
+fn resolve_sequence_task_id(req: &KernelSequenceRequest) -> Option<String> {
+    if let Some(task_id) = req
+        .reactive
+        .task_id
+        .as_ref()
+        .filter(|task_id| !task_id.trim().is_empty())
+    {
+        return Some(task_id.clone());
+    }
+
+    req.steps.iter().find_map(|step| {
+        step.policy_context
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|task_id| !task_id.trim().is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn record_replan_cancellations(
+    steps: &[KernelStepRequest],
+    applied: &[context_scheduler_core::AppliedMutation],
+    skipped: &mut Vec<String>,
+    step_results: &mut Vec<KernelStepResponse>,
+) {
+    for mutation in applied.iter().filter(|mutation| mutation.kind == "cancel") {
+        if let Some(step) = steps.iter().find(|step| step.id == mutation.step_id) {
+            skipped.push(step.id.clone());
+            step_results.push(KernelStepResponse {
+                id: step.id.clone(),
+                target: step.target.clone(),
+                status: "skipped".to_string(),
+                response: None,
+                failure: Some(KernelFailure {
+                    code: mutation.reason.clone(),
+                    message: format!("step skipped by replanning: {}", mutation.reason),
+                    target: Some(step.target.clone()),
+                }),
+            });
+        }
+    }
 }
 
 fn path_matches_any(patterns: &[String], candidate: &str) -> bool {
@@ -4181,6 +4640,7 @@ policy:
                     byte_cap: None,
                     runtime_ms_cap: None,
                 },
+                reactive: ReactiveSequenceConfig::default(),
                 steps: vec![
                     KernelStepRequest {
                         id: "b".to_string(),
@@ -4222,6 +4682,7 @@ policy:
                     byte_cap: None,
                     runtime_ms_cap: None,
                 },
+                reactive: ReactiveSequenceConfig::default(),
                 steps: vec![
                     KernelStepRequest {
                         id: "a".to_string(),
@@ -4258,6 +4719,7 @@ policy:
         let response = kernel
             .execute_sequence(KernelSequenceRequest {
                 budget: ExecutionBudget::default(),
+                reactive: ReactiveSequenceConfig::default(),
                 steps: vec![
                     KernelStepRequest {
                         id: "fail".to_string(),
@@ -4280,6 +4742,181 @@ policy:
             .find(|step| step.id == "after")
             .unwrap();
         assert_eq!(after.status, "skipped");
+    }
+
+    #[test]
+    fn reactive_sequence_cancels_completed_steps_and_releases_dependencies() {
+        let kernel = Kernel::with_v1_reducers();
+        kernel
+            .execute(KernelRequest {
+                target: "agenty.state.write".to_string(),
+                reducer_input: json!({
+                    "task_id": "task-reactive",
+                    "event_id": "evt-1",
+                    "occurred_at_unix": 1,
+                    "actor": "agent",
+                    "kind": "step_completed",
+                    "data": {
+                        "type": "step_completed",
+                        "step_id": "map-step"
+                    }
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        let mut kernel = kernel;
+        kernel.register_reducer("step.noop", |_ctx, _packets| Ok(ReducerResult::default()));
+
+        let response = kernel
+            .execute_sequence(KernelSequenceRequest {
+                budget: ExecutionBudget::default(),
+                reactive: ReactiveSequenceConfig {
+                    enabled: true,
+                    task_id: Some("task-reactive".to_string()),
+                    append_focused_map: false,
+                },
+                steps: vec![
+                    KernelStepRequest {
+                        id: "map-step".to_string(),
+                        target: "step.noop".to_string(),
+                        ..KernelStepRequest::default()
+                    },
+                    KernelStepRequest {
+                        id: "final-step".to_string(),
+                        target: "step.noop".to_string(),
+                        depends_on: vec!["map-step".to_string()],
+                        ..KernelStepRequest::default()
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(response.scheduled, vec!["final-step".to_string()]);
+        assert!(response.skipped.contains(&"map-step".to_string()));
+        assert!(response
+            .metadata
+            .get("reactive")
+            .and_then(|reactive| reactive.get("replans"))
+            .and_then(Value::as_array)
+            .is_some_and(|replans| !replans.is_empty()));
+    }
+
+    #[test]
+    fn reactive_sequence_replaces_map_steps_after_focus_update() {
+        let dir = tempdir().unwrap();
+        setup_diff_repo(dir.path());
+
+        let mut kernel = Kernel::with_v1_reducers();
+        kernel.register_reducer("custom.focus", |ctx, _packets| {
+            let event = suite_packet_core::AgentStateEventPayload {
+                task_id: "task-focus".to_string(),
+                event_id: "focus-1".to_string(),
+                occurred_at_unix: 2,
+                actor: "agent".to_string(),
+                kind: suite_packet_core::AgentStateEventKind::FocusSet,
+                paths: vec!["src/alpha.rs".to_string()],
+                symbols: Vec::new(),
+                data: suite_packet_core::AgentStateEventData::FocusSet { note: None },
+            };
+            let (_, packet) = build_agent_state_packet(&ctx.target, &event, "custom.focus")?;
+            Ok(ReducerResult {
+                output_packets: vec![packet],
+                metadata: json!({"source":"custom.focus"}),
+            })
+        });
+
+        let response = kernel
+            .execute_sequence(KernelSequenceRequest {
+                budget: ExecutionBudget::default(),
+                reactive: ReactiveSequenceConfig {
+                    enabled: true,
+                    task_id: Some("task-focus".to_string()),
+                    append_focused_map: false,
+                },
+                steps: vec![
+                    KernelStepRequest {
+                        id: "focus".to_string(),
+                        target: "custom.focus".to_string(),
+                        ..KernelStepRequest::default()
+                    },
+                    KernelStepRequest {
+                        id: "map".to_string(),
+                        target: "mapy.repo".to_string(),
+                        reducer_input: serde_json::to_value(mapy_core::RepoMapRequest {
+                            repo_root: dir.path().to_string_lossy().to_string(),
+                            focus_paths: Vec::new(),
+                            focus_symbols: Vec::new(),
+                            max_files: 10,
+                            max_symbols: 20,
+                            include_tests: false,
+                        })
+                        .unwrap(),
+                        ..KernelStepRequest::default()
+                    },
+                ],
+            })
+            .unwrap();
+
+        let map_response = response
+            .step_results
+            .iter()
+            .find(|step| step.id == "map")
+            .and_then(|step| step.response.as_ref())
+            .unwrap();
+        assert_eq!(
+            map_response
+                .metadata
+                .get("focus_paths")
+                .and_then(Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(Value::as_str),
+            Some("src/alpha.rs")
+        );
+    }
+
+    #[test]
+    fn reactive_mutations_can_append_focused_map_followup() {
+        let original = vec![KernelStepRequest {
+            id: "map".to_string(),
+            target: "mapy.repo".to_string(),
+            reducer_input: serde_json::to_value(mapy_core::RepoMapRequest {
+                repo_root: ".".to_string(),
+                focus_paths: Vec::new(),
+                focus_symbols: Vec::new(),
+                max_files: 10,
+                max_symbols: 20,
+                include_tests: false,
+            })
+            .unwrap(),
+            ..KernelStepRequest::default()
+        }];
+        let remaining = vec![KernelStepRequest {
+            id: "other".to_string(),
+            target: "step.noop".to_string(),
+            ..KernelStepRequest::default()
+        }];
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            task_id: "task-focus".to_string(),
+            focus_paths: vec!["src/alpha.rs".to_string()],
+            ..suite_packet_core::AgentSnapshotPayload::default()
+        };
+
+        let mutations = build_reactive_kernel_mutations(
+            &remaining,
+            &original,
+            &snapshot,
+            &BTreeSet::new(),
+            true,
+            Some("other"),
+        );
+
+        assert!(mutations.iter().any(|mutation| matches!(
+            mutation,
+            KernelPlanMutation::Append { step, .. }
+                if step.id == "map__reactive_focus"
+                && step.depends_on == vec!["other".to_string()]
+        )));
     }
 
     #[test]
@@ -4459,8 +5096,9 @@ policy:
                     .is_some_and(|kind| kind == "focus_set")
             })
             .expect("focus_set packet should be emitted");
-        let focus_envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentStateEventPayload> =
-            serde_json::from_value(focus_packet.body.clone()).unwrap();
+        let focus_envelope: suite_packet_core::EnvelopeV1<
+            suite_packet_core::AgentStateEventPayload,
+        > = serde_json::from_value(focus_packet.body.clone()).unwrap();
         assert_eq!(focus_envelope.payload.paths, vec!["src/alpha.rs"]);
 
         let snapshot = kernel
@@ -4475,8 +5113,9 @@ policy:
                 ..KernelRequest::default()
             })
             .unwrap();
-        let snapshot_envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentSnapshotPayload> =
-            serde_json::from_value(snapshot.output_packets[0].body.clone()).unwrap();
+        let snapshot_envelope: suite_packet_core::EnvelopeV1<
+            suite_packet_core::AgentSnapshotPayload,
+        > = serde_json::from_value(snapshot.output_packets[0].body.clone()).unwrap();
         assert_eq!(snapshot_envelope.payload.focus_paths, vec!["src/alpha.rs"]);
         assert!(snapshot_envelope
             .payload
@@ -4537,15 +5176,17 @@ policy:
         );
 
         let stack_packet = KernelPacket::from_value(
-            serde_json::to_value(stacky_core::slice_to_envelope(stacky_core::StackSliceRequest {
-                log_text: r#"
+            serde_json::to_value(stacky_core::slice_to_envelope(
+                stacky_core::StackSliceRequest {
+                    log_text: r#"
 java.lang.IllegalStateException: boom
   at org.example.ArrayUtils.run(src/ArrayUtils.java:42)
 "#
-                .to_string(),
-                source: Some("stack.log".to_string()),
-                max_failures: None,
-            }))
+                    .to_string(),
+                    source: Some("stack.log".to_string()),
+                    max_failures: None,
+                },
+            ))
             .unwrap(),
             Some("stack".to_string()),
         );
