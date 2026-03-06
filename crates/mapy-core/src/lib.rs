@@ -11,7 +11,7 @@ use suite_packet_core::{BudgetCost, CovyError, EnvelopeV1, FileRef, Provenance, 
 use tree_sitter::{Node, Parser};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RepoMapRequest {
     pub repo_root: String,
     pub focus_paths: Vec<String>,

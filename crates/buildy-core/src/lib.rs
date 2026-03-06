@@ -10,7 +10,7 @@ use suite_packet_core::{BudgetCost, EnvelopeV1, FileRef, Provenance, SymbolRef};
 pub const BUILDY_SCHEMA_VERSION: &str = "buildy.reduce.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BuildReduceRequest {
     pub log_text: String,
     pub source: Option<String>,
