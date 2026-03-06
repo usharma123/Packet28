@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Args;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Args)]
 pub struct ImpactArgs {
@@ -345,7 +345,7 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     Ok(0)
 }
 
-pub fn run_remote(args: ImpactArgs, config_path: &str) -> Result<i32> {
+pub fn run_remote(args: ImpactArgs, config_path: &str, daemon_root: &Path) -> Result<i32> {
     if args.json.is_none() || args.legacy_json {
         return run(args, config_path);
     }
@@ -375,7 +375,7 @@ pub fn run_remote(args: ImpactArgs, config_path: &str) -> Result<i32> {
     };
 
     let response = crate::cmd_daemon::send_kernel_request(
-        &cwd,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: "testy.impact".to_string(),
             reducer_input: serde_json::to_value(context_kernel_core::ImpactKernelInput {
@@ -400,7 +400,7 @@ pub fn run_remote(args: ImpactArgs, config_path: &str) -> Result<i32> {
 
     let governed_response = if governed_context_config.is_some() {
         Some(crate::cmd_daemon::send_kernel_request(
-            &cwd,
+            daemon_root,
             context_kernel_core::KernelRequest {
                 target: "governed.assemble".to_string(),
                 input_packets: vec![output_packet.clone()],

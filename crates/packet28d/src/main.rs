@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::fs;
+use std::io::{BufReader, BufWriter};
+use std::os::unix::net::UnixStream;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -18,7 +21,7 @@ use diffy_core::model::CoverageFormat;
 use glob::Pattern;
 use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
 use packet28_daemon_core::{
-    ensure_daemon_dir, load_task_registry, load_watch_registry, now_unix,
+    ensure_daemon_dir, load_task_registry, load_watch_registry, log_path, now_unix, ready_path,
     read_socket_message, remove_runtime_files, save_task_registry, save_watch_registry,
     socket_path, write_runtime_info, write_socket_message, CoverCheckRequest, CoverCheckResponse,
     ContextRecallRequest, ContextRecallResponse, ContextStoreGetRequest, ContextStoreGetResponse,
@@ -52,6 +55,13 @@ struct WatchEventMsg {
     error: Option<String>,
 }
 
+struct PendingWatchEvent {
+    watch_id: String,
+    paths: Vec<PathBuf>,
+    error: Option<String>,
+    due_at: Instant,
+}
+
 struct DaemonState {
     root: PathBuf,
     kernel: Arc<Kernel>,
@@ -80,23 +90,31 @@ fn serve(root: PathBuf) -> Result<()> {
     std::env::set_current_dir(&root)
         .with_context(|| format!("failed to set daemon cwd to '{}'", root.display()))?;
     ensure_daemon_dir(&root)?;
+    let daemon_log_path = log_path(&root);
     let socket = socket_path(&root);
     if socket.exists() {
-        std::fs::remove_file(&socket)
+        fs::remove_file(&socket)
             .with_context(|| format!("failed to remove stale socket '{}'", socket.display()))?;
     }
 
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind '{}'", socket.display()))?;
-    listener.set_nonblocking(true)?;
 
     let runtime = DaemonRuntimeInfo {
         pid: std::process::id(),
         started_at_unix: now_unix(),
+        ready_at_unix: None,
         socket_path: socket.to_string_lossy().to_string(),
         workspace_root: root.to_string_lossy().to_string(),
+        log_path: daemon_log_path.to_string_lossy().to_string(),
     };
     write_runtime_info(&root, &runtime)?;
+    daemon_log(&format!(
+        "starting packet28d pid={} root={} log={}",
+        runtime.pid,
+        root.display(),
+        daemon_log_path.display()
+    ));
 
     let kernel = Arc::new(Kernel::with_v1_reducers_and_persistence(PersistConfig::new(
         root.clone(),
@@ -116,42 +134,61 @@ fn serve(root: PathBuf) -> Result<()> {
     let (watch_tx, watch_rx) = mpsc::channel();
     restore_watchers(&state, &watch_tx)?;
     spawn_watch_processor(state.clone(), watch_rx);
+    mark_ready(&state)?;
 
     loop {
         if state.lock().map_err(lock_err)?.shutting_down {
             break;
         }
         match listener.accept() {
-            Ok((mut stream, _)) => {
-                let request = match read_socket_message(&mut stream) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        let _ = write_socket_message(
-                            &mut stream,
-                            &DaemonResponse::Error {
-                                message: err.to_string(),
-                            },
-                        );
-                        continue;
+            Ok((stream, _)) => {
+                let state = state.clone();
+                let watch_tx = watch_tx.clone();
+                thread::spawn(move || {
+                    if let Err(err) = handle_connection(state, watch_tx, stream) {
+                        daemon_log(&format!("request handling failed: {err}"));
                     }
-                };
-                let response = handle_request(state.clone(), watch_tx.clone(), request);
-                let response = match response {
-                    Ok(value) => value,
-                    Err(err) => DaemonResponse::Error {
-                        message: err.to_string(),
-                    },
-                };
-                write_socket_message(&mut stream, &response)?;
+                });
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
+            Err(err) => {
+                daemon_log(&format!("listener accept failed: {err}"));
+                return Err(err.into());
             }
-            Err(err) => return Err(err.into()),
         }
     }
 
+    daemon_log("shutting down packet28d");
     remove_runtime_files(&root)?;
+    Ok(())
+}
+
+fn handle_connection(
+    state: Arc<Mutex<DaemonState>>,
+    watch_tx: Sender<WatchEventMsg>,
+    stream: UnixStream,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = BufWriter::new(stream);
+    let request = match read_socket_message(&mut reader) {
+        Ok(value) => value,
+        Err(err) => {
+            let response = DaemonResponse::Error {
+                message: err.to_string(),
+            };
+            write_socket_message(&mut writer, &response)?;
+            return Ok(());
+        }
+    };
+    let response = match handle_request(state, watch_tx, request) {
+        Ok(value) => value,
+        Err(err) => {
+            daemon_log(&format!("daemon request failed: {err}"));
+            DaemonResponse::Error {
+                message: err.to_string(),
+            }
+        }
+    };
+    write_socket_message(&mut writer, &response)?;
     Ok(())
 }
 
@@ -168,7 +205,30 @@ fn handle_request(
         }
         DaemonRequest::ExecuteSequence { spec } => {
             let (task, watches) = register_task_and_watches(state.clone(), watch_tx, spec)?;
-            let response = run_sequence_for_task(state.clone(), &task.task_id)?;
+            let response = match run_sequence_for_task(state.clone(), &task.task_id) {
+                Ok(response) => response,
+                Err(err) => {
+                    daemon_log(&format!(
+                        "initial task run failed task_id={} error={err}",
+                        task.task_id
+                    ));
+                    let _ = cancel_task(state.clone(), &task.task_id);
+                    return Err(err);
+                }
+            };
+            if let Some(failure) = response
+                .step_results
+                .iter()
+                .find_map(|step| step.failure.as_ref())
+            {
+                let message = failure.message.clone();
+                daemon_log(&format!(
+                    "initial task run failed task_id={} error={message}",
+                    task.task_id
+                ));
+                let _ = cancel_task(state.clone(), &task.task_id);
+                return Err(anyhow!(message));
+            }
             let task = state
                 .lock()
                 .map_err(lock_err)?
@@ -189,7 +249,12 @@ fn handle_request(
             Ok(DaemonResponse::Status { status })
         }
         DaemonRequest::Stop => {
-            state.lock().map_err(lock_err)?.shutting_down = true;
+            let root = {
+                let mut guard = state.lock().map_err(lock_err)?;
+                guard.shutting_down = true;
+                guard.root.clone()
+            };
+            wake_listener(&root);
             Ok(DaemonResponse::Ack {
                 message: "stopping".to_string(),
             })
@@ -282,6 +347,8 @@ fn build_status(state: &DaemonState) -> Result<DaemonStatus> {
         socket_path: state.runtime.socket_path.clone(),
         workspace_root: state.runtime.workspace_root.clone(),
         started_at_unix: state.runtime.started_at_unix,
+        ready_at_unix: state.runtime.ready_at_unix,
+        log_path: state.runtime.log_path.clone(),
         uptime_secs: now_unix().saturating_sub(state.runtime.started_at_unix),
         tasks: state.tasks.tasks.values().cloned().collect(),
         watches: state.watches.watches.clone(),
@@ -291,13 +358,13 @@ fn build_status(state: &DaemonState) -> Result<DaemonStatus> {
 fn register_task_and_watches(
     state: Arc<Mutex<DaemonState>>,
     watch_tx: Sender<WatchEventMsg>,
-    mut spec: TaskSubmitSpec,
+    spec: TaskSubmitSpec,
 ) -> Result<(TaskRecord, Vec<WatchRegistration>)> {
-    if spec.task_id.trim().is_empty() {
-        anyhow::bail!("task_id cannot be empty");
-    }
-    spec.sequence.reactive.enabled = true;
-    spec.sequence.reactive.task_id = Some(spec.task_id.clone());
+    let root = {
+        let guard = state.lock().map_err(lock_err)?;
+        guard.root.clone()
+    };
+    let spec = normalize_task_submit_spec(&root, spec)?;
 
     let removed_watch_ids = {
         let guard = state.lock().map_err(lock_err)?;
@@ -413,6 +480,7 @@ fn run_sequence_for_task(
                 }
                 Err(err) => {
                     task.last_error = Some(err.to_string());
+                    daemon_log(&format!("task run failed task_id={} error={err}", task_id));
                 }
             }
             let rerun = task.pending_replan && !task.cancel_requested;
@@ -479,7 +547,9 @@ fn restore_watchers(state: &Arc<Mutex<DaemonState>>, watch_tx: &Sender<WatchEven
         .map(|watch| watch.watch_id.clone())
         .collect::<Vec<_>>();
     for watch_id in watch_ids {
-        install_watch(state.clone(), watch_tx.clone(), watch_id)?;
+        if let Err(err) = install_watch(state.clone(), watch_tx.clone(), watch_id.clone()) {
+            daemon_log(&format!("failed to restore watch {watch_id}: {err}"));
+        }
     }
     Ok(())
 }
@@ -543,19 +613,44 @@ fn install_watch(
     }
     guard.watcher_handles.insert(watch_id, watcher);
     persist_state(&guard)?;
+    daemon_log(&format!(
+        "installed watch watch_id={} task_id={} kind={:?}",
+        guard
+            .watches
+            .watches
+            .last()
+            .map(|watch| watch.watch_id.as_str())
+            .unwrap_or("unknown"),
+        spec.task_id,
+        spec.kind
+    ));
     Ok(())
 }
 
 fn spawn_watch_processor(state: Arc<Mutex<DaemonState>>, watch_rx: Receiver<WatchEventMsg>) {
     thread::spawn(move || {
-        while let Ok(message) = watch_rx.recv() {
-            if state.lock().map_err(lock_err).map(|guard| guard.shutting_down).unwrap_or(false) {
-                break;
-            }
-            if let Err(err) = process_watch_event(state.clone(), message) {
-                let _ = err;
+        let mut pending = HashMap::<String, PendingWatchEvent>::new();
+        loop {
+            flush_due_watch_events(state.clone(), &mut pending);
+            let timeout = next_watch_timeout(&pending).unwrap_or(Duration::from_secs(60));
+            match watch_rx.recv_timeout(timeout) {
+                Ok(message) => {
+                    if state.lock().map_err(lock_err).map(|guard| guard.shutting_down).unwrap_or(false)
+                    {
+                        break;
+                    }
+                    merge_watch_event(state.clone(), &mut pending, message);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if state.lock().map_err(lock_err).map(|guard| guard.shutting_down).unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
+        flush_all_watch_events(state, &mut pending);
     });
 }
 
@@ -625,6 +720,12 @@ fn process_watch_event(state: Arc<Mutex<DaemonState>>, message: WatchEventMsg) -
         reducer_input: event,
         ..KernelRequest::default()
     })?;
+    daemon_log(&format!(
+        "watch event watch_id={} task_id={} paths={}",
+        watch.watch_id,
+        task_id,
+        paths.join(",")
+    ));
 
     if sequence_present {
         let mut spawn_replan = false;
@@ -641,6 +742,7 @@ fn process_watch_event(state: Arc<Mutex<DaemonState>>, message: WatchEventMsg) -
         }
         if spawn_replan {
             let state_clone = state.clone();
+            daemon_log(&format!("spawning replan task_id={task_id}"));
             thread::spawn(move || {
                 let _ = run_sequence_for_task(state_clone, &task_id);
             });
@@ -734,10 +836,180 @@ fn watch_id_for(spec: &WatchSpec) -> String {
     format!("watch-{}", &hash[..12])
 }
 
+fn normalize_task_submit_spec(root: &Path, mut spec: TaskSubmitSpec) -> Result<TaskSubmitSpec> {
+    if spec.task_id.trim().is_empty() {
+        anyhow::bail!("task_id cannot be empty");
+    }
+    spec.sequence.reactive.enabled = true;
+    spec.sequence.reactive.task_id = Some(spec.task_id.clone());
+    if spec.sequence.steps.is_empty() {
+        anyhow::bail!("sequence must contain at least one step");
+    }
+
+    let mut ids = std::collections::BTreeSet::new();
+    for (index, step) in spec.sequence.steps.iter_mut().enumerate() {
+        if step.target.trim().is_empty() {
+            anyhow::bail!("sequence step {} target cannot be empty", index);
+        }
+        if step.id.trim().is_empty() {
+            step.id = format!("{}-{}", step.target.replace('.', "-"), index);
+        }
+        if !ids.insert(step.id.clone()) {
+            anyhow::bail!("sequence step id '{}' must be unique", step.id);
+        }
+    }
+    for step in &spec.sequence.steps {
+        for dep in &step.depends_on {
+            if dep.trim().is_empty() {
+                anyhow::bail!("sequence step '{}' has an empty dependency id", step.id);
+            }
+            if dep == &step.id {
+                anyhow::bail!("sequence step '{}' cannot depend on itself", step.id);
+            }
+            if !ids.contains(dep) {
+                anyhow::bail!(
+                    "sequence step '{}' depends on unknown step '{}'",
+                    step.id,
+                    dep
+                );
+            }
+        }
+    }
+
+    for watch in &mut spec.watches {
+        watch.task_id = spec.task_id.clone();
+        if watch.root.trim().is_empty() {
+            watch.root = root.to_string_lossy().to_string();
+        }
+        let watch_root = resolve_root(Path::new(&watch.root));
+        if !watch_root.exists() {
+            anyhow::bail!("watch root '{}' does not exist", watch_root.display());
+        }
+        for path in watch_paths(watch) {
+            if !path.exists() {
+                anyhow::bail!("watch path '{}' does not exist", path.display());
+            }
+        }
+    }
+
+    Ok(spec)
+}
+
+fn merge_watch_event(
+    state: Arc<Mutex<DaemonState>>,
+    pending: &mut HashMap<String, PendingWatchEvent>,
+    message: WatchEventMsg,
+) {
+    let debounce_ms = watch_debounce_ms(&state, &message.watch_id).unwrap_or(250);
+    let due_at = Instant::now() + Duration::from_millis(debounce_ms);
+    let entry = pending
+        .entry(message.watch_id.clone())
+        .or_insert_with(|| PendingWatchEvent {
+            watch_id: message.watch_id.clone(),
+            paths: Vec::new(),
+            error: None,
+            due_at,
+        });
+    entry.due_at = due_at;
+    if let Some(error) = message.error {
+        entry.error = Some(error);
+    }
+    for path in message.paths {
+        if !entry.paths.iter().any(|existing| existing == &path) {
+            entry.paths.push(path);
+        }
+    }
+}
+
+fn flush_due_watch_events(
+    state: Arc<Mutex<DaemonState>>,
+    pending: &mut HashMap<String, PendingWatchEvent>,
+) {
+    let now = Instant::now();
+    let due = pending
+        .iter()
+        .filter_map(|(watch_id, entry)| (entry.due_at <= now).then_some(watch_id.clone()))
+        .collect::<Vec<_>>();
+    for watch_id in due {
+        if let Some(entry) = pending.remove(&watch_id) {
+            let message = WatchEventMsg {
+                watch_id: entry.watch_id,
+                paths: entry.paths,
+                error: entry.error,
+            };
+            if let Err(err) = process_watch_event(state.clone(), message) {
+                daemon_log(&format!("watch processing failed: {err}"));
+            }
+        }
+    }
+}
+
+fn flush_all_watch_events(
+    state: Arc<Mutex<DaemonState>>,
+    pending: &mut HashMap<String, PendingWatchEvent>,
+) {
+    let watch_ids = pending.keys().cloned().collect::<Vec<_>>();
+    for watch_id in watch_ids {
+        if let Some(entry) = pending.remove(&watch_id) {
+            let message = WatchEventMsg {
+                watch_id: entry.watch_id,
+                paths: entry.paths,
+                error: entry.error,
+            };
+            if let Err(err) = process_watch_event(state.clone(), message) {
+                daemon_log(&format!("watch processing failed during flush: {err}"));
+            }
+        }
+    }
+}
+
+fn next_watch_timeout(pending: &HashMap<String, PendingWatchEvent>) -> Option<Duration> {
+    pending
+        .values()
+        .map(|entry| entry.due_at)
+        .min()
+        .map(|due_at| due_at.saturating_duration_since(Instant::now()))
+}
+
+fn watch_debounce_ms(state: &Arc<Mutex<DaemonState>>, watch_id: &str) -> Option<u64> {
+    let guard = state.lock().ok()?;
+    guard
+        .watches
+        .watches
+        .iter()
+        .find(|watch| watch.watch_id == watch_id)
+        .and_then(|watch| watch.spec.debounce_ms)
+}
+
 fn persist_state(state: &DaemonState) -> Result<()> {
     save_watch_registry(&state.root, &state.watches)?;
     save_task_registry(&state.root, &state.tasks)?;
     Ok(())
+}
+
+fn mark_ready(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
+    let (root, runtime) = {
+        let mut guard = state.lock().map_err(lock_err)?;
+        guard.runtime.ready_at_unix = Some(now_unix());
+        (guard.root.clone(), guard.runtime.clone())
+    };
+    write_runtime_info(&root, &runtime)?;
+    fs::write(ready_path(&root), format!("{}\n", runtime.ready_at_unix.unwrap_or_default()))
+        .with_context(|| format!("failed to write ready file for '{}'", root.display()))?;
+    daemon_log(&format!(
+        "daemon ready root={} socket={}",
+        root.display(),
+        runtime.socket_path
+    ));
+    Ok(())
+}
+
+fn wake_listener(root: &Path) {
+    let _ = UnixStream::connect(socket_path(root));
+}
+
+fn daemon_log(message: &str) {
+    eprintln!("[packet28d {}] {message}", now_unix());
 }
 
 fn resolve_root(path: &Path) -> PathBuf {

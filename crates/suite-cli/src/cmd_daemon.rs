@@ -1,5 +1,6 @@
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use packet28_daemon_core::{
-    read_runtime_info, read_socket_message, resolve_workspace_root, socket_path,
+    log_path, read_runtime_info, read_socket_message, ready_path, resolve_workspace_root, socket_path,
     write_socket_message, ContextRecallRequest, ContextRecallResponse, ContextStoreGetRequest,
     ContextStoreGetResponse, ContextStoreListRequest, ContextStoreListResponse,
     ContextStorePruneDaemonRequest, ContextStorePruneResponse, ContextStoreStatsRequest,
@@ -144,39 +145,62 @@ pub fn run(args: DaemonArgs) -> Result<i32> {
 }
 
 pub fn run_via_daemon(cli: crate::Cli, _raw_args: &[String]) -> Result<i32> {
+    let daemon_root = daemon_workspace_root(cli.daemon_root.as_deref())?;
     match cli.command {
         crate::Commands::Cover(cover) => match cover.command {
-            crate::CoverCommands::Check(args) => crate::cmd_cover::run_remote(args, &cli.config),
+            crate::CoverCommands::Check(args) => {
+                crate::cmd_cover::run_remote(args, &cli.config, &daemon_root)
+            }
         },
         crate::Commands::Diff(diff) => match diff.command {
-            crate::DiffCommands::Analyze(args) => crate::cmd_diff::run_remote(args, &cli.config),
+            crate::DiffCommands::Analyze(args) => {
+                crate::cmd_diff::run_remote(args, &cli.config, &daemon_root)
+            }
         },
         crate::Commands::Test(test) => match test.command {
-            crate::TestCommands::Impact(args) => crate::cmd_impact::run_remote(args, &cli.config),
-            crate::TestCommands::Shard(args) => crate::cmd_shard::run_remote(args, &cli.config),
-            crate::TestCommands::Map(args) => crate::cmd_map::run_remote(args),
+            crate::TestCommands::Impact(args) => {
+                crate::cmd_impact::run_remote(args, &cli.config, &daemon_root)
+            }
+            crate::TestCommands::Shard(args) => {
+                crate::cmd_shard::run_remote(args, &cli.config, &daemon_root)
+            }
+            crate::TestCommands::Map(args) => crate::cmd_map::run_remote(args, &daemon_root),
         },
         crate::Commands::Context(context) => match context.command {
-            crate::ContextCommands::Assemble(args) => crate::cmd_context::run_assemble_remote(args),
-            crate::ContextCommands::Correlate(args) => crate::cmd_context::run_correlate_remote(args),
-            crate::ContextCommands::State(args) => crate::cmd_context::run_state_remote(args),
-            crate::ContextCommands::Store(args) => crate::cmd_context::run_store_remote(args),
-            crate::ContextCommands::Recall(args) => crate::cmd_context::run_recall_remote(args),
+            crate::ContextCommands::Assemble(args) => {
+                crate::cmd_context::run_assemble_remote(args, &daemon_root)
+            }
+            crate::ContextCommands::Correlate(args) => {
+                crate::cmd_context::run_correlate_remote(args, &daemon_root)
+            }
+            crate::ContextCommands::State(args) => {
+                crate::cmd_context::run_state_remote(args, &daemon_root)
+            }
+            crate::ContextCommands::Store(args) => {
+                crate::cmd_context::run_store_remote(args, &daemon_root)
+            }
+            crate::ContextCommands::Recall(args) => {
+                crate::cmd_context::run_recall_remote(args, &daemon_root)
+            }
         },
         crate::Commands::Stack(stack) => match stack.command {
-            crate::StackCommands::Slice(args) => crate::cmd_stack::run_remote(args),
+            crate::StackCommands::Slice(args) => crate::cmd_stack::run_remote(args, &daemon_root),
         },
         crate::Commands::Build(build) => match build.command {
-            crate::BuildCommands::Reduce(args) => crate::cmd_build::run_remote(args),
+            crate::BuildCommands::Reduce(args) => crate::cmd_build::run_remote(args, &daemon_root),
         },
         crate::Commands::Map(map) => match map.command {
-            crate::MapCommands::Repo(args) => crate::cmd_map_repo::run_remote(args),
+            crate::MapCommands::Repo(args) => crate::cmd_map_repo::run_remote(args, &daemon_root),
         },
         crate::Commands::Proxy(proxy) => match proxy.command {
-            crate::cmd_proxy::ProxyCommands::Run(args) => crate::cmd_proxy::run_remote(args),
+            crate::cmd_proxy::ProxyCommands::Run(args) => {
+                crate::cmd_proxy::run_remote(args, &daemon_root)
+            }
         },
         crate::Commands::Packet(packet) => match packet.command {
-            crate::cmd_packet::PacketCommands::Fetch(args) => crate::cmd_packet::run_fetch_remote(args),
+            crate::cmd_packet::PacketCommands::Fetch(args) => {
+                crate::cmd_packet::run_fetch_remote(args, &daemon_root)
+            }
         },
         other => {
             let cli = crate::Cli {
@@ -194,6 +218,24 @@ pub fn via_daemon_env_enabled() -> bool {
         .ok()
         .map(|value| !matches!(value.trim(), "" | "0" | "false" | "False" | "FALSE"))
         .unwrap_or(false)
+}
+
+pub fn daemon_root_env() -> Option<String> {
+    std::env::var("PACKET28_DAEMON_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub fn daemon_workspace_root(explicit_root: Option<&str>) -> Result<PathBuf> {
+    let start = if let Some(root) = explicit_root {
+        PathBuf::from(root)
+    } else if let Some(root) = daemon_root_env() {
+        PathBuf::from(root)
+    } else {
+        std::env::current_dir().context("failed to resolve current directory")?
+    };
+    Ok(resolve_workspace_root(&start))
 }
 
 pub fn execute_kernel_request(root: &Path, request: context_kernel_core::KernelRequest) -> Result<context_kernel_core::KernelResponse> {
@@ -382,6 +424,7 @@ fn run_status(args: JsonRootArgs) -> Result<i32> {
                 println!("pid={}", status.pid);
                 println!("root={}", status.workspace_root);
                 println!("socket={}", status.socket_path);
+                println!("log={}", status.log_path);
                 println!("tasks={}", status.tasks.len());
                 println!("watches={}", status.watches.len());
             }
@@ -527,13 +570,28 @@ fn run_watch(args: WatchArgs) -> Result<i32> {
 fn start_daemon(root: &Path) -> Result<()> {
     let binary = packet28d_binary()?;
     let root_arg = root.to_string_lossy().to_string();
+    let log_path = log_path(root);
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create daemon log dir '{}'", parent.display()))?;
+    }
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
+    let stderr = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
     Command::new(binary)
         .arg("serve")
         .arg("--root")
         .arg(root_arg)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .context("failed to spawn packet28d")?;
     Ok(())
@@ -542,16 +600,20 @@ fn start_daemon(root: &Path) -> Result<()> {
 fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if socket_path(root).exists() && UnixStream::connect(socket_path(root)).is_ok() {
+        if ready_path(root).exists()
+            && socket_path(root).exists()
+            && UnixStream::connect(socket_path(root)).is_ok()
+        {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(10));
     }
     if let Ok(runtime) = read_runtime_info(root) {
         return Err(anyhow!(
-            "packet28d did not become ready; runtime file exists for pid {} at {}",
+            "packet28d did not become ready; runtime file exists for pid {} at {} (log: {})",
             runtime.pid,
-            runtime.socket_path
+            runtime.socket_path,
+            runtime.log_path
         ));
     }
     Err(anyhow!("packet28d did not become ready"))

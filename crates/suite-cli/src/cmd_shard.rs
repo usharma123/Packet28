@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Args;
+use std::path::Path;
 
 pub use testy_cli_common::shard::PlannerAlgorithmArg;
 
@@ -79,10 +80,9 @@ pub fn run(args: ShardArgs, config_path: &str) -> Result<i32> {
     )
 }
 
-pub fn run_remote(args: ShardArgs, config_path: &str) -> Result<i32> {
-    let cwd = std::env::current_dir()?;
+pub fn run_remote(args: ShardArgs, config_path: &str, daemon_root: &Path) -> Result<i32> {
     let response = crate::cmd_daemon::execute_test_shard(
-        &cwd,
+        daemon_root,
         packet28_daemon_core::TestShardRequest {
             shards: args.shards,
             tasks_json: args.tasks_json,

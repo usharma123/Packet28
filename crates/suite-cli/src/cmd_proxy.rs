@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
 pub enum PacketDetailArg {
@@ -349,7 +349,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
     })
 }
 
-pub fn run_remote(args: RunArgs) -> Result<i32> {
+pub fn run_remote(args: RunArgs, daemon_root: &Path) -> Result<i32> {
     let persist_root = persistence_root(&args)?;
     let machine_profile = args
         .json
@@ -373,7 +373,7 @@ pub fn run_remote(args: RunArgs) -> Result<i32> {
         detail: detail_mode.into(),
     };
     let response = crate::cmd_daemon::send_kernel_request(
-        &persist_root,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: "proxy.run".to_string(),
             reducer_input: serde_json::to_value(input)?,
@@ -394,7 +394,7 @@ pub fn run_remote(args: RunArgs) -> Result<i32> {
             .map_err(|source| anyhow!("invalid proxy output packet: {source}"))?;
     let governed_response = if let Some(context_config) = args.context_config {
         Some(crate::cmd_daemon::send_kernel_request(
-            &persist_root,
+            daemon_root,
             context_kernel_core::KernelRequest {
                 target: "governed.assemble".to_string(),
                 input_packets: vec![output_packet.clone()],

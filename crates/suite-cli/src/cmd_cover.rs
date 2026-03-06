@@ -302,16 +302,15 @@ pub fn run(args: CheckArgs, config_path: &str) -> Result<i32> {
     Ok(if output.gate_result.passed { 0 } else { 1 })
 }
 
-pub fn run_remote(args: CheckArgs, config_path: &str) -> Result<i32> {
+pub fn run_remote(args: CheckArgs, config_path: &str, daemon_root: &Path) -> Result<i32> {
     let machine_profile =
         crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
     if machine_profile.is_none() || args.legacy_json || args.stdin {
         return run(args, config_path);
     }
 
-    let root = std::env::current_dir()?;
     let response = crate::cmd_daemon::send_cover_check(
-        &root,
+        daemon_root,
         packet28_daemon_core::CoverCheckRequest {
             coverage: args.coverage,
             paths: args.paths,

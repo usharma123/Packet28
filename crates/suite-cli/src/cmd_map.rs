@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Args;
+use std::path::Path;
 
 #[derive(Args)]
 pub struct MapArgs {
@@ -37,10 +38,9 @@ pub fn run(args: MapArgs) -> Result<i32> {
     )
 }
 
-pub fn run_remote(args: MapArgs) -> Result<i32> {
-    let cwd = std::env::current_dir()?;
+pub fn run_remote(args: MapArgs, daemon_root: &Path) -> Result<i32> {
     let response = crate::cmd_daemon::execute_test_map(
-        &cwd,
+        daemon_root,
         packet28_daemon_core::TestMapRequest {
             manifest: args.manifest,
             output: args.output,

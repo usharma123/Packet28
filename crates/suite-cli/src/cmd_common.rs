@@ -76,8 +76,8 @@ pub fn emit_machine_envelope<T: serde::Serialize + Clone>(
 
     match profile {
         JsonProfile::Full => {
-            if let Some(debug) = debug {
-                insert_payload_debug(&mut packet, debug);
+            if let Some(ref debug) = debug {
+                insert_payload_debug(&mut packet, debug.clone());
             }
         }
         JsonProfile::Compact => {
@@ -92,7 +92,13 @@ pub fn emit_machine_envelope<T: serde::Serialize + Clone>(
         }
     }
 
-    let wrapper = PacketWrapperV1::new(packet_type.to_string(), packet);
+    refresh_packet_budget(&mut packet);
+
+    let mut wrapper = PacketWrapperV1::new(packet_type.to_string(), packet);
+    wrapper.cache_hit = debug
+        .as_ref()
+        .and_then(extract_cache_hit)
+        .unwrap_or(false);
     emit_json(&serde_json::to_value(wrapper)?, pretty)
 }
 
@@ -103,6 +109,31 @@ pub fn emit_json(value: &Value, pretty: bool) -> Result<()> {
         println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
+}
+
+pub fn emit_machine_error(
+    command: &str,
+    error: &anyhow::Error,
+    pretty: bool,
+    target: Option<&str>,
+    retry_hint: Option<Value>,
+) -> Result<()> {
+    let causes = error
+        .chain()
+        .skip(1)
+        .map(|cause| Value::String(cause.to_string()))
+        .collect::<Vec<_>>();
+    emit_json(
+        &json!({
+            "schema_version": "suite.error.v1",
+            "command": command,
+            "message": error.to_string(),
+            "target": target,
+            "retry_hint": retry_hint,
+            "causes": causes,
+        }),
+        pretty,
+    )
 }
 
 pub fn resolve_artifact_root(explicit_root: Option<&Path>) -> PathBuf {
@@ -120,6 +151,94 @@ fn insert_payload_debug(packet: &mut Value, debug: Value) {
         return;
     };
     map.insert("debug".to_string(), debug);
+}
+
+fn refresh_packet_budget(packet: &mut Value) {
+    for _ in 0..5 {
+        let payload_bytes = packet
+            .get("payload")
+            .and_then(|payload| serde_json::to_vec(payload).ok())
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        let packet_bytes = serde_json::to_vec(&*packet)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        let payload_tokens = suite_packet_core::estimate_tokens_from_bytes(payload_bytes);
+        let packet_tokens = suite_packet_core::estimate_tokens_from_bytes(packet_bytes);
+
+        let Some(budget_cost) = packet.get_mut("budget_cost").and_then(Value::as_object_mut) else {
+            return;
+        };
+
+        let current_packet_bytes = budget_cost
+            .get("est_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let current_packet_tokens = budget_cost
+            .get("est_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let current_payload_bytes = budget_cost
+            .get("payload_est_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let current_payload_tokens = budget_cost
+            .get("payload_est_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        budget_cost.insert("est_bytes".to_string(), Value::from(packet_bytes as u64));
+        budget_cost.insert("est_tokens".to_string(), Value::from(packet_tokens));
+        budget_cost.insert(
+            "payload_est_bytes".to_string(),
+            Value::from(payload_bytes as u64),
+        );
+        budget_cost.insert(
+            "payload_est_tokens".to_string(),
+            Value::from(payload_tokens),
+        );
+
+        if current_packet_bytes == packet_bytes
+            && current_packet_tokens == packet_tokens
+            && current_payload_bytes == payload_bytes
+            && current_payload_tokens == payload_tokens
+        {
+            break;
+        }
+    }
+}
+
+fn extract_cache_hit(debug: &Value) -> Option<bool> {
+    match debug {
+        Value::Object(map) => {
+            if let Some(cache) = map.get("cache") {
+                if let Some(hit) = find_cache_hit(cache) {
+                    return Some(hit);
+                }
+            }
+            for value in map.values() {
+                if let Some(hit) = extract_cache_hit(value) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(extract_cache_hit),
+        _ => None,
+    }
+}
+
+fn find_cache_hit(value: &Value) -> Option<bool> {
+    match value {
+        Value::Object(map) => {
+            if let Some(hit) = map.get("hit").and_then(Value::as_bool) {
+                return Some(hit);
+            }
+            map.values().find_map(find_cache_hit)
+        }
+        Value::Array(values) => values.iter().find_map(find_cache_hit),
+        _ => None,
+    }
 }
 
 fn compact_packet_payload(packet_type: &str, packet: &mut Value) {

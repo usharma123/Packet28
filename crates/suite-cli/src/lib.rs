@@ -17,6 +17,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +38,10 @@ pub struct Cli {
     /// Route supported command execution through packet28d
     #[arg(long, global = true)]
     pub via_daemon: bool,
+
+    /// Workspace root that owns the packet28d socket/runtime for routed commands
+    #[arg(long, global = true)]
+    pub daemon_root: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -185,6 +190,7 @@ pub enum MapCommands {
 pub fn main_entry() {
     let raw_args = std::env::args().collect::<Vec<_>>();
     let cli = Cli::parse();
+    let machine_error = machine_error_context(&cli, &raw_args);
     if let Err(e) = configure_stdout_output(cli.output.as_deref()) {
         display_error(&e);
         std::process::exit(2);
@@ -194,6 +200,18 @@ pub fn main_entry() {
     match result {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => {
+            if let Some(context) = machine_error {
+                if let Err(emit_err) = crate::cmd_common::emit_machine_error(
+                    &context.command,
+                    &e,
+                    context.pretty,
+                    context.target.as_deref(),
+                    context.retry_hint,
+                ) {
+                    display_error(&emit_err);
+                }
+                std::process::exit(2);
+            }
             display_error(&e);
             std::process::exit(2);
         }
@@ -268,6 +286,212 @@ pub fn display_error(err: &anyhow::Error) {
             eprintln!("  {} {cause}", "caused by:".dimmed());
         }
     }
+}
+
+struct MachineErrorContext {
+    command: String,
+    pretty: bool,
+    target: Option<String>,
+    retry_hint: Option<Value>,
+}
+
+fn machine_error_context(cli: &Cli, raw_args: &[String]) -> Option<MachineErrorContext> {
+    let pretty = has_flag(raw_args, "--pretty");
+    let json_requested =
+        has_flag(raw_args, "--json") || has_flag(raw_args, "--legacy-json") || has_flag_pair(raw_args, "--report", "json");
+    let governed_requested = has_flag(raw_args, "--context-config");
+    match &cli.command {
+        Commands::Cover(cover) => match &cover.command {
+            CoverCommands::Check(_) if json_requested => {
+                Some(MachineErrorContext {
+                    command: "Packet28 cover check".to_string(),
+                    pretty,
+                    target: Some("cover.check".to_string()),
+                    retry_hint: None,
+                })
+            }
+            _ => None,
+        },
+        Commands::Diff(diff) => match &diff.command {
+            DiffCommands::Analyze(_) if json_requested => {
+                Some(MachineErrorContext {
+                    command: "Packet28 diff analyze".to_string(),
+                    pretty,
+                    target: Some("diffy.analyze".to_string()),
+                    retry_hint: governed_retry_hint(governed_requested, "Packet28 diff analyze --context-config <context.yaml>"),
+                })
+            }
+            _ => None,
+        },
+        Commands::Test(test) => match &test.command {
+            TestCommands::Impact(_) if json_requested => Some(MachineErrorContext {
+                command: "Packet28 test impact".to_string(),
+                pretty,
+                target: Some("testy.impact".to_string()),
+                retry_hint: governed_retry_hint(governed_requested, "Packet28 test impact --context-config <context.yaml>"),
+            }),
+            TestCommands::Shard(_) if json_requested => Some(MachineErrorContext {
+                command: "Packet28 test shard".to_string(),
+                pretty,
+                target: Some("testy.shard".to_string()),
+                retry_hint: None,
+            }),
+            TestCommands::Map(_) if json_requested => Some(MachineErrorContext {
+                command: "Packet28 test map".to_string(),
+                pretty,
+                target: Some("testy.map".to_string()),
+                retry_hint: None,
+            }),
+            _ => None,
+        },
+        Commands::Context(context) => match &context.command {
+            ContextCommands::Assemble(_) if json_requested => {
+                Some(MachineErrorContext {
+                    command: "Packet28 context assemble".to_string(),
+                    pretty,
+                    target: Some(if governed_requested {
+                        "governed.assemble".to_string()
+                    } else {
+                        "contextq.assemble".to_string()
+                    }),
+                    retry_hint: governed_retry_hint(governed_requested, "Packet28 context assemble --context-config <context.yaml>"),
+                })
+            }
+            ContextCommands::Correlate(_) if json_requested => Some(MachineErrorContext {
+                command: "Packet28 context correlate".to_string(),
+                pretty,
+                target: Some("contextq.correlate".to_string()),
+                retry_hint: None,
+            }),
+            ContextCommands::State(state) => match &state.command {
+                cmd_context::StateCommands::Append(_) if json_requested => {
+                    Some(MachineErrorContext {
+                        command: "Packet28 context state append".to_string(),
+                        pretty,
+                        target: Some("agenty.state.write".to_string()),
+                        retry_hint: None,
+                    })
+                }
+                cmd_context::StateCommands::Snapshot(_) if json_requested => {
+                    Some(MachineErrorContext {
+                        command: "Packet28 context state snapshot".to_string(),
+                        pretty,
+                        target: Some("agenty.state.snapshot".to_string()),
+                        retry_hint: None,
+                    })
+                }
+                _ => None,
+            },
+            ContextCommands::Store(store) => match &store.command {
+                cmd_context::StoreCommands::List(_) if json_requested => Some(machine_error(
+                    "Packet28 context store list",
+                    pretty,
+                    "context.store.list",
+                )),
+                cmd_context::StoreCommands::Get(_) if json_requested => Some(machine_error(
+                    "Packet28 context store get",
+                    pretty,
+                    "context.store.get",
+                )),
+                cmd_context::StoreCommands::Prune(_) if json_requested => Some(machine_error(
+                    "Packet28 context store prune",
+                    pretty,
+                    "context.store.prune",
+                )),
+                cmd_context::StoreCommands::Stats(_) if json_requested => Some(machine_error(
+                    "Packet28 context store stats",
+                    pretty,
+                    "context.store.stats",
+                )),
+                _ => None,
+            },
+            ContextCommands::Recall(_) if json_requested => Some(machine_error(
+                "Packet28 context recall",
+                pretty,
+                "context.recall",
+            )),
+            _ => None,
+        },
+        Commands::Stack(stack) => match &stack.command {
+            StackCommands::Slice(_) if json_requested => {
+                Some(MachineErrorContext {
+                    command: "Packet28 stack slice".to_string(),
+                    pretty,
+                    target: Some("stacky.slice".to_string()),
+                    retry_hint: governed_retry_hint(governed_requested, "Packet28 stack slice --context-config <context.yaml>"),
+                })
+            }
+            _ => None,
+        },
+        Commands::Build(build) => match &build.command {
+            BuildCommands::Reduce(_) if json_requested => {
+                Some(MachineErrorContext {
+                    command: "Packet28 build reduce".to_string(),
+                    pretty,
+                    target: Some("buildy.reduce".to_string()),
+                    retry_hint: governed_retry_hint(governed_requested, "Packet28 build reduce --context-config <context.yaml>"),
+                })
+            }
+            _ => None,
+        },
+        Commands::Map(map) => match &map.command {
+            MapCommands::Repo(_) if json_requested => {
+                Some(MachineErrorContext {
+                    command: "Packet28 map repo".to_string(),
+                    pretty,
+                    target: Some("mapy.repo".to_string()),
+                    retry_hint: governed_retry_hint(governed_requested, "Packet28 map repo --context-config <context.yaml>"),
+                })
+            }
+            _ => None,
+        },
+        Commands::Proxy(proxy) => match &proxy.command {
+            cmd_proxy::ProxyCommands::Run(_) if json_requested => {
+                Some(MachineErrorContext {
+                    command: "Packet28 proxy run".to_string(),
+                    pretty,
+                    target: Some("proxy.run".to_string()),
+                    retry_hint: governed_retry_hint(governed_requested, "Packet28 proxy run --context-config <context.yaml> -- <command>"),
+                })
+            }
+            _ => None,
+        },
+        Commands::Packet(packet) => match &packet.command {
+            cmd_packet::PacketCommands::Fetch(_) if json_requested => Some(machine_error(
+                "Packet28 packet fetch",
+                pretty,
+                "packet.fetch",
+            )),
+            _ => None,
+        },
+        Commands::Daemon(_) | Commands::Guard(_) => None,
+    }
+}
+
+fn machine_error(command: &str, pretty: bool, target: &str) -> MachineErrorContext {
+    MachineErrorContext {
+        command: command.to_string(),
+        pretty,
+        target: Some(target.to_string()),
+        retry_hint: None,
+    }
+}
+
+fn governed_retry_hint(enabled: bool, command: &str) -> Option<Value> {
+    enabled.then(|| {
+        json!({
+            "retry_command": command
+        })
+    })
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn has_flag_pair(args: &[String], flag: &str, value: &str) -> bool {
+    args.windows(2)
+        .any(|window| window[0] == flag && window[1].eq_ignore_ascii_case(value))
 }
 
 #[cfg(unix)]

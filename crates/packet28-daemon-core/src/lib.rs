@@ -16,14 +16,19 @@ pub const DAEMON_DIR_NAME: &str = ".packet28/daemon";
 pub const SOCKET_FILE_NAME: &str = "packet28d.sock";
 pub const PID_FILE_NAME: &str = "pid";
 pub const RUNTIME_FILE_NAME: &str = "runtime.json";
+pub const READY_FILE_NAME: &str = "ready";
+pub const LOG_FILE_NAME: &str = "packet28d.log";
 pub const WATCH_REGISTRY_FILE_NAME: &str = "watch-registry-v1.json";
 pub const TASK_REGISTRY_FILE_NAME: &str = "task-registry-v1.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchKind {
+    #[serde(alias = "File")]
     File,
+    #[serde(alias = "Git")]
     Git,
+    #[serde(alias = "TestReport")]
     TestReport,
 }
 
@@ -357,8 +362,10 @@ pub enum DaemonResponse {
 pub struct DaemonRuntimeInfo {
     pub pid: u32,
     pub started_at_unix: u64,
+    pub ready_at_unix: Option<u64>,
     pub socket_path: String,
     pub workspace_root: String,
+    pub log_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -408,6 +415,8 @@ pub struct DaemonStatus {
     pub socket_path: String,
     pub workspace_root: String,
     pub started_at_unix: u64,
+    pub ready_at_unix: Option<u64>,
+    pub log_path: String,
     pub uptime_secs: u64,
     pub tasks: Vec<TaskRecord>,
     pub watches: Vec<WatchRegistration>,
@@ -427,6 +436,14 @@ pub fn pid_path(root: &Path) -> PathBuf {
 
 pub fn runtime_path(root: &Path) -> PathBuf {
     daemon_dir(root).join(RUNTIME_FILE_NAME)
+}
+
+pub fn ready_path(root: &Path) -> PathBuf {
+    daemon_dir(root).join(READY_FILE_NAME)
+}
+
+pub fn log_path(root: &Path) -> PathBuf {
+    daemon_dir(root).join(LOG_FILE_NAME)
 }
 
 pub fn watch_registry_path(root: &Path) -> PathBuf {
@@ -460,7 +477,7 @@ pub fn read_runtime_info(root: &Path) -> Result<DaemonRuntimeInfo> {
 }
 
 pub fn remove_runtime_files(root: &Path) -> Result<()> {
-    for path in [socket_path(root), pid_path(root), runtime_path(root)] {
+    for path in [socket_path(root), pid_path(root), runtime_path(root), ready_path(root)] {
         if path.exists() {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to remove '{}'", path.display()))?;

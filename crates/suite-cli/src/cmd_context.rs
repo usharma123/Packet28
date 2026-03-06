@@ -423,7 +423,7 @@ pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
     Ok(0)
 }
 
-pub fn run_assemble_remote(args: AssembleArgs) -> Result<i32> {
+pub fn run_assemble_remote(args: AssembleArgs, daemon_root: &Path) -> Result<i32> {
     if args.legacy_json {
         return run_assemble(args);
     }
@@ -443,14 +443,13 @@ pub fn run_assemble_remote(args: AssembleArgs) -> Result<i32> {
         .iter()
         .map(|path| context_kernel_core::load_packet_file(Path::new(path)))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let cwd = std::env::current_dir()?;
     let target = if args.context_config.is_some() {
         "governed.assemble"
     } else {
         "contextq.assemble"
     };
     let response = crate::cmd_daemon::send_kernel_request(
-        &cwd,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: target.to_string(),
             input_packets,
@@ -593,12 +592,11 @@ pub fn run_correlate(args: CorrelateArgs) -> Result<i32> {
     Ok(0)
 }
 
-pub fn run_correlate_remote(args: CorrelateArgs) -> Result<i32> {
+pub fn run_correlate_remote(args: CorrelateArgs, daemon_root: &Path) -> Result<i32> {
     let profile = args
         .json
         .map(suite_packet_core::JsonProfile::from)
         .unwrap_or(suite_packet_core::JsonProfile::Compact);
-    let cwd = std::env::current_dir()?;
     let input_packets = args
         .packets
         .iter()
@@ -607,7 +605,7 @@ pub fn run_correlate_remote(args: CorrelateArgs) -> Result<i32> {
         .map_err(|source| anyhow!("{source}"))?;
 
     let response = crate::cmd_daemon::send_kernel_request(
-        &cwd,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: "contextq.correlate".to_string(),
             input_packets,
@@ -662,12 +660,12 @@ pub fn run_store(args: StoreArgs) -> Result<i32> {
     }
 }
 
-pub fn run_store_remote(args: StoreArgs) -> Result<i32> {
+pub fn run_store_remote(args: StoreArgs, daemon_root: &Path) -> Result<i32> {
     match args.command {
-        StoreCommands::List(args) => run_store_list_remote(args),
-        StoreCommands::Get(args) => run_store_get_remote(args),
-        StoreCommands::Prune(args) => run_store_prune_remote(args),
-        StoreCommands::Stats(args) => run_store_stats_remote(args),
+        StoreCommands::List(args) => run_store_list_remote(args, daemon_root),
+        StoreCommands::Get(args) => run_store_get_remote(args, daemon_root),
+        StoreCommands::Prune(args) => run_store_prune_remote(args, daemon_root),
+        StoreCommands::Stats(args) => run_store_stats_remote(args, daemon_root),
     }
 }
 
@@ -678,10 +676,10 @@ pub fn run_state(args: StateArgs) -> Result<i32> {
     }
 }
 
-pub fn run_state_remote(args: StateArgs) -> Result<i32> {
+pub fn run_state_remote(args: StateArgs, daemon_root: &Path) -> Result<i32> {
     match args.command {
-        StateCommands::Append(args) => run_state_append_remote(args),
-        StateCommands::Snapshot(args) => run_state_snapshot_remote(args),
+        StateCommands::Append(args) => run_state_append_remote(args, daemon_root),
+        StateCommands::Snapshot(args) => run_state_snapshot_remote(args, daemon_root),
     }
 }
 
@@ -727,10 +725,9 @@ pub fn run_recall(args: RecallArgs) -> Result<i32> {
     Ok(0)
 }
 
-pub fn run_recall_remote(args: RecallArgs) -> Result<i32> {
-    let root = crate::cmd_daemon::resolve_root_arg(&args.root);
+pub fn run_recall_remote(args: RecallArgs, daemon_root: &Path) -> Result<i32> {
     let response = crate::cmd_daemon::execute_context_recall(
-        &root,
+        daemon_root,
         packet28_daemon_core::ContextRecallRequest {
             query: args.query.clone(),
             root: args.root.clone(),
@@ -810,10 +807,9 @@ fn run_store_list(args: StoreListArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn run_store_list_remote(args: StoreListArgs) -> Result<i32> {
-    let root = crate::cmd_daemon::resolve_root_arg(&args.root);
+fn run_store_list_remote(args: StoreListArgs, daemon_root: &Path) -> Result<i32> {
     let response = crate::cmd_daemon::execute_context_store_list(
-        &root,
+        daemon_root,
         packet28_daemon_core::ContextStoreListRequest {
             root: args.root.clone(),
             target: args.target.clone(),
@@ -879,10 +875,9 @@ fn run_store_get(args: StoreGetArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn run_store_get_remote(args: StoreGetArgs) -> Result<i32> {
-    let root = crate::cmd_daemon::resolve_root_arg(&args.root);
+fn run_store_get_remote(args: StoreGetArgs, daemon_root: &Path) -> Result<i32> {
     let response = crate::cmd_daemon::execute_context_store_get(
-        &root,
+        daemon_root,
         packet28_daemon_core::ContextStoreGetRequest {
             root: args.root.clone(),
             key: args.key.clone(),
@@ -947,14 +942,13 @@ fn run_store_prune(args: StorePruneArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn run_store_prune_remote(args: StorePruneArgs) -> Result<i32> {
+fn run_store_prune_remote(args: StorePruneArgs, daemon_root: &Path) -> Result<i32> {
     if !args.all && args.ttl_secs.is_none() {
         anyhow::bail!("set --all or --ttl-secs for prune");
     }
 
-    let root = crate::cmd_daemon::resolve_root_arg(&args.root);
     let response = crate::cmd_daemon::execute_context_store_prune(
-        &root,
+        daemon_root,
         packet28_daemon_core::ContextStorePruneDaemonRequest {
             root: args.root.clone(),
             all: args.all,
@@ -1013,10 +1007,9 @@ fn run_store_stats(args: StoreStatsArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn run_store_stats_remote(args: StoreStatsArgs) -> Result<i32> {
-    let root = crate::cmd_daemon::resolve_root_arg(&args.root);
+fn run_store_stats_remote(args: StoreStatsArgs, daemon_root: &Path) -> Result<i32> {
     let response = crate::cmd_daemon::execute_context_store_stats(
-        &root,
+        daemon_root,
         packet28_daemon_core::ContextStoreStatsRequest {
             root: args.root.clone(),
         },
@@ -1123,7 +1116,7 @@ fn run_state_append(args: StateAppendArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn run_state_append_remote(args: StateAppendArgs) -> Result<i32> {
+fn run_state_append_remote(args: StateAppendArgs, daemon_root: &Path) -> Result<i32> {
     let profile = args
         .json
         .map(suite_packet_core::JsonProfile::from)
@@ -1149,9 +1142,8 @@ fn run_state_append_remote(args: StateAppendArgs) -> Result<i32> {
         }
     }
 
-    let root = crate::cmd_daemon::resolve_root_arg(&args.root);
     let response = crate::cmd_daemon::send_kernel_request(
-        &root,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: "agenty.state.write".to_string(),
             reducer_input: input_value,
@@ -1247,14 +1239,13 @@ fn run_state_snapshot(args: StateSnapshotArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn run_state_snapshot_remote(args: StateSnapshotArgs) -> Result<i32> {
+fn run_state_snapshot_remote(args: StateSnapshotArgs, daemon_root: &Path) -> Result<i32> {
     let profile = args
         .json
         .map(suite_packet_core::JsonProfile::from)
         .unwrap_or(suite_packet_core::JsonProfile::Compact);
-    let root = crate::cmd_daemon::resolve_root_arg(&args.root);
     let response = crate::cmd_daemon::send_kernel_request(
-        &root,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: "agenty.state.snapshot".to_string(),
             reducer_input: json!({

@@ -356,7 +356,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     Ok(if gate_passed { 0 } else { 1 })
 }
 
-pub fn run_remote(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
+pub fn run_remote(args: AnalyzeArgs, config_path: &str, daemon_root: &Path) -> Result<i32> {
     let machine_profile =
         crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
     if machine_profile.is_none() || args.legacy_json {
@@ -410,7 +410,7 @@ pub fn run_remote(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     };
 
     let response = crate::cmd_daemon::send_kernel_request(
-        &cwd,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: "diffy.analyze".to_string(),
             reducer_input: serde_json::to_value(kernel_input)?,
@@ -429,7 +429,7 @@ pub fn run_remote(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
 
     let governed_response = if let Some(context_config) = governed_context_config {
         Some(crate::cmd_daemon::send_kernel_request(
-            &cwd,
+            daemon_root,
             context_kernel_core::KernelRequest {
                 target: "governed.assemble".to_string(),
                 input_packets: vec![output_packet.clone()],

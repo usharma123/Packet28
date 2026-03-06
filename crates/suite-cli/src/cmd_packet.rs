@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Args)]
 pub struct PacketArgs {
@@ -61,10 +62,10 @@ pub fn run_fetch(args: FetchArgs) -> Result<i32> {
     Ok(0)
 }
 
-pub fn run_fetch_remote(args: FetchArgs) -> Result<i32> {
+pub fn run_fetch_remote(args: FetchArgs, daemon_root: &Path) -> Result<i32> {
     let root = std::path::PathBuf::from(&args.root);
     let response = crate::cmd_daemon::send_packet_fetch(
-        &root,
+        daemon_root,
         packet28_daemon_core::PacketFetchRequest {
             handle: args.handle.clone(),
             root: args.root.clone(),

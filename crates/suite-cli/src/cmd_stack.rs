@@ -3,7 +3,7 @@ use std::io::Read;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use suite_packet_core::EnvelopeV1;
 
 #[derive(Args)]
@@ -273,11 +273,10 @@ pub fn run(args: SliceArgs) -> Result<i32> {
     Ok(0)
 }
 
-pub fn run_remote(args: SliceArgs) -> Result<i32> {
+pub fn run_remote(args: SliceArgs, daemon_root: &Path) -> Result<i32> {
     let input_text = read_input_text(args.input.as_deref())?;
-    let cwd = std::env::current_dir()?;
     let response = crate::cmd_daemon::send_kernel_request(
-        &cwd,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: "stacky.slice".to_string(),
             reducer_input: serde_json::to_value(stacky_core::StackSliceRequest {
@@ -312,7 +311,7 @@ pub fn run_remote(args: SliceArgs) -> Result<i32> {
 
     let governed_response = if let Some(context_config) = args.context_config.clone() {
         Some(crate::cmd_daemon::send_kernel_request(
-            &cwd,
+            daemon_root,
             context_kernel_core::KernelRequest {
                 target: "governed.assemble".to_string(),
                 input_packets: vec![output_packet.clone()],

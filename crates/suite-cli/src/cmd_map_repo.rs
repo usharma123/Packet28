@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
 pub enum PacketDetailArg {
@@ -354,7 +354,7 @@ pub fn run(args: RepoArgs) -> Result<i32> {
     Ok(0)
 }
 
-pub fn run_remote(args: RepoArgs) -> Result<i32> {
+pub fn run_remote(args: RepoArgs, daemon_root: &Path) -> Result<i32> {
     if args.json.is_none() || args.legacy_json {
         return run(args);
     }
@@ -382,7 +382,7 @@ pub fn run_remote(args: RepoArgs) -> Result<i32> {
     let repo_root_path = PathBuf::from(&input.repo_root);
     let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(&repo_root_path, &[]);
     let response = crate::cmd_daemon::send_kernel_request(
-        &repo_root_path,
+        daemon_root,
         context_kernel_core::KernelRequest {
             target: "mapy.repo".to_string(),
             reducer_input: serde_json::to_value(input)?,
@@ -425,7 +425,7 @@ pub fn run_remote(args: RepoArgs) -> Result<i32> {
     };
     let governed_response = if let Some(context_config) = args.context_config {
         Some(crate::cmd_daemon::send_kernel_request(
-            &repo_root_path,
+            daemon_root,
             context_kernel_core::KernelRequest {
                 target: "governed.assemble".to_string(),
                 input_packets: vec![governed_input_packet],
