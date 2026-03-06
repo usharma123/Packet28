@@ -1967,3 +1967,79 @@ fn test_suite_context_state_append_then_snapshot() {
         Some(1)
     );
 }
+
+#[test]
+fn test_suite_context_assemble_task_id_compresses_read_section() {
+    let dir = TempDir::new().unwrap();
+    let event_path = dir.path().join("event.json");
+    let packet_path = dir.path().join("packet.json");
+    write_state_event(
+        &event_path,
+        r#"{
+  "event_id": "evt-1",
+  "occurred_at_unix": 1700000000,
+  "actor": "agent",
+  "kind": "file_read",
+  "paths": ["src/time/StopWatch.java"],
+  "data": {
+    "type": "file_read"
+  }
+}"#,
+    );
+    fs::write(
+        &packet_path,
+        r#"{
+  "packet_id": "diffy",
+  "sections": [
+    {
+      "title": "Diff",
+      "body": "StopWatch.java changed on lines 10-20",
+      "refs": [{"kind": "file", "value": "src/time/StopWatch.java"}],
+      "relevance": 0.9
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    suite_cmd()
+        .args([
+            "context",
+            "state",
+            "append",
+            "--task-id",
+            "task-demo",
+            "--input",
+            event_path.to_str().unwrap(),
+            "--root",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "context",
+            "assemble",
+            "--packet",
+            packet_path.to_str().unwrap(),
+            "--task-id",
+            "task-demo",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value = parse_packet_wrapper(&output, "suite.context.assemble.v1");
+    let first_body = packet_payload(&value)
+        .get("sections")
+        .and_then(Value::as_array)
+        .and_then(|sections| sections.first())
+        .and_then(|section| section.get("body"))
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(first_body.starts_with("Reminder: already reviewed"));
+}

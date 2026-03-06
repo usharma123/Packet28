@@ -21,12 +21,13 @@ pub enum DetailMode {
     Rich,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AssembleOptions {
     pub budget_tokens: u64,
     pub budget_bytes: usize,
     pub detail_mode: DetailMode,
     pub compact_assembly: bool,
+    pub agent_snapshot: Option<suite_packet_core::AgentSnapshotPayload>,
 }
 
 impl Default for AssembleOptions {
@@ -36,6 +37,7 @@ impl Default for AssembleOptions {
             budget_bytes: DEFAULT_BUDGET_BYTES,
             detail_mode: DetailMode::Compact,
             compact_assembly: false,
+            agent_snapshot: None,
         }
     }
 }
@@ -183,6 +185,11 @@ pub fn assemble_packets(
     mut packets: Vec<InputPacket>,
     options: AssembleOptions,
 ) -> AssembledPacket {
+    let question_tokens = options
+        .agent_snapshot
+        .as_ref()
+        .map(question_tokens)
+        .unwrap_or_default();
     let mut tools = BTreeSet::new();
     let mut reducers = BTreeSet::new();
     let mut paths = BTreeSet::new();
@@ -260,7 +267,17 @@ pub fn assemble_packets(
                 section.relevance = Some(infer_relevance(section));
             }
 
-            let score = section.relevance.unwrap_or(0.5) + (section.refs.len() as f64 * 0.05);
+            if let Some(snapshot) = options.agent_snapshot.as_ref() {
+                if should_compress_section(section, snapshot, &question_tokens) {
+                    compress_section(section);
+                }
+            }
+
+            let mut score = section.relevance.unwrap_or(0.5) + (section.refs.len() as f64 * 0.05);
+            if let Some(snapshot) = options.agent_snapshot.as_ref() {
+                score += section_focus_boost(section, snapshot);
+                score += question_match_boost(section, &question_tokens);
+            }
             all_sections.push((
                 Reverse(F64Ord(score)),
                 packet_idx,
@@ -343,6 +360,14 @@ pub fn assemble_packets(
     }
 
     let mut refs_ranked: Vec<_> = refs_by_key.into_values().collect();
+    if let Some(snapshot) = options.agent_snapshot.as_ref() {
+        for reference in &mut refs_ranked {
+            let base = reference.relevance.unwrap_or(0.0);
+            reference.relevance = Some(
+                base + ref_focus_boost(reference, snapshot) + ref_question_boost(reference, &question_tokens),
+            );
+        }
+    }
     refs_ranked.sort_by(|a, b| {
         b.relevance
             .unwrap_or(0.0)
@@ -379,7 +404,7 @@ pub fn assemble_packets(
         }
     }
 
-    enforce_budget(&mut payload, options);
+    enforce_budget(&mut payload, &options);
 
     let payload_value = serde_json::to_value(&payload).unwrap_or(Value::Null);
     let payload_text = serde_json::to_string(&payload_value).unwrap_or_default();
@@ -773,6 +798,207 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+fn question_tokens(snapshot: &suite_packet_core::AgentSnapshotPayload) -> BTreeSet<String> {
+    snapshot
+        .open_questions
+        .iter()
+        .flat_map(|question| tokenize_text(&question.text))
+        .collect()
+}
+
+fn tokenize_text(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != ':' && c != '/')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 2)
+        .collect()
+}
+
+fn section_focus_boost(
+    section: &ContextSection,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> f64 {
+    let mut boost = 0.0;
+    let file_refs = section_file_refs(section);
+    let symbol_refs = section_symbol_refs(section);
+
+    if file_refs
+        .iter()
+        .any(|path| path_matches_any(path, &snapshot.focus_paths))
+    {
+        boost += 0.35;
+    }
+    if symbol_refs
+        .iter()
+        .any(|symbol| symbol_matches_any(symbol, &snapshot.focus_symbols))
+    {
+        boost += 0.25;
+    }
+
+    boost
+}
+
+fn question_match_boost(section: &ContextSection, question_tokens: &BTreeSet<String>) -> f64 {
+    if question_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let corpus = section_corpus(section);
+    let matched = question_tokens
+        .iter()
+        .filter(|token| corpus.contains(token.as_str()))
+        .count();
+    if matched == 0 {
+        0.0
+    } else {
+        ((matched as f64 / question_tokens.len() as f64) * 0.25).min(0.25)
+    }
+}
+
+fn ref_focus_boost(
+    reference: &ContextRef,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> f64 {
+    let normalized = normalize_path(reference.value.trim());
+    match reference.kind.as_str() {
+        "file" | "path" => {
+            if path_matches_any(&normalized, &snapshot.focus_paths) {
+                0.3
+            } else {
+                0.0
+            }
+        }
+        "symbol" => {
+            if symbol_matches_any(reference.value.trim(), &snapshot.focus_symbols) {
+                0.2
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+fn ref_question_boost(reference: &ContextRef, question_tokens: &BTreeSet<String>) -> f64 {
+    if question_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let haystack = reference.value.to_ascii_lowercase();
+    let matched = question_tokens
+        .iter()
+        .filter(|token| haystack.contains(token.as_str()))
+        .count();
+    if matched == 0 {
+        0.0
+    } else {
+        ((matched as f64 / question_tokens.len() as f64) * 0.15).min(0.15)
+    }
+}
+
+fn should_compress_section(
+    section: &ContextSection,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    question_tokens: &BTreeSet<String>,
+) -> bool {
+    if snapshot.files_read.is_empty() {
+        return false;
+    }
+
+    let file_refs = section_file_refs(section);
+    if file_refs.is_empty() {
+        return false;
+    }
+    if !file_refs
+        .iter()
+        .all(|path| path_matches_any(path, &snapshot.files_read))
+    {
+        return false;
+    }
+    if file_refs
+        .iter()
+        .any(|path| path_matches_any(path, &snapshot.files_edited))
+    {
+        return false;
+    }
+    if file_refs
+        .iter()
+        .any(|path| path_matches_any(path, &snapshot.focus_paths))
+    {
+        return false;
+    }
+    if section_symbol_refs(section)
+        .iter()
+        .any(|symbol| symbol_matches_any(symbol, &snapshot.focus_symbols))
+    {
+        return false;
+    }
+    if question_match_boost(section, question_tokens) > 0.0 {
+        return false;
+    }
+
+    true
+}
+
+fn compress_section(section: &mut ContextSection) {
+    let files = section_file_refs(section);
+    let label = if files.is_empty() {
+        section
+            .source_packet
+            .clone()
+            .unwrap_or_else(|| "section".to_string())
+    } else {
+        files.into_iter().take(2).collect::<Vec<_>>().join(", ")
+    };
+    section.body = format!("Reminder: already reviewed {label}");
+    section.relevance = Some(section.relevance.unwrap_or(0.5) * 0.6);
+}
+
+fn section_file_refs(section: &ContextSection) -> Vec<String> {
+    section
+        .refs
+        .iter()
+        .filter(|reference| matches!(reference.kind.as_str(), "file" | "path"))
+        .map(|reference| normalize_path(reference.value.trim()))
+        .collect()
+}
+
+fn section_symbol_refs(section: &ContextSection) -> Vec<String> {
+    section
+        .refs
+        .iter()
+        .filter(|reference| reference.kind == "symbol")
+        .map(|reference| reference.value.trim().to_ascii_lowercase())
+        .collect()
+}
+
+fn section_corpus(section: &ContextSection) -> String {
+    let mut corpus = format!("{} {}", section.title, section.body).to_ascii_lowercase();
+    for reference in &section.refs {
+        corpus.push(' ');
+        corpus.push_str(&reference.value.to_ascii_lowercase());
+    }
+    corpus
+}
+
+fn path_matches_any(path: &str, candidates: &[String]) -> bool {
+    let normalized = normalize_path(path);
+    candidates.iter().any(|candidate| {
+        let candidate = normalize_path(candidate);
+        normalized == candidate
+            || normalized.starts_with(&candidate)
+            || candidate.starts_with(&normalized)
+    })
+}
+
+fn symbol_matches_any(symbol: &str, candidates: &[String]) -> bool {
+    let normalized = symbol.to_ascii_lowercase();
+    candidates.iter().any(|candidate| {
+        let candidate = candidate.to_ascii_lowercase();
+        normalized == candidate || normalized.contains(&candidate) || candidate.contains(&normalized)
+    })
+}
+
 fn non_empty(input: Option<&str>) -> Option<&str> {
     let value = input?;
     let trimmed = value.trim();
@@ -871,7 +1097,7 @@ fn exceeds_budget_usize(used: usize, add: usize, cap: usize) -> bool {
     used.saturating_add(add) > cap
 }
 
-fn enforce_budget(payload: &mut AssembledPayload, options: AssembleOptions) {
+fn enforce_budget(payload: &mut AssembledPayload, options: &AssembleOptions) {
     while let Ok(serialized) = serde_json::to_string(payload) {
         let token_estimate = estimate_tokens(&serialized);
         let byte_estimate = serialized.len();
@@ -1168,5 +1394,80 @@ mod tests {
         assert_eq!(payload.sections.len(), 1);
         assert!(payload.sections[0].refs.is_empty());
         assert_eq!(payload.refs.len(), 1);
+    }
+
+    #[test]
+    fn task_aware_assembly_boosts_focus_and_compresses_read_sections() {
+        let already_read = InputPacket {
+            packet_id: Some("diffy".to_string()),
+            sections: vec![ContextSection {
+                title: "Diff".to_string(),
+                body: "StopWatch.java changed on lines 10-20".to_string(),
+                refs: vec![ContextRef {
+                    kind: "file".to_string(),
+                    value: "src/time/StopWatch.java".to_string(),
+                    source: Some("diffy.analyze".to_string()),
+                    relevance: Some(0.9),
+                }],
+                relevance: Some(0.9),
+                ..ContextSection::default()
+            }],
+            ..InputPacket::default()
+        };
+        let focused = InputPacket {
+            packet_id: Some("mapy".to_string()),
+            sections: vec![ContextSection {
+                title: "Neighbors".to_string(),
+                body: "DateUtils references split() in the time package".to_string(),
+                refs: vec![
+                    ContextRef {
+                        kind: "file".to_string(),
+                        value: "src/time/DateUtils.java".to_string(),
+                        source: Some("mapy.repo".to_string()),
+                        relevance: Some(0.7),
+                    },
+                    ContextRef {
+                        kind: "symbol".to_string(),
+                        value: "split".to_string(),
+                        source: Some("mapy.repo".to_string()),
+                        relevance: Some(0.7),
+                    },
+                ],
+                relevance: Some(0.7),
+                ..ContextSection::default()
+            }],
+            ..InputPacket::default()
+        };
+
+        let assembled = assemble_packets(
+            vec![already_read, focused],
+            AssembleOptions {
+                budget_tokens: 1200,
+                budget_bytes: 24_000,
+                agent_snapshot: Some(suite_packet_core::AgentSnapshotPayload {
+                    task_id: "task-a".to_string(),
+                    focus_paths: vec!["src/time/DateUtils.java".to_string()],
+                    focus_symbols: vec!["split".to_string()],
+                    files_read: vec!["src/time/StopWatch.java".to_string()],
+                    files_edited: Vec::new(),
+                    active_decisions: Vec::new(),
+                    completed_steps: vec!["read_diff".to_string()],
+                    open_questions: vec![suite_packet_core::AgentQuestion {
+                        id: "q1".to_string(),
+                        text: "Does DateUtils call split()?".to_string(),
+                    }],
+                    event_count: 3,
+                    last_event_at_unix: Some(3),
+                }),
+                ..AssembleOptions::default()
+            },
+        );
+        let payload: AssembledPayload = serde_json::from_value(assembled.payload).unwrap();
+
+        assert_eq!(payload.sections[0].title, "Neighbors");
+        assert!(payload
+            .sections
+            .iter()
+            .any(|section| section.body.starts_with("Reminder: already reviewed")));
     }
 }

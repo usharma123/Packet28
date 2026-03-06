@@ -30,6 +30,10 @@ pub struct AssembleArgs {
     #[arg(long)]
     cache: bool,
 
+    /// Task identifier for state-aware assembly
+    #[arg(long)]
+    task_id: Option<String>,
+
     /// Emit JSON output profile
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
     json: Option<crate::cmd_common::JsonProfileArg>,
@@ -267,7 +271,8 @@ pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
         .map(|path| context_kernel_core::load_packet_file(Path::new(path)))
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let kernel = build_kernel(args.cache, std::env::current_dir()?);
+    let cwd = std::env::current_dir()?;
+    let kernel = build_kernel(args.cache || args.task_id.is_some(), cwd.clone());
     let target = if args.context_config.is_some() {
         "governed.assemble"
     } else {
@@ -286,10 +291,14 @@ pub fn run_assemble(args: AssembleArgs) -> Result<i32> {
                 "config_path": config_path,
                 "detail_mode": detail_mode,
                 "compact_assembly": compact_assembly,
+                "task_id": args.task_id,
+                "disable_cache": args.task_id.is_some(),
             }),
             None => json!({
                 "detail_mode": detail_mode,
                 "compact_assembly": compact_assembly,
+                "task_id": args.task_id,
+                "disable_cache": args.task_id.is_some(),
             }),
         },
         ..context_kernel_core::KernelRequest::default()

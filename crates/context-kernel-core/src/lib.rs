@@ -1090,6 +1090,17 @@ fn run_contextq_assemble(
         });
     }
 
+    let agent_snapshot = ctx
+        .policy_context
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.trim().is_empty())
+        .map(|task_id| {
+            let entries = ctx.cache_entries()?;
+            Ok::<_, KernelError>(derive_agent_snapshot(&entries, task_id))
+        })
+        .transpose()?;
+
     let options = contextq_core::AssembleOptions {
         budget_tokens: ctx
             .budget
@@ -1105,6 +1116,7 @@ fn run_contextq_assemble(
             .get("compact_assembly")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        agent_snapshot: agent_snapshot.clone(),
     };
 
     let packets: Vec<contextq_core::InputPacket> = input_packets
@@ -1133,6 +1145,10 @@ fn run_contextq_assemble(
         "sections_kept",
         Value::from(assembled.assembly.sections_kept as u64),
     );
+    if let Some(snapshot) = agent_snapshot {
+        ctx.set_shared("task_id", Value::String(snapshot.task_id));
+        ctx.set_shared("state_events", Value::from(snapshot.event_count as u64));
+    }
 
     let mut files = Vec::new();
     let mut symbols = Vec::new();
@@ -3244,6 +3260,57 @@ policy:
         assert!(envelope.payload.open_questions.is_empty());
         assert_eq!(envelope.payload.active_decisions.len(), 1);
         assert_eq!(envelope.payload.active_decisions[0].id, "d1");
+    }
+
+    #[test]
+    fn contextq_assemble_uses_task_snapshot_to_compress_read_sections() {
+        let dir = tempdir().unwrap();
+        let kernel =
+            Kernel::with_v1_reducers_and_persistence(PersistConfig::new(dir.path().to_path_buf()));
+        kernel
+            .execute(KernelRequest {
+                target: "agenty.state.write".to_string(),
+                reducer_input: json!({
+                    "task_id": "task-a",
+                    "event_id": "evt-1",
+                    "occurred_at_unix": 1,
+                    "actor": "agent",
+                    "kind": "file_read",
+                    "paths": ["src/time/StopWatch.java"],
+                    "data": {"type": "file_read"}
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        let packet = KernelPacket::from_value(
+            json!({
+                "packet_id": "diffy",
+                "sections": [{
+                    "title": "Diff",
+                    "body": "StopWatch.java changed on lines 10-20",
+                    "refs": [{"kind": "file", "value": "src/time/StopWatch.java"}],
+                    "relevance": 0.9
+                }]
+            }),
+            None,
+        );
+        let response = kernel
+            .execute(KernelRequest {
+                target: "contextq.assemble".to_string(),
+                input_packets: vec![packet],
+                policy_context: json!({
+                    "task_id": "task-a",
+                    "disable_cache": true
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        let envelope: suite_packet_core::EnvelopeV1<ContextAssembleEnvelopePayload> =
+            serde_json::from_value(response.output_packets[0].body.clone()).unwrap();
+        assert!(envelope.payload.sections[0]
+            .body
+            .starts_with("Reminder: already reviewed"));
     }
 
     #[test]
