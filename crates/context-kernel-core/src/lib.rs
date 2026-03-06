@@ -3844,6 +3844,59 @@ policy:
     }
 
     #[test]
+    fn cache_fingerprint_changes_force_cache_miss() {
+        let mut kernel = Kernel::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = calls.clone();
+        kernel.register_reducer("count.reducer", move |_ctx, _packets| {
+            calls_ref.fetch_add(1, Ordering::Relaxed);
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(json!({"ok": true}), None)],
+                metadata: json!({"source":"reducer"}),
+            })
+        });
+
+        let mut request = KernelRequest {
+            target: "count.reducer".to_string(),
+            reducer_input: json!({"task":"same"}),
+            policy_context: json!({"cache_fingerprint":"fp-1"}),
+            ..KernelRequest::default()
+        };
+
+        let first = kernel.execute(request.clone()).unwrap();
+        assert_eq!(
+            first
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let second = kernel.execute(request.clone()).unwrap();
+        assert_eq!(
+            second
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        request.policy_context = json!({"cache_fingerprint":"fp-2"});
+        let third = kernel.execute(request).unwrap();
+        assert_eq!(
+            third
+                .metadata
+                .get("cache")
+                .and_then(|v| v.get("hit"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn persistent_kernel_reuses_cache_across_instances() {
         let dir = tempdir().unwrap();
         let config = PersistConfig::new(dir.path().to_path_buf());

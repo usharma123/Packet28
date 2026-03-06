@@ -580,6 +580,10 @@ pub fn default_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineInges
     }
 }
 
+pub fn repo_cache_fingerprint(repo_root: &Path, relevant_paths: &[PathBuf]) -> String {
+    suite_foundation_core::repo_fingerprint::cache_fingerprint(repo_root, relevant_paths)
+}
+
 fn ingest_coverage_auto(path: &Path) -> Result<CoverageData> {
     suite_ingest::ingest_coverage_path(path, None).map_err(Into::into)
 }

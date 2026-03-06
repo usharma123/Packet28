@@ -99,6 +99,8 @@ pub fn run(args: RepoArgs) -> Result<i32> {
         max_symbols: args.max_symbols,
         include_tests: args.include_tests,
     };
+    let repo_root_path = PathBuf::from(&input.repo_root);
+    let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(&repo_root_path, &[]);
 
     let use_kernel = args.cache || args.context_config.is_some() || args.task_id.is_some();
     if !use_kernel {
@@ -142,13 +144,20 @@ pub fn run(args: RepoArgs) -> Result<i32> {
                 "config_path": path,
                 "task_id": task_id,
                 "disable_cache": true,
+                "cache_fingerprint": cache_fingerprint,
             }),
-            (Some(path), None) => json!({"config_path": path}),
+            (Some(path), None) => json!({
+                "config_path": path,
+                "cache_fingerprint": cache_fingerprint,
+            }),
             (None, Some(task_id)) => json!({
                 "task_id": task_id,
                 "disable_cache": true,
+                "cache_fingerprint": cache_fingerprint,
             }),
-            (None, None) => Value::Null,
+            (None, None) => json!({
+                "cache_fingerprint": cache_fingerprint,
+            }),
         },
         ..context_kernel_core::KernelRequest::default()
     })?;

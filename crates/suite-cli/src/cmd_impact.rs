@@ -58,18 +58,28 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
     let governed_context_config = args.context_config.clone();
     let governed_budget_tokens = args.context_budget_tokens;
     let governed_budget_bytes = args.context_budget_bytes;
+    let cwd = std::env::current_dir()?;
+    let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(
+        &cwd,
+        &[cwd.join(&args.testmap)],
+    );
     let policy_context = match (governed_context_config.as_ref(), args.task_id.as_ref()) {
         (Some(config_path), Some(task_id)) => json!({
             "config_path": config_path,
             "task_id": task_id,
+            "cache_fingerprint": cache_fingerprint,
         }),
         (Some(config_path), None) => json!({
             "config_path": config_path,
+            "cache_fingerprint": cache_fingerprint,
         }),
         (None, Some(task_id)) => json!({
             "task_id": task_id,
+            "cache_fingerprint": cache_fingerprint,
         }),
-        (None, None) => Value::Null,
+        (None, None) => json!({
+            "cache_fingerprint": cache_fingerprint,
+        }),
     };
 
     if args.json.is_some()
@@ -108,7 +118,7 @@ pub fn run(args: ImpactArgs, config_path: &str) -> Result<i32> {
         return Ok(0);
     }
 
-    let kernel = build_kernel(args.cache || args.task_id.is_some(), std::env::current_dir()?);
+    let kernel = build_kernel(args.cache || args.task_id.is_some(), cwd);
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "testy.impact".to_string(),
         reducer_input: serde_json::to_value(context_kernel_core::ImpactKernelInput {

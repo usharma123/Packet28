@@ -89,20 +89,8 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
     let governed_context_config = args.context_config.clone();
     let governed_budget_tokens = args.context_budget_tokens;
     let governed_budget_bytes = args.context_budget_bytes;
-    let policy_context = match (governed_context_config.as_ref(), args.task_id.as_ref()) {
-        (Some(config_path), Some(task_id)) => json!({
-            "config_path": config_path,
-            "task_id": task_id,
-        }),
-        (Some(config_path), None) => json!({
-            "config_path": config_path,
-        }),
-        (None, Some(task_id)) => json!({
-            "task_id": task_id,
-        }),
-        (None, None) => Value::Null,
-    };
     let config = CovyConfig::load(Path::new(config_path)).unwrap_or_default();
+    let cwd = std::env::current_dir()?;
     let machine_profile =
         crate::cmd_common::resolve_machine_profile(args.json, args.report.as_deref(), "--report")?;
     let report = if machine_profile.is_some() {
@@ -129,6 +117,28 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         coverage: args.coverage,
         input: args.input,
     };
+    let cache_fingerprint = crate::cmd_common::repo_cache_fingerprint(
+        &cwd,
+        &diff_cache_fingerprint_paths(&kernel_input, &cwd),
+    );
+    let policy_context = match (governed_context_config.as_ref(), args.task_id.as_ref()) {
+        (Some(config_path), Some(task_id)) => json!({
+            "config_path": config_path,
+            "task_id": task_id,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (Some(config_path), None) => json!({
+            "config_path": config_path,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (None, Some(task_id)) => json!({
+            "task_id": task_id,
+            "cache_fingerprint": cache_fingerprint,
+        }),
+        (None, None) => json!({
+            "cache_fingerprint": cache_fingerprint,
+        }),
+    };
 
     if machine_profile.is_some()
         && !args.legacy_json
@@ -151,7 +161,7 @@ pub fn run(args: AnalyzeArgs, config_path: &str) -> Result<i32> {
         return Ok(if output.gate_result.passed { 0 } else { 1 });
     }
 
-    let kernel = build_kernel(args.cache || args.task_id.is_some(), std::env::current_dir()?);
+    let kernel = build_kernel(args.cache || args.task_id.is_some(), cwd);
     let response = kernel.execute(context_kernel_core::KernelRequest {
         target: "diffy.analyze".to_string(),
         reducer_input: serde_json::to_value(kernel_input)?,
@@ -353,4 +363,22 @@ fn build_kernel(cache: bool, root_dir: PathBuf) -> context_kernel_core::Kernel {
         );
     }
     context_kernel_core::Kernel::with_v1_reducers()
+}
+
+fn diff_cache_fingerprint_paths(
+    input: &context_kernel_core::DiffAnalyzeKernelInput,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    let mut paths = input
+        .coverage
+        .iter()
+        .map(|path| cwd.join(path))
+        .collect::<Vec<_>>();
+    if let Some(path) = input.input.as_ref() {
+        paths.push(cwd.join(path));
+    }
+    if let Some(path) = input.issues_state.as_ref() {
+        paths.push(cwd.join(path));
+    }
+    paths
 }

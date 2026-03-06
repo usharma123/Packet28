@@ -23,6 +23,7 @@ pub mod config_edit;
 pub mod doctor;
 pub mod path_diagnose;
 pub mod pathmap;
+pub mod repo_fingerprint;
 pub mod snapshot;
 
 pub use config::CovyConfig;
