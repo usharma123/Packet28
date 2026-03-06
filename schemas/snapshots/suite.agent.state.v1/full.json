@@ -1,0 +1,38 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.agent.state.v1",
+  "packet": {
+    "version": "1",
+    "tool": "agenty",
+    "kind": "agent_state",
+    "hash": "hash-full-example",
+    "summary": "agent state event full snapshot",
+    "budget_cost": {
+      "est_tokens": 55,
+      "est_bytes": 220,
+      "runtime_ms": 6,
+      "tool_calls": 1,
+      "payload_est_tokens": 35,
+      "payload_est_bytes": 140
+    },
+    "provenance": {
+      "inputs": ["task:demo"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-demo",
+      "event_id": "evt-2",
+      "occurred_at_unix": 1700000001,
+      "actor": "agent",
+      "kind": "decision_added",
+      "paths": ["src/time/StopWatch.java"],
+      "symbols": ["split"],
+      "data": {
+        "type": "decision_added",
+        "decision_id": "d1",
+        "text": "Bug is in split() not getStopTime()",
+        "supersedes": "d0"
+      }
+    }
+  }
+}

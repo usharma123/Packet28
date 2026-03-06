@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod coverage;
 pub mod diagnostics;
 pub mod diff;
@@ -10,6 +11,7 @@ pub mod registry;
 pub mod shard;
 pub mod testmap;
 
+pub use agent::*;
 pub use coverage::*;
 pub use diagnostics::*;
 pub use envelope::*;

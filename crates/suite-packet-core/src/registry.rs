@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 pub const PACKET_TYPE_COVER_CHECK: &str = "suite.cover.check.v1";
 pub const PACKET_TYPE_DIFF_ANALYZE: &str = "suite.diff.analyze.v1";
 pub const PACKET_TYPE_TEST_IMPACT: &str = "suite.test.impact.v1";
+pub const PACKET_TYPE_AGENT_STATE: &str = "suite.agent.state.v1";
+pub const PACKET_TYPE_AGENT_SNAPSHOT: &str = "suite.agent.snapshot.v1";
 pub const PACKET_TYPE_STACK_SLICE: &str = "suite.stack.slice.v1";
 pub const PACKET_TYPE_BUILD_REDUCE: &str = "suite.build.reduce.v1";
 pub const PACKET_TYPE_MAP_REPO: &str = "suite.map.repo.v1";
@@ -71,6 +73,40 @@ static CONTRACTS: &[PacketTypeContract] = &[
         ],
         boundedness_rules: &["test arrays truncated in compact profile"],
         compatibility_notes: &["legacy impact_result top-level fields supported for one release"],
+    },
+    PacketTypeContract {
+        packet_type: PACKET_TYPE_AGENT_STATE,
+        required_payload_fields: &[
+            "task_id",
+            "event_id",
+            "occurred_at_unix",
+            "actor",
+            "kind",
+            "data",
+        ],
+        optional_payload_fields: &["paths", "symbols", "debug", "artifact_handle"],
+        boundedness_rules: &["single event payload", "bounded path and symbol refs"],
+        compatibility_notes: &["v1 task-state event contract"],
+    },
+    PacketTypeContract {
+        packet_type: PACKET_TYPE_AGENT_SNAPSHOT,
+        required_payload_fields: &[
+            "task_id",
+            "focus_paths",
+            "focus_symbols",
+            "files_read",
+            "files_edited",
+            "active_decisions",
+            "completed_steps",
+            "open_questions",
+            "event_count",
+        ],
+        optional_payload_fields: &["last_event_at_unix", "debug", "artifact_handle"],
+        boundedness_rules: &[
+            "snapshot lists are task scoped",
+            "compact mode keeps bounded payload",
+        ],
+        compatibility_notes: &["v1 derived task-state snapshot contract"],
     },
     PacketTypeContract {
         packet_type: PACKET_TYPE_STACK_SLICE,
@@ -230,6 +266,8 @@ mod tests {
             PACKET_TYPE_COVER_CHECK,
             PACKET_TYPE_DIFF_ANALYZE,
             PACKET_TYPE_TEST_IMPACT,
+            PACKET_TYPE_AGENT_STATE,
+            PACKET_TYPE_AGENT_SNAPSHOT,
             PACKET_TYPE_STACK_SLICE,
             PACKET_TYPE_BUILD_REDUCE,
             PACKET_TYPE_MAP_REPO,

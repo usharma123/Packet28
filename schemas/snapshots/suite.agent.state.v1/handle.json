@@ -1,0 +1,42 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.agent.state.v1",
+  "packet": {
+    "version": "1",
+    "tool": "agenty",
+    "kind": "agent_state",
+    "hash": "hash-handle-example",
+    "summary": "agent state event handle snapshot",
+    "budget_cost": {
+      "est_tokens": 40,
+      "est_bytes": 160,
+      "runtime_ms": 5,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["task:demo"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-demo",
+      "event_id": "evt-3",
+      "occurred_at_unix": 1700000002,
+      "actor": "system",
+      "kind": "focus_set",
+      "paths": ["src/time/"],
+      "symbols": [],
+      "data": {
+        "type": "focus_set",
+        "note": "derived from diff analyze"
+      },
+      "artifact_handle": {
+        "handle_id": "handle-suite.agent.state.v1",
+        "packet_type": "suite.agent.state.v1",
+        "packet_hash": "hash-handle-example",
+        "artifact_sha256": "sha256-example",
+        "path": ".packet28/artifacts/handle-suite.agent.state.v1.json",
+        "created_at_unix": 1700000000
+      }
+    }
+  }
+}

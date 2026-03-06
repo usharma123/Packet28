@@ -1,0 +1,33 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.agent.state.v1",
+  "packet": {
+    "version": "1",
+    "tool": "agenty",
+    "kind": "agent_state",
+    "hash": "hash-compact-example",
+    "summary": "agent state event compact snapshot",
+    "budget_cost": {
+      "est_tokens": 40,
+      "est_bytes": 160,
+      "runtime_ms": 5,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["task:demo"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-demo",
+      "event_id": "evt-1",
+      "occurred_at_unix": 1700000000,
+      "actor": "agent",
+      "kind": "file_read",
+      "paths": ["src/lib.rs"],
+      "symbols": [],
+      "data": {
+        "type": "file_read"
+      }
+    }
+  }
+}

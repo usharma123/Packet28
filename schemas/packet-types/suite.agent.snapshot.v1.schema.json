@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.agent.snapshot.v1.schema.json",
+  "title": "Packet Type Contract: suite.agent.snapshot.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.agent.snapshot.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": [
+            "task_id",
+            "focus_paths",
+            "focus_symbols",
+            "files_read",
+            "files_edited",
+            "active_decisions",
+            "completed_steps",
+            "open_questions",
+            "event_count"
+          ],
+          "properties": {
+            "last_event_at_unix": {},
+            "debug": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": [
+    "task_id",
+    "focus_paths",
+    "focus_symbols",
+    "files_read",
+    "files_edited",
+    "active_decisions",
+    "completed_steps",
+    "open_questions",
+    "event_count"
+  ],
+  "x-optional_payload_fields": ["last_event_at_unix", "debug", "artifact_handle"],
+  "x-boundedness_rules": ["snapshot lists are task scoped", "compact mode keeps bounded payload"],
+  "x-compatibility_notes": ["v1 derived task-state snapshot contract"]
+}

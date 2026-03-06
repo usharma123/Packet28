@@ -1,0 +1,45 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.agent.snapshot.v1",
+  "packet": {
+    "version": "1",
+    "tool": "agenty",
+    "kind": "agent_snapshot",
+    "hash": "hash-full-example",
+    "summary": "agent snapshot full snapshot",
+    "budget_cost": {
+      "est_tokens": 80,
+      "est_bytes": 320,
+      "runtime_ms": 8,
+      "tool_calls": 1,
+      "payload_est_tokens": 48,
+      "payload_est_bytes": 192
+    },
+    "provenance": {
+      "inputs": ["task:demo"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-demo",
+      "focus_paths": ["src/time/"],
+      "focus_symbols": ["split"],
+      "files_read": ["src/time/StopWatch.java"],
+      "files_edited": ["src/time/StopWatch.java"],
+      "active_decisions": [
+        {
+          "id": "d1",
+          "text": "Bug is in split() not getStopTime()"
+        }
+      ],
+      "completed_steps": ["read_diff", "locate_bug"],
+      "open_questions": [
+        {
+          "id": "q1",
+          "text": "Does DateUtils call split() transitively?"
+        }
+      ],
+      "event_count": 5,
+      "last_event_at_unix": 1700000004
+    }
+  }
+}

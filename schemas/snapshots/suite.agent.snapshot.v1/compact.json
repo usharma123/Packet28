@@ -1,0 +1,33 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.agent.snapshot.v1",
+  "packet": {
+    "version": "1",
+    "tool": "agenty",
+    "kind": "agent_snapshot",
+    "hash": "hash-compact-example",
+    "summary": "agent snapshot compact snapshot",
+    "budget_cost": {
+      "est_tokens": 60,
+      "est_bytes": 240,
+      "runtime_ms": 7,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["task:demo"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-demo",
+      "focus_paths": ["src/time/"],
+      "focus_symbols": ["split"],
+      "files_read": ["src/time/StopWatch.java"],
+      "files_edited": [],
+      "active_decisions": [],
+      "completed_steps": ["read_diff"],
+      "open_questions": [],
+      "event_count": 3,
+      "last_event_at_unix": 1700000002
+    }
+  }
+}
