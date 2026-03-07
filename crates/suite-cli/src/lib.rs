@@ -9,6 +9,7 @@ pub mod cmd_impact;
 pub mod cmd_map;
 pub mod cmd_map_repo;
 pub mod cmd_packet;
+pub mod cmd_preflight;
 pub mod cmd_proxy;
 pub mod cmd_shard;
 pub mod cmd_stack;
@@ -69,6 +70,8 @@ pub enum Commands {
     Proxy(cmd_proxy::ProxyArgs),
     /// Packet artifact utilities
     Packet(cmd_packet::PacketArgs),
+    /// Bounded agent preflight context for a natural-language task
+    Preflight(cmd_preflight::PreflightArgs),
     /// Daemon lifecycle and task commands
     Daemon(cmd_daemon::DaemonArgs),
 }
@@ -271,6 +274,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         Commands::Packet(packet) => match packet.command {
             cmd_packet::PacketCommands::Fetch(args) => cmd_packet::run_fetch(args),
         },
+        Commands::Preflight(args) => cmd_preflight::run(args, &cli.config),
         Commands::Daemon(daemon) => cmd_daemon::run(daemon),
     }
 }
@@ -506,6 +510,12 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
                 _ => None,
             }
         }
+        Commands::Preflight(args) if args.machine_output_requested() => Some(machine_error(
+            "Packet28 preflight",
+            args.pretty_output(),
+            "preflight",
+        )),
+        Commands::Preflight(_) => None,
         Commands::Daemon(_) | Commands::Guard(_) => None,
     }
 }

@@ -76,31 +76,8 @@ pub fn emit_machine_envelope<T: serde::Serialize + Clone>(
     artifact_root: &Path,
     debug: Option<Value>,
 ) -> Result<()> {
-    let mut packet = serde_json::to_value(envelope)?;
-
-    match profile {
-        JsonProfile::Full => {
-            if let Some(ref debug) = debug {
-                insert_payload_debug(&mut packet, debug.clone());
-            }
-        }
-        JsonProfile::Compact => {
-            compact_packet_payload(packet_type, &mut packet);
-        }
-        JsonProfile::Handle => {
-            let handle =
-                suite_packet_core::write_packet_artifact(artifact_root, packet_type, envelope)
-                    .map_err(|source| anyhow::anyhow!(source.to_string()))?;
-            compact_packet_payload(packet_type, &mut packet);
-            attach_artifact_handle(&mut packet, serde_json::to_value(handle)?);
-        }
-    }
-
-    refresh_packet_budget(&mut packet);
-
-    let mut wrapper = PacketWrapperV1::new(packet_type.to_string(), packet);
-    wrapper.cache_hit = debug.as_ref().and_then(extract_cache_hit).unwrap_or(false);
-    emit_json(&serde_json::to_value(wrapper)?, pretty)
+    let value = machine_envelope_value(packet_type, envelope, profile, artifact_root, debug)?;
+    emit_json(&value, pretty)
 }
 
 pub fn emit_machine_wrapper<T: serde::Serialize + Clone>(
@@ -110,6 +87,27 @@ pub fn emit_machine_wrapper<T: serde::Serialize + Clone>(
     artifact_root: &Path,
     debug: Option<Value>,
 ) -> Result<()> {
+    let value = machine_wrapper_value(wrapper, profile, artifact_root, debug)?;
+    emit_json(&value, pretty)
+}
+
+pub fn machine_envelope_value<T: serde::Serialize + Clone>(
+    packet_type: &str,
+    envelope: &EnvelopeV1<T>,
+    profile: JsonProfile,
+    artifact_root: &Path,
+    debug: Option<Value>,
+) -> Result<Value> {
+    let wrapper = PacketWrapperV1::new(packet_type.to_string(), envelope.clone());
+    machine_wrapper_value(&wrapper, profile, artifact_root, debug)
+}
+
+pub fn machine_wrapper_value<T: serde::Serialize + Clone>(
+    wrapper: &PacketWrapperV1<EnvelopeV1<T>>,
+    profile: JsonProfile,
+    artifact_root: &Path,
+    debug: Option<Value>,
+) -> Result<Value> {
     let mut packet = serde_json::to_value(&wrapper.packet)?;
 
     match profile {
@@ -139,7 +137,7 @@ pub fn emit_machine_wrapper<T: serde::Serialize + Clone>(
     output.schema_version = wrapper.schema_version.clone();
     output.cache_hit =
         wrapper.cache_hit || debug.as_ref().and_then(extract_cache_hit).unwrap_or(false);
-    emit_json(&serde_json::to_value(output)?, pretty)
+    serde_json::to_value(output).map_err(Into::into)
 }
 
 pub fn emit_json(value: &Value, pretty: bool) -> Result<()> {

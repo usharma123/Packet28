@@ -237,6 +237,9 @@ pub fn run_via_daemon(cli: crate::Cli, _raw_args: &[String]) -> Result<i32> {
                 crate::cmd_packet::run_fetch_remote(args, &daemon_root)
             }
         },
+        crate::Commands::Preflight(args) => {
+            crate::cmd_preflight::run_remote(args, &cli.config, &daemon_root)
+        }
         other => {
             let cli = crate::Cli {
                 command: other,

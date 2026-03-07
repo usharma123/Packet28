@@ -355,6 +355,15 @@ fn parse_packet_wrapper(output: &[u8], packet_type: &str) -> Value {
     value
 }
 
+fn parse_preflight_response(output: &[u8]) -> Value {
+    let value: Value = serde_json::from_slice(output).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.preflight.v1")
+    );
+    value
+}
+
 fn packet_payload<'a>(wrapper: &'a Value) -> &'a Value {
     wrapper
         .get("packet")
@@ -1141,9 +1150,9 @@ fn test_suite_context_correlate_emits_v1_findings() {
     assert!(findings.iter().any(|finding| {
         finding.get("relation").and_then(Value::as_str) == Some("pre_existing_or_unrelated")
     }));
-    assert!(findings.iter().any(|finding| {
-        finding.get("rule").and_then(Value::as_str) == Some("shared_file")
-    }));
+    assert!(findings
+        .iter()
+        .any(|finding| { finding.get("rule").and_then(Value::as_str) == Some("shared_file") }));
 }
 
 #[test]
@@ -2406,6 +2415,190 @@ fn test_suite_daemon_start_status_stop_cycle() {
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[test]
+fn test_suite_preflight_json_selects_expected_reducers() {
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "preflight",
+            "--task",
+            "fix coverage gap in FooService",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--include",
+            "impact",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value = parse_preflight_response(&output);
+    let selected = value
+        .get("selection")
+        .and_then(|selection| selection.get("selected_reducers"))
+        .and_then(Value::as_array)
+        .unwrap();
+    assert!(selected.iter().any(|item| item.as_str() == Some("cover")));
+    assert!(selected.iter().any(|item| item.as_str() == Some("diff")));
+    assert!(selected.iter().any(|item| item.as_str() == Some("map")));
+    assert!(selected.iter().any(|item| item.as_str() == Some("recall")));
+    assert!(value
+        .get("selection")
+        .and_then(|selection| selection.get("anchors"))
+        .and_then(|anchors| anchors.get("symbols"))
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .any(|item| item.as_str() == Some("FooService")));
+    assert!(value
+        .get("selection")
+        .and_then(|selection| selection.get("skipped"))
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .any(|item| {
+            item.get("reducer").and_then(Value::as_str) == Some("impact")
+                && item.get("reason").and_then(Value::as_str) == Some("no_testmap")
+        }));
+}
+
+#[test]
+fn test_suite_preflight_handle_outputs_fetchable_packet_handles() {
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "preflight",
+            "--task",
+            "fix coverage gap in FooService",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--json=handle",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value = parse_preflight_response(&output);
+    let handle = value
+        .get("results")
+        .and_then(|results| results.get("packets"))
+        .and_then(Value::as_array)
+        .and_then(|packets| packets.first())
+        .and_then(|packet| packet.get("packet"))
+        .and_then(|wrapper| wrapper.get("packet"))
+        .and_then(|packet| {
+            packet.get("artifact_handle").or_else(|| {
+                packet
+                    .get("payload")
+                    .and_then(|payload| payload.get("artifact_handle"))
+            })
+        })
+        .and_then(|handle| handle.get("handle_id"))
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let fetched = suite_cmd()
+        .current_dir(dir.path())
+        .args(["packet", "fetch", "--handle", &handle, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let fetched_value: Value = serde_json::from_slice(&fetched).unwrap();
+    assert_eq!(
+        fetched_value.get("schema_version").and_then(Value::as_str),
+        Some("suite.packet.v1")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_suite_preflight_via_daemon_composes_existing_remote_calls() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--via-daemon",
+            "--daemon-root",
+            dir.path().to_str().unwrap(),
+            "preflight",
+            "--task",
+            "fix coverage gap in FooService",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value = parse_preflight_response(&output);
+    assert!(value
+        .get("selection")
+        .and_then(|selection| selection.get("selected_reducers"))
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .any(|item| item.as_str() == Some("diff")));
+    assert!(dir.path().join(".packet28/daemon/runtime.json").exists());
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_suite_preflight_machine_failure_emits_suite_error_v1() {
+    let dir = TempDir::new().unwrap();
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "preflight",
+            "--task",
+            "debug stack failure",
+            "--include",
+            "stack",
+            "--stack-input",
+            "missing.log",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some("suite.error.v1")
+    );
+    assert_eq!(
+        value.get("target").and_then(Value::as_str),
+        Some("preflight")
+    );
 }
 
 #[test]
