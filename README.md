@@ -46,10 +46,10 @@ Packet28 is a Rust workspace of 24 crates organized into four layers:
 │  policy/guard · agent state                                     │
 ├─────────────────────────────────────────────────────────────────┤
 │                       Reducer Layer                             │
-│  diffy · covy · testy · stacky · buildy · mapy · proxy         │
+│  diffy · covy · testy · stacky · buildy · mapy · proxy          │
 ├─────────────────────────────────────────────────────────────────┤
 │                     Shared Contracts                            │
-│  EnvelopeV1 · BudgetCost · FileRef/SymbolRef · Provenance      │
+│  EnvelopeV1 · BudgetCost · FileRef/SymbolRef · Provenance       │
 │  suite-packet-core · suite-foundation-core                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
