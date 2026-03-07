@@ -197,6 +197,9 @@ struct PreflightTotals {
     tool_calls: u64,
     packet_count: usize,
     cache_hits: usize,
+    recall_hits: usize,
+    planned_over_budget: bool,
+    actual_over_budget: bool,
     over_budget: bool,
 }
 
@@ -280,9 +283,10 @@ fn execute(
     let testmap_path = crate::cmd_common::resolve_path_from_cwd(&args.testmap, &root);
     let coverage_state_path = root.join(".covy").join("state").join("latest.bin");
     let issues_state_path = root.join(".covy").join("state").join("issues.bin");
+    let coverage_inputs = select_coverage_inputs(&coverage_paths, coverage_state_path.exists());
 
     let availability = Availability {
-        has_cover: !coverage_paths.is_empty() || coverage_state_path.exists(),
+        has_cover: coverage_inputs.has_coverage(),
         has_diff: is_git_repo(&root),
         has_map: true,
         has_recall: true,
@@ -294,7 +298,7 @@ fn execute(
     let selection = plan_selection(&args, &availability);
     let artifact_root = root.clone();
     let mut totals = PreflightTotals {
-        over_budget: selection.over_budget,
+        planned_over_budget: selection.over_budget,
         ..PreflightTotals::default()
     };
     let mut packets = Vec::new();
@@ -307,10 +311,11 @@ fn execute(
                 &config_path,
                 &base,
                 &head,
-                &coverage_paths,
-                coverage_state_path
-                    .exists()
-                    .then_some(coverage_state_path.as_path()),
+                &coverage_inputs.paths,
+                coverage_inputs
+                    .input_state
+                    .as_ref()
+                    .map(|_| coverage_state_path.as_path()),
                 issues_state_path
                     .exists()
                     .then_some(issues_state_path.as_path()),
@@ -323,10 +328,11 @@ fn execute(
                 &config_path,
                 &base,
                 &head,
-                &coverage_paths,
-                coverage_state_path
-                    .exists()
-                    .then_some(coverage_state_path.as_path()),
+                &coverage_inputs.paths,
+                coverage_inputs
+                    .input_state
+                    .as_ref()
+                    .map(|_| coverage_state_path.as_path()),
                 issues_state_path
                     .exists()
                     .then_some(issues_state_path.as_path()),
@@ -409,10 +415,13 @@ fn execute(
                 .runtime_ms
                 .saturating_add(hit.budget_estimate.runtime_ms);
         }
+        totals.recall_hits = hits.len();
         hits
     } else {
         Vec::new()
     };
+    totals.actual_over_budget = totals.est_tokens > args.budget_tokens;
+    totals.over_budget = totals.actual_over_budget;
 
     Ok(PreflightResponse {
         schema_version: PREFLIGHT_SCHEMA_VERSION.to_string(),
@@ -450,6 +459,18 @@ struct Availability {
     has_stack: bool,
     has_build: bool,
     has_impact: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CoverageInputs {
+    paths: Vec<String>,
+    input_state: Option<String>,
+}
+
+impl CoverageInputs {
+    fn has_coverage(&self) -> bool {
+        !self.paths.is_empty() || self.input_state.is_some()
+    }
 }
 
 fn plan_selection(args: &PreflightArgs, availability: &Availability) -> SelectionPlan {
@@ -497,6 +518,22 @@ fn plan_selection(args: &PreflightArgs, availability: &Availability) -> Selectio
         skipped,
         over_budget: planned_tokens > args.budget_tokens,
     }
+}
+
+fn select_coverage_inputs(coverage_paths: &[String], has_state_file: bool) -> CoverageInputs {
+    if !coverage_paths.is_empty() {
+        return CoverageInputs {
+            paths: coverage_paths.to_vec(),
+            input_state: None,
+        };
+    }
+    if has_state_file {
+        return CoverageInputs {
+            paths: Vec::new(),
+            input_state: Some(".covy/state/latest.bin".to_string()),
+        };
+    }
+    CoverageInputs::default()
 }
 
 fn availability_reason(
@@ -1717,5 +1754,19 @@ mod tests {
             .skipped
             .iter()
             .any(|item| item.reducer == "recall" && item.reason == "budget_trimmed"));
+    }
+
+    #[test]
+    fn explicit_coverage_paths_win_over_cached_state() {
+        let selected = select_coverage_inputs(&["report.info".to_string()], true);
+        assert_eq!(selected.paths, vec!["report.info".to_string()]);
+        assert!(selected.input_state.is_none());
+
+        let cached = select_coverage_inputs(&[], true);
+        assert!(cached.paths.is_empty());
+        assert_eq!(
+            cached.input_state.as_deref(),
+            Some(".covy/state/latest.bin")
+        );
     }
 }

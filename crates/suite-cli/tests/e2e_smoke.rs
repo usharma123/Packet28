@@ -375,6 +375,18 @@ fn packet_debug(wrapper: &Value) -> Option<&Value> {
     packet_payload(wrapper).get("debug")
 }
 
+fn write_cached_coverage_state(root: &Path) {
+    let mut coverage = suite_packet_core::CoverageData::new();
+    let mut file = suite_packet_core::FileCoverage::new();
+    file.lines_instrumented.insert(1);
+    file.lines_covered.insert(1);
+    coverage.files.insert("src/alpha.rs".to_string(), file);
+    let bytes = suite_foundation_core::cache::serialize_coverage(&coverage).unwrap();
+    let state_dir = root.join(".covy").join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(state_dir.join("latest.bin"), bytes).unwrap();
+}
+
 fn write_state_event(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
 }
@@ -2468,6 +2480,38 @@ fn test_suite_preflight_json_selects_expected_reducers() {
             item.get("reducer").and_then(Value::as_str) == Some("impact")
                 && item.get("reason").and_then(Value::as_str) == Some("no_testmap")
         }));
+}
+
+#[test]
+fn test_suite_preflight_prefers_explicit_coverage_over_cached_state() {
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+    write_cached_coverage_state(dir.path());
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args([
+            "preflight",
+            "--task",
+            "fix coverage gap in FooService",
+            "--coverage",
+            &fixture("lcov/basic.info"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value = parse_preflight_response(&output);
+    assert!(value
+        .get("selection")
+        .and_then(|selection| selection.get("selected_reducers"))
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .any(|item| item.as_str() == Some("cover")));
 }
 
 #[test]
