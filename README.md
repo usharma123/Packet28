@@ -1,173 +1,62 @@
-# Coverage / Packet28 Workspace
+# Packet28
 
-This repository is a Rust multi-crate workspace for:
+Packet28 is a context engineering layer for AI agents and CI systems. It reduces raw development artifacts — coverage reports, diffs, build logs, stack traces, test results, repo structure — into bounded, machine-readable packets that fit within agent context windows. It persists, indexes, and recalls those packets across tasks, and manages token budgets so agents spend context on reasoning instead of exploration.
 
-- coverage ingestion and gating
-- diff-aware diagnostics analysis
-- test impact analysis and sharding
-- deterministic repo, build, stack, and proxy reduction
-- governed context packet assembly, storage, recall, and policy enforcement
+## The Problem
 
-The current umbrella CLI is `Packet28` (`suite-cli`). Legacy and focused CLIs remain available as compatibility and domain-specific entry points:
+An AI agent asked to "fix the coverage regression in AuthService" will typically:
 
-- `covy` for coverage-first workflows
-- `diffy` for diff analysis
-- `testy` for impact, sharding, and testmap workflows
+1. Read config files to find coverage report paths
+2. Grep for source files matching "AuthService"
+3. Read the coverage XML (often megabytes, may not fit in context)
+4. Read the git diff to understand what changed
+5. Read test files to see what's covered
 
-## What Changed
+This costs 10-20 tool calls and 5-50K tokens of raw content before the agent starts working. Most of that content is redundant, unstructured, and immediately stale.
 
-The workspace is no longer just a coverage gate plus helpers. It now centers on a shared packet protocol and a kernel-driven execution path that can:
+## The Solution
 
-- emit stable machine-readable packet wrappers
-- cache and persist reducer outputs under `.packet28/`
-- apply policy checks through `guardy-core` and `suite-policy-core`
-- assemble bounded final context packets for agent and CI consumers
-
-## Workspace Architecture
-
-```mermaid
-flowchart LR
-  subgraph CLIs["CLI entry points"]
-    Packet28["Packet28 (suite-cli)"]
-    Covy["covy"]
-    Diffy["diffy"]
-    Testy["testy"]
-  end
-
-  subgraph Domain["Domain and reducer crates"]
-    CovyIngest["covy-ingest"]
-    DiffyCore["diffy-core"]
-    TestyCore["testy-core"]
-    TestyCommon["testy-cli-common"]
-    Stacky["stacky-core"]
-    Buildy["buildy-core"]
-    Mapy["mapy-core"]
-    Proxy["suite-proxy-core"]
-    Ingest["suite-ingest"]
-  end
-
-  subgraph Context["Context and policy subsystem"]
-    Kernel["context-kernel-core"]
-    ContextQ["contextq-core"]
-    Memory["context-memory-core"]
-    Scheduler["context-scheduler-core"]
-    Guardy["guardy-core"]
-    Policy["suite-policy-core"]
-  end
-
-  subgraph Shared["Shared contracts and state"]
-    Foundation["suite-foundation-core"]
-    Packet["suite-packet-core"]
-    CovyCore["covy-core"]
-  end
-
-  Packet28 --> Kernel
-  Packet28 --> DiffyCore
-  Packet28 --> TestyCore
-  Packet28 --> Stacky
-  Packet28 --> Buildy
-  Packet28 --> Mapy
-  Packet28 --> Proxy
-  Packet28 --> Ingest
-  Packet28 --> Guardy
-
-  Covy --> CovyIngest
-  Covy --> DiffyCore
-  Covy --> TestyCore
-  Diffy --> DiffyCore
-  Testy --> TestyCommon
-
-  TestyCommon --> TestyCore
-  TestyCommon --> CovyIngest
-
-  Kernel --> ContextQ
-  Kernel --> Memory
-  Kernel --> Scheduler
-  Kernel --> Guardy
-  Kernel --> Policy
-  Kernel --> Packet
-
-  CovyIngest --> CovyCore
-  DiffyCore --> Foundation
-  TestyCore --> Foundation
-  Stacky --> Packet
-  Buildy --> Packet
-  Mapy --> Packet
-  Proxy --> Packet
-  Ingest --> Packet
-  ContextQ --> Packet
-  Guardy --> Foundation
-  Policy --> Packet
-  Foundation --> Packet
+```bash
+Packet28 preflight --task "fix coverage regression in AuthService" --json
 ```
 
-## Main Binaries
+Packet28 classifies the task, selects the right reducers (cover, diff, map, recall), runs them, and returns one bounded JSON payload with pre-analyzed results:
 
-| Binary | Package | Purpose |
-| --- | --- | --- |
-| `Packet28` | `suite-cli` | Umbrella CLI for cover, diff, test, context, guard, stack, build, map, proxy, and packet flows |
-| `packet28-agent` | `suite-cli` | Thin wrapper that runs Packet28 preflight and then delegates to an external agent runtime |
-| `covy` | `covy-cli` | Coverage ingestion, reports, PR artifacts, path mapping, merge, doctor |
-| `diffy` | `diffy-cli` | Diff-focused gate analysis |
-| `testy` | `testy-cli` | Test impact, sharding, and testmap commands |
+- Coverage gate status with percentages and violations (~800 tokens)
+- Diff analysis with changed files and coverage impact (~1200 tokens)
+- Repo map focused on AuthService with ranked files and symbols (~2000 tokens)
+- Recall hits from prior related work (~600 tokens)
 
-## Packet28 Command Surface
+Total: ~4600 tokens, 0 tool calls, under 150ms. The agent starts working immediately with structured, relevant context.
 
-`Packet28` currently exposes these top-level domains:
+## Architecture
 
-- `cover check`
-- `diff analyze`
-- `test impact`
-- `test shard`
-- `test map`
-- `guard validate`
-- `guard check`
-- `context assemble`
-- `context correlate`
-- `context state append`
-- `context state snapshot`
-- `context store list|get|prune|stats`
-- `context recall`
-- `stack slice`
-- `build reduce`
-- `map repo`
-- `proxy run`
-- `packet fetch`
-- `preflight`
-- `agent-prompt`
-- `daemon`
+Packet28 is a Rust workspace of 24 crates organized into four layers:
 
-## Execution Model
-
-Most Packet28 reducers can run in two modes:
-
-1. Direct reducer mode for fast local output.
-2. Kernel-backed mode when you enable `--cache`, `--task-id`, or `--context-config`.
-
-Kernel-backed mode adds cache metadata, policy context, packet persistence, and optional governed assembly.
-
-```mermaid
-flowchart TD
-  Cmd["Packet28 command"] --> Mode{"Kernel-backed?"}
-
-  Mode -->|"no"| Direct["Reducer runs directly"]
-  Direct --> PacketA["EnvelopeV1 packet"]
-  PacketA --> WrapperA["suite.packet.v1 machine wrapper or text summary"]
-
-  Mode -->|"yes"| Kernel["context-kernel-core execute"]
-  Kernel --> Reducer["Run reducer target"]
-  Reducer --> Audit["Policy + audit hooks"]
-  Audit --> Cache["Optional cache read/write under .packet28/"]
-  Cache --> PacketB["Output packet(s)"]
-  PacketB --> Governed{"--context-config?"}
-  Governed -->|"no"| WrapperB["Wrapper + metadata/audit"]
-  Governed -->|"yes"| Assemble["governed.assemble via contextq-core"]
-  Assemble --> WrapperC["Final bounded context packet"]
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Agent Surface                            │
+│  packet28-agent wrapper · agent-prompt generator · preflight    │
+├─────────────────────────────────────────────────────────────────┤
+│                     CLI + Daemon Layer                          │
+│  Packet28 CLI · packet28d daemon · task/watch/stream protocol   │
+├─────────────────────────────────────────────────────────────────┤
+│                    Context Runtime Layer                        │
+│  kernel · scheduler · memory/recall · assembly · correlation    │
+│  policy/guard · agent state                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                       Reducer Layer                             │
+│  diffy · covy · testy · stacky · buildy · mapy · proxy         │
+├─────────────────────────────────────────────────────────────────┤
+│                     Shared Contracts                            │
+│  EnvelopeV1 · BudgetCost · FileRef/SymbolRef · Provenance      │
+│  suite-packet-core · suite-foundation-core                      │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Machine Output Contract
+### Layer 1: Shared Contracts
 
-All Packet28 machine-mode commands use the same wrapper:
+Every reducer output is wrapped in the same envelope:
 
 ```json
 {
@@ -179,72 +68,491 @@ All Packet28 machine-mode commands use the same wrapper:
     "kind": "...",
     "hash": "...",
     "summary": "...",
-    "budget_cost": {},
-    "provenance": {},
+    "files": [{ "path": "...", "relevance": 0.75 }],
+    "symbols": [{ "name": "...", "kind": "method", "relevance": 0.6 }],
+    "budget_cost": {
+      "est_tokens": 800,
+      "est_bytes": 3200,
+      "runtime_ms": 12,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["src/auth.rs"],
+      "git_base": "origin/main",
+      "git_head": "HEAD",
+      "generated_at_unix": 1709000000
+    },
     "payload": {}
   }
 }
 ```
 
-Machine profiles:
+`EnvelopeV1<T>` is the universal packet type. Every packet carries:
 
-- `--json` or `--json=compact` for bounded compact payloads
-- `--json=full` for the full payload
-- `--json=handle` for compact wire output plus a persisted packet artifact handle
+- **`budget_cost`**: Token and byte estimates so consumers know the cost before reading the payload
+- **`files` and `symbols`**: Structured references that enable cross-packet correlation
+- **`provenance`**: Git refs and input paths for reproducibility
+- **`hash`**: Canonical blake3 hash for deduplication and cache keying
 
-Exit codes:
+| Crate | Purpose |
+| --- | --- |
+| `suite-packet-core` | `EnvelopeV1`, `BudgetCost`, `FileRef`, `SymbolRef`, `Provenance`, packet type constants, agent state event types |
+| `suite-foundation-core` | `CovyConfig` (covy.toml), gate config, path mapping, snapshot/cache primitives |
+| `covy-core` | Coverage data model shared between ingestion and analysis |
 
-- `0` for success and passing gates/policy
-- `1` for domain failure with a valid command run
-- `2+` for runtime, config, or execution failures
+### Layer 2: Reducers
 
-## Cache, Store, And Recall
+Each reducer takes a raw artifact and produces a bounded `EnvelopeV1` packet:
 
-When persistence is enabled, Packet28 stores cache state under `.packet28/` at the workspace or explicit root.
-
-- cache file: `.packet28/packet-cache-v1.bin`
-- artifact directory: `.packet28/artifacts/`
-- packet fetch path: `Packet28 packet fetch --handle <handle_id>`
+| Crate | Input | Output | What It Does |
+| --- | --- | --- | --- |
+| `covy-ingest` | JaCoCo XML, LCOV, Cobertura, gocov, llvm-cov | Normalized coverage model | Parses coverage reports into a unified format with path normalization |
+| `diffy-core` | Git diff + coverage data | `suite.diff.analyze.v1` | Runs diff analysis against a quality gate: changed/total/new coverage, issue counts, violations |
+| `testy-core` | Testmap + git diff | `suite.test.impact.v1` | Computes impacted tests from file changes using a prebuilt test-to-file map |
+| `stacky-core` | Log text / stack traces | `suite.stack.slice.v1` | Deduplicates failures by fingerprint, extracts frames, limits to N worst |
+| `buildy-core` | Compiler / linter output | `suite.build.reduce.v1` | Groups diagnostics by root cause and severity, deduplicates by fingerprint |
+| `mapy-core` | Repository root + focus hints | `suite.map.repo.v1` | Builds a ranked repo map: files by centrality, symbols by relevance, import edges. Uses tree-sitter for symbol extraction |
+| `suite-proxy-core` | Shell command + output limits | `suite.proxy.run.v1` | Executes a command safely, deduplicates output lines, enforces output caps |
+| `suite-ingest` | Coverage/diagnostics file paths | Ingested models | Thin wrapper dispatching to `covy-ingest` format parsers |
 
 ```mermaid
 flowchart LR
-  Out["Reducer output packet"] --> Cache["Packet cache entry"]
-  Cache --> Disk[".packet28/packet-cache-v1.bin"]
-  Disk --> List["context store list"]
-  Disk --> Get["context store get"]
-  Disk --> Stats["context store stats"]
-  Disk --> Prune["context store prune"]
-  Disk --> Recall["context recall --query ..."]
-  Recall --> Rank["lexical + path/symbol + recency scoring"]
-  Rank --> Hits["ranked hits"]
+  subgraph Inputs["Raw Artifacts"]
+    COV["Coverage XML/LCOV"]
+    DIFF["Git diff"]
+    LOG["Build log"]
+    STACK["Stack trace"]
+    REPO["Source tree"]
+    CMD["Shell command"]
+    TMAP["Testmap"]
+  end
+
+  subgraph Reducers["Reducer Layer"]
+    COVY["covy-ingest"]
+    DIFFY["diffy-core"]
+    TESTY["testy-core"]
+    STACKY["stacky-core"]
+    BUILDY["buildy-core"]
+    MAPY["mapy-core"]
+    PROXY["suite-proxy-core"]
+  end
+
+  COV --> COVY
+  COV & DIFF --> DIFFY
+  TMAP & DIFF --> TESTY
+  STACK --> STACKY
+  LOG --> BUILDY
+  REPO --> MAPY
+  CMD --> PROXY
+
+  COVY & DIFFY & TESTY & STACKY & BUILDY & MAPY & PROXY --> ENV["EnvelopeV1 packets"]
 ```
+
+### Layer 3: Context Runtime
+
+The runtime layer manages execution, caching, recall, assembly, correlation, scheduling, and policy enforcement.
+
+```mermaid
+flowchart TD
+  REQ["KernelRequest\n(target + reducer_input)"] --> KERNEL["context-kernel-core"]
+
+  KERNEL --> SCHED["context-scheduler-core\nDAG scheduling + budget enforcement"]
+  KERNEL --> REDUCER["Registered reducer\n(diffy, stacky, mapy, etc.)"]
+  KERNEL --> CACHE["context-memory-core\nPacketCache + BM25 recall index"]
+  KERNEL --> POLICY["guardy-core + suite-policy-core\nPolicy evaluation"]
+
+  REDUCER --> PACKET["EnvelopeV1 output packet"]
+  PACKET --> CACHE
+  PACKET --> ASSEMBLY["contextq-core\nassemble / correlate / manage"]
+
+  CACHE --> RECALL["BM25 recall\n+ path/symbol/test indexes"]
+  ASSEMBLY --> FINAL["Bounded context packet\nor correlation insights"]
+```
+
+#### Kernel (`context-kernel-core`)
+
+The kernel is the central dispatch. It receives a `KernelRequest` with a `target` string and routes to a registered reducer:
+
+| Target | Reducer |
+| --- | --- |
+| `diffy.analyze` | Diff analysis against quality gate |
+| `testy.impact` | Test impact from diff + testmap |
+| `stacky.slice` | Stack trace deduplication |
+| `buildy.reduce` | Build diagnostic reduction |
+| `mapy.repo` | Repo structure mapping |
+| `proxy.run` | Safe command execution |
+| `contextq.assemble` | Merge packets into bounded context |
+| `contextq.correlate` | Synthesize insights across packets |
+| `contextq.manage` | Budget-aware context guidance |
+| `governed.assemble` | Policy-constrained assembly |
+| `guardy.check` | Guard policy evaluation |
+| `agenty.state.write` | Append agent state event |
+| `agenty.state.snapshot` | Read agent state snapshot |
+
+The kernel supports two execution modes:
+
+- **Single request**: `execute(request)` — runs one reducer, optionally caches the result
+- **Sequence**: `execute_sequence(steps)` — runs a DAG of steps with dependency ordering, budget enforcement, and reactive replanning via `ScheduleMutation` (cancel/replace/append steps based on prior results)
+
+#### Memory and Recall (`context-memory-core`)
+
+Packets are persisted in `.packet28/packet-cache-v2.bin` (bincode). The cache maintains six indexes:
+
+| Index | Key | Value | Used For |
+| --- | --- | --- | --- |
+| `recall_postings` | Term | (cache_key, term_frequency) | BM25 full-text search |
+| `file_ref_index` | Canonical path | Cache keys | Path-based lookup |
+| `basename_alias_index` | Filename only | Canonical paths | Cross-reducer path normalization |
+| `symbol_index` | Symbol name | Cache keys | Symbol-based lookup |
+| `test_index` | Test name | Cache keys | Test-based lookup |
+| `task_index` | Task ID | Cache keys | Per-task scoping |
+
+Recall uses BM25 scoring (k1=1.5, b=0.75) plus structured field matching. A query like "coverage gap in AuthService" matches both text terms and the symbol index. Results are ranked by a weighted combination of BM25 score, path/symbol match bonuses, and recency.
+
+```rust
+RecallOptions {
+    limit: 8,
+    scope: TaskFirst,       // Task-scoped entries first, then global
+    path_filters: ["src/auth.rs"],
+    symbol_filters: ["AuthService"],
+    since_unix: Some(week_ago),
+}
+```
+
+Recall returns `RecallHit` with score, summary, matched paths/symbols, match reasons, budget estimate, and associated task IDs.
+
+#### Assembly and Correlation (`contextq-core`)
+
+- **Assemble**: Merges multiple reducer packets into one bounded context packet. Extracts sections and refs from each input, ranks by relevance, truncates to fit `budget_tokens` and `budget_bytes`. Output: `AssembledPayload` with sections, refs, and truncation metadata.
+- **Correlate**: Finds relationships across packets using four rules:
+  - `shared_file`: Packets reference the same file path (with basename normalization)
+  - `shared_symbol`: Packets reference the same symbol
+  - `shared_test`: Packets reference the same test
+  - `map_edge_connects`: A repo map edge connects files from different packets
+- **Manage**: Produces budget-aware guidance: working set size, eviction candidates, recommendations for which packets to keep or drop.
+
+#### Scheduler (`context-scheduler-core`)
+
+Topological DAG scheduler with budget enforcement. Takes a set of steps with dependencies and estimated costs, orders them, and stops when budget is exhausted. Supports reactive mutations: cancel, replace, or append steps mid-sequence based on reducer outputs.
+
+#### Policy and Guard (`guardy-core`, `suite-policy-core`)
+
+Optional governance via `context.yaml`:
+
+```yaml
+version: 1
+policy:
+  tools:
+    allowlist: [Packet28, git]
+  reducers:
+    allowlist: [diffy.analyze, mapy.repo, stacky.slice]
+  paths:
+    include: ["src/**"]
+    exclude: ["**/*.secret"]
+  budgets:
+    token_cap: 10000
+    runtime_ms_cap: 5000
+  redaction:
+    forbidden_patterns: ["SECRET_KEY_\\w+"]
+  human_review:
+    required: false
+    on_policy_violation: true
+```
+
+Guard evaluates packets against policy and reports violations. Governed assembly applies policy constraints during context assembly.
+
+### Layer 4: CLI, Daemon, and Agent Surface
+
+#### Packet28 CLI (`suite-cli`)
+
+The umbrella CLI exposes all domains through a consistent interface:
+
+```
+Packet28 cover check          Coverage quality gate
+Packet28 diff analyze         Diff analysis against gate
+Packet28 test impact          Impacted tests from diff
+Packet28 test shard           Test shard planning
+Packet28 test map             Build testmap artifacts
+Packet28 stack slice          Stack trace reduction
+Packet28 build reduce         Build diagnostic reduction
+Packet28 map repo             Repo structure mapping
+Packet28 proxy run            Safe command execution
+Packet28 context assemble     Merge packets into bounded context
+Packet28 context correlate    Cross-packet insight synthesis
+Packet28 context manage       Budget-aware context guidance
+Packet28 context state        Agent state append/snapshot
+Packet28 context store        List/get/prune/stats on persisted packets
+Packet28 context recall       BM25 + structured recall query
+Packet28 guard validate       Validate policy config
+Packet28 guard check          Evaluate packet against policy
+Packet28 packet fetch         Retrieve persisted artifact by handle
+Packet28 preflight            Bounded agent context for a task
+Packet28 agent-prompt         Generate agent instruction fragments
+Packet28 daemon               Daemon lifecycle and task management
+```
+
+All machine-mode commands emit `suite.packet.v1` JSON wrappers. Three output profiles:
+
+- `--json` or `--json=compact`: Bounded compact payload
+- `--json=full`: Complete payload with all fields
+- `--json=handle`: Compact output + persisted artifact handle for later `packet fetch`
+
+Exit codes: `0` success/passing, `1` domain failure, `2+` runtime/config error.
+
+#### Daemon (`packet28d`)
+
+A local Unix socket daemon that provides persistent state, file watching, task streaming, and command routing for long-running agent workflows.
+
+```mermaid
+flowchart TD
+  AGENT["Agent / CI"] -->|"DaemonRequest"| SOCK["Unix socket\n.packet28/daemon/packet28d.sock"]
+  SOCK --> DAEMON["packet28d"]
+
+  DAEMON --> KERNEL["Kernel execution"]
+  DAEMON --> WATCH["File watchers\n(notify crate)"]
+  DAEMON --> TASKS["Task registry\nwith step DAGs"]
+  DAEMON --> STREAM["Event streaming\nper-step lifecycle"]
+  DAEMON --> CACHE["Persistent PacketCache\nwith recall indexes"]
+
+  WATCH -->|"file changed"| DEBOUNCE["Debounce coalescing\n(PendingWatchEvent)"]
+  DEBOUNCE -->|"flush"| REPLAN["Reactive replan\nrefresh task context"]
+  REPLAN --> STREAM
+
+  STREAM -->|"TaskSubscribe"| AGENT
+```
+
+**Daemon protocol** (`packet28-daemon-core`):
+
+| Request | Response | Purpose |
+| --- | --- | --- |
+| `Execute` | `Execute` | Run single kernel request |
+| `ExecuteSequence` | `ExecuteSequence` | Submit multi-step task with watches |
+| `TaskStatus` | `TaskStatus` | Query task state |
+| `TaskCancel` | `TaskCancel` | Cancel task and remove watches |
+| `TaskSubscribe` | `TaskSubscribeAck` + streaming events | Live per-step lifecycle events |
+| `WatchList` / `WatchRemove` | Watch metadata | Manage file watchers |
+| `CoverCheck` | `CoverCheck` | Direct cover check (no kernel overhead) |
+| `ContextRecall` | `ContextRecall` | Recall from daemon's persistent cache |
+| `ContextStore*` | Store metadata | List/get/prune/stats on cache |
+| `Status` / `Stop` | `Status` / `Ack` | Daemon lifecycle |
+
+Watch kinds: `File` (glob pattern), `Git` (ref changes), `TestReport` (test result files).
+
+Daemon persistence:
+- `.packet28/daemon/packet28d.sock` — Unix socket
+- `.packet28/daemon/runtime.json` — PID, startup time, socket path
+- `.packet28/daemon/packet28d.log` — Daemon logs
+- `.packet28/daemon/watch-registry-v1.json` — Active watches
+- `.packet28/daemon/task-registry-v1.json` — Task state
+- `.packet28/daemon/tasks/<id>/events.jsonl` — Per-task event log
+- `.packet28/packet-cache-v2.bin` — Persistent packet cache with indexes
+
+The `--via-daemon` flag on any Packet28 command routes execution through the daemon instead of running locally. The daemon auto-starts if not running.
+
+#### Agent Surface
+
+Two entry points for agent integration:
+
+**`Packet28 agent-prompt`** generates instruction fragments for agent config files:
+
+```bash
+Packet28 agent-prompt --format claude    # CLAUDE.md fragment
+Packet28 agent-prompt --format agents    # AGENTS.md fragment
+Packet28 agent-prompt --format cursor    # .cursorrules fragment
+```
+
+Output tells the agent: use preflight before broad file reads for non-trivial tasks, prefer bounded packets over raw file scans, fall back to direct reads if preflight fails, skip for trivial edits.
+
+**`packet28-agent`** is a wrapper binary that runs preflight automatically before delegating to an agent runtime:
+
+```bash
+packet28-agent \
+  --task "investigate flaky parser test" \
+  -- codex exec "review the failure"
+```
+
+The wrapper:
+1. Runs `Packet28 preflight` with the task description
+2. Persists the result to `.packet28/agent/latest-preflight.json`
+3. Exports `PACKET28_PREFLIGHT_PATH` and `PACKET28_ROOT` as environment variables
+4. Executes the delegated command, propagating its exit code
+
+#### Preflight
+
+Preflight is the primary agent entry point. It maps a natural language task description to the right reducers, runs them, and returns one bounded payload.
+
+```mermaid
+flowchart LR
+  TASK["Natural language task"] --> CLASSIFY["Classify tags\n(coverage, diff, build,\nstack, test)"]
+  CLASSIFY --> SELECT["Select reducers\nby tag + availability\n+ budget"]
+  SELECT --> ANCHOR["Extract anchors\n(paths, symbols, terms)\nfrom task text"]
+
+  ANCHOR --> COVER["cover check"]
+  ANCHOR --> DIFF["diff analyze"]
+  ANCHOR --> MAP["map repo\n--focus-path/symbol"]
+  ANCHOR --> STACK["stack slice"]
+  ANCHOR --> BUILD["build reduce"]
+  ANCHOR --> IMPACT["test impact"]
+  ANCHOR --> RECALL["BM25 recall\nquery from task + anchors"]
+
+  COVER & DIFF & MAP & STACK & BUILD & IMPACT & RECALL --> RESULT["suite.preflight.v1\nselection + packets + recall + totals"]
+```
+
+Heuristic selection:
+
+| Task mentions | Reducers selected |
+| --- | --- |
+| coverage, jacoco, lcov, gate | cover + diff + map + recall |
+| diff, change, regression, review, pr | diff + map + recall |
+| build, compile, lint, warning, error | build + diff + recall |
+| stack, trace, exception, crash, panic | stack + map + recall |
+| test, impact, flaky | impact + diff + recall |
+| (none of the above) | diff + map + recall |
+
+Reducers are selected in execution order (cover → diff → map → stack → build → impact → recall) and trimmed when cumulative planned cost exceeds `--budget-tokens` (default 5000). `--include` and `--exclude` flags override heuristics. Recall always runs last and always uses BM25 against the task description + extracted anchors.
+
+## Binaries
+
+| Binary | Package | Purpose |
+| --- | --- | --- |
+| `Packet28` | `suite-cli` | Umbrella CLI for all domains |
+| `packet28-agent` | `suite-cli` | Wrapper that runs preflight before delegating to an agent |
+| `packet28d` | `packet28d` | Local daemon for persistent state and file watching |
+| `covy` | `covy-cli` | Legacy coverage CLI: check, ingest, report, diff, testmap, impact, shard, merge |
+| `diffy` | `diffy-cli` | Diff-focused gate analysis |
+| `testy` | `testy-cli` | Test impact and sharding |
+
+## Crate Map
+
+| Group | Crates |
+| --- | --- |
+| Shared contracts | `suite-packet-core`, `suite-foundation-core`, `covy-core` |
+| Reducers | `covy-ingest`, `diffy-core`, `testy-core`, `stacky-core`, `buildy-core`, `mapy-core`, `suite-proxy-core`, `suite-ingest` |
+| Context runtime | `context-kernel-core`, `context-memory-core`, `context-scheduler-core`, `contextq-core` |
+| Governance | `guardy-core`, `suite-policy-core` |
+| CLI + daemon | `suite-cli`, `packet28-daemon-core`, `packet28d` |
+| Legacy CLIs | `covy-cli`, `diffy-cli`, `testy-cli`, `testy-cli-common` |
+
+```mermaid
+flowchart TD
+  subgraph Surface["Agent Surface"]
+    PA["packet28-agent"]
+    P28["Packet28 CLI"]
+    PROMPT["agent-prompt"]
+  end
+
+  subgraph Daemon["Daemon"]
+    D["packet28d"]
+    DC["packet28-daemon-core"]
+  end
+
+  subgraph Runtime["Context Runtime"]
+    K["context-kernel-core"]
+    M["context-memory-core"]
+    S["context-scheduler-core"]
+    CQ["contextq-core"]
+    G["guardy-core"]
+    POL["suite-policy-core"]
+  end
+
+  subgraph Reducers["Reducers"]
+    DIF["diffy-core"]
+    TES["testy-core"]
+    STA["stacky-core"]
+    BUI["buildy-core"]
+    MAP["mapy-core"]
+    PRX["suite-proxy-core"]
+    ING["suite-ingest"]
+  end
+
+  subgraph Shared["Contracts"]
+    PKT["suite-packet-core"]
+    FND["suite-foundation-core"]
+    COV["covy-core"]
+  end
+
+  PA --> P28
+  P28 --> K
+  P28 --> DC
+  D --> DC
+  D --> K
+  D --> M
+
+  K --> S
+  K --> M
+  K --> CQ
+  K --> G
+  K --> DIF
+  K --> TES
+  K --> STA
+  K --> BUI
+  K --> MAP
+  K --> PRX
+  K --> ING
+
+  CQ --> PKT
+  G --> FND
+  POL --> PKT
+  M --> PKT
+  S --> PKT
+
+  DIF --> FND
+  TES --> FND
+  STA --> PKT
+  BUI --> PKT
+  MAP --> PKT
+  PRX --> PKT
+  ING --> PKT
+  FND --> PKT
+  ING --> COV
+```
+
+## Persistence
+
+All persistent state lives under `.packet28/` at the workspace root:
+
+```
+.packet28/
+├── packet-cache-v2.bin          Packet cache with BM25 + ref indexes (bincode)
+├── artifacts/                   Full packet artifacts for --json=handle
+├── agent/
+│   └── latest-preflight.json    Last preflight result from packet28-agent
+└── daemon/
+    ├── packet28d.sock           Unix socket
+    ├── runtime.json             Daemon PID and metadata
+    ├── packet28d.log            Daemon log
+    ├── watch-registry-v1.json   Active file watches
+    ├── task-registry-v1.json    Task state
+    └── tasks/
+        └── <task-id>/
+            └── events.jsonl     Per-task event log
+```
+
+Coverage state from the legacy `covy` CLI lives under `.covy/state/`.
 
 ## Quick Start
 
-Build the primary binaries:
+Build:
 
 ```bash
-cargo build --release -p suite-cli -p covy-cli -p diffy-cli -p testy-cli
+cargo build --release -p suite-cli -p packet28d
 ```
 
-Run a diff gate through the umbrella CLI:
+Run preflight for a task:
 
 ```bash
-./target/release/Packet28 diff analyze \
-  --coverage tests/fixtures/lcov/basic.info \
-  --base HEAD \
-  --head HEAD \
-  --no-issues-state \
+./target/release/Packet28 preflight \
+  --task "fix coverage regression in AuthService" \
   --json
 ```
 
-Generate a Claude/Codex prompt fragment that teaches repo-local agents to use Packet28 preflight:
+Generate agent instructions:
 
 ```bash
-./target/release/Packet28 agent-prompt --format claude
+./target/release/Packet28 agent-prompt --format claude >> CLAUDE.md
 ```
 
-Run preflight automatically before launching an agent runtime:
+Use the wrapper to launch an agent with preflight context:
 
 ```bash
 ./target/release/packet28-agent \
@@ -252,282 +560,105 @@ Run preflight automatically before launching an agent runtime:
   -- codex exec "review the failure"
 ```
 
-Run the legacy coverage-first CLI:
+Run individual reducers:
 
 ```bash
-./target/release/covy check \
-  --coverage tests/fixtures/lcov/basic.info \
-  --base HEAD \
-  --head HEAD \
-  --no-issues-state
-```
-
-## Common Workflows
-
-### 0. Agent Setup
-
-Milestone 1 is repo-local prompt integration plus the wrapper binary. It does not include an MCP server and does not write agent config files automatically.
-
-Generate fragments you can paste into agent config files:
-
-```bash
-./target/release/Packet28 agent-prompt --format claude
-./target/release/Packet28 agent-prompt --format agents
-./target/release/Packet28 agent-prompt --format cursor
-```
-
-Wrapper example:
-
-```bash
-./target/release/packet28-agent \
-  --task "review the latest parser regression" \
-  -- codex exec "debug the issue"
-```
-
-The wrapper persists the latest preflight payload under `.packet28/agent/latest-preflight.json` and exports:
-
-- `PACKET28_PREFLIGHT_PATH`
-- `PACKET28_ROOT`
-
-### 1. Coverage Gate
-
-```bash
+# Coverage gate
 ./target/release/Packet28 cover check \
-  --coverage tests/fixtures/lcov/basic.info \
-  --base HEAD \
-  --head HEAD \
-  --no-issues-state \
-  --json=compact
+  --coverage report.xml --base HEAD~1 --head HEAD --json
+
+# Diff analysis
+./target/release/Packet28 diff analyze \
+  --coverage report.xml --base HEAD~1 --head HEAD --json
+
+# Repo map focused on a symbol
+./target/release/Packet28 map repo \
+  --repo-root . --focus-symbol AuthService --json
+
+# Stack trace reduction
+./target/release/Packet28 stack slice --input crash.log --json
+
+# Build diagnostic reduction
+./target/release/Packet28 build reduce --input build.log --json
+
+# Test impact
+./target/release/Packet28 test impact \
+  --base main --head HEAD --testmap .covy/state/testmap.bin --json
 ```
 
-### 2. Diff Analysis With Governed Context
+Recall prior context:
+
+```bash
+./target/release/Packet28 context recall \
+  --root . --query "coverage gap AuthService" --limit 5 --json
+```
+
+Start the daemon for persistent state and file watching:
+
+```bash
+./target/release/Packet28 daemon start --root .
+./target/release/Packet28 daemon status --root . --json
+```
+
+Route commands through the daemon:
 
 ```bash
 ./target/release/Packet28 diff analyze \
-  --coverage tests/fixtures/lcov/basic.info \
-  --base HEAD~1 \
-  --head HEAD \
-  --no-issues-state \
-  --cache \
-  --context-config context.yaml \
-  --json=full
+  --coverage report.xml --base HEAD~1 --head HEAD \
+  --via-daemon --json
 ```
 
-### 3. Repo Map With Artifact Handle
-
-```bash
-./target/release/Packet28 map repo \
-  --repo-root . \
-  --focus-path crates/suite-cli/src \
-  --focus-symbol KernelRequest \
-  --cache \
-  --json=handle
-```
-
-Fetch the full artifact later:
-
-```bash
-./target/release/Packet28 packet fetch \
-  --root . \
-  --handle <handle_id> \
-  --json=full
-```
-
-### 4. Test Impact And Sharding
-
-Build a testmap:
-
-```bash
-./target/release/Packet28 test map \
-  --manifest 'tests/**/*.json' \
-  --output .covy/state/testmap.bin \
-  --timings-output .covy/state/testtimings.bin
-```
-
-Compute impacted tests:
-
-```bash
-./target/release/Packet28 test impact \
-  --base main \
-  --head HEAD \
-  --testmap .covy/state/testmap.bin \
-  --print-command \
-  --json
-```
-
-Plan shards:
-
-```bash
-./target/release/Packet28 test shard \
-  --tasks-json tasks.json \
-  --shards 6 \
-  --tier nightly \
-  --timings .covy/state/testtimings.bin \
-  --json
-```
-
-### 5. Stack And Build Reduction
-
-```bash
-./target/release/Packet28 stack slice \
-  --input crash.log \
-  --max-failures 25 \
-  --json
-
-./target/release/Packet28 build reduce \
-  --input build.log \
-  --max-diagnostics 100 \
-  --json
-```
-
-### 6. Context Assembly, State, And Recall
-
-Assemble packets into a bounded context packet:
+Assemble multiple packets into a bounded context:
 
 ```bash
 ./target/release/Packet28 context assemble \
-  --packet a.json \
-  --packet b.json \
-  --budget-tokens 5000 \
-  --budget-bytes 32000 \
-  --json
-```
-
-Correlate packets for a task:
-
-```bash
-./target/release/Packet28 context correlate \
-  --packet a.json \
-  --packet b.json \
-  --task-id task-123 \
-  --json
-```
-
-Append and snapshot task state:
-
-```bash
-./target/release/Packet28 context state append \
-  --task-id task-123 \
-  --input event.json \
-  --root . \
-  --json
-
-./target/release/Packet28 context state snapshot \
-  --task-id task-123 \
-  --root . \
-  --json
-```
-
-Inspect persisted memory:
-
-```bash
-./target/release/Packet28 context store stats --root . --json
-./target/release/Packet28 context store list --root . --limit 20 --json
-./target/release/Packet28 context recall --root . --query "missing mappings parser" --limit 5 --json
-```
-
-### 7. Guard And Policy Checks
-
-Validate policy config:
-
-```bash
-./target/release/Packet28 guard validate --context-config context.yaml
-```
-
-Evaluate a packet against policy:
-
-```bash
-./target/release/Packet28 guard check \
-  --packet packet.json \
-  --context-config context.yaml \
-  --json
-```
-
-## Legacy Covy Workflow
-
-`covy` is still the shortest path for classic coverage automation. It currently supports:
-
-- `check`
-- `ingest`
-- `report`
-- `diff`
-- `testmap`
-- `impact`
-- `comment`
-- `annotate`
-- `pr`
-- `init`
-- `doctor`
-- `map-paths`
-- `shard`
-- `merge`
-- `github-comment`
-
-Typical flow:
-
-```mermaid
-flowchart LR
-  Reports["Coverage and SARIF inputs"] --> Ingest["covy ingest"]
-  Ingest --> State[".covy/state/*.bin"]
-  State --> Check["covy check or covy diff"]
-  Check --> Artifacts["report/comment/annotate/pr outputs"]
-  State --> Impact["covy impact / testmap / shard / merge"]
+  --packet cover.json --packet diff.json --packet map.json \
+  --budget-tokens 5000 --json
 ```
 
 ## Configuration
 
-`covy.toml` remains the shared config entry point for coverage, diff, path mapping, test impact, and shard planning. Start from:
+`covy.toml` is the shared config entry point:
 
-- `covy.toml.example`
+```toml
+[project]
+name = "my-project"
 
-Important sections:
+[ingest]
+report_paths = ["target/site/jacoco/jacoco.xml"]
+strip_prefixes = ["src/main/java/"]
 
-- `[ingest]` for report discovery and path normalization
-- `[diff]` for base/head refs
-- `[gate]` and `[gate.issues]` for thresholds
-- `[impact]` for testmap behavior
-- `[shard]` for planner defaults
-- `[paths]` for prefix stripping and replacement rules
+[diff]
+base = "origin/main"
+head = "HEAD"
 
-## Crate Groups
+[gate]
+fail_under_total = 80.0
+fail_under_changed = 90.0
 
-| Group | Crates |
-| --- | --- |
-| Coverage and ingestion | `covy-core`, `covy-ingest`, `suite-ingest` |
-| Diff and tests | `diffy-core`, `testy-core`, `testy-cli-common` |
-| Context runtime | `context-kernel-core`, `contextq-core`, `context-memory-core`, `context-scheduler-core` |
-| Reducers | `stacky-core`, `buildy-core`, `mapy-core`, `suite-proxy-core` |
-| Governance and contracts | `guardy-core`, `suite-policy-core`, `suite-foundation-core`, `suite-packet-core` |
-| CLI packages | `suite-cli`, `covy-cli`, `diffy-cli`, `testy-cli` |
-
-## Protocol And Design Docs
-
-- `docs/machine-output-contract.md`
-- `docs/wire-profiles.md`
-- `docs/packet-envelope-v1.md`
-- `docs/schema-registry.md`
-- `docs/context-store-v1.md`
-- `docs/ci-agent-examples.md`
-
-Schema artifacts live under:
-
-- `schemas/packet-wrapper/`
-- `schemas/packet-types/`
-- `schemas/snapshots/`
-
-## Benchmarks
-
-Coverage benchmark harnesses live under:
-
-- `benchmarks/`
-- `hyperfine/`
-
-Start with:
-
-```bash
-./benchmarks/run.sh
+[gate.issues]
+max_new_errors = 0
+max_new_warnings = 5
 ```
 
-## Repository Status
+Optional governance via `context.yaml` for policy-constrained execution. See `docs/` for protocol specifications.
 
-The repository name still reflects its coverage-tool origins, but the codebase now spans a broader packet and context runtime. If you are integrating with the current system, prefer `Packet28` and the shared `suite.packet.v1` machine contract first; use `covy`, `diffy`, and `testy` when you want a narrower workflow or compatibility surface.
+## Protocol Documentation
+
+| Document | Path |
+| --- | --- |
+| Machine output contract | `docs/machine-output-contract.md` |
+| Wire profiles (compact/full/handle) | `docs/wire-profiles.md` |
+| Packet envelope v1 spec | `docs/packet-envelope-v1.md` |
+| Schema registry | `docs/schema-registry.md` |
+| Context store v1 | `docs/context-store-v1.md` |
+| CI/agent integration examples | `docs/ci-agent-examples.md` |
+
+Schema artifacts: `schemas/packet-wrapper/`, `schemas/packet-types/`, `schemas/snapshots/`.
+
+## Project Stats
+
+- ~52K lines of Rust across 126 source files
+- 24 crates in the workspace
+- 69 end-to-end tests
+- 6 binaries (Packet28, packet28-agent, packet28d, covy, diffy, testy)
