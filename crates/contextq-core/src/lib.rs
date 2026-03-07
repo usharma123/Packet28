@@ -1457,6 +1457,10 @@ mod tests {
                     }],
                     event_count: 3,
                     last_event_at_unix: Some(3),
+                    latest_checkpoint_id: None,
+                    latest_checkpoint_at_unix: None,
+                    changed_paths_since_checkpoint: Vec::new(),
+                    changed_symbols_since_checkpoint: Vec::new(),
                 }),
                 ..AssembleOptions::default()
             },
