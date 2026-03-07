@@ -7,6 +7,7 @@ pub enum AgentStateEventKind {
     FocusCleared,
     FileRead,
     FileEdited,
+    CheckpointSaved,
     DecisionAdded,
     DecisionSuperseded,
     StepCompleted,
@@ -35,6 +36,11 @@ pub enum AgentStateEventData {
     FileEdited {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         regions: Vec<String>,
+    },
+    CheckpointSaved {
+        checkpoint_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     DecisionAdded {
         decision_id: String,
@@ -106,4 +112,12 @@ pub struct AgentSnapshotPayload {
     pub event_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_paths_since_checkpoint: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_symbols_since_checkpoint: Vec<String>,
 }

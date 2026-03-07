@@ -7,6 +7,7 @@ pub const PACKET_TYPE_TEST_IMPACT: &str = "suite.test.impact.v1";
 pub const PACKET_TYPE_AGENT_STATE: &str = "suite.agent.state.v1";
 pub const PACKET_TYPE_AGENT_SNAPSHOT: &str = "suite.agent.snapshot.v1";
 pub const PACKET_TYPE_CONTEXT_CORRELATE: &str = "suite.context.correlate.v1";
+pub const PACKET_TYPE_CONTEXT_MANAGE: &str = "suite.context.manage.v1";
 pub const PACKET_TYPE_STACK_SLICE: &str = "suite.stack.slice.v1";
 pub const PACKET_TYPE_BUILD_REDUCE: &str = "suite.build.reduce.v1";
 pub const PACKET_TYPE_MAP_REPO: &str = "suite.map.repo.v1";
@@ -115,6 +116,23 @@ static CONTRACTS: &[PacketTypeContract] = &[
         optional_payload_fields: &["task_id", "debug", "artifact_handle"],
         boundedness_rules: &["finding list bounded by deterministic rule set"],
         compatibility_notes: &["v1 deterministic cross-packet correlation contract"],
+    },
+    PacketTypeContract {
+        packet_type: PACKET_TYPE_CONTEXT_MANAGE,
+        required_payload_fields: &["task_id", "budget", "working_set", "eviction_candidates"],
+        optional_payload_fields: &[
+            "query",
+            "recommended_packets",
+            "recommended_actions",
+            "changed_paths_since_checkpoint",
+            "changed_symbols_since_checkpoint",
+            "open_questions",
+            "active_decisions",
+            "debug",
+            "artifact_handle",
+        ],
+        boundedness_rules: &["working set and eviction lists bounded by requested budgets"],
+        compatibility_notes: &["v1 task-scoped context management contract"],
     },
     PacketTypeContract {
         packet_type: PACKET_TYPE_STACK_SLICE,
