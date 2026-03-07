@@ -1,3 +1,5 @@
+pub mod agent_surface;
+pub mod cmd_agent_prompt;
 pub mod cmd_build;
 pub mod cmd_common;
 pub mod cmd_context;
@@ -13,6 +15,7 @@ pub mod cmd_preflight;
 pub mod cmd_proxy;
 pub mod cmd_shard;
 pub mod cmd_stack;
+pub mod packet28_agent;
 
 use std::path::Path;
 
@@ -25,7 +28,7 @@ use serde_json::{json, Value};
     name = "Packet28",
     version,
     about = "Umbrella platform CLI for suite domains",
-    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
+    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 preflight --task \"investigate flaky parser test\" --json=compact\n  Packet28 agent-prompt --format claude\n  Packet28 daemon status --root . --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
 )]
 pub struct Cli {
     /// Path to config file
@@ -72,6 +75,8 @@ pub enum Commands {
     Packet(cmd_packet::PacketArgs),
     /// Bounded agent preflight context for a natural-language task
     Preflight(cmd_preflight::PreflightArgs),
+    /// Emit repo-local agent instruction fragments that describe how to use Packet28
+    AgentPrompt(cmd_agent_prompt::AgentPromptArgs),
     /// Daemon lifecycle and task commands
     Daemon(cmd_daemon::DaemonArgs),
 }
@@ -275,6 +280,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
             cmd_packet::PacketCommands::Fetch(args) => cmd_packet::run_fetch(args),
         },
         Commands::Preflight(args) => cmd_preflight::run(args, &cli.config),
+        Commands::AgentPrompt(args) => cmd_agent_prompt::run(args),
         Commands::Daemon(daemon) => cmd_daemon::run(daemon),
     }
 }
@@ -516,7 +522,7 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
             "preflight",
         )),
         Commands::Preflight(_) => None,
-        Commands::Daemon(_) | Commands::Guard(_) => None,
+        Commands::Daemon(_) | Commands::Guard(_) | Commands::AgentPrompt(_) => None,
     }
 }
 

@@ -106,6 +106,7 @@ flowchart LR
 | Binary | Package | Purpose |
 | --- | --- | --- |
 | `Packet28` | `suite-cli` | Umbrella CLI for cover, diff, test, context, guard, stack, build, map, proxy, and packet flows |
+| `packet28-agent` | `suite-cli` | Thin wrapper that runs Packet28 preflight and then delegates to an external agent runtime |
 | `covy` | `covy-cli` | Coverage ingestion, reports, PR artifacts, path mapping, merge, doctor |
 | `diffy` | `diffy-cli` | Diff-focused gate analysis |
 | `testy` | `testy-cli` | Test impact, sharding, and testmap commands |
@@ -132,6 +133,9 @@ flowchart LR
 - `map repo`
 - `proxy run`
 - `packet fetch`
+- `preflight`
+- `agent-prompt`
+- `daemon`
 
 ## Execution Model
 
@@ -234,6 +238,20 @@ Run a diff gate through the umbrella CLI:
   --json
 ```
 
+Generate a Claude/Codex prompt fragment that teaches repo-local agents to use Packet28 preflight:
+
+```bash
+./target/release/Packet28 agent-prompt --format claude
+```
+
+Run preflight automatically before launching an agent runtime:
+
+```bash
+./target/release/packet28-agent \
+  --task "investigate flaky parser test" \
+  -- codex exec "review the failure"
+```
+
 Run the legacy coverage-first CLI:
 
 ```bash
@@ -245,6 +263,31 @@ Run the legacy coverage-first CLI:
 ```
 
 ## Common Workflows
+
+### 0. Agent Setup
+
+Milestone 1 is repo-local prompt integration plus the wrapper binary. It does not include an MCP server and does not write agent config files automatically.
+
+Generate fragments you can paste into agent config files:
+
+```bash
+./target/release/Packet28 agent-prompt --format claude
+./target/release/Packet28 agent-prompt --format agents
+./target/release/Packet28 agent-prompt --format cursor
+```
+
+Wrapper example:
+
+```bash
+./target/release/packet28-agent \
+  --task "review the latest parser regression" \
+  -- codex exec "debug the issue"
+```
+
+The wrapper persists the latest preflight payload under `.packet28/agent/latest-preflight.json` and exports:
+
+- `PACKET28_PREFLIGHT_PATH`
+- `PACKET28_ROOT`
 
 ### 1. Coverage Gate
 

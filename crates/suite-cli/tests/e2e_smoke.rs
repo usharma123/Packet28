@@ -10,6 +10,10 @@ fn suite_cmd() -> Command {
     assert_cmd::cargo::cargo_bin_cmd!("Packet28")
 }
 
+fn agent_cmd() -> Command {
+    assert_cmd::cargo::cargo_bin_cmd!("packet28-agent")
+}
+
 fn ensure_packet28d_built() {
     static BUILT: OnceLock<()> = OnceLock::new();
     BUILT.get_or_init(|| {
@@ -2610,6 +2614,139 @@ fn test_suite_preflight_via_daemon_composes_existing_remote_calls() {
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[test]
+fn test_suite_agent_prompt_outputs_all_supported_fragments() {
+    for format in ["claude", "agents", "cursor"] {
+        let output = suite_cmd()
+            .args(["agent-prompt", "--format", format])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(!rendered.trim().is_empty());
+        assert!(rendered.contains("Packet28 preflight"));
+        assert!(rendered.contains("--json=compact"));
+        assert!(rendered
+            .to_ascii_lowercase()
+            .contains("fall back to direct file reads"));
+    }
+}
+
+#[test]
+fn test_suite_agent_prompt_root_is_reflected_in_command_example() {
+    suite_cmd()
+        .args(["agent-prompt", "--format", "claude", "--root", "repo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--root \"repo\""));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_agent_persists_preflight_and_exports_env() {
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+    let env_dump = dir.path().join("env.txt");
+
+    agent_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--task",
+            "trace Alpha",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s\\n%s\\n' \"$PACKET28_ROOT\" \"$PACKET28_PREFLIGHT_PATH\" > \"$1\"",
+            "sh",
+            env_dump.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let persisted_path = dir
+        .path()
+        .join(".packet28")
+        .join("agent")
+        .join("latest-preflight.json");
+    assert!(persisted_path.exists());
+
+    let env_lines = fs::read_to_string(&env_dump)
+        .unwrap()
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        PathBuf::from(&env_lines[0]).canonicalize().unwrap(),
+        dir.path().canonicalize().unwrap()
+    );
+    assert_eq!(
+        PathBuf::from(&env_lines[1]).canonicalize().unwrap(),
+        persisted_path.canonicalize().unwrap()
+    );
+
+    let value = parse_preflight_response(&fs::read(&persisted_path).unwrap());
+    let selected = value
+        .get("selection")
+        .and_then(|selection| selection.get("selected_reducers"))
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(selected.contains(&"map"));
+    assert!(selected.contains(&"recall"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_agent_returns_child_exit_code() {
+    let dir = TempDir::new().unwrap();
+    setup_changed_repo(dir.path());
+
+    agent_cmd()
+        .current_dir(dir.path())
+        .args(["--task", "trace Alpha", "--", "sh", "-c", "exit 7"])
+        .assert()
+        .code(7);
+}
+
+#[test]
+fn test_packet28_agent_requires_child_command() {
+    agent_cmd()
+        .args(["--task", "review alpha.rs change"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Usage:"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_agent_preflight_failure_skips_child_process() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("child-ran.txt");
+    let state_dir = dir.path().join(".covy").join("state");
+    fs::create_dir_all(state_dir.join("latest.bin")).unwrap();
+
+    agent_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--task",
+            "fix coverage gap",
+            "--",
+            "sh",
+            "-c",
+            "touch \"$1\"",
+            "sh",
+            marker.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    assert!(!marker.exists());
 }
 
 #[test]

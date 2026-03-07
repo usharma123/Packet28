@@ -256,6 +256,11 @@ pub fn run_remote(args: PreflightArgs, config_path: &str, daemon_root: &Path) ->
     Ok(0)
 }
 
+pub(crate) fn execute_local_json(args: PreflightArgs, config_path: &str) -> Result<Value> {
+    let response = execute(args, config_path, ExecutionMode::Local)?;
+    serde_json::to_value(response).map_err(Into::into)
+}
+
 fn execute(
     args: PreflightArgs,
     config_path: &str,
