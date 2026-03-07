@@ -1654,7 +1654,8 @@ fn map_has_edge(
         else {
             return false;
         };
-        (left.contains(&from) && right.contains(&to)) || (left.contains(&to) && right.contains(&from))
+        (left.contains(&from) && right.contains(&to))
+            || (left.contains(&to) && right.contains(&from))
     })
 }
 
@@ -2615,18 +2616,10 @@ fn load_task_scoped_packets(
 ) -> Result<(Vec<KernelPacket>, Value), KernelError> {
     let workspace_root = kernel_workspace_root();
     let refs = input_packets_ref_query(input_packets);
-    let cache = ctx
-        .memory
-        .lock()
-        .map_err(|source| KernelError::CacheLock {
-            detail: source.to_string(),
-        })?;
-    let matches = cache.related_entries(
-        Some(task_id),
-        &refs.paths,
-        &refs.symbols,
-        &refs.tests,
-    );
+    let cache = ctx.memory.lock().map_err(|source| KernelError::CacheLock {
+        detail: source.to_string(),
+    })?;
+    let matches = cache.related_entries(Some(task_id), &refs.paths, &refs.symbols, &refs.tests);
     drop(cache);
 
     let mut packets = Vec::new();

@@ -687,15 +687,16 @@ impl PacketCache {
                         continue;
                     }
                     if let Some(entry) = self.entries_by_hash.get(cache_key).cloned() {
-                        let item = matches
-                            .entry(cache_key.clone())
-                            .or_insert_with(|| RelatedEntryMatch {
-                                entry,
-                                canonical_path_matches: Vec::new(),
-                                basename_path_matches: Vec::new(),
-                                symbol_matches: Vec::new(),
-                                test_matches: Vec::new(),
-                            });
+                        let item =
+                            matches
+                                .entry(cache_key.clone())
+                                .or_insert_with(|| RelatedEntryMatch {
+                                    entry,
+                                    canonical_path_matches: Vec::new(),
+                                    basename_path_matches: Vec::new(),
+                                    symbol_matches: Vec::new(),
+                                    test_matches: Vec::new(),
+                                });
                         if !item
                             .canonical_path_matches
                             .iter()
@@ -714,16 +715,18 @@ impl PacketCache {
                                     if !task_match_allowed(cache_key, task_keys.as_ref()) {
                                         continue;
                                     }
-                                    if let Some(entry) = self.entries_by_hash.get(cache_key).cloned()
+                                    if let Some(entry) =
+                                        self.entries_by_hash.get(cache_key).cloned()
                                     {
-                                        let item = matches
-                                            .entry(cache_key.clone())
-                                            .or_insert_with(|| RelatedEntryMatch {
-                                                entry,
-                                                canonical_path_matches: Vec::new(),
-                                                basename_path_matches: Vec::new(),
-                                                symbol_matches: Vec::new(),
-                                                test_matches: Vec::new(),
+                                        let item =
+                                            matches.entry(cache_key.clone()).or_insert_with(|| {
+                                                RelatedEntryMatch {
+                                                    entry,
+                                                    canonical_path_matches: Vec::new(),
+                                                    basename_path_matches: Vec::new(),
+                                                    symbol_matches: Vec::new(),
+                                                    test_matches: Vec::new(),
+                                                }
                                             });
                                         if !item
                                             .basename_path_matches
@@ -753,16 +756,20 @@ impl PacketCache {
                             continue;
                         }
                         if let Some(entry) = self.entries_by_hash.get(cache_key).cloned() {
-                            let item = matches
-                                .entry(cache_key.clone())
-                                .or_insert_with(|| RelatedEntryMatch {
+                            let item = matches.entry(cache_key.clone()).or_insert_with(|| {
+                                RelatedEntryMatch {
                                     entry,
                                     canonical_path_matches: Vec::new(),
                                     basename_path_matches: Vec::new(),
                                     symbol_matches: Vec::new(),
                                     test_matches: Vec::new(),
-                                });
-                            if !item.symbol_matches.iter().any(|existing| existing == candidate) {
+                                }
+                            });
+                            if !item
+                                .symbol_matches
+                                .iter()
+                                .any(|existing| existing == candidate)
+                            {
                                 item.symbol_matches.push(candidate.clone());
                             }
                         }
@@ -780,16 +787,20 @@ impl PacketCache {
                             continue;
                         }
                         if let Some(entry) = self.entries_by_hash.get(cache_key).cloned() {
-                            let item = matches
-                                .entry(cache_key.clone())
-                                .or_insert_with(|| RelatedEntryMatch {
+                            let item = matches.entry(cache_key.clone()).or_insert_with(|| {
+                                RelatedEntryMatch {
                                     entry,
                                     canonical_path_matches: Vec::new(),
                                     basename_path_matches: Vec::new(),
                                     symbol_matches: Vec::new(),
                                     test_matches: Vec::new(),
-                                });
-                            if !item.test_matches.iter().any(|existing| existing == candidate) {
+                                }
+                            });
+                            if !item
+                                .test_matches
+                                .iter()
+                                .any(|existing| existing == candidate)
+                            {
                                 item.test_matches.push(candidate.clone());
                             }
                         }
@@ -914,7 +925,8 @@ impl PacketCache {
             .cloned()
         {
             let normalized_needle = needle.to_ascii_lowercase();
-            if let Some(path_ref) = normalize_context_path(&needle, self.workspace_root.as_deref()) {
+            if let Some(path_ref) = normalize_context_path(&needle, self.workspace_root.as_deref())
+            {
                 if let Some(cache_keys) = self.file_ref_index.get(&path_ref.canonical) {
                     for cache_key in cache_keys {
                         candidate_scores.entry(cache_key.clone()).or_insert(0.0);
@@ -944,7 +956,8 @@ impl PacketCache {
                 }
             }
             for (canonical, cache_keys) in &self.file_ref_index {
-                if canonical.contains(&normalized_needle) || canonical.starts_with(&normalized_needle)
+                if canonical.contains(&normalized_needle)
+                    || canonical.starts_with(&normalized_needle)
                 {
                     for cache_key in cache_keys {
                         candidate_scores.entry(cache_key.clone()).or_insert(0.0);
@@ -957,7 +970,8 @@ impl PacketCache {
                 }
             }
             for (basename, canonicals) in &self.basename_alias_index {
-                if (basename.contains(&normalized_needle) || basename.starts_with(&normalized_needle))
+                if (basename.contains(&normalized_needle)
+                    || basename.starts_with(&normalized_needle))
                     && canonicals.len() == 1
                 {
                     for canonical in canonicals {
@@ -1413,7 +1427,10 @@ fn tokenize(input: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn normalize_context_path(raw: &str, workspace_root: Option<&Path>) -> Option<NormalizedPathRef> {
+pub fn normalize_context_path(
+    raw: &str,
+    workspace_root: Option<&Path>,
+) -> Option<NormalizedPathRef> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -1446,7 +1463,10 @@ pub fn normalize_context_path(raw: &str, workspace_root: Option<&Path>) -> Optio
         .map(str::trim)
         .filter(|basename| !basename.is_empty())
         .map(ToOwned::to_owned);
-    Some(NormalizedPathRef { canonical, basename })
+    Some(NormalizedPathRef {
+        canonical,
+        basename,
+    })
 }
 
 pub fn basename_alias(raw: &str) -> Option<String> {
@@ -1602,7 +1622,10 @@ fn collect_matches(
     matches
 }
 
-fn build_recall_document(entry: &PacketCacheEntry, workspace_root: Option<&Path>) -> RecallDocument {
+fn build_recall_document(
+    entry: &PacketCacheEntry,
+    workspace_root: Option<&Path>,
+) -> RecallDocument {
     let mut corpus = Vec::new();
     let mut summaries = Vec::new();
     let mut path_terms = Vec::new();
@@ -2051,26 +2074,12 @@ fn collect_ref_terms(
                 }
             }
             for child in map.values() {
-                collect_ref_terms(
-                    child,
-                    workspace_root,
-                    paths,
-                    path_basenames,
-                    symbols,
-                    tests,
-                );
+                collect_ref_terms(child, workspace_root, paths, path_basenames, symbols, tests);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_ref_terms(
-                    item,
-                    workspace_root,
-                    paths,
-                    path_basenames,
-                    symbols,
-                    tests,
-                );
+                collect_ref_terms(item, workspace_root, paths, path_basenames, symbols, tests);
             }
         }
         Value::String(text) => {
