@@ -81,5 +81,8 @@ Large domains must emit bounded compact payloads and use handle expansion:
 - `build reduce`
 - `context assemble`
 
+Compact `map repo` is a special case: the payload stays bounded, but ranked entries inline
+their `path`/`name` context so agents do not need to join opaque indices against envelope refs.
+
 ## Semantic Consistency Rule
 `compact`, `full`, and `handle` projections for the same semantic packet must preserve canonical `packet.hash`.

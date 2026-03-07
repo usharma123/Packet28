@@ -313,37 +313,39 @@ fn find_cache_hit(value: &Value) -> Option<bool> {
 
 fn compact_packet_payload(packet_type: &str, packet: &mut Value) {
     let mut stats = CompactStats::default();
-    {
-        let Some(payload) = packet.get_mut("payload") else {
-            return;
-        };
-        match packet_type {
-            suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE => {
-                compact_context_assemble_payload(payload, &mut stats)
+    match packet_type {
+        suite_packet_core::PACKET_TYPE_MAP_REPO => compact_map_repo_packet(packet, &mut stats),
+        _ => {
+            let Some(payload) = packet.get_mut("payload") else {
+                return;
+            };
+            match packet_type {
+                suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE => {
+                    compact_context_assemble_payload(payload, &mut stats)
+                }
+                suite_packet_core::PACKET_TYPE_DIFF_ANALYZE => {
+                    compact_diff_payload(payload, &mut stats)
+                }
+                suite_packet_core::PACKET_TYPE_TEST_IMPACT => {
+                    compact_test_impact_payload(payload, &mut stats)
+                }
+                suite_packet_core::PACKET_TYPE_STACK_SLICE => {
+                    compact_stack_slice_payload(payload, &mut stats)
+                }
+                suite_packet_core::PACKET_TYPE_BUILD_REDUCE => {
+                    compact_build_reduce_payload(payload, &mut stats)
+                }
+                suite_packet_core::PACKET_TYPE_PROXY_RUN => {
+                    compact_proxy_payload(payload, &mut stats)
+                }
+                suite_packet_core::PACKET_TYPE_GUARD_CHECK => {
+                    compact_guard_check_payload(payload, &mut stats)
+                }
+                suite_packet_core::PACKET_TYPE_COVER_CHECK => {
+                    compact_cover_check_payload(payload, &mut stats)
+                }
+                _ => compact_value(payload, 32, &mut stats),
             }
-            suite_packet_core::PACKET_TYPE_DIFF_ANALYZE => {
-                compact_diff_payload(payload, &mut stats)
-            }
-            suite_packet_core::PACKET_TYPE_TEST_IMPACT => {
-                compact_test_impact_payload(payload, &mut stats)
-            }
-            suite_packet_core::PACKET_TYPE_STACK_SLICE => {
-                compact_stack_slice_payload(payload, &mut stats)
-            }
-            suite_packet_core::PACKET_TYPE_BUILD_REDUCE => {
-                compact_build_reduce_payload(payload, &mut stats)
-            }
-            suite_packet_core::PACKET_TYPE_MAP_REPO => {
-                compact_map_repo_payload(payload, &mut stats)
-            }
-            suite_packet_core::PACKET_TYPE_PROXY_RUN => compact_proxy_payload(payload, &mut stats),
-            suite_packet_core::PACKET_TYPE_GUARD_CHECK => {
-                compact_guard_check_payload(payload, &mut stats)
-            }
-            suite_packet_core::PACKET_TYPE_COVER_CHECK => {
-                compact_cover_check_payload(payload, &mut stats)
-            }
-            _ => compact_value(payload, 32, &mut stats),
         }
     }
     compact_packet_envelope(packet_type, packet, &mut stats);
@@ -579,33 +581,95 @@ fn compact_build_reduce_payload(payload: &mut Value, stats: &mut CompactStats) {
     }
 }
 
-fn compact_map_repo_payload(payload: &mut Value, stats: &mut CompactStats) {
+fn compact_map_repo_packet(packet: &mut Value, stats: &mut CompactStats) {
+    let file_refs = packet
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let symbol_refs = packet
+        .get("symbols")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let Some(payload) = packet.get_mut("payload") else {
+        return;
+    };
     let Some(map) = payload.as_object_mut() else {
         compact_value(payload, 12, stats);
         return;
     };
     remove_field(map, "debug", stats);
+
     if let Some(Value::Array(files)) = map.get_mut("files_ranked") {
         cap_array(files, 2, stats);
         for file in files {
             let Some(file_map) = file.as_object_mut() else {
                 continue;
             };
-            remove_field(file_map, "import_count", stats);
-            remove_field(file_map, "symbol_count", stats);
-            remove_field(file_map, "score", stats);
+            let Some(file_idx) = file_map
+                .get("file_idx")
+                .and_then(Value::as_u64)
+                .map(|idx| idx as usize)
+            else {
+                continue;
+            };
+            let Some(path) = file_refs
+                .get(file_idx)
+                .and_then(|file| file.get("path"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            file_map.insert("path".to_string(), Value::String(path.to_string()));
         }
     }
+
     if let Some(Value::Array(symbols)) = map.get_mut("symbols_ranked") {
         cap_array(symbols, 4, stats);
         for symbol in symbols {
             let Some(symbol_map) = symbol.as_object_mut() else {
                 continue;
             };
-            remove_field(symbol_map, "file_idx", stats);
-            remove_field(symbol_map, "score", stats);
+
+            if let Some(symbol_idx) = symbol_map
+                .get("symbol_idx")
+                .and_then(Value::as_u64)
+                .map(|idx| idx as usize)
+            {
+                if let Some(name) = symbol_refs
+                    .get(symbol_idx)
+                    .and_then(|symbol| symbol.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    symbol_map.insert("name".to_string(), Value::String(name.to_string()));
+                }
+                if let Some(kind) = symbol_refs
+                    .get(symbol_idx)
+                    .and_then(|symbol| symbol.get("kind"))
+                    .and_then(Value::as_str)
+                {
+                    symbol_map.insert("kind".to_string(), Value::String(kind.to_string()));
+                }
+            }
+
+            if let Some(file_idx) = symbol_map
+                .get("file_idx")
+                .and_then(Value::as_u64)
+                .map(|idx| idx as usize)
+            {
+                if let Some(path) = file_refs
+                    .get(file_idx)
+                    .and_then(|file| file.get("path"))
+                    .and_then(Value::as_str)
+                {
+                    symbol_map.insert("file".to_string(), Value::String(path.to_string()));
+                }
+            }
         }
     }
+
     if let Some(Value::Array(edges)) = map.get_mut("edges") {
         if edges.is_empty() {
             map.remove("edges");
@@ -613,25 +677,74 @@ fn compact_map_repo_payload(payload: &mut Value, stats: &mut CompactStats) {
             stats.total_count += 1;
         } else {
             cap_array(edges, 4, stats);
+            for edge in edges {
+                let Some(edge_map) = edge.as_object_mut() else {
+                    continue;
+                };
+                if let Some(from_idx) = edge_map
+                    .get("from_file_idx")
+                    .and_then(Value::as_u64)
+                    .map(|idx| idx as usize)
+                {
+                    if let Some(path) = file_refs
+                        .get(from_idx)
+                        .and_then(|file| file.get("path"))
+                        .and_then(Value::as_str)
+                    {
+                        edge_map.insert("from".to_string(), Value::String(path.to_string()));
+                    }
+                }
+                if let Some(to_idx) = edge_map
+                    .get("to_file_idx")
+                    .and_then(Value::as_u64)
+                    .map(|idx| idx as usize)
+                {
+                    if let Some(path) = file_refs
+                        .get(to_idx)
+                        .and_then(|file| file.get("path"))
+                        .and_then(Value::as_str)
+                    {
+                        edge_map.insert("to".to_string(), Value::String(path.to_string()));
+                    }
+                }
+            }
         }
     }
+
     if let Some(Value::Array(hits)) = map.get_mut("focus_hits") {
         cap_array(hits, 2, stats);
         for hit in hits {
             let Some(hit_map) = hit.as_object_mut() else {
                 continue;
             };
-            remove_field(hit_map, "kind", stats);
-        }
-    }
-    if let Some(Value::Object(truncation)) = map.get_mut("truncation") {
-        let all_zero = truncation
-            .values()
-            .all(|value| value.as_u64().unwrap_or_default() == 0);
-        if all_zero {
-            map.remove("truncation");
-            stats.truncated = true;
-            stats.total_count += 1;
+            let Some(ref_idx) = hit_map
+                .get("ref_idx")
+                .and_then(Value::as_u64)
+                .map(|idx| idx as usize)
+            else {
+                continue;
+            };
+            match hit_map.get("kind").and_then(Value::as_str) {
+                Some("file") => {
+                    if let Some(path) = file_refs
+                        .get(ref_idx)
+                        .and_then(|file| file.get("path"))
+                        .and_then(Value::as_str)
+                    {
+                        hit_map.insert("value".to_string(), Value::String(path.to_string()));
+                    }
+                }
+                Some("symbol") => {
+                    if let Some(name) = symbol_refs
+                        .get(ref_idx)
+                        .and_then(|symbol| symbol.get("name"))
+                        .and_then(Value::as_str)
+                    {
+                        hit_map.insert("value".to_string(), Value::String(name.to_string()));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }

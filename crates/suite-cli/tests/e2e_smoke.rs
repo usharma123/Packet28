@@ -1420,7 +1420,17 @@ fn test_suite_map_repo_json_smoke() {
         .and_then(|p| p.get("files_ranked"))
         .and_then(Value::as_array)
         .and_then(|arr| arr.first())
-        .and_then(|v| v.get("file_idx"))
+        .and_then(|v| v.get("path"))
+        .and_then(Value::as_str)
+        .is_some());
+    assert!(value
+        .get("packet")
+        .and_then(|p| p.get("payload"))
+        .and_then(|p| p.get("symbols_ranked"))
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str)
         .is_some());
 }
 
@@ -2026,6 +2036,21 @@ fn test_suite_map_repo_profiles_and_handle_fetch_share_hash() {
         .and_then(|packet| packet.get("hash"))
         .and_then(Value::as_str)
         .unwrap();
+    assert!(packet_payload(&compact)
+        .get("files_ranked")
+        .and_then(Value::as_array)
+        .and_then(|files| files.first())
+        .and_then(|file| file.get("path"))
+        .and_then(Value::as_str)
+        .is_some());
+    assert!(packet_payload(&compact)
+        .get("symbols_ranked")
+        .and_then(Value::as_array)
+        .and_then(|symbols| symbols.first())
+        .and_then(|symbol| symbol.get("name"))
+        .and_then(Value::as_str)
+        .is_some());
+
     let full_hash = full
         .get("packet")
         .and_then(|packet| packet.get("hash"))
@@ -2043,6 +2068,13 @@ fn test_suite_map_repo_profiles_and_handle_fetch_share_hash() {
         .get("artifact_handle")
         .cloned()
         .unwrap();
+    assert!(packet_payload(&handle)
+        .get("files_ranked")
+        .and_then(Value::as_array)
+        .and_then(|files| files.first())
+        .and_then(|file| file.get("path"))
+        .and_then(Value::as_str)
+        .is_some());
     let handle_id = artifact_handle
         .get("handle_id")
         .and_then(Value::as_str)
