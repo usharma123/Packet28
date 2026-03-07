@@ -129,7 +129,7 @@ pub enum GuardCommands {
 
 #[derive(Args)]
 #[command(
-    after_help = "Examples:\n  Packet28 context assemble --packet a.json --packet b.json --context-config context.yaml\n  Packet28 context store list --root . --limit 20\n  Packet28 context recall --query \"what changed in parser\" --limit 5"
+    after_help = "Examples:\n  Packet28 context assemble --packet a.json --packet b.json --context-config context.yaml\n  Packet28 context store list --root . --limit 20\n  Packet28 context recall --query \"what changed in parser\" --limit 5\n  Packet28 context manage --task-id task-123 --budget-tokens 4000 --budget-bytes 32000"
 )]
 pub struct ContextArgs {
     #[command(subcommand)]
@@ -143,6 +143,8 @@ pub enum ContextCommands {
     Assemble(cmd_context::AssembleArgs),
     /// Correlate multiple packets into a synthesized insight packet
     Correlate(cmd_context::CorrelateArgs),
+    /// Produce budget-aware task context management guidance
+    Manage(cmd_context::ManageArgs),
     /// Write and inspect agent task state
     State(cmd_context::StateArgs),
     /// Query and manage persisted context store entries
@@ -249,6 +251,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         Commands::Context(context) => match context.command {
             ContextCommands::Assemble(args) => cmd_context::run_assemble(args),
             ContextCommands::Correlate(args) => cmd_context::run_correlate(args),
+            ContextCommands::Manage(args) => cmd_context::run_manage(args),
             ContextCommands::State(args) => cmd_context::run_state(args),
             ContextCommands::Store(args) => cmd_context::run_store(args),
             ContextCommands::Recall(args) => cmd_context::run_recall(args),
@@ -369,6 +372,14 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
                     command: "Packet28 context correlate".to_string(),
                     pretty: args.pretty_output(),
                     target: Some("contextq.correlate".to_string()),
+                    retry_hint: None,
+                })
+            }
+            ContextCommands::Manage(args) if args.machine_output_requested() => {
+                Some(MachineErrorContext {
+                    command: "Packet28 context manage".to_string(),
+                    pretty: args.pretty_output(),
+                    target: Some("contextq.manage".to_string()),
                     retry_hint: None,
                 })
             }

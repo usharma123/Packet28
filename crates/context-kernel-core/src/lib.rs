@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use context_memory_core::{CachePacket, DeltaReuseHooks, NoopDeltaReuseHooks, PacketCache};
+use context_memory_core::{
+    basename_alias, normalize_context_path, CachePacket, DeltaReuseHooks, NoopDeltaReuseHooks,
+    PacketCache, RecallHit, RecallOptions, RecallScope,
+};
 
 pub use context_memory_core::PersistConfig;
 
@@ -103,6 +106,7 @@ pub struct KernelStepRequest {
     pub policy_context: Value,
     pub reducer_input: Value,
     pub budget: ExecutionBudget,
+    pub reactive: Option<KernelStepReactiveConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -174,6 +178,25 @@ pub struct ReactiveSequenceConfig {
     pub enabled: bool,
     pub task_id: Option<String>,
     pub append_focused_map: bool,
+    pub mode: ReactiveReplanMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReactiveReplanMode {
+    #[default]
+    Basic,
+    TaskAware,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct KernelStepReactiveConfig {
+    pub event_kinds: Vec<suite_packet_core::AgentStateEventKind>,
+    pub path_globs: Vec<String>,
+    pub rerun_on_focus_change: bool,
+    pub skip_if_inputs_unchanged: bool,
+    pub produces_focus: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +217,39 @@ pub struct KernelSequenceResponse {
     pub step_results: Vec<KernelStepResponse>,
     pub metadata: Value,
 }
+
+pub trait SequenceObserver {
+    fn on_step_started(&mut self, _position: usize, _step: &KernelStepRequest) {}
+
+    fn on_step_completed(
+        &mut self,
+        _position: usize,
+        _step: &KernelStepRequest,
+        _response: &KernelResponse,
+    ) {
+    }
+
+    fn on_step_failed(
+        &mut self,
+        _position: usize,
+        _step: &KernelStepRequest,
+        _failure: &KernelFailure,
+    ) {
+    }
+
+    fn on_replan_applied(
+        &mut self,
+        _after_step: Option<&str>,
+        _event_count: usize,
+        _applied_mutations: &Value,
+    ) {
+    }
+}
+
+#[derive(Default)]
+pub struct NoopSequenceObserver;
+
+impl SequenceObserver for NoopSequenceObserver {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelResponse {
@@ -401,6 +457,20 @@ impl ExecutionContext {
                 detail: source.to_string(),
             })?;
         Ok(cache.entries())
+    }
+
+    pub fn cache_recall(
+        &self,
+        query: &str,
+        options: &RecallOptions,
+    ) -> Result<Vec<RecallHit>, KernelError> {
+        let cache = self
+            .memory
+            .lock()
+            .map_err(|source| KernelError::CacheLock {
+                detail: source.to_string(),
+            })?;
+        Ok(cache.recall(query, options))
     }
 }
 
@@ -711,6 +781,15 @@ impl Kernel {
         &self,
         req: KernelSequenceRequest,
     ) -> Result<KernelSequenceResponse, KernelError> {
+        let mut observer = NoopSequenceObserver;
+        self.execute_sequence_with_observer(req, &mut observer)
+    }
+
+    pub fn execute_sequence_with_observer(
+        &self,
+        req: KernelSequenceRequest,
+        observer: &mut dyn SequenceObserver,
+    ) -> Result<KernelSequenceResponse, KernelError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let req = normalize_sequence_request(req)?;
         let task_id = resolve_sequence_task_id(&req);
@@ -737,6 +816,7 @@ impl Kernel {
                     &original_steps,
                     &snapshot,
                     &completed_success,
+                    reactive.mode,
                     reactive.append_focused_map,
                     None,
                 );
@@ -764,6 +844,11 @@ impl Kernel {
                         "event_count": snapshot.event_count,
                         "applied_mutations": applied.applied,
                     }));
+                    observer.on_replan_applied(
+                        None,
+                        snapshot.event_count,
+                        replans.last().unwrap_or(&Value::Null),
+                    );
                 }
             }
         }
@@ -814,6 +899,8 @@ impl Kernel {
                 .position(|step| step.id == next_step_id)
                 .expect("scheduled step must exist in remaining plan");
             let original = remaining.remove(next_idx);
+            let position = scheduled.len() + 1;
+            observer.on_step_started(position, &original);
             let estimate = kernel_step_estimate(&original);
             consumed_estimate = context_scheduler_core::StepEstimate {
                 tokens: consumed_estimate.tokens.saturating_add(estimate.tokens),
@@ -843,6 +930,7 @@ impl Kernel {
                     scheduled.push(original.id.clone());
                     completed_success.insert(original.id.clone());
                     remove_satisfied_dependency(&mut remaining, &original.id);
+                    observer.on_step_completed(position, &original, &response);
                     step_results.push(KernelStepResponse {
                         id: original.id.clone(),
                         target: original.target.clone(),
@@ -860,6 +948,7 @@ impl Kernel {
                                     &original_steps,
                                     &snapshot,
                                     &completed_success,
+                                    reactive.mode,
                                     reactive.append_focused_map,
                                     Some(&original.id),
                                 );
@@ -888,6 +977,11 @@ impl Kernel {
                                         "event_count": snapshot.event_count,
                                         "applied_mutations": applied.applied,
                                     }));
+                                    observer.on_replan_applied(
+                                        Some(&original.id),
+                                        snapshot.event_count,
+                                        replans.last().unwrap_or(&Value::Null),
+                                    );
                                 }
                                 last_event_count = snapshot.event_count;
                             }
@@ -895,13 +989,15 @@ impl Kernel {
                     }
                 }
                 Err(err) => {
+                    let failure = err.structured();
+                    observer.on_step_failed(position, &original, &failure);
                     let failed_dependents = remove_failed_dependents(&mut remaining, &original.id);
                     step_results.push(KernelStepResponse {
                         id: original.id.clone(),
                         target: original.target.clone(),
                         status: "failed".to_string(),
                         response: None,
-                        failure: Some(err.structured()),
+                        failure: Some(failure),
                     });
                     for skipped_step in failed_dependents {
                         skipped.push(skipped_step.id.clone());
@@ -972,6 +1068,7 @@ pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("agenty.state.write", run_agenty_state_write);
     kernel.register_reducer("agenty.state.snapshot", run_agenty_state_snapshot);
     kernel.register_reducer("contextq.correlate", run_contextq_correlate);
+    kernel.register_reducer("contextq.manage", run_contextq_manage);
     kernel.register_reducer("contextq.assemble", run_contextq_assemble);
     kernel.register_reducer("governed.assemble", run_governed_assemble);
     kernel.register_reducer("guardy.check", run_guardy_check);
@@ -1002,6 +1099,30 @@ struct ContextAssembleEnvelopePayload {
 #[serde(default)]
 struct AgentSnapshotRequest {
     task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ContextManageRequest {
+    task_id: String,
+    query: Option<String>,
+    budget_tokens: u64,
+    budget_bytes: usize,
+    scope: RecallScope,
+    checkpoint_id: Option<String>,
+}
+
+impl Default for ContextManageRequest {
+    fn default() -> Self {
+        Self {
+            task_id: String::new(),
+            query: None,
+            budget_tokens: contextq_core::DEFAULT_BUDGET_TOKENS,
+            budget_bytes: contextq_core::DEFAULT_BUDGET_BYTES,
+            scope: RecallScope::TaskFirst,
+            checkpoint_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1334,6 +1455,7 @@ fn build_context_correlation_packet(
     target: &str,
     task_id: Option<String>,
     findings: Vec<suite_packet_core::ContextCorrelationFinding>,
+    debug: Option<Value>,
 ) -> Result<
     (
         suite_packet_core::EnvelopeV1<suite_packet_core::ContextCorrelationPayload>,
@@ -1345,6 +1467,7 @@ fn build_context_correlation_packet(
         task_id,
         finding_count: findings.len(),
         findings,
+        debug,
     };
     let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default().len();
     let mut files = BTreeSet::new();
@@ -1473,19 +1596,22 @@ fn parse_correlatable_packet<T: DeserializeOwned + Default>(
 }
 
 fn diff_changed_files(packet: &CorrelatablePacket<DiffAnalyzeKernelOutput>) -> BTreeSet<String> {
+    let workspace_root = kernel_workspace_root();
     let from_payload = packet
         .envelope
         .payload
         .diffs
         .iter()
-        .map(|diff| diff.path.clone())
+        .filter_map(|diff| normalize_context_path(&diff.path, workspace_root.as_deref()))
+        .map(|path| path.canonical)
         .collect::<BTreeSet<_>>();
     if from_payload.is_empty() {
         packet
             .envelope
             .files
             .iter()
-            .map(|file| file.path.clone())
+            .filter_map(|file| normalize_context_path(&file.path, workspace_root.as_deref()))
+            .map(|path| path.canonical)
             .collect()
     } else {
         from_payload
@@ -1493,11 +1619,13 @@ fn diff_changed_files(packet: &CorrelatablePacket<DiffAnalyzeKernelOutput>) -> B
 }
 
 fn packet_files<T>(packet: &CorrelatablePacket<T>) -> BTreeSet<String> {
+    let workspace_root = kernel_workspace_root();
     packet
         .envelope
         .files
         .iter()
-        .map(|file| file.path.clone())
+        .filter_map(|file| normalize_context_path(&file.path, workspace_root.as_deref()))
+        .map(|path| path.canonical)
         .collect()
 }
 
@@ -1506,12 +1634,14 @@ fn map_has_edge(
     left: &BTreeSet<String>,
     right: &BTreeSet<String>,
 ) -> bool {
+    let workspace_root = kernel_workspace_root();
     packet.envelope.payload.edges.iter().any(|edge| {
         let Some(from) = packet
             .envelope
             .files
             .get(edge.from_file_idx)
-            .map(|file| &file.path)
+            .and_then(|file| normalize_context_path(&file.path, workspace_root.as_deref()))
+            .map(|path| path.canonical)
         else {
             return false;
         };
@@ -1519,17 +1649,18 @@ fn map_has_edge(
             .envelope
             .files
             .get(edge.to_file_idx)
-            .map(|file| &file.path)
+            .and_then(|file| normalize_context_path(&file.path, workspace_root.as_deref()))
+            .map(|path| path.canonical)
         else {
             return false;
         };
-        (left.contains(from) && right.contains(to)) || (left.contains(to) && right.contains(from))
+        (left.contains(&from) && right.contains(&to)) || (left.contains(&to) && right.contains(&from))
     })
 }
 
 fn evidence_file_refs(
     packet_id: &Option<String>,
-    packet_type: &'static str,
+    packet_type: &str,
     values: impl IntoIterator<Item = String>,
 ) -> Vec<suite_packet_core::CorrelationEvidenceRef> {
     values
@@ -1543,9 +1674,228 @@ fn evidence_file_refs(
         .collect()
 }
 
+#[derive(Clone, Default)]
+struct NormalizedCorrelationPacket {
+    packet_id: Option<String>,
+    packet_type: String,
+    tool: String,
+    kind: String,
+    files: BTreeSet<String>,
+    file_basenames: BTreeSet<String>,
+    symbols: BTreeSet<String>,
+    tests: BTreeSet<String>,
+    map_edges: Vec<(String, String)>,
+}
+
+fn packet_type_for(tool: &str, kind: &str) -> String {
+    match (tool, kind) {
+        ("diffy", "diff_analyze") => suite_packet_core::PACKET_TYPE_DIFF_ANALYZE.to_string(),
+        ("testy", "test_impact") => suite_packet_core::PACKET_TYPE_TEST_IMPACT.to_string(),
+        ("stacky", "stack_slice") => suite_packet_core::PACKET_TYPE_STACK_SLICE.to_string(),
+        ("buildy", "build_reduce") => suite_packet_core::PACKET_TYPE_BUILD_REDUCE.to_string(),
+        ("mapy", "repo_map") => suite_packet_core::PACKET_TYPE_MAP_REPO.to_string(),
+        ("agenty", "agent_snapshot") => suite_packet_core::PACKET_TYPE_AGENT_SNAPSHOT.to_string(),
+        ("agenty", "agent_state") => suite_packet_core::PACKET_TYPE_AGENT_STATE.to_string(),
+        ("contextq", "context_correlate") => {
+            suite_packet_core::PACKET_TYPE_CONTEXT_CORRELATE.to_string()
+        }
+        ("contextq", "context_manage") => suite_packet_core::PACKET_TYPE_CONTEXT_MANAGE.to_string(),
+        ("contextq", "context_assemble") => {
+            suite_packet_core::PACKET_TYPE_CONTEXT_ASSEMBLE.to_string()
+        }
+        _ => format!("suite.{tool}.{kind}.v1"),
+    }
+}
+
+fn kernel_workspace_root() -> Option<PathBuf> {
+    std::env::current_dir().ok()
+}
+
+fn normalize_correlation_packet(packet: &KernelPacket) -> Option<NormalizedCorrelationPacket> {
+    let value = extract_packet_value(&packet.body);
+    let tool = value.get("tool").and_then(Value::as_str)?.to_string();
+    let kind = value.get("kind").and_then(Value::as_str)?.to_string();
+    let packet_type = packet_type_for(&tool, &kind);
+    let workspace_root = kernel_workspace_root();
+    let mut files = BTreeSet::new();
+    let mut file_basenames = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    let mut tests = BTreeSet::new();
+    let mut map_edges = Vec::new();
+
+    if let Some(file_refs) = value.get("files").and_then(Value::as_array) {
+        for file in file_refs {
+            if let Some(path) = file.get("path").and_then(Value::as_str) {
+                if let Some(path) = normalize_context_path(path, workspace_root.as_deref()) {
+                    files.insert(path.canonical.clone());
+                    if let Some(basename) = path.basename {
+                        file_basenames.insert(basename);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(symbol_refs) = value.get("symbols").and_then(Value::as_array) {
+        for symbol in symbol_refs {
+            if let Some(name) = symbol.get("name").and_then(Value::as_str) {
+                symbols.insert(name.to_string());
+            }
+        }
+    }
+    collect_packet_refs(
+        value.get("payload").unwrap_or(&value),
+        workspace_root.as_deref(),
+        &mut files,
+        &mut symbols,
+        &mut tests,
+    );
+
+    if tool == "mapy" && kind == "repo_map" {
+        if let (Some(payload), Some(file_refs)) = (
+            value.get("payload").and_then(Value::as_object),
+            value.get("files").and_then(Value::as_array),
+        ) {
+            if let Some(edges) = payload.get("edges").and_then(Value::as_array) {
+                for edge in edges {
+                    let Some(from_idx) = edge.get("from_file_idx").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let Some(to_idx) = edge.get("to_file_idx").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let Some(from) = file_refs
+                        .get(from_idx as usize)
+                        .and_then(|file| file.get("path"))
+                        .and_then(Value::as_str)
+                        .and_then(|path| normalize_context_path(path, workspace_root.as_deref()))
+                    else {
+                        continue;
+                    };
+                    let Some(to) = file_refs
+                        .get(to_idx as usize)
+                        .and_then(|file| file.get("path"))
+                        .and_then(Value::as_str)
+                        .and_then(|path| normalize_context_path(path, workspace_root.as_deref()))
+                    else {
+                        continue;
+                    };
+                    map_edges.push((from.canonical, to.canonical));
+                }
+            }
+        }
+    }
+
+    Some(NormalizedCorrelationPacket {
+        packet_id: packet.packet_id.clone(),
+        packet_type,
+        tool,
+        kind,
+        files,
+        file_basenames,
+        symbols,
+        tests,
+        map_edges,
+    })
+}
+
+fn collect_packet_refs(
+    value: &Value,
+    workspace_root: Option<&Path>,
+    files: &mut BTreeSet<String>,
+    symbols: &mut BTreeSet<String>,
+    tests: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(path) = map.get("path").and_then(Value::as_str) {
+                if let Some(path) = normalize_context_path(path, workspace_root) {
+                    files.insert(path.canonical);
+                }
+            }
+            if let Some(file) = map.get("file").and_then(Value::as_str) {
+                if let Some(path) = normalize_context_path(file, workspace_root) {
+                    files.insert(path.canonical);
+                }
+            }
+            if let Some(name) = map.get("name").and_then(Value::as_str) {
+                symbols.insert(name.to_ascii_lowercase());
+            }
+            if let Some(test_id) = map.get("test_id").and_then(Value::as_str) {
+                tests.insert(test_id.to_ascii_lowercase());
+            }
+            if map
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
+            {
+                if let Some(value) = map.get("value").and_then(Value::as_str) {
+                    if let Some(path) = normalize_context_path(value, workspace_root) {
+                        files.insert(path.canonical);
+                    }
+                }
+            }
+            if map
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("symbol"))
+            {
+                if let Some(value) = map.get("value").and_then(Value::as_str) {
+                    symbols.insert(value.to_ascii_lowercase());
+                }
+            }
+            if let Some(selected_tests) = map.get("selected_tests").and_then(Value::as_array) {
+                for test in selected_tests {
+                    if let Some(test) = test.as_str() {
+                        tests.insert(test.to_ascii_lowercase());
+                    }
+                }
+            }
+            for child in map.values() {
+                collect_packet_refs(child, workspace_root, files, symbols, tests);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_packet_refs(item, workspace_root, files, symbols, tests);
+            }
+        }
+        Value::String(text) => {
+            if let Some(path) = normalize_context_path(text, workspace_root) {
+                files.insert(path.canonical);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dedupe_findings(
+    findings: Vec<suite_packet_core::ContextCorrelationFinding>,
+) -> Vec<suite_packet_core::ContextCorrelationFinding> {
+    let mut deduped = HashMap::<String, suite_packet_core::ContextCorrelationFinding>::new();
+    for finding in findings {
+        let mut evidence = finding
+            .evidence_refs
+            .iter()
+            .map(|item| format!("{}:{}:{}", item.packet_type, item.kind, item.value))
+            .collect::<Vec<_>>();
+        evidence.sort();
+        let key = format!(
+            "{}|{}|{}",
+            finding.rule,
+            finding.relation,
+            evidence.join("|")
+        );
+        deduped.entry(key).or_insert(finding);
+    }
+    let mut values = deduped.into_values().collect::<Vec<_>>();
+    values.sort_by(|a, b| a.rule.cmp(&b.rule).then_with(|| a.summary.cmp(&b.summary)));
+    values
+}
+
 fn correlate_packets(
     input_packets: &[KernelPacket],
     task_id: Option<String>,
+    snapshot: Option<&suite_packet_core::AgentSnapshotPayload>,
 ) -> Vec<suite_packet_core::ContextCorrelationFinding> {
     let diffs = input_packets
         .iter()
@@ -1723,10 +2073,262 @@ fn correlate_packets(
         }
     }
 
-    if findings.is_empty() && task_id.is_some() {
-        Vec::new()
+    let normalized = input_packets
+        .iter()
+        .filter_map(normalize_correlation_packet)
+        .collect::<Vec<_>>();
+    let basename_counts = normalized
+        .iter()
+        .flat_map(|packet| packet.file_basenames.iter().cloned())
+        .fold(HashMap::<String, usize>::new(), |mut counts, basename| {
+            *counts.entry(basename).or_insert(0) += 1;
+            counts
+        });
+
+    for (idx, left) in normalized.iter().enumerate() {
+        for right in normalized.iter().skip(idx + 1) {
+            let shared_files = left
+                .files
+                .intersection(&right.files)
+                .cloned()
+                .collect::<Vec<_>>();
+            let shared_basenames = if shared_files.is_empty() {
+                left.file_basenames
+                    .intersection(&right.file_basenames)
+                    .filter(|basename| basename_counts.get(*basename) == Some(&2))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if !shared_files.is_empty() || !shared_basenames.is_empty() {
+                let mut evidence_refs =
+                    evidence_file_refs(&left.packet_id, &left.packet_type, shared_files.clone());
+                evidence_refs.extend(evidence_file_refs(
+                    &right.packet_id,
+                    &right.packet_type,
+                    shared_files.clone(),
+                ));
+                if shared_files.is_empty() {
+                    evidence_refs.extend(shared_basenames.iter().map(|value| {
+                        suite_packet_core::CorrelationEvidenceRef {
+                            packet_id: left.packet_id.clone(),
+                            packet_type: left.packet_type.clone(),
+                            kind: "file_basename".to_string(),
+                            value: value.clone(),
+                        }
+                    }));
+                    evidence_refs.extend(shared_basenames.iter().map(|value| {
+                        suite_packet_core::CorrelationEvidenceRef {
+                            packet_id: right.packet_id.clone(),
+                            packet_type: right.packet_type.clone(),
+                            kind: "file_basename".to_string(),
+                            value: value.clone(),
+                        }
+                    }));
+                }
+                findings.push(suite_packet_core::ContextCorrelationFinding {
+                    rule: "shared_file".to_string(),
+                    relation: "related".to_string(),
+                    confidence: if shared_files.is_empty() { 0.58 } else { 0.74 },
+                    summary: if shared_files.is_empty() {
+                        format!(
+                            "Packets share unique file basenames: {}",
+                            shared_basenames.join(", ")
+                        )
+                    } else {
+                        format!("Packets share files: {}", shared_files.join(", "))
+                    },
+                    evidence_refs,
+                });
+            }
+
+            let shared_symbols = left
+                .symbols
+                .intersection(&right.symbols)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !shared_symbols.is_empty() {
+                let mut evidence_refs = shared_symbols
+                    .iter()
+                    .map(|value| suite_packet_core::CorrelationEvidenceRef {
+                        packet_id: left.packet_id.clone(),
+                        packet_type: left.packet_type.clone(),
+                        kind: "symbol".to_string(),
+                        value: value.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                evidence_refs.extend(shared_symbols.iter().map(|value| {
+                    suite_packet_core::CorrelationEvidenceRef {
+                        packet_id: right.packet_id.clone(),
+                        packet_type: right.packet_type.clone(),
+                        kind: "symbol".to_string(),
+                        value: value.clone(),
+                    }
+                }));
+                findings.push(suite_packet_core::ContextCorrelationFinding {
+                    rule: "shared_symbol".to_string(),
+                    relation: "related".to_string(),
+                    confidence: 0.7,
+                    summary: format!("Packets share symbols: {}", shared_symbols.join(", ")),
+                    evidence_refs,
+                });
+            }
+
+            let shared_tests = left
+                .tests
+                .intersection(&right.tests)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !shared_tests.is_empty() {
+                let mut evidence_refs = shared_tests
+                    .iter()
+                    .map(|value| suite_packet_core::CorrelationEvidenceRef {
+                        packet_id: left.packet_id.clone(),
+                        packet_type: left.packet_type.clone(),
+                        kind: "test".to_string(),
+                        value: value.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                evidence_refs.extend(shared_tests.iter().map(|value| {
+                    suite_packet_core::CorrelationEvidenceRef {
+                        packet_id: right.packet_id.clone(),
+                        packet_type: right.packet_type.clone(),
+                        kind: "test".to_string(),
+                        value: value.clone(),
+                    }
+                }));
+                findings.push(suite_packet_core::ContextCorrelationFinding {
+                    rule: "shared_test".to_string(),
+                    relation: "related".to_string(),
+                    confidence: 0.68,
+                    summary: format!("Packets share tests: {}", shared_tests.join(", ")),
+                    evidence_refs,
+                });
+            }
+
+            for map in normalized
+                .iter()
+                .filter(|candidate| candidate.tool == "mapy" && candidate.kind == "repo_map")
+            {
+                let connected = map.map_edges.iter().any(|(from, to)| {
+                    (left.files.contains(from) && right.files.contains(to))
+                        || (left.files.contains(to) && right.files.contains(from))
+                });
+                if connected {
+                    findings.push(suite_packet_core::ContextCorrelationFinding {
+                        rule: "map_edge_connects".to_string(),
+                        relation: "related".to_string(),
+                        confidence: 0.76,
+                        summary: format!(
+                            "Repo map connects {} and {}",
+                            left.packet_type, right.packet_type
+                        ),
+                        evidence_refs: vec![suite_packet_core::CorrelationEvidenceRef {
+                            packet_id: map.packet_id.clone(),
+                            packet_type: map.packet_type.clone(),
+                            kind: "map_edge".to_string(),
+                            value: "edge".to_string(),
+                        }],
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(snapshot) = snapshot {
+        let workspace_root = kernel_workspace_root();
+        let snapshot_paths = snapshot
+            .changed_paths_since_checkpoint
+            .iter()
+            .filter_map(|path| normalize_context_path(path, workspace_root.as_deref()))
+            .map(|path| path.canonical)
+            .collect::<Vec<_>>();
+        let snapshot_basenames = snapshot
+            .changed_paths_since_checkpoint
+            .iter()
+            .filter_map(|path| basename_alias(path))
+            .collect::<BTreeSet<_>>();
+        let snapshot_symbols = snapshot
+            .changed_symbols_since_checkpoint
+            .iter()
+            .map(|symbol| symbol.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        for packet in &normalized {
+            let shared_paths = packet
+                .files
+                .iter()
+                .filter(|path| snapshot_paths.iter().any(|item| item == *path))
+                .cloned()
+                .collect::<Vec<_>>();
+            let shared_path_basenames = if shared_paths.is_empty() {
+                packet
+                    .file_basenames
+                    .iter()
+                    .filter(|basename| snapshot_basenames.contains(*basename))
+                    .filter(|basename| basename_counts.get(*basename) == Some(&1))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let shared_symbols = packet
+                .symbols
+                .iter()
+                .filter(|symbol| snapshot_symbols.iter().any(|item| item == *symbol))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !shared_paths.is_empty()
+                || !shared_path_basenames.is_empty()
+                || !shared_symbols.is_empty()
+            {
+                let mut evidence_refs = shared_paths
+                    .iter()
+                    .map(|value| suite_packet_core::CorrelationEvidenceRef {
+                        packet_id: packet.packet_id.clone(),
+                        packet_type: packet.packet_type.clone(),
+                        kind: "file".to_string(),
+                        value: value.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                evidence_refs.extend(shared_symbols.iter().map(|value| {
+                    suite_packet_core::CorrelationEvidenceRef {
+                        packet_id: packet.packet_id.clone(),
+                        packet_type: packet.packet_type.clone(),
+                        kind: "symbol".to_string(),
+                        value: value.clone(),
+                    }
+                }));
+                evidence_refs.extend(shared_path_basenames.iter().map(|value| {
+                    suite_packet_core::CorrelationEvidenceRef {
+                        packet_id: packet.packet_id.clone(),
+                        packet_type: packet.packet_type.clone(),
+                        kind: "file_basename".to_string(),
+                        value: value.clone(),
+                    }
+                }));
+                findings.push(suite_packet_core::ContextCorrelationFinding {
+                    rule: "task_focus_overlap".to_string(),
+                    relation: "related".to_string(),
+                    confidence: if shared_paths.is_empty() && !shared_path_basenames.is_empty() {
+                        0.61
+                    } else {
+                        0.73
+                    },
+                    summary: format!(
+                        "Packet overlaps task checkpoint deltas for task {}",
+                        snapshot.task_id
+                    ),
+                    evidence_refs,
+                });
+            }
+        }
+    }
+
+    if task_id.is_some() {
+        dedupe_findings(findings)
     } else {
-        findings
+        dedupe_findings(findings)
     }
 }
 
@@ -1997,6 +2599,98 @@ fn load_agent_snapshot(
     Ok(Some(derive_agent_snapshot(&entries, task_id)))
 }
 
+fn parse_recall_scope(value: Option<&Value>, default: RecallScope) -> RecallScope {
+    match value.and_then(Value::as_str).unwrap_or_default() {
+        "task_first" => RecallScope::TaskFirst,
+        "task_only" => RecallScope::TaskOnly,
+        "global" => RecallScope::Global,
+        _ => default,
+    }
+}
+
+fn load_task_scoped_packets(
+    ctx: &ExecutionContext,
+    task_id: &str,
+    input_packets: &[KernelPacket],
+) -> Result<(Vec<KernelPacket>, Value), KernelError> {
+    let workspace_root = kernel_workspace_root();
+    let refs = input_packets_ref_query(input_packets);
+    let cache = ctx
+        .memory
+        .lock()
+        .map_err(|source| KernelError::CacheLock {
+            detail: source.to_string(),
+        })?;
+    let matches = cache.related_entries(
+        Some(task_id),
+        &refs.paths,
+        &refs.symbols,
+        &refs.tests,
+    );
+    drop(cache);
+
+    let mut packets = Vec::new();
+    let mut debug_matches = Vec::new();
+    for related in matches {
+        for packet in related.entry.packets {
+            packets.push(KernelPacket {
+                packet_id: packet.packet_id,
+                format: default_packet_format(),
+                body: packet.body,
+                token_usage: packet.token_usage,
+                runtime_ms: packet.runtime_ms,
+                metadata: packet.metadata,
+            });
+        }
+        debug_matches.push(json!({
+            "cache_key": related.entry.cache_key,
+            "canonical_path_matches": related.canonical_path_matches,
+            "basename_path_matches": related.basename_path_matches,
+            "symbol_matches": related.symbol_matches,
+            "test_matches": related.test_matches,
+        }));
+    }
+    Ok((
+        packets,
+        json!({
+            "task_id": task_id,
+            "workspace_root": workspace_root.map(|path| path.to_string_lossy().to_string()),
+            "related_cache_entries": debug_matches,
+        }),
+    ))
+}
+
+#[derive(Default)]
+struct CorrelationRefQuery {
+    paths: Vec<String>,
+    symbols: Vec<String>,
+    tests: Vec<String>,
+}
+
+fn input_packets_ref_query(input_packets: &[KernelPacket]) -> CorrelationRefQuery {
+    let workspace_root = kernel_workspace_root();
+    let mut paths = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    let mut tests = BTreeSet::new();
+
+    for packet in input_packets {
+        let value = extract_packet_value(&packet.body);
+        collect_packet_refs(
+            &value,
+            workspace_root.as_deref(),
+            &mut paths,
+            &mut symbols,
+            &mut tests,
+        );
+    }
+
+    CorrelationRefQuery {
+        paths: paths.into_iter().collect(),
+        symbols: symbols.into_iter().collect(),
+        tests: tests.into_iter().collect(),
+    }
+}
+
 fn run_contextq_correlate(
     ctx: &mut ExecutionContext,
     input_packets: &[KernelPacket],
@@ -2007,9 +2701,29 @@ fn run_contextq_correlate(
         .and_then(Value::as_str)
         .filter(|task_id| !task_id.trim().is_empty())
         .map(ToOwned::to_owned);
-    let findings = correlate_packets(input_packets, task_id.clone());
-    let (envelope, packet) =
-        build_context_correlation_packet(&ctx.target, task_id.clone(), findings)?;
+    let scope = parse_recall_scope(ctx.policy_context.get("scope"), RecallScope::TaskFirst);
+    let snapshot = load_agent_snapshot(ctx)?;
+    let mut packets = input_packets.to_vec();
+    let mut correlation_debug = None;
+    if let Some(task_id) = task_id.as_deref() {
+        if scope != RecallScope::Global {
+            let (task_packets, debug) = load_task_scoped_packets(ctx, task_id, input_packets)?;
+            packets.extend(task_packets);
+            correlation_debug = Some(debug);
+            let mut seen = BTreeSet::new();
+            packets.retain(|packet| {
+                let key = PacketCache::hash_value(&extract_packet_value(&packet.body));
+                seen.insert(key)
+            });
+        }
+    }
+    let findings = correlate_packets(&packets, task_id.clone(), snapshot.as_ref());
+    let (envelope, packet) = build_context_correlation_packet(
+        &ctx.target,
+        task_id.clone(),
+        findings,
+        correlation_debug,
+    )?;
 
     if let Some(task_id) = task_id {
         ctx.set_shared("task_id", Value::String(task_id));
@@ -2027,6 +2741,362 @@ fn run_contextq_correlate(
             "finding_count": envelope.payload.finding_count,
         }),
     })
+}
+
+fn build_context_manage_packet(
+    target: &str,
+    payload: suite_packet_core::ContextManagePayload,
+) -> Result<
+    (
+        suite_packet_core::EnvelopeV1<suite_packet_core::ContextManagePayload>,
+        KernelPacket,
+    ),
+    KernelError,
+> {
+    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default().len();
+    let envelope = suite_packet_core::EnvelopeV1 {
+        version: "1".to_string(),
+        tool: "contextq".to_string(),
+        kind: "context_manage".to_string(),
+        hash: String::new(),
+        summary: format!(
+            "context manage task={} working_set={} evictions={}",
+            payload.task_id,
+            payload.working_set.len(),
+            payload.eviction_candidates.len()
+        ),
+        files: payload
+            .changed_paths_since_checkpoint
+            .iter()
+            .map(|path| suite_packet_core::FileRef {
+                path: path.clone(),
+                relevance: Some(1.0),
+                source: Some("contextq.manage".to_string()),
+            })
+            .collect(),
+        symbols: payload
+            .changed_symbols_since_checkpoint
+            .iter()
+            .map(|name| suite_packet_core::SymbolRef {
+                name: name.clone(),
+                file: None,
+                kind: Some("changed_since_checkpoint".to_string()),
+                relevance: Some(1.0),
+                source: Some("contextq.manage".to_string()),
+            })
+            .collect(),
+        risk: None,
+        confidence: Some(0.88),
+        budget_cost: suite_packet_core::BudgetCost {
+            est_tokens: 0,
+            est_bytes: 0,
+            runtime_ms: 0,
+            tool_calls: 1,
+            payload_est_tokens: Some((payload_bytes / 4) as u64),
+            payload_est_bytes: Some(payload_bytes),
+        },
+        provenance: suite_packet_core::Provenance {
+            inputs: vec![format!("task:{}", payload.task_id)],
+            git_base: None,
+            git_head: None,
+            generated_at_unix: now_unix(),
+        },
+        payload,
+    }
+    .with_canonical_hash_and_real_budget();
+
+    let packet = KernelPacket {
+        packet_id: Some(format!(
+            "contextq-manage-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
+        format: default_packet_format(),
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+            target: target.to_string(),
+            detail: source.to_string(),
+        })?,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
+        metadata: json!({
+            "reducer": "contextq.manage",
+            "kind": "context_manage",
+            "hash": envelope.hash,
+            "working_set_count": envelope.payload.working_set.len(),
+            "eviction_count": envelope.payload.eviction_candidates.len(),
+        }),
+    };
+
+    Ok((envelope, packet))
+}
+
+fn derive_manage_query(
+    request: &ContextManageRequest,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> String {
+    if let Some(query) = request
+        .query
+        .as_ref()
+        .filter(|query| !query.trim().is_empty())
+    {
+        return query.clone();
+    }
+
+    let mut tokens = Vec::new();
+    tokens.extend(snapshot.changed_paths_since_checkpoint.iter().cloned());
+    tokens.extend(snapshot.changed_symbols_since_checkpoint.iter().cloned());
+    tokens.extend(snapshot.focus_paths.iter().take(4).cloned());
+    tokens.extend(snapshot.focus_symbols.iter().take(4).cloned());
+    tokens.extend(
+        snapshot
+            .open_questions
+            .iter()
+            .take(2)
+            .map(|question| question.text.clone()),
+    );
+    if tokens.is_empty() {
+        snapshot.task_id.clone()
+    } else {
+        tokens.join(" ")
+    }
+}
+
+fn run_contextq_manage(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let request: ContextManageRequest =
+        serde_json::from_value(ctx.reducer_input.clone()).map_err(|source| {
+            KernelError::ReducerFailed {
+                target: ctx.target.clone(),
+                detail: format!("invalid reducer input: {source}"),
+            }
+        })?;
+    if request.task_id.trim().is_empty() {
+        return Err(KernelError::InvalidRequest {
+            detail: "contextq.manage requires reducer_input.task_id".to_string(),
+        });
+    }
+
+    let snapshot = derive_agent_snapshot(&ctx.cache_entries()?, &request.task_id);
+    let query = derive_manage_query(&request, &snapshot);
+    let hits = ctx.cache_recall(
+        &query,
+        &RecallOptions {
+            limit: 32,
+            task_id: Some(request.task_id.clone()),
+            scope: request.scope,
+            ..RecallOptions::default()
+        },
+    )?;
+
+    let mut working_set = Vec::new();
+    let mut recommended_packets = Vec::new();
+    let mut used_tokens = 0_u64;
+    let mut used_bytes = 0_usize;
+    for hit in &hits {
+        let packet_ref = suite_packet_core::ContextManagePacketRef {
+            cache_key: hit.cache_key.clone(),
+            target: hit.target.clone(),
+            score: hit.score,
+            summary: hit.summary.clone(),
+            reason: hit.match_reasons.first().cloned(),
+            packet_types: hit.packet_types.clone(),
+            est_tokens: hit.budget_estimate.est_tokens,
+            est_bytes: hit.budget_estimate.est_bytes,
+            runtime_ms: hit.budget_estimate.runtime_ms,
+        };
+        if recommended_packets.len() < 5 {
+            recommended_packets.push(packet_ref.clone());
+        }
+        let next_tokens = used_tokens.saturating_add(hit.budget_estimate.est_tokens);
+        let next_bytes = used_bytes.saturating_add(hit.budget_estimate.est_bytes as usize);
+        if next_tokens <= request.budget_tokens && next_bytes <= request.budget_bytes {
+            used_tokens = next_tokens;
+            used_bytes = next_bytes;
+            working_set.push(packet_ref);
+        }
+    }
+
+    let eviction_candidates = hits
+        .iter()
+        .skip(working_set.len())
+        .take(8)
+        .map(|hit| suite_packet_core::ContextManagePacketRef {
+            cache_key: hit.cache_key.clone(),
+            target: hit.target.clone(),
+            score: hit.score,
+            summary: hit.summary.clone(),
+            reason: Some("outside_working_set_budget".to_string()),
+            packet_types: hit.packet_types.clone(),
+            est_tokens: hit.budget_estimate.est_tokens,
+            est_bytes: hit.budget_estimate.est_bytes,
+            runtime_ms: hit.budget_estimate.runtime_ms,
+        })
+        .collect::<Vec<_>>();
+
+    let mut recommended_actions = Vec::new();
+    if !snapshot.changed_paths_since_checkpoint.is_empty()
+        || !snapshot.changed_symbols_since_checkpoint.is_empty()
+    {
+        recommended_actions.push(suite_packet_core::ContextManageRecommendedAction {
+            kind: "rerun".to_string(),
+            summary: "rerun correlate and assemble for checkpoint deltas".to_string(),
+            related_paths: snapshot.changed_paths_since_checkpoint.clone(),
+            related_symbols: snapshot.changed_symbols_since_checkpoint.clone(),
+        });
+    }
+    if !snapshot.open_questions.is_empty() {
+        recommended_actions.push(suite_packet_core::ContextManageRecommendedAction {
+            kind: "question".to_string(),
+            summary: format!("resolve {} open question(s)", snapshot.open_questions.len()),
+            related_paths: Vec::new(),
+            related_symbols: Vec::new(),
+        });
+    }
+
+    let payload = suite_packet_core::ContextManagePayload {
+        task_id: request.task_id.clone(),
+        query: Some(query),
+        budget: suite_packet_core::ContextManageBudgetSummary {
+            requested_tokens: request.budget_tokens,
+            requested_bytes: request.budget_bytes,
+            working_set_tokens: used_tokens,
+            working_set_bytes: used_bytes,
+            evictable_tokens: eviction_candidates.iter().map(|item| item.est_tokens).sum(),
+            evictable_bytes: eviction_candidates
+                .iter()
+                .map(|item| item.est_bytes as usize)
+                .sum(),
+            reserved_headroom_tokens: request.budget_tokens.saturating_sub(used_tokens),
+            reserved_headroom_bytes: request.budget_bytes.saturating_sub(used_bytes),
+        },
+        working_set,
+        eviction_candidates,
+        recommended_packets,
+        recommended_actions,
+        changed_paths_since_checkpoint: snapshot.changed_paths_since_checkpoint.clone(),
+        changed_symbols_since_checkpoint: snapshot.changed_symbols_since_checkpoint.clone(),
+        open_questions: snapshot.open_questions.clone(),
+        active_decisions: snapshot.active_decisions.clone(),
+    };
+
+    let (envelope, packet) = build_context_manage_packet(&ctx.target, payload)?;
+    ctx.set_shared("task_id", Value::String(request.task_id));
+    ctx.set_shared(
+        "context_manage",
+        json!({
+            "working_set_tokens": envelope.payload.budget.working_set_tokens,
+            "working_set_bytes": envelope.payload.budget.working_set_bytes,
+            "evictable_tokens": envelope.payload.budget.evictable_tokens,
+            "evictable_bytes": envelope.payload.budget.evictable_bytes,
+        }),
+    );
+
+    Ok(ReducerResult {
+        output_packets: vec![packet],
+        metadata: json!({
+            "reducer": "contextq.manage",
+            "kind": "context_manage",
+            "task_id": envelope.payload.task_id,
+            "working_set_count": envelope.payload.working_set.len(),
+            "eviction_count": envelope.payload.eviction_candidates.len(),
+        }),
+    })
+}
+
+fn task_memory_requested(policy_context: &Value) -> bool {
+    policy_context
+        .get("task_memory")
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            policy_context
+                .get("include_task_memory")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+}
+
+fn augment_assemble_with_task_memory(
+    ctx: &ExecutionContext,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    assemble_packets: &mut Vec<KernelPacket>,
+    budget_tokens: u64,
+    budget_bytes: usize,
+) -> Result<(), KernelError> {
+    if !task_memory_requested(&ctx.policy_context) {
+        return Ok(());
+    }
+
+    let query = derive_manage_query(
+        &ContextManageRequest {
+            task_id: snapshot.task_id.clone(),
+            query: None,
+            budget_tokens,
+            budget_bytes,
+            scope: RecallScope::TaskFirst,
+            checkpoint_id: None,
+        },
+        snapshot,
+    );
+    let reserve_tokens = (budget_tokens / 4).max(256);
+    let reserve_bytes = (budget_bytes / 4).max(4_096);
+    let hits = ctx.cache_recall(
+        &query,
+        &RecallOptions {
+            limit: 8,
+            task_id: Some(snapshot.task_id.clone()),
+            scope: RecallScope::TaskFirst,
+            ..RecallOptions::default()
+        },
+    )?;
+    if hits.is_empty() {
+        return Ok(());
+    }
+
+    let mut seen = assemble_packets
+        .iter()
+        .map(|packet| PacketCache::hash_value(&extract_packet_value(&packet.body)))
+        .collect::<BTreeSet<_>>();
+    let entries = ctx.cache_entries()?;
+    let by_key = entries
+        .into_iter()
+        .map(|entry| (entry.cache_key.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut used_tokens = 0_u64;
+    let mut used_bytes = 0_usize;
+
+    for hit in hits {
+        if used_tokens >= reserve_tokens || used_bytes >= reserve_bytes {
+            break;
+        }
+        let Some(entry) = by_key.get(&hit.cache_key) else {
+            continue;
+        };
+        for packet in &entry.packets {
+            let key = PacketCache::hash_value(&extract_packet_value(&packet.body));
+            if !seen.insert(key) {
+                continue;
+            }
+            let next_tokens = used_tokens.saturating_add(hit.budget_estimate.est_tokens);
+            let next_bytes = used_bytes.saturating_add(hit.budget_estimate.est_bytes as usize);
+            if next_tokens > reserve_tokens || next_bytes > reserve_bytes {
+                break;
+            }
+            used_tokens = next_tokens;
+            used_bytes = next_bytes;
+            assemble_packets.push(KernelPacket {
+                packet_id: packet.packet_id.clone(),
+                format: default_packet_format(),
+                body: packet.body.clone(),
+                token_usage: packet.token_usage,
+                runtime_ms: packet.runtime_ms,
+                metadata: packet.metadata.clone(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn run_contextq_assemble(
@@ -2060,6 +3130,15 @@ fn run_contextq_assemble(
     };
 
     let mut assemble_packets = input_packets.to_vec();
+    if let Some(snapshot) = agent_snapshot.as_ref() {
+        augment_assemble_with_task_memory(
+            ctx,
+            snapshot,
+            &mut assemble_packets,
+            options.budget_tokens,
+            options.budget_bytes,
+        )?;
+    }
     if ctx
         .policy_context
         .get("task_id")
@@ -3225,6 +4304,14 @@ fn validate_agent_state_event(
             }
         }
         (
+            suite_packet_core::AgentStateEventKind::CheckpointSaved,
+            suite_packet_core::AgentStateEventData::CheckpointSaved { checkpoint_id, .. },
+        ) => {
+            if checkpoint_id.trim().is_empty() {
+                return Err("checkpoint_saved requires a non-empty checkpoint_id".to_string());
+            }
+        }
+        (
             suite_packet_core::AgentStateEventKind::DecisionAdded,
             suite_packet_core::AgentStateEventData::DecisionAdded {
                 decision_id, text, ..
@@ -3302,6 +4389,10 @@ fn summarize_agent_state_event(event: &suite_packet_core::AgentStateEventPayload
             event.task_id,
             event.paths.join(", ")
         ),
+        suite_packet_core::AgentStateEventData::CheckpointSaved { checkpoint_id, .. } => format!(
+            "checkpoint saved task={} checkpoint={}",
+            event.task_id, checkpoint_id
+        ),
         suite_packet_core::AgentStateEventData::DecisionAdded {
             decision_id, text, ..
         } => format!(
@@ -3352,6 +4443,10 @@ fn derive_agent_snapshot(
     let mut completed_steps = std::collections::BTreeSet::new();
     let mut open_questions = std::collections::BTreeMap::<String, String>::new();
     let mut last_event_at_unix = None;
+    let mut latest_checkpoint_id = None;
+    let mut latest_checkpoint_at_unix = None;
+    let mut changed_paths_since_checkpoint = std::collections::BTreeSet::new();
+    let mut changed_symbols_since_checkpoint = std::collections::BTreeSet::new();
 
     for event in &events {
         last_event_at_unix = Some(event.occurred_at_unix);
@@ -3385,7 +4480,17 @@ fn derive_agent_snapshot(
             suite_packet_core::AgentStateEventData::FileEdited { .. } => {
                 for path in &event.paths {
                     files_edited.insert(path.clone());
+                    changed_paths_since_checkpoint.insert(path.clone());
                 }
+                for symbol in &event.symbols {
+                    changed_symbols_since_checkpoint.insert(symbol.clone());
+                }
+            }
+            suite_packet_core::AgentStateEventData::CheckpointSaved { checkpoint_id, .. } => {
+                latest_checkpoint_id = Some(checkpoint_id.clone());
+                latest_checkpoint_at_unix = Some(event.occurred_at_unix);
+                changed_paths_since_checkpoint.clear();
+                changed_symbols_since_checkpoint.clear();
             }
             suite_packet_core::AgentStateEventData::DecisionAdded {
                 decision_id,
@@ -3429,6 +4534,10 @@ fn derive_agent_snapshot(
             .collect(),
         event_count: events.len(),
         last_event_at_unix,
+        latest_checkpoint_id,
+        latest_checkpoint_at_unix,
+        changed_paths_since_checkpoint: changed_paths_since_checkpoint.into_iter().collect(),
+        changed_symbols_since_checkpoint: changed_symbols_since_checkpoint.into_iter().collect(),
     }
 }
 
@@ -3577,6 +4686,7 @@ fn build_reactive_kernel_mutations(
     original_steps: &[KernelStepRequest],
     snapshot: &suite_packet_core::AgentSnapshotPayload,
     completed_success: &BTreeSet<String>,
+    mode: ReactiveReplanMode,
     append_focused_map: bool,
     anchor_step_id: Option<&str>,
 ) -> Vec<KernelPlanMutation> {
@@ -3591,6 +4701,16 @@ fn build_reactive_kernel_mutations(
             mutations.push(KernelPlanMutation::Cancel {
                 step_id: step.id.clone(),
                 reason: "completed_step".to_string(),
+            });
+            continue;
+        }
+        if mode == ReactiveReplanMode::TaskAware
+            && !snapshot.changed_paths_since_checkpoint.is_empty()
+            && !step_affected_by_snapshot(step, snapshot)
+        {
+            mutations.push(KernelPlanMutation::Cancel {
+                step_id: step.id.clone(),
+                reason: "inputs_unchanged".to_string(),
             });
             continue;
         }
@@ -3634,6 +4754,67 @@ fn build_reactive_kernel_mutations(
     }
 
     mutations
+}
+
+fn step_affected_by_snapshot(
+    step: &KernelStepRequest,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> bool {
+    let changed_paths = &snapshot.changed_paths_since_checkpoint;
+    let changed_symbols = &snapshot.changed_symbols_since_checkpoint;
+    let focus_changed = !snapshot.focus_paths.is_empty() || !snapshot.focus_symbols.is_empty();
+
+    if let Some(reactive) = step.reactive.as_ref() {
+        if reactive.rerun_on_focus_change && focus_changed {
+            return true;
+        }
+        if !reactive.path_globs.is_empty() {
+            let matched = changed_paths.iter().any(|path| {
+                reactive.path_globs.iter().any(|glob| {
+                    path == glob || path.contains(glob.trim_matches('*')) || glob.contains(path)
+                })
+            });
+            if reactive.skip_if_inputs_unchanged {
+                return matched;
+            }
+            if matched {
+                return true;
+            }
+        }
+    }
+
+    match step.target.as_str() {
+        "mapy.repo" => {
+            focus_changed
+                || changed_paths.iter().any(|path| {
+                    !(path.ends_with(".info")
+                        || path.ends_with(".lcov")
+                        || path.ends_with(".xml")
+                        || path.contains("coverage")
+                        || path.contains("report"))
+                })
+                || !changed_symbols.is_empty()
+        }
+        "diffy.analyze" | "testy.impact" => changed_paths.iter().any(|path| {
+            !(path.ends_with(".info")
+                || path.ends_with(".lcov")
+                || path.ends_with(".xml")
+                || path.contains("coverage")
+                || path.contains("report")
+                || path.ends_with(".log"))
+        }),
+        "contextq.correlate" | "contextq.assemble" | "contextq.manage" => {
+            !changed_paths.is_empty() || !changed_symbols.is_empty() || focus_changed
+        }
+        "stacky.slice" | "buildy.reduce" => changed_paths.iter().any(|path| {
+            path.ends_with(".log")
+                || path.ends_with(".txt")
+                || path.contains("report")
+                || path.contains("diagnostic")
+        }),
+        target if target.contains("cover") || target.contains("guard") => !changed_paths.is_empty(),
+        _ => true,
+    }
 }
 
 fn to_schedule_mutations(
@@ -4457,7 +5638,7 @@ policy:
                 .and_then(Value::as_bool),
             Some(true)
         );
-        assert!(dir.path().join(".packet28/packet-cache-v1.bin").exists());
+        assert!(dir.path().join(".packet28/packet-cache-v2.bin").exists());
     }
 
     #[test]
@@ -4899,6 +6080,7 @@ policy:
                     enabled: true,
                     task_id: Some("task-reactive".to_string()),
                     append_focused_map: false,
+                    mode: ReactiveReplanMode::Basic,
                 },
                 steps: vec![
                     KernelStepRequest {
@@ -4957,6 +6139,7 @@ policy:
                     enabled: true,
                     task_id: Some("task-focus".to_string()),
                     append_focused_map: false,
+                    mode: ReactiveReplanMode::Basic,
                 },
                 steps: vec![
                     KernelStepRequest {
@@ -5031,6 +6214,7 @@ policy:
             &original,
             &snapshot,
             &BTreeSet::new(),
+            ReactiveReplanMode::Basic,
             true,
             Some("other"),
         );
@@ -5402,6 +6586,260 @@ java.lang.IllegalStateException: boom
     }
 
     #[test]
+    fn contextq_correlate_emits_shared_file_findings_without_diff() {
+        let kernel = Kernel::with_v1_reducers();
+
+        let stack_packet = KernelPacket::from_value(
+            serde_json::to_value(stacky_core::slice_to_envelope(
+                stacky_core::StackSliceRequest {
+                    log_text: r#"
+java.lang.IllegalStateException: boom
+  at org.example.StringUtils.run(src/StringUtils.java:42)
+"#
+                    .to_string(),
+                    source: Some("stack.log".to_string()),
+                    max_failures: None,
+                },
+            ))
+            .unwrap(),
+            Some("stack".to_string()),
+        );
+
+        let map_packet = KernelPacket::from_value(
+            serde_json::to_value(
+                suite_packet_core::EnvelopeV1 {
+                    version: "1".to_string(),
+                    tool: "mapy".to_string(),
+                    kind: "repo_map".to_string(),
+                    hash: String::new(),
+                    summary: "repo map".to_string(),
+                    files: vec![suite_packet_core::FileRef {
+                        path: "src/StringUtils.java".to_string(),
+                        relevance: Some(1.0),
+                        source: Some("mapy.repo".to_string()),
+                    }],
+                    symbols: Vec::new(),
+                    risk: None,
+                    confidence: Some(1.0),
+                    budget_cost: suite_packet_core::BudgetCost::default(),
+                    provenance: suite_packet_core::Provenance {
+                        inputs: vec!["repo".to_string()],
+                        git_base: None,
+                        git_head: None,
+                        generated_at_unix: 1,
+                    },
+                    payload: mapy_core::RepoMapPayload::default(),
+                }
+                .with_canonical_hash_and_real_budget(),
+            )
+            .unwrap(),
+            Some("map".to_string()),
+        );
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "contextq.correlate".to_string(),
+                input_packets: vec![stack_packet, map_packet],
+                policy_context: json!({"task_id":"task-correlation","scope":"task_first"}),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextCorrelationPayload> =
+            serde_json::from_value(response.output_packets[0].body.clone()).unwrap();
+
+        assert!(envelope
+            .payload
+            .findings
+            .iter()
+            .any(|finding| finding.rule == "shared_file"));
+    }
+
+    #[test]
+    fn contextq_correlate_uses_unique_basename_fallback() {
+        let kernel = Kernel::with_v1_reducers();
+
+        let stack_packet = KernelPacket::from_value(
+            serde_json::to_value(stacky_core::slice_to_envelope(
+                stacky_core::StackSliceRequest {
+                    log_text: r#"
+java.lang.IllegalStateException: boom
+  at org.example.StringUtils.run(StringUtils.java:42)
+"#
+                    .to_string(),
+                    source: Some("stack.log".to_string()),
+                    max_failures: None,
+                },
+            ))
+            .unwrap(),
+            Some("stack".to_string()),
+        );
+
+        let map_packet = KernelPacket::from_value(
+            serde_json::to_value(
+                suite_packet_core::EnvelopeV1 {
+                    version: "1".to_string(),
+                    tool: "mapy".to_string(),
+                    kind: "repo_map".to_string(),
+                    hash: String::new(),
+                    summary: "repo map".to_string(),
+                    files: vec![suite_packet_core::FileRef {
+                        path: "src/auth/StringUtils.java".to_string(),
+                        relevance: Some(1.0),
+                        source: Some("mapy.repo".to_string()),
+                    }],
+                    symbols: Vec::new(),
+                    risk: None,
+                    confidence: Some(1.0),
+                    budget_cost: suite_packet_core::BudgetCost::default(),
+                    provenance: suite_packet_core::Provenance {
+                        inputs: vec!["repo".to_string()],
+                        git_base: None,
+                        git_head: None,
+                        generated_at_unix: 1,
+                    },
+                    payload: mapy_core::RepoMapPayload::default(),
+                }
+                .with_canonical_hash_and_real_budget(),
+            )
+            .unwrap(),
+            Some("map".to_string()),
+        );
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "contextq.correlate".to_string(),
+                input_packets: vec![stack_packet, map_packet],
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextCorrelationPayload> =
+            serde_json::from_value(response.output_packets[0].body.clone()).unwrap();
+        let finding = envelope
+            .payload
+            .findings
+            .iter()
+            .find(|finding| finding.rule == "shared_file")
+            .expect("shared_file finding");
+        assert!(finding.confidence < 0.74);
+        assert!(finding
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.kind == "file_basename"));
+    }
+
+    #[test]
+    fn contextq_manage_reports_checkpoint_deltas_and_working_set() {
+        let dir = tempdir().unwrap();
+        let mut kernel =
+            Kernel::with_v1_reducers_and_persistence(PersistConfig::new(dir.path().to_path_buf()));
+        kernel.register_reducer("test.packet", |ctx, _packets| {
+            let envelope = suite_packet_core::EnvelopeV1 {
+                version: "1".to_string(),
+                tool: "contextq".to_string(),
+                kind: "context_manage".to_string(),
+                hash: String::new(),
+                summary: "auth investigation".to_string(),
+                files: vec![suite_packet_core::FileRef {
+                    path: "src/auth.rs".to_string(),
+                    relevance: Some(1.0),
+                    source: Some("test.packet".to_string()),
+                }],
+                symbols: vec![suite_packet_core::SymbolRef {
+                    name: "authenticate".to_string(),
+                    file: None,
+                    kind: Some("function".to_string()),
+                    relevance: Some(1.0),
+                    source: Some("test.packet".to_string()),
+                }],
+                risk: None,
+                confidence: Some(1.0),
+                budget_cost: suite_packet_core::BudgetCost {
+                    est_tokens: 48,
+                    est_bytes: 256,
+                    runtime_ms: 3,
+                    tool_calls: 1,
+                    payload_est_tokens: Some(24),
+                    payload_est_bytes: Some(128),
+                },
+                provenance: suite_packet_core::Provenance {
+                    inputs: vec!["task:task-manage".to_string()],
+                    git_base: None,
+                    git_head: None,
+                    generated_at_unix: 1,
+                },
+                payload: json!({"task_id":"task-manage","summary":"auth investigation"}),
+            }
+            .with_canonical_hash_and_real_budget();
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(
+                    serde_json::to_value(envelope).unwrap(),
+                    Some(format!("packet-{}", ctx.request_id)),
+                )],
+                metadata: json!({"task_id":"task-manage"}),
+            })
+        });
+
+        kernel
+            .execute(KernelRequest {
+                target: "test.packet".to_string(),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        for event in [
+            json!({
+                "task_id": "task-manage",
+                "event_id": "checkpoint-1",
+                "occurred_at_unix": 1,
+                "actor": "agent",
+                "kind": "checkpoint_saved",
+                "paths": [],
+                "symbols": [],
+                "data": {"type":"checkpoint_saved","checkpoint_id":"ckpt-1"}
+            }),
+            json!({
+                "task_id": "task-manage",
+                "event_id": "edit-1",
+                "occurred_at_unix": 2,
+                "actor": "agent",
+                "kind": "file_edited",
+                "paths": ["src/auth.rs"],
+                "symbols": ["authenticate"],
+                "data": {"type":"file_edited","regions":[]}
+            }),
+        ] {
+            kernel
+                .execute(KernelRequest {
+                    target: "agenty.state.write".to_string(),
+                    reducer_input: event,
+                    ..KernelRequest::default()
+                })
+                .unwrap();
+        }
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "contextq.manage".to_string(),
+                reducer_input: json!({
+                    "task_id": "task-manage",
+                    "budget_tokens": 256,
+                    "budget_bytes": 4096,
+                    "scope": "task_first"
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextManagePayload> =
+            serde_json::from_value(response.output_packets[0].body.clone()).unwrap();
+
+        assert_eq!(envelope.payload.task_id, "task-manage");
+        assert!(envelope
+            .payload
+            .changed_paths_since_checkpoint
+            .contains(&"src/auth.rs".to_string()));
+        assert!(!envelope.payload.working_set.is_empty());
+    }
+
+    #[test]
     fn contextq_assemble_uses_task_snapshot_to_compress_read_sections() {
         let dir = tempdir().unwrap();
         let kernel =
@@ -5450,6 +6888,225 @@ java.lang.IllegalStateException: boom
         assert!(envelope.payload.sections[0]
             .body
             .starts_with("Reminder: already reviewed"));
+    }
+
+    #[test]
+    fn contextq_assemble_can_augment_with_task_memory() {
+        let dir = tempdir().unwrap();
+        let kernel =
+            Kernel::with_v1_reducers_and_persistence(PersistConfig::new(dir.path().to_path_buf()));
+
+        kernel
+            .execute(KernelRequest {
+                target: "agenty.state.write".to_string(),
+                reducer_input: json!({
+                    "task_id": "task-memory",
+                    "event_id": "evt-edit",
+                    "occurred_at_unix": 1,
+                    "actor": "agent",
+                    "kind": "file_edited",
+                    "paths": ["src/auth/Login.java"],
+                    "symbols": ["authenticate"],
+                    "data": {"type": "file_edited", "regions": []}
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        {
+            let mut cache = kernel.memory.lock().unwrap();
+            let mut hooks = NoopDeltaReuseHooks;
+            let lookup = cache.lookup_with_hooks(
+                "diffy.analyze",
+                &json!({"task_id":"task-memory"}),
+                &mut hooks,
+            );
+            cache.put_with_hooks(
+                "diffy.analyze",
+                &lookup,
+                vec![CachePacket {
+                    body: serde_json::to_value(
+                        suite_packet_core::EnvelopeV1 {
+                            version: "1".to_string(),
+                            tool: "diffy".to_string(),
+                            kind: "diff_analyze".to_string(),
+                            hash: String::new(),
+                            summary: "authentication fix in src/auth/Login.java".to_string(),
+                            files: vec![suite_packet_core::FileRef {
+                                path: "src/auth/Login.java".to_string(),
+                                relevance: Some(1.0),
+                                source: Some("diffy.analyze".to_string()),
+                            }],
+                            symbols: vec![suite_packet_core::SymbolRef {
+                                name: "authenticate".to_string(),
+                                file: Some("src/auth/Login.java".to_string()),
+                                kind: Some("method".to_string()),
+                                relevance: Some(1.0),
+                                source: Some("diffy.analyze".to_string()),
+                            }],
+                            risk: None,
+                            confidence: Some(1.0),
+                            budget_cost: suite_packet_core::BudgetCost {
+                                est_tokens: 80,
+                                est_bytes: 512,
+                                runtime_ms: 10,
+                                tool_calls: 1,
+                                payload_est_tokens: None,
+                                payload_est_bytes: None,
+                            },
+                            provenance: suite_packet_core::Provenance {
+                                inputs: vec!["task:task-memory".to_string()],
+                                git_base: None,
+                                git_head: None,
+                                generated_at_unix: 2,
+                            },
+                            payload: DiffAnalyzeKernelOutput {
+                                gate_result: suite_packet_core::QualityGateResult {
+                                    passed: true,
+                                    total_coverage_pct: None,
+                                    changed_coverage_pct: None,
+                                    new_file_coverage_pct: None,
+                                    violations: Vec::new(),
+                                    issue_counts: None,
+                                },
+                                diagnostics: None,
+                                diffs: vec![SerializableFileDiff {
+                                    path: "src/auth/Login.java".to_string(),
+                                    old_path: None,
+                                    status: suite_packet_core::DiffStatus::Modified,
+                                    changed_lines: vec![10, 11],
+                                }],
+                            },
+                        }
+                        .with_canonical_hash_and_real_budget(),
+                    )
+                    .unwrap(),
+                    metadata: json!({"task_id":"task-memory"}),
+                    token_usage: Some(80),
+                    runtime_ms: Some(10),
+                    ..CachePacket::default()
+                }],
+                json!({"task_id":"task-memory"}),
+                &mut hooks,
+            );
+        }
+
+        let seed_packet = KernelPacket::from_value(
+            json!({
+                "packet_id": "seed",
+                "tool": "stacky",
+                "kind": "stack_slice",
+                "summary": "seed packet",
+                "budget_cost": {"est_tokens": 20, "est_bytes": 128, "runtime_ms": 1},
+                "payload": {"total_failures": 1, "unique_failures": 1}
+            }),
+            None,
+        );
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "contextq.assemble".to_string(),
+                input_packets: vec![seed_packet],
+                policy_context: json!({
+                    "task_id": "task-memory",
+                    "include_task_memory": true,
+                }),
+                budget: ExecutionBudget {
+                    token_cap: Some(500),
+                    byte_cap: Some(20_000),
+                    runtime_ms_cap: None,
+                },
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        let envelope: suite_packet_core::EnvelopeV1<ContextAssembleEnvelopePayload> =
+            serde_json::from_value(response.output_packets[0].body.clone()).unwrap();
+        assert!(envelope
+            .payload
+            .refs
+            .iter()
+            .any(|reference| reference.value == "src/auth/Login.java"));
+    }
+
+    #[test]
+    fn execute_sequence_with_observer_emits_live_step_events_in_order() {
+        #[derive(Default)]
+        struct RecordingObserver {
+            events: Vec<String>,
+        }
+
+        impl SequenceObserver for RecordingObserver {
+            fn on_step_started(&mut self, _position: usize, step: &KernelStepRequest) {
+                self.events.push(format!("started:{}", step.id));
+            }
+
+            fn on_step_completed(
+                &mut self,
+                _position: usize,
+                step: &KernelStepRequest,
+                _response: &KernelResponse,
+            ) {
+                self.events.push(format!("completed:{}", step.id));
+            }
+
+            fn on_step_failed(
+                &mut self,
+                _position: usize,
+                step: &KernelStepRequest,
+                _failure: &KernelFailure,
+            ) {
+                self.events.push(format!("failed:{}", step.id));
+            }
+        }
+
+        let mut kernel = Kernel::new();
+        kernel.register_reducer("demo.ok", |_ctx, _input| {
+            Ok(ReducerResult {
+                output_packets: Vec::new(),
+                metadata: Value::Null,
+            })
+        });
+        kernel.register_reducer("demo.fail", |_ctx, _input| {
+            Err(KernelError::ReducerFailed {
+                target: "demo.fail".to_string(),
+                detail: "boom".to_string(),
+            })
+        });
+
+        let mut observer = RecordingObserver::default();
+        let response = kernel
+            .execute_sequence_with_observer(
+                KernelSequenceRequest {
+                    steps: vec![
+                        KernelStepRequest {
+                            id: "one".to_string(),
+                            target: "demo.ok".to_string(),
+                            ..KernelStepRequest::default()
+                        },
+                        KernelStepRequest {
+                            id: "two".to_string(),
+                            target: "demo.fail".to_string(),
+                            depends_on: vec!["one".to_string()],
+                            ..KernelStepRequest::default()
+                        },
+                    ],
+                    ..KernelSequenceRequest::default()
+                },
+                &mut observer,
+            )
+            .unwrap();
+
+        assert_eq!(response.step_results.len(), 2);
+        assert_eq!(
+            observer.events,
+            vec![
+                "started:one".to_string(),
+                "completed:one".to_string(),
+                "started:two".to_string(),
+                "failed:two".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -4,9 +4,36 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use context_memory_core::{
     ContextStoreListFilter, ContextStorePaging, ContextStorePruneRequest, PacketCache,
-    PersistConfig, RecallOptions,
+    PersistConfig, RecallOptions, RecallScope as MemoryRecallScope,
 };
 use serde_json::{json, Value};
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum RecallScopeArg {
+    Global,
+    TaskFirst,
+    TaskOnly,
+}
+
+impl From<RecallScopeArg> for MemoryRecallScope {
+    fn from(value: RecallScopeArg) -> Self {
+        match value {
+            RecallScopeArg::Global => MemoryRecallScope::Global,
+            RecallScopeArg::TaskFirst => MemoryRecallScope::TaskFirst,
+            RecallScopeArg::TaskOnly => MemoryRecallScope::TaskOnly,
+        }
+    }
+}
+
+impl RecallScopeArg {
+    fn as_policy_scope(self) -> &'static str {
+        match self {
+            RecallScopeArg::Global => "global",
+            RecallScopeArg::TaskFirst => "task_first",
+            RecallScopeArg::TaskOnly => "task_only",
+        }
+    }
+}
 
 #[derive(Args)]
 pub struct AssembleArgs {
@@ -69,7 +96,11 @@ pub struct CorrelateArgs {
 
     /// Task identifier for correlation context
     #[arg(long)]
-    task_id: String,
+    task_id: Option<String>,
+
+    /// Correlation scope for task-aware cache history
+    #[arg(long, value_enum)]
+    scope: Option<RecallScopeArg>,
 
     /// Emit JSON output profile
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
@@ -78,6 +109,51 @@ pub struct CorrelateArgs {
     /// Pretty-print JSON output
     #[arg(long)]
     pretty: bool,
+}
+
+#[derive(Args)]
+pub struct ManageArgs {
+    /// Task identifier for context management
+    #[arg(long)]
+    task_id: String,
+
+    /// Optional retrieval query; defaults to task snapshot signals
+    #[arg(long)]
+    query: Option<String>,
+
+    /// Max approximate token budget for the recommended working set.
+    #[arg(long, default_value_t = contextq_core::DEFAULT_BUDGET_TOKENS)]
+    budget_tokens: u64,
+
+    /// Max byte budget for the recommended working set.
+    #[arg(long, default_value_t = contextq_core::DEFAULT_BUDGET_BYTES)]
+    budget_bytes: usize,
+
+    /// Scope for task-aware memory lookup
+    #[arg(long, value_enum)]
+    scope: Option<RecallScopeArg>,
+
+    /// Optional checkpoint identifier, or omit to use the latest checkpoint
+    #[arg(long)]
+    checkpoint_id: Option<String>,
+
+    /// Emit JSON output profile
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
+    json: Option<crate::cmd_common::JsonProfileArg>,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pretty: bool,
+}
+
+impl ManageArgs {
+    pub(crate) fn machine_output_requested(&self) -> bool {
+        self.json.is_some()
+    }
+
+    pub(crate) fn pretty_output(&self) -> bool {
+        self.pretty
+    }
 }
 
 impl CorrelateArgs {
@@ -347,6 +423,26 @@ pub struct RecallArgs {
     /// Optional target substring filter
     #[arg(long)]
     target: Option<String>,
+
+    /// Optional task identifier for task-first memory
+    #[arg(long)]
+    task_id: Option<String>,
+
+    /// Recall scope; defaults to task-first when task_id is present
+    #[arg(long, value_enum)]
+    scope: Option<RecallScopeArg>,
+
+    /// Optional packet-type substring filter
+    #[arg(long = "packet-type")]
+    packet_types: Vec<String>,
+
+    /// Optional path substring filter
+    #[arg(long = "path")]
+    path_filters: Vec<String>,
+
+    /// Optional symbol substring filter
+    #[arg(long = "symbol")]
+    symbol_filters: Vec<String>,
 
     /// Emit JSON output
     #[arg(long)]
@@ -668,6 +764,149 @@ pub fn run_assemble_remote(args: AssembleArgs, daemon_root: &Path) -> Result<i32
     Ok(0)
 }
 
+pub fn run_manage(args: ManageArgs) -> Result<i32> {
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let cwd = std::env::current_dir()?;
+    let kernel = build_kernel(true, cwd);
+    let response = kernel.execute(context_kernel_core::KernelRequest {
+        target: "contextq.manage".to_string(),
+        reducer_input: json!({
+            "task_id": args.task_id,
+            "query": args.query,
+            "budget_tokens": args.budget_tokens,
+            "budget_bytes": args.budget_bytes,
+            "scope": args
+                .scope
+                .map(|scope| scope.as_policy_scope().to_string())
+                .unwrap_or_else(|| "task_first".to_string()),
+            "checkpoint_id": args.checkpoint_id,
+        }),
+        policy_context: json!({
+            "task_id": args.task_id,
+        }),
+        ..context_kernel_core::KernelRequest::default()
+    })?;
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextManagePayload> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid manage output packet: {source}"))?;
+
+    if args.json.is_some() {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_CONTEXT_MANAGE,
+            &envelope,
+            profile,
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            Some(json!({
+                "kernel_metadata": {
+                    "manage": response.metadata,
+                },
+            })),
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "task={} working_set={} evictions={} headroom_tokens={}",
+        envelope.payload.task_id,
+        envelope.payload.working_set.len(),
+        envelope.payload.eviction_candidates.len(),
+        envelope.payload.budget.reserved_headroom_tokens
+    );
+    for packet in envelope.payload.working_set.iter().take(5) {
+        println!(
+            "- keep score={:.3} target={} key={} tokens={}",
+            packet.score, packet.target, packet.cache_key, packet.est_tokens
+        );
+        if let Some(summary) = packet.summary.as_ref() {
+            println!("  {summary}");
+        }
+    }
+    for action in &envelope.payload.recommended_actions {
+        println!("* {}: {}", action.kind, action.summary);
+    }
+    Ok(0)
+}
+
+pub fn run_manage_remote(args: ManageArgs, daemon_root: &Path) -> Result<i32> {
+    let profile = args
+        .json
+        .map(suite_packet_core::JsonProfile::from)
+        .unwrap_or(suite_packet_core::JsonProfile::Compact);
+    let response = crate::cmd_daemon::send_kernel_request(
+        daemon_root,
+        context_kernel_core::KernelRequest {
+            target: "contextq.manage".to_string(),
+            reducer_input: json!({
+                "task_id": args.task_id,
+                "query": args.query,
+                "budget_tokens": args.budget_tokens,
+                "budget_bytes": args.budget_bytes,
+                "scope": args
+                    .scope
+                    .map(|scope| scope.as_policy_scope().to_string())
+                    .unwrap_or_else(|| "task_first".to_string()),
+                "checkpoint_id": args.checkpoint_id,
+            }),
+            policy_context: json!({
+                "task_id": args.task_id,
+            }),
+            ..context_kernel_core::KernelRequest::default()
+        },
+    )?;
+    let output_packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no output packets"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextManagePayload> =
+        serde_json::from_value(output_packet.body.clone())
+            .map_err(|source| anyhow!("invalid manage output packet: {source}"))?;
+
+    if args.json.is_some() {
+        crate::cmd_common::emit_machine_envelope(
+            suite_packet_core::PACKET_TYPE_CONTEXT_MANAGE,
+            &envelope,
+            profile,
+            args.pretty,
+            &crate::cmd_common::resolve_artifact_root(None),
+            Some(json!({
+                "kernel_metadata": {
+                    "manage": response.metadata,
+                },
+            })),
+        )?;
+        return Ok(0);
+    }
+
+    println!(
+        "task={} working_set={} evictions={} headroom_tokens={}",
+        envelope.payload.task_id,
+        envelope.payload.working_set.len(),
+        envelope.payload.eviction_candidates.len(),
+        envelope.payload.budget.reserved_headroom_tokens
+    );
+    for packet in envelope.payload.working_set.iter().take(5) {
+        println!(
+            "- keep score={:.3} target={} key={} tokens={}",
+            packet.score, packet.target, packet.cache_key, packet.est_tokens
+        );
+        if let Some(summary) = packet.summary.as_ref() {
+            println!("  {summary}");
+        }
+    }
+    for action in &envelope.payload.recommended_actions {
+        println!("* {}: {}", action.kind, action.summary);
+    }
+    Ok(0)
+}
+
 pub fn run_correlate(args: CorrelateArgs) -> Result<i32> {
     let profile = args
         .json
@@ -687,7 +926,11 @@ pub fn run_correlate(args: CorrelateArgs) -> Result<i32> {
         input_packets,
         policy_context: json!({
             "task_id": args.task_id,
-            "disable_cache": true,
+            "disable_cache": false,
+            "scope": args
+                .scope
+                .map(|scope| scope.as_policy_scope().to_string())
+                .unwrap_or_else(|| "task_first".to_string()),
         }),
         ..context_kernel_core::KernelRequest::default()
     })?;
@@ -745,7 +988,11 @@ pub fn run_correlate_remote(args: CorrelateArgs, daemon_root: &Path) -> Result<i
             input_packets,
             policy_context: json!({
                 "task_id": args.task_id,
-                "disable_cache": true,
+                "disable_cache": false,
+                "scope": args
+                    .scope
+                    .map(|scope| scope.as_policy_scope().to_string())
+                    .unwrap_or_else(|| "task_first".to_string()),
             }),
             ..context_kernel_core::KernelRequest::default()
         },
@@ -821,6 +1068,13 @@ pub fn run_recall(args: RecallArgs) -> Result<i32> {
     let cache = load_cache(&args.root)?;
     let now = current_unix();
     let since_default = now.saturating_sub(86_400);
+    let scope = args.scope.map(Into::into).unwrap_or_else(|| {
+        if args.task_id.is_some() {
+            MemoryRecallScope::TaskFirst
+        } else {
+            MemoryRecallScope::Global
+        }
+    });
     let hits = cache.recall(
         &args.query,
         &RecallOptions {
@@ -828,6 +1082,11 @@ pub fn run_recall(args: RecallArgs) -> Result<i32> {
             since_unix: args.since.or(Some(since_default)),
             until_unix: args.until,
             target: args.target,
+            task_id: args.task_id,
+            scope,
+            packet_types: args.packet_types,
+            path_filters: args.path_filters,
+            symbol_filters: args.symbol_filters,
         },
     );
 
@@ -879,6 +1138,11 @@ pub fn run_recall_remote(args: RecallArgs, daemon_root: &Path) -> Result<i32> {
             since: args.since.or(Some(since_default)),
             until: args.until,
             target: args.target.clone(),
+            task_id: args.task_id.clone(),
+            scope: args.scope.map(|scope| scope.as_policy_scope().to_string()),
+            packet_types: args.packet_types.clone(),
+            path_filters: args.path_filters.clone(),
+            symbol_filters: args.symbol_filters.clone(),
         },
     )?;
 

@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use context_kernel_core::{normalize_sequence_request, Kernel, KernelRequest, PersistConfig};
+use context_kernel_core::{
+    normalize_sequence_request, Kernel, KernelFailure, KernelRequest, KernelResponse,
+    KernelStepRequest, PersistConfig, SequenceObserver,
+};
 use context_memory_core::{
     ContextStoreListFilter, ContextStorePaging, ContextStorePruneRequest, PacketCache,
     PersistConfig as MemoryPersistConfig, RecallOptions,
@@ -21,16 +24,16 @@ use diffy_core::model::CoverageFormat;
 use glob::Pattern;
 use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
 use packet28_daemon_core::{
-    ensure_daemon_dir, load_task_registry, load_watch_registry, log_path, now_unix,
-    read_socket_message, ready_path, remove_runtime_files, save_task_registry, save_watch_registry,
-    socket_path, write_runtime_info, write_socket_message, ContextRecallRequest,
-    ContextRecallResponse, ContextStoreGetRequest, ContextStoreGetResponse,
+    append_task_event, ensure_daemon_dir, load_task_events, load_task_registry,
+    load_watch_registry, log_path, now_unix, read_socket_message, ready_path, remove_runtime_files,
+    save_task_registry, save_watch_registry, socket_path, write_runtime_info, write_socket_message,
+    ContextRecallRequest, ContextRecallResponse, ContextStoreGetRequest, ContextStoreGetResponse,
     ContextStoreListRequest, ContextStoreListResponse, ContextStorePruneDaemonRequest,
     ContextStorePruneResponse, ContextStoreStatsRequest, ContextStoreStatsResponse,
-    CoverCheckRequest, CoverCheckResponse, DaemonRequest, DaemonResponse, DaemonRuntimeInfo,
-    DaemonStatus, PacketFetchResponse, TaskRecord, TaskRegistry, TaskSubmitSpec, TestMapRequest,
-    TestMapResponse, TestMapSummary, TestShardRequest, TestShardResponse, WatchKind,
-    WatchRegistration, WatchRegistry, WatchSpec,
+    CoverCheckRequest, CoverCheckResponse, DaemonEvent, DaemonEventFrame, DaemonRequest,
+    DaemonResponse, DaemonRuntimeInfo, DaemonStatus, PacketFetchResponse, TaskRecord, TaskRegistry,
+    TaskSubmitSpec, TestMapRequest, TestMapResponse, TestMapSummary, TestShardRequest,
+    TestShardResponse, WatchKind, WatchRegistration, WatchRegistry, WatchSpec,
 };
 use serde_json::{json, Value};
 
@@ -70,8 +73,92 @@ struct DaemonState {
     tasks: TaskRegistry,
     watches: WatchRegistry,
     watcher_handles: HashMap<String, PollWatcher>,
+    subscribers: HashMap<String, Vec<Sender<DaemonEventFrame>>>,
     shutting_down: bool,
 }
+
+struct TaskSequenceObserver {
+    state: Arc<Mutex<DaemonState>>,
+    task_id: String,
+}
+
+impl SequenceObserver for TaskSequenceObserver {
+    fn on_step_started(&mut self, position: usize, step: &KernelStepRequest) {
+        let _ = emit_task_event(
+            self.state.clone(),
+            &self.task_id,
+            "step_started",
+            json!({
+                "task_id": self.task_id,
+                "step_id": step.id,
+                "target": step.target,
+                "position": position,
+            }),
+        );
+    }
+
+    fn on_step_completed(
+        &mut self,
+        position: usize,
+        step: &KernelStepRequest,
+        response: &KernelResponse,
+    ) {
+        let _ = emit_task_event(
+            self.state.clone(),
+            &self.task_id,
+            "step_completed",
+            json!({
+                "task_id": self.task_id,
+                "step_id": step.id,
+                "target": step.target,
+                "position": position,
+                "request_id": response.request_id,
+            }),
+        );
+    }
+
+    fn on_step_failed(
+        &mut self,
+        position: usize,
+        step: &KernelStepRequest,
+        failure: &KernelFailure,
+    ) {
+        let _ = emit_task_event(
+            self.state.clone(),
+            &self.task_id,
+            "step_failed",
+            json!({
+                "task_id": self.task_id,
+                "step_id": step.id,
+                "target": step.target,
+                "position": position,
+                "failure": failure,
+            }),
+        );
+    }
+
+    fn on_replan_applied(
+        &mut self,
+        after_step: Option<&str>,
+        event_count: usize,
+        applied_mutations: &Value,
+    ) {
+        let _ = emit_task_event(
+            self.state.clone(),
+            &self.task_id,
+            "replan_applied",
+            json!({
+                "task_id": self.task_id,
+                "after_step": after_step,
+                "event_count": event_count,
+                "mutation_summary": applied_mutations,
+            }),
+        );
+    }
+}
+
+const DEFAULT_CONTEXT_MANAGE_BUDGET_TOKENS: u64 = 5_000;
+const DEFAULT_CONTEXT_MANAGE_BUDGET_BYTES: usize = 32_000;
 
 fn main() {
     if let Err(err) = run() {
@@ -123,6 +210,7 @@ fn serve(root: PathBuf) -> Result<()> {
         tasks,
         watches,
         watcher_handles: HashMap::new(),
+        subscribers: HashMap::new(),
         shutting_down: false,
     }));
 
@@ -174,6 +262,13 @@ fn handle_connection(
             return Ok(());
         }
     };
+    if let DaemonRequest::TaskSubscribe {
+        task_id,
+        replay_last,
+    } = request
+    {
+        return handle_task_subscribe(state, &mut writer, task_id, replay_last);
+    }
     let response = match handle_request(state, watch_tx, request) {
         Ok(value) => value,
         Err(err) => {
@@ -184,6 +279,54 @@ fn handle_connection(
         }
     };
     write_socket_response(&mut writer, &response)?;
+    Ok(())
+}
+
+fn handle_task_subscribe(
+    state: Arc<Mutex<DaemonState>>,
+    writer: &mut BufWriter<UnixStream>,
+    task_id: String,
+    replay_last: usize,
+) -> Result<()> {
+    let root = state.lock().map_err(lock_err)?.root.clone();
+    let replay = load_task_events(&root, &task_id)?;
+    let replay = if replay_last == 0 || replay_last >= replay.len() {
+        replay
+    } else {
+        replay[replay.len().saturating_sub(replay_last)..].to_vec()
+    };
+    write_socket_response(
+        writer,
+        &DaemonResponse::TaskSubscribeAck {
+            task_id: task_id.clone(),
+            replayed: replay.len(),
+        },
+    )?;
+    for frame in replay {
+        match write_socket_message(writer, &frame) {
+            Ok(()) => {}
+            Err(err) if is_benign_disconnect_error(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        }
+    }
+
+    let (tx, rx) = mpsc::channel();
+    {
+        let mut guard = state.lock().map_err(lock_err)?;
+        guard
+            .subscribers
+            .entry(task_id.clone())
+            .or_default()
+            .push(tx);
+    }
+
+    while let Ok(frame) = rx.recv() {
+        match write_socket_message(writer, &frame) {
+            Ok(()) => {}
+            Err(err) if is_benign_disconnect_error(&err) => break,
+            Err(err) => return Err(err),
+        }
+    }
     Ok(())
 }
 
@@ -295,6 +438,9 @@ fn handle_request(
                 removed_watch_ids: removed.1,
             })
         }
+        DaemonRequest::TaskSubscribe { .. } => {
+            Err(anyhow!("task subscribe is handled as a streaming request"))
+        }
         DaemonRequest::WatchList { task_id } => {
             let state = state.lock().map_err(lock_err)?;
             let watches = state
@@ -399,6 +545,100 @@ fn build_status(state: &DaemonState) -> Result<DaemonStatus> {
     })
 }
 
+fn emit_task_event(
+    state: Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    kind: &str,
+    data: Value,
+) -> Result<()> {
+    let (root, frame, subscribers) = {
+        let mut guard = state.lock().map_err(lock_err)?;
+        let task = guard
+            .tasks
+            .tasks
+            .entry(task_id.to_string())
+            .or_insert_with(|| TaskRecord {
+                task_id: task_id.to_string(),
+                ..TaskRecord::default()
+            });
+        task.last_event_seq = task.last_event_seq.saturating_add(1);
+        let frame = DaemonEventFrame {
+            seq: task.last_event_seq,
+            task_id: task_id.to_string(),
+            event: DaemonEvent {
+                kind: kind.to_string(),
+                occurred_at_unix: now_unix(),
+                data,
+            },
+        };
+        let subscribers = guard.subscribers.get(task_id).cloned().unwrap_or_default();
+        (guard.root.clone(), frame, subscribers)
+    };
+    append_task_event(&root, &frame)?;
+    let mut still_open = Vec::new();
+    for subscriber in subscribers {
+        if subscriber.send(frame.clone()).is_ok() {
+            still_open.push(subscriber);
+        }
+    }
+    let mut guard = state.lock().map_err(lock_err)?;
+    if still_open.is_empty() {
+        guard.subscribers.remove(task_id);
+    } else {
+        guard.subscribers.insert(task_id.to_string(), still_open);
+    }
+    persist_state(&guard)?;
+    Ok(())
+}
+
+fn refresh_task_context_summary(
+    state: Arc<Mutex<DaemonState>>,
+    task_id: &str,
+) -> Result<Option<Value>> {
+    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    let response = match kernel.execute(KernelRequest {
+        target: "contextq.manage".to_string(),
+        reducer_input: json!({
+            "task_id": task_id,
+            "budget_tokens": DEFAULT_CONTEXT_MANAGE_BUDGET_TOKENS,
+            "budget_bytes": DEFAULT_CONTEXT_MANAGE_BUDGET_BYTES,
+            "scope": "task_first",
+        }),
+        ..KernelRequest::default()
+    }) {
+        Ok(response) => response,
+        Err(err) => {
+            daemon_log(&format!(
+                "context manage refresh failed task_id={task_id}: {err}"
+            ));
+            return Ok(None);
+        }
+    };
+    let Some(packet) = response.output_packets.first() else {
+        return Ok(None);
+    };
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextManagePayload> =
+        serde_json::from_value(packet.body.clone())
+            .map_err(|source| anyhow!(source.to_string()))?;
+    let summary = json!({
+        "working_set_tokens": envelope.payload.budget.working_set_tokens,
+        "evictable_tokens": envelope.payload.budget.evictable_tokens,
+        "changed_paths_since_checkpoint": envelope.payload.changed_paths_since_checkpoint.len(),
+        "changed_symbols_since_checkpoint": envelope.payload.changed_symbols_since_checkpoint.len(),
+    });
+    let mut guard = state.lock().map_err(lock_err)?;
+    if let Some(task) = guard.tasks.tasks.get_mut(task_id) {
+        task.last_context_refresh_at_unix = Some(now_unix());
+        task.working_set_est_tokens = envelope.payload.budget.working_set_tokens;
+        task.evictable_est_tokens = envelope.payload.budget.evictable_tokens;
+        task.changed_since_checkpoint_paths = envelope.payload.changed_paths_since_checkpoint.len();
+        task.changed_since_checkpoint_symbols =
+            envelope.payload.changed_symbols_since_checkpoint.len();
+    }
+    persist_state(&guard)?;
+    Ok(Some(summary))
+}
+
 fn register_task_and_watches(
     state: Arc<Mutex<DaemonState>>,
     watch_tx: Sender<WatchEventMsg>,
@@ -461,6 +701,12 @@ fn register_task_and_watches(
             sequence_present: true,
             sequence: Some(spec.sequence.clone()),
             last_sequence_metadata: None,
+            last_event_seq: 0,
+            last_context_refresh_at_unix: None,
+            working_set_est_tokens: 0,
+            evictable_est_tokens: 0,
+            changed_since_checkpoint_paths: 0,
+            changed_since_checkpoint_symbols: 0,
         };
         guard.tasks.tasks.insert(spec.task_id.clone(), task.clone());
     }
@@ -528,8 +774,18 @@ fn run_sequence_for_task(
             persist_state(&guard)?;
             (guard.kernel.clone(), sequence)
         };
+        let _ = emit_task_event(
+            state.clone(),
+            task_id,
+            "task_started",
+            json!({"task_id": task_id, "step_count": sequence.steps.len()}),
+        );
 
-        let result = kernel.execute_sequence(sequence);
+        let mut observer = TaskSequenceObserver {
+            state: state.clone(),
+            task_id: task_id.to_string(),
+        };
+        let result = kernel.execute_sequence_with_observer(sequence, &mut observer);
 
         let rerun = {
             let mut guard = state.lock().map_err(lock_err)?;
@@ -559,10 +815,34 @@ fn run_sequence_for_task(
             rerun
         };
 
+        if let Ok(_response) = &result {
+            if let Ok(Some(summary)) = refresh_task_context_summary(state.clone(), task_id) {
+                let _ = emit_task_event(state.clone(), task_id, "context_updated", summary);
+            }
+        }
+
         match result {
-            Ok(response) if rerun => continue,
-            Ok(response) => return Ok(response),
-            Err(err) => return Err(err.into()),
+            Ok(response) if rerun => {
+                continue;
+            }
+            Ok(response) => {
+                let _ = emit_task_event(
+                    state.clone(),
+                    task_id,
+                    "task_completed",
+                    json!({"task_id": task_id, "request_id": response.request_id}),
+                );
+                return Ok(response);
+            }
+            Err(err) => {
+                let _ = emit_task_event(
+                    state.clone(),
+                    task_id,
+                    "task_failed",
+                    json!({"task_id": task_id, "error": err.to_string()}),
+                );
+                return Err(err.into());
+            }
         }
     }
 }
@@ -805,6 +1085,16 @@ fn process_watch_event(state: Arc<Mutex<DaemonState>>, message: WatchEventMsg) -
         task_id,
         paths.join(",")
     ));
+    let _ = emit_task_event(
+        state.clone(),
+        &task_id,
+        "watch_triggered",
+        json!({
+            "watch_id": watch.watch_id,
+            "paths": paths,
+            "kind": format!("{:?}", watch.spec.kind),
+        }),
+    );
 
     if sequence_present {
         let mut spawn_replan = false;
@@ -820,6 +1110,12 @@ fn process_watch_event(state: Arc<Mutex<DaemonState>>, message: WatchEventMsg) -
             }
             persist_state(&guard)?;
         }
+        let _ = emit_task_event(
+            state.clone(),
+            &task_id,
+            "replan_requested",
+            json!({"task_id": task_id}),
+        );
         if spawn_replan {
             let state_clone = state.clone();
             daemon_log(&format!("spawning replan task_id={task_id}"));
@@ -1386,6 +1682,12 @@ fn run_context_recall(request: ContextRecallRequest) -> Result<ContextRecallResp
     let cache = load_cache_root(&request.root);
     let now = now_unix();
     let since_default = now.saturating_sub(86_400);
+    let scope = match request.scope.as_deref().unwrap_or_default() {
+        "task_first" => context_memory_core::RecallScope::TaskFirst,
+        "task_only" => context_memory_core::RecallScope::TaskOnly,
+        _ if request.task_id.is_some() => context_memory_core::RecallScope::TaskFirst,
+        _ => context_memory_core::RecallScope::Global,
+    };
     let hits = cache.recall(
         &request.query,
         &RecallOptions {
@@ -1393,6 +1695,11 @@ fn run_context_recall(request: ContextRecallRequest) -> Result<ContextRecallResp
             since_unix: request.since.or(Some(since_default)),
             until_unix: request.until,
             target: request.target,
+            task_id: request.task_id,
+            scope,
+            packet_types: request.packet_types,
+            path_filters: request.path_filters,
+            symbol_filters: request.symbol_filters,
         },
     );
     Ok(ContextRecallResponse {

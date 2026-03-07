@@ -22,6 +22,7 @@ pub const READY_FILE_NAME: &str = "ready";
 pub const LOG_FILE_NAME: &str = "packet28d.log";
 pub const WATCH_REGISTRY_FILE_NAME: &str = "watch-registry-v1.json";
 pub const TASK_REGISTRY_FILE_NAME: &str = "task-registry-v1.json";
+pub const TASK_EVENTS_DIR_NAME: &str = "tasks";
 pub const MAX_SOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +238,11 @@ pub struct ContextRecallRequest {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub target: Option<String>,
+    pub task_id: Option<String>,
+    pub scope: Option<String>,
+    pub packet_types: Vec<String>,
+    pub path_filters: Vec<String>,
+    pub symbol_filters: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -262,6 +268,10 @@ pub enum DaemonRequest {
     },
     TaskCancel {
         task_id: String,
+    },
+    TaskSubscribe {
+        task_id: String,
+        replay_last: usize,
     },
     WatchList {
         task_id: Option<String>,
@@ -321,6 +331,10 @@ pub enum DaemonResponse {
     TaskCancel {
         task: Option<TaskRecord>,
         removed_watch_ids: Vec<String>,
+    },
+    TaskSubscribeAck {
+        task_id: String,
+        replayed: usize,
     },
     WatchList {
         watches: Vec<WatchRegistration>,
@@ -387,6 +401,12 @@ pub struct TaskRecord {
     pub sequence_present: bool,
     pub sequence: Option<KernelSequenceRequest>,
     pub last_sequence_metadata: Option<Value>,
+    pub last_event_seq: u64,
+    pub last_context_refresh_at_unix: Option<u64>,
+    pub working_set_est_tokens: u64,
+    pub evictable_est_tokens: u64,
+    pub changed_since_checkpoint_paths: usize,
+    pub changed_since_checkpoint_symbols: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -425,6 +445,22 @@ pub struct DaemonStatus {
     pub watches: Vec<WatchRegistration>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonEvent {
+    pub kind: String,
+    pub occurred_at_unix: u64,
+    pub data: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonEventFrame {
+    pub seq: u64,
+    pub task_id: String,
+    pub event: DaemonEvent,
+}
+
 pub fn daemon_dir(root: &Path) -> PathBuf {
     root.join(DAEMON_DIR_NAME)
 }
@@ -455,6 +491,24 @@ pub fn watch_registry_path(root: &Path) -> PathBuf {
 
 pub fn task_registry_path(root: &Path) -> PathBuf {
     daemon_dir(root).join(TASK_REGISTRY_FILE_NAME)
+}
+
+pub fn task_events_dir(root: &Path) -> PathBuf {
+    daemon_dir(root).join(TASK_EVENTS_DIR_NAME)
+}
+
+pub fn task_event_log_path(root: &Path, task_id: &str) -> PathBuf {
+    let safe = task_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    task_events_dir(root).join(format!("{safe}.events.jsonl"))
 }
 
 pub fn ensure_daemon_dir(root: &Path) -> Result<PathBuf> {
@@ -530,6 +584,37 @@ pub fn save_task_registry(root: &Path, registry: &TaskRegistry) -> Result<()> {
     Ok(())
 }
 
+pub fn append_task_event(root: &Path, frame: &DaemonEventFrame) -> Result<()> {
+    let dir = task_events_dir(root);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create task events dir '{}'", dir.display()))?;
+    let path = task_event_log_path(root, &frame.task_id);
+    let mut bytes = serde_json::to_vec(frame)?;
+    bytes.push(b'\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open task event log '{}'", path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("failed to append task event log '{}'", path.display()))?;
+    Ok(())
+}
+
+pub fn load_task_events(root: &Path, task_id: &str) -> Result<Vec<DaemonEventFrame>> {
+    let path = task_event_log_path(root, task_id);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read task event log '{}'", path.display()))?;
+    let mut events = Vec::new();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        events.push(serde_json::from_str(line)?);
+    }
+    Ok(events)
+}
+
 pub fn resolve_workspace_root(start: &Path) -> PathBuf {
     let mut dir = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     loop {
@@ -574,4 +659,43 @@ pub fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn appends_and_loads_task_events() {
+        let dir = tempdir().unwrap();
+        let frame = DaemonEventFrame {
+            seq: 1,
+            task_id: "task/demo".to_string(),
+            event: DaemonEvent {
+                kind: "task_started".to_string(),
+                occurred_at_unix: 1,
+                data: serde_json::json!({"task_id":"task/demo"}),
+            },
+        };
+        append_task_event(dir.path(), &frame).unwrap();
+        append_task_event(
+            dir.path(),
+            &DaemonEventFrame {
+                seq: 2,
+                task_id: "task/demo".to_string(),
+                event: DaemonEvent {
+                    kind: "task_completed".to_string(),
+                    occurred_at_unix: 2,
+                    data: serde_json::json!({"task_id":"task/demo"}),
+                },
+            },
+        )
+        .unwrap();
+
+        let loaded = load_task_events(dir.path(), "task/demo").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].seq, 1);
+        assert_eq!(loaded[1].event.kind, "task_completed");
+    }
 }

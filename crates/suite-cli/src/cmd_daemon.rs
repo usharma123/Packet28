@@ -8,8 +8,8 @@ use packet28_daemon_core::{
     ContextStoreGetRequest, ContextStoreGetResponse, ContextStoreListRequest,
     ContextStoreListResponse, ContextStorePruneDaemonRequest, ContextStorePruneResponse,
     ContextStoreStatsRequest, ContextStoreStatsResponse, CoverCheckRequest, CoverCheckResponse,
-    DaemonRequest, DaemonResponse, PacketFetchRequest, PacketFetchResponse, TaskSubmitSpec,
-    TestMapRequest, TestMapResponse, TestShardRequest, TestShardResponse,
+    DaemonEventFrame, DaemonRequest, DaemonResponse, PacketFetchRequest, PacketFetchResponse,
+    TaskSubmitSpec, TestMapRequest, TestMapResponse, TestShardRequest, TestShardResponse,
 };
 
 #[cfg(unix)]
@@ -70,6 +70,7 @@ pub enum TaskCommands {
     Submit(TaskSubmitArgs),
     Status(TaskStatusArgs),
     Cancel(TaskCancelArgs),
+    Watch(TaskWatchArgs),
 }
 
 #[derive(Args)]
@@ -102,6 +103,20 @@ pub struct TaskCancelArgs {
     pub task_id: String,
     #[arg(long, default_value = ".")]
     pub root: String,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub pretty: bool,
+}
+
+#[derive(Args)]
+pub struct TaskWatchArgs {
+    #[arg(long)]
+    pub task_id: String,
+    #[arg(long, default_value = ".")]
+    pub root: String,
+    #[arg(long, default_value_t = 0)]
+    pub replay_last: usize,
     #[arg(long)]
     pub json: bool,
     #[arg(long)]
@@ -189,6 +204,9 @@ pub fn run_via_daemon(cli: crate::Cli, _raw_args: &[String]) -> Result<i32> {
             }
             crate::ContextCommands::Correlate(args) => {
                 crate::cmd_context::run_correlate_remote(args, &daemon_root)
+            }
+            crate::ContextCommands::Manage(args) => {
+                crate::cmd_context::run_manage_remote(args, &daemon_root)
             }
             crate::ContextCommands::State(args) => {
                 crate::cmd_context::run_state_remote(args, &daemon_root)
@@ -459,6 +477,30 @@ pub fn send_request(root: &Path, request: &DaemonRequest) -> Result<DaemonRespon
     read_socket_message(&mut reader)
 }
 
+#[cfg(unix)]
+fn subscribe_task(root: &Path, task_id: &str, replay_last: usize) -> Result<(UnixStream, usize)> {
+    let socket = socket_path(root);
+    let stream = UnixStream::connect(&socket)
+        .with_context(|| format!("failed to connect to daemon socket '{}'", socket.display()))?;
+    stream
+        .set_read_timeout(None)
+        .context("failed to configure subscribe read timeout")?;
+    let mut writer = BufWriter::new(stream.try_clone()?);
+    let mut reader = BufReader::new(stream.try_clone()?);
+    write_socket_message(
+        &mut writer,
+        &DaemonRequest::TaskSubscribe {
+            task_id: task_id.to_string(),
+            replay_last,
+        },
+    )?;
+    match read_socket_message(&mut reader)? {
+        DaemonResponse::TaskSubscribeAck { replayed, .. } => Ok((stream, replayed)),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
 #[cfg(not(unix))]
 pub fn send_request(_root: &Path, _request: &DaemonRequest) -> Result<DaemonResponse> {
     daemon_not_supported()
@@ -619,6 +661,72 @@ fn run_task(args: TaskArgs) -> Result<i32> {
                 }
                 DaemonResponse::Error { message } => Err(anyhow!(message)),
                 other => Err(anyhow!("unexpected daemon response: {other:?}")),
+            }
+        }
+        TaskCommands::Watch(args) => {
+            #[cfg(not(unix))]
+            {
+                let _ = args;
+                return daemon_not_supported();
+            }
+            #[cfg(unix)]
+            {
+                let root = resolve_root_arg(&args.root);
+                ensure_daemon(&root)?;
+                let (stream, replayed) = subscribe_task(&root, &args.task_id, args.replay_last)?;
+                let mut reader = BufReader::new(stream);
+                if !args.json {
+                    println!("task={} replayed={}", args.task_id, replayed);
+                }
+                loop {
+                    let frame: DaemonEventFrame = match read_socket_message(&mut reader) {
+                        Ok(frame) => frame,
+                        Err(err) => {
+                            if args.json {
+                                return Err(err);
+                            }
+                            println!("stream closed");
+                            return Ok(0);
+                        }
+                    };
+                    if args.json {
+                        crate::cmd_common::emit_json(&serde_json::to_value(frame)?, args.pretty)?;
+                        continue;
+                    }
+                    println!(
+                        "[{}] seq={} kind={}",
+                        frame.event.occurred_at_unix, frame.seq, frame.event.kind
+                    );
+                    if let Some(text) = frame
+                        .event
+                        .data
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        println!("  {text}");
+                    } else if let Some(step_id) = frame
+                        .event
+                        .data
+                        .get("step_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        println!("  step={step_id}");
+                    } else if let Some(paths) = frame
+                        .event
+                        .data
+                        .get("paths")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        let joined = paths
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        if !joined.is_empty() {
+                            println!("  paths={joined}");
+                        }
+                    }
+                }
             }
         }
     }

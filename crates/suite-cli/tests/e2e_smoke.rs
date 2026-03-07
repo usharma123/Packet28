@@ -338,7 +338,7 @@ fn init_repo(root: &Path) {
 }
 
 fn kernel_cache_file(root: &Path) -> PathBuf {
-    root.join(".packet28").join("packet-cache-v1.bin")
+    root.join(".packet28").join("packet-cache-v2.bin")
 }
 
 fn parse_packet_wrapper(output: &[u8], packet_type: &str) -> Value {
@@ -1131,7 +1131,7 @@ fn test_suite_context_correlate_emits_v1_findings() {
         .get("findings")
         .and_then(Value::as_array)
         .unwrap();
-    assert_eq!(findings.len(), 3);
+    assert!(findings.len() >= 3);
     assert!(findings
         .iter()
         .any(|finding| { finding.get("relation").and_then(Value::as_str) == Some("unrelated") }));
@@ -1140,6 +1140,9 @@ fn test_suite_context_correlate_emits_v1_findings() {
         .any(|finding| { finding.get("relation").and_then(Value::as_str) == Some("supports") }));
     assert!(findings.iter().any(|finding| {
         finding.get("relation").and_then(Value::as_str) == Some("pre_existing_or_unrelated")
+    }));
+    assert!(findings.iter().any(|finding| {
+        finding.get("rule").and_then(Value::as_str) == Some("shared_file")
     }));
 }
 
