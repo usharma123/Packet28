@@ -4,6 +4,10 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
+use packet28_daemon_core::{
+    task_brief_json_path, task_brief_markdown_path, task_state_json_path, BrokerAction,
+    BrokerGetContextRequest,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -56,7 +60,6 @@ pub fn main_entry() {
 pub fn run(cli: Packet28AgentCli) -> Result<i32> {
     let root = resolve_root_arg(&cli.root)?;
     let preflight_path = crate::agent_surface::latest_preflight_path(&root);
-    let cached_coverage_state = root.join(".covy").join("state").join("latest.bin");
     let preflight_parent = preflight_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid preflight output path"))?;
@@ -67,32 +70,42 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
         )
     })?;
 
-    let preflight_args = crate::cmd_preflight::PreflightArgs {
-        task: cli.task,
-        root: root.to_string_lossy().into_owned(),
-        task_id: cli.task_id,
-        base: None,
-        head: None,
-        budget_tokens: 5_000,
-        limit_recall: 4,
-        focus_paths: Vec::new(),
-        focus_symbols: Vec::new(),
-        coverage: Vec::new(),
-        stack_input: None,
-        build_input: None,
-        testmap: ".covy/state/testmap.bin".to_string(),
-        include: Vec::new(),
-        exclude: wrapper_excludes(&cached_coverage_state),
-        json: Some(cli.json),
-        pretty: false,
-    };
-    let preflight_value = crate::cmd_preflight::execute_local_json(preflight_args, "covy.toml")?;
-    fs::write(&preflight_path, serde_json::to_vec(&preflight_value)?).with_context(|| {
+    let task_id = cli
+        .task_id
+        .clone()
+        .unwrap_or_else(|| crate::broker_client::derive_task_id(&cli.task));
+    let broker_response = crate::broker_client::get_context(
+        &root,
+        BrokerGetContextRequest {
+            task_id: task_id.clone(),
+            action: Some(BrokerAction::Plan),
+            budget_tokens: Some(5_000),
+            budget_bytes: Some(32_000),
+            since_version: None,
+            focus_paths: Vec::new(),
+            focus_symbols: Vec::new(),
+            tool_name: None,
+            tool_result_kind: None,
+            query: Some(cli.task.clone()),
+            include_sections: Vec::new(),
+            exclude_sections: Vec::new(),
+            verbosity: None,
+            response_mode: None,
+            include_self_context: false,
+            max_sections: None,
+            default_max_items_per_section: None,
+            section_item_limits: std::collections::BTreeMap::new(),
+        },
+    )?;
+    fs::write(&preflight_path, serde_json::to_vec(&broker_response)?).with_context(|| {
         format!(
-            "failed to persist preflight payload to '{}'",
+            "failed to persist broker payload to '{}'",
             preflight_path.display()
         )
     })?;
+    let brief_json_path = task_brief_json_path(&root, &task_id);
+    let brief_md_path = task_brief_markdown_path(&root, &task_id);
+    let state_json_path = task_state_json_path(&root, &task_id);
 
     let mut child = Command::new(&cli.command[0]);
     child
@@ -101,21 +114,45 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("PACKET28_PREFLIGHT_PATH", &preflight_path)
+        .env("PACKET28_TASK_ID", &task_id)
+        .env(
+            "PACKET28_BROKER_CONTEXT_VERSION",
+            &broker_response.context_version,
+        )
+        .env(
+            "PACKET28_BROKER_BUDGET_REMAINING_TOKENS",
+            broker_response.budget_remaining_tokens.to_string(),
+        )
+        .env("PACKET28_BROKER_BRIEF_PATH", &brief_md_path)
+        .env("PACKET28_BROKER_BRIEF_JSON_PATH", &brief_json_path)
+        .env("PACKET28_BROKER_STATE_PATH", &state_json_path)
+        .env("PACKET28_BROKER_SUPPORTS_PUSH", "1")
+        .env("PACKET28_BROKER_ESTIMATE_TOOL", "packet28.estimate_context")
+        .env("PACKET28_BROKER_GET_CONTEXT_TOOL", "packet28.get_context")
+        .env(
+            "PACKET28_BROKER_VALIDATE_PLAN_TOOL",
+            "packet28.validate_plan",
+        )
+        .env("PACKET28_BROKER_DECOMPOSE_TOOL", "packet28.decompose")
+        .env("PACKET28_BROKER_RESPONSE_MODE", "auto")
+        .env("PACKET28_BROKER_POLL_FIELD", "since_version")
+        .env("PACKET28_BROKER_WINDOW_MODE", "replace")
+        .env("PACKET28_BROKER_SUPERSESSION", "1")
+        .env("PACKET28_BROKER_SECTION_CACHE_KEY", "sections_by_id")
+        .env("PACKET28_BROKER_REPLACE_PACKET28_CONTEXT", "1")
+        .env(
+            "PACKET28_MCP_NOTIFICATION_METHOD",
+            "notifications/packet28.context_updated",
+        )
+        .env(
+            "PACKET28_MCP_COMMAND",
+            format!("Packet28 mcp serve --root {}", root.display()),
+        )
         .env("PACKET28_ROOT", &root);
     let status = child
         .status()
         .with_context(|| format!("failed to execute delegated command '{}'", cli.command[0]))?;
     Ok(status.code().unwrap_or(1))
-}
-
-fn wrapper_excludes(
-    cached_coverage_state: &std::path::Path,
-) -> Vec<crate::cmd_preflight::PreflightReducer> {
-    if cached_coverage_state.exists() {
-        Vec::new()
-    } else {
-        vec![crate::cmd_preflight::PreflightReducer::Diff]
-    }
 }
 
 fn resolve_root_arg(root: &str) -> Result<PathBuf> {
@@ -146,8 +183,8 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_excludes_diff_without_cached_coverage_state() {
-        let excludes = wrapper_excludes(std::path::Path::new("/tmp/does-not-exist"));
-        assert_eq!(excludes, vec![crate::cmd_preflight::PreflightReducer::Diff]);
+    fn derived_task_id_is_stable() {
+        let task_id = crate::broker_client::derive_task_id("investigate parser regression");
+        assert!(task_id.starts_with("task-"));
     }
 }

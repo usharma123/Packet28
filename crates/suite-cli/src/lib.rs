@@ -1,4 +1,5 @@
 pub mod agent_surface;
+pub mod broker_client;
 pub mod cmd_agent_prompt;
 pub mod cmd_build;
 pub mod cmd_common;
@@ -10,6 +11,7 @@ pub mod cmd_guard;
 pub mod cmd_impact;
 pub mod cmd_map;
 pub mod cmd_map_repo;
+pub mod cmd_mcp;
 pub mod cmd_packet;
 pub mod cmd_preflight;
 pub mod cmd_proxy;
@@ -77,6 +79,8 @@ pub enum Commands {
     Preflight(cmd_preflight::PreflightArgs),
     /// Emit repo-local agent instruction fragments that describe how to use Packet28
     AgentPrompt(cmd_agent_prompt::AgentPromptArgs),
+    /// Run Packet28 as an MCP stdio server
+    Mcp(cmd_mcp::McpArgs),
     /// Daemon lifecycle and task commands
     Daemon(cmd_daemon::DaemonArgs),
 }
@@ -281,6 +285,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         },
         Commands::Preflight(args) => cmd_preflight::run(args, &cli.config),
         Commands::AgentPrompt(args) => cmd_agent_prompt::run(args),
+        Commands::Mcp(args) => cmd_mcp::run(args),
         Commands::Daemon(daemon) => cmd_daemon::run(daemon),
     }
 }
@@ -522,7 +527,9 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
             "preflight",
         )),
         Commands::Preflight(_) => None,
-        Commands::Daemon(_) | Commands::Guard(_) | Commands::AgentPrompt(_) => None,
+        Commands::Daemon(_) | Commands::Guard(_) | Commands::AgentPrompt(_) | Commands::Mcp(_) => {
+            None
+        }
     }
 }
 

@@ -204,6 +204,13 @@ struct PreflightTotals {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct PreflightBrokerSummary {
+    task_id: String,
+    context_version: String,
+    brief: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct PreflightResponse {
     schema_version: String,
     task: String,
@@ -214,6 +221,8 @@ struct PreflightResponse {
     selection: PreflightSelection,
     results: PreflightResults,
     totals: PreflightTotals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broker: Option<PreflightBrokerSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,11 +263,6 @@ pub fn run_remote(args: PreflightArgs, config_path: &str, daemon_root: &Path) ->
     )?;
     emit_response(&args, &response)?;
     Ok(0)
-}
-
-pub(crate) fn execute_local_json(args: PreflightArgs, config_path: &str) -> Result<Value> {
-    let response = execute(args, config_path, ExecutionMode::Local)?;
-    serde_json::to_value(response).map_err(Into::into)
 }
 
 fn execute(
@@ -427,6 +431,66 @@ fn execute(
     };
     totals.actual_over_budget = totals.est_tokens > args.budget_tokens;
     totals.over_budget = totals.actual_over_budget;
+    let broker_task_id = args
+        .task_id
+        .clone()
+        .unwrap_or_else(|| crate::broker_client::derive_task_id(&args.task));
+    let broker_response = match mode {
+        ExecutionMode::Local => crate::broker_client::get_context(
+            &root,
+            packet28_daemon_core::BrokerGetContextRequest {
+                task_id: broker_task_id.clone(),
+                action: Some(packet28_daemon_core::BrokerAction::Plan),
+                budget_tokens: Some(args.budget_tokens.max(1)),
+                budget_bytes: Some(DEFAULT_PREFLIGHT_BUDGET_TOKENS as usize * 8),
+                since_version: None,
+                focus_paths: selection.anchors.paths.clone(),
+                focus_symbols: selection.anchors.symbols.clone(),
+                tool_name: None,
+                tool_result_kind: None,
+                query: Some(args.task.clone()),
+                include_sections: Vec::new(),
+                exclude_sections: Vec::new(),
+                verbosity: None,
+                response_mode: None,
+                include_self_context: false,
+                max_sections: None,
+                default_max_items_per_section: None,
+                section_item_limits: std::collections::BTreeMap::new(),
+            },
+        )
+        .ok(),
+        ExecutionMode::Remote(daemon_root) => match crate::cmd_daemon::send_request(
+            daemon_root,
+            &packet28_daemon_core::DaemonRequest::BrokerGetContext {
+                request: packet28_daemon_core::BrokerGetContextRequest {
+                    task_id: broker_task_id.clone(),
+                    action: Some(packet28_daemon_core::BrokerAction::Plan),
+                    budget_tokens: Some(args.budget_tokens.max(1)),
+                    budget_bytes: Some(DEFAULT_PREFLIGHT_BUDGET_TOKENS as usize * 8),
+                    since_version: None,
+                    focus_paths: selection.anchors.paths.clone(),
+                    focus_symbols: selection.anchors.symbols.clone(),
+                    tool_name: None,
+                    tool_result_kind: None,
+                    query: Some(args.task.clone()),
+                    include_sections: Vec::new(),
+                    exclude_sections: Vec::new(),
+                    verbosity: None,
+                    response_mode: None,
+                    include_self_context: false,
+                    max_sections: None,
+                    default_max_items_per_section: None,
+                    section_item_limits: std::collections::BTreeMap::new(),
+                },
+            },
+        ) {
+            Ok(packet28_daemon_core::DaemonResponse::BrokerGetContext { response }) => {
+                Some(response)
+            }
+            _ => None,
+        },
+    };
 
     Ok(PreflightResponse {
         schema_version: PREFLIGHT_SCHEMA_VERSION.to_string(),
@@ -452,6 +516,11 @@ fn execute(
             },
         },
         totals,
+        broker: broker_response.map(|response| PreflightBrokerSummary {
+            task_id: broker_task_id,
+            context_version: response.context_version,
+            brief: response.brief,
+        }),
     })
 }
 

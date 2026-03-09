@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, BufWriter, ErrorKind};
 use std::os::unix::net::UnixListener;
@@ -26,8 +26,18 @@ use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
 use packet28_daemon_core::{
     append_task_event, ensure_daemon_dir, load_task_events, load_task_registry,
     load_watch_registry, log_path, now_unix, read_socket_message, ready_path, remove_runtime_files,
-    save_task_registry, save_watch_registry, socket_path, write_runtime_info, write_socket_message,
-    ContextRecallRequest, ContextRecallResponse, ContextStoreGetRequest, ContextStoreGetResponse,
+    save_task_registry, save_watch_registry, socket_path, task_brief_json_path,
+    task_brief_markdown_path, task_event_log_path, task_state_json_path, task_version_json_path,
+    write_runtime_info, write_socket_message, BrokerAction, BrokerDecision, BrokerDecomposeIntent,
+    BrokerDecomposeRequest, BrokerDecomposeResponse, BrokerDecomposedStep, BrokerDeltaResponse,
+    BrokerEstimateContextRequest, BrokerEstimateContextResponse, BrokerEvictionCandidate,
+    BrokerGetContextRequest, BrokerGetContextResponse, BrokerPacketRef, BrokerPlanStep,
+    BrokerPlanViolation, BrokerQuestion, BrokerRecommendedAction, BrokerResolvedQuestion,
+    BrokerResponseMode, BrokerSection, BrokerSectionEstimate, BrokerSourceKind,
+    BrokerSupersessionMode, BrokerTaskStatusRequest, BrokerTaskStatusResponse,
+    BrokerToolResultKind, BrokerValidatePlanRequest, BrokerValidatePlanResponse, BrokerVerbosity,
+    BrokerWriteOp, BrokerWriteStateRequest, BrokerWriteStateResponse, ContextRecallRequest,
+    ContextRecallResponse, ContextStoreGetRequest, ContextStoreGetResponse,
     ContextStoreListRequest, ContextStoreListResponse, ContextStorePruneDaemonRequest,
     ContextStorePruneResponse, ContextStoreStatsRequest, ContextStoreStatsResponse,
     CoverCheckRequest, CoverCheckResponse, DaemonEvent, DaemonEventFrame, DaemonRequest,
@@ -503,6 +513,30 @@ fn handle_request(
             let response = run_context_recall(request)?;
             Ok(DaemonResponse::ContextRecall { response })
         }
+        DaemonRequest::BrokerGetContext { request } => {
+            let response = broker_get_context(state, request)?;
+            Ok(DaemonResponse::BrokerGetContext { response })
+        }
+        DaemonRequest::BrokerEstimateContext { request } => {
+            let response = broker_estimate_context(state, request)?;
+            Ok(DaemonResponse::BrokerEstimateContext { response })
+        }
+        DaemonRequest::BrokerValidatePlan { request } => {
+            let response = broker_validate_plan(state, request)?;
+            Ok(DaemonResponse::BrokerValidatePlan { response })
+        }
+        DaemonRequest::BrokerDecompose { request } => {
+            let response = broker_decompose(state, request)?;
+            Ok(DaemonResponse::BrokerDecompose { response })
+        }
+        DaemonRequest::BrokerWriteState { request } => {
+            let response = broker_write_state(state, request)?;
+            Ok(DaemonResponse::BrokerWriteState { response })
+        }
+        DaemonRequest::BrokerTaskStatus { request } => {
+            let response = broker_task_status(state, request)?;
+            Ok(DaemonResponse::BrokerTaskStatus { response })
+        }
     }
 }
 
@@ -639,6 +673,2236 @@ fn refresh_task_context_summary(
     Ok(Some(summary))
 }
 
+fn broker_default_budget_tokens() -> u64 {
+    DEFAULT_CONTEXT_MANAGE_BUDGET_TOKENS
+}
+
+fn broker_default_budget_bytes() -> usize {
+    DEFAULT_CONTEXT_MANAGE_BUDGET_BYTES
+}
+
+fn ensure_task_record_mut<'a>(tasks: &'a mut TaskRegistry, task_id: &str) -> &'a mut TaskRecord {
+    tasks
+        .tasks
+        .entry(task_id.to_string())
+        .or_insert_with(|| TaskRecord {
+            task_id: task_id.to_string(),
+            ..TaskRecord::default()
+        })
+}
+
+fn next_context_version(current: Option<&str>) -> String {
+    current
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1)
+        .to_string()
+}
+
+fn ensure_context_version(task: &mut TaskRecord) -> String {
+    let version = task
+        .latest_context_version
+        .clone()
+        .unwrap_or_else(|| next_context_version(None));
+    task.latest_context_version = Some(version.clone());
+    version
+}
+
+fn bump_context_version(state: &Arc<Mutex<DaemonState>>, task_id: &str) -> Result<String> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+    let version = next_context_version(task.latest_context_version.as_deref());
+    task.latest_context_version = Some(version.clone());
+    persist_state(&guard)?;
+    Ok(version)
+}
+
+fn set_context_reason(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    reason: impl Into<String>,
+) -> Result<()> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+    task.latest_context_reason = Some(reason.into());
+    persist_state(&guard)?;
+    Ok(())
+}
+
+fn current_context_version(state: &Arc<Mutex<DaemonState>>, task_id: &str) -> Result<String> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    let version = ensure_context_version(ensure_task_record_mut(&mut guard.tasks, task_id));
+    persist_state(&guard)?;
+    Ok(version)
+}
+
+fn update_broker_link_state(
+    state: &Arc<Mutex<DaemonState>>,
+    request: &BrokerWriteStateRequest,
+) -> Result<()> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    let task = ensure_task_record_mut(&mut guard.tasks, &request.task_id);
+    match request.op.unwrap_or(BrokerWriteOp::FileRead) {
+        BrokerWriteOp::QuestionOpen => {
+            if let (Some(question_id), Some(text)) = (&request.question_id, &request.text) {
+                task.question_texts
+                    .insert(question_id.clone(), text.clone());
+                task.resolved_questions.remove(question_id);
+            }
+        }
+        BrokerWriteOp::QuestionResolve => {
+            if let Some(question_id) = &request.question_id {
+                task.question_texts
+                    .entry(question_id.clone())
+                    .or_insert_with(|| "resolved question".to_string());
+                if let Some(decision_id) = &request.resolution_decision_id {
+                    task.resolved_questions
+                        .insert(question_id.clone(), decision_id.clone());
+                    task.linked_decisions
+                        .insert(decision_id.clone(), question_id.clone());
+                } else {
+                    task.resolved_questions
+                        .entry(question_id.clone())
+                        .or_insert_with(String::new);
+                }
+            }
+        }
+        BrokerWriteOp::DecisionAdd => {
+            if let (Some(decision_id), Some(question_id)) =
+                (&request.decision_id, &request.resolves_question_id)
+            {
+                task.linked_decisions
+                    .insert(decision_id.clone(), question_id.clone());
+                task.resolved_questions
+                    .insert(question_id.clone(), decision_id.clone());
+            }
+        }
+        BrokerWriteOp::DecisionSupersede => {
+            if let Some(decision_id) = &request.decision_id {
+                task.linked_decisions.remove(decision_id);
+                task.resolved_questions
+                    .retain(|_, linked_decision_id| linked_decision_id != decision_id);
+            }
+        }
+        _ => {}
+    }
+    persist_state(&guard)?;
+    Ok(())
+}
+
+fn load_agent_snapshot_for_task(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+) -> Result<suite_packet_core::AgentSnapshotPayload> {
+    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    let response = kernel.execute(KernelRequest {
+        target: "agenty.state.snapshot".to_string(),
+        reducer_input: json!({ "task_id": task_id }),
+        ..KernelRequest::default()
+    })?;
+    let packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no agent snapshot packet"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentSnapshotPayload> =
+        serde_json::from_value(packet.body.clone())
+            .map_err(|source| anyhow!("invalid agent snapshot packet: {source}"))?;
+    Ok(envelope.payload)
+}
+
+fn load_context_manage_for_task(
+    state: &Arc<Mutex<DaemonState>>,
+    request: &BrokerGetContextRequest,
+) -> Result<suite_packet_core::ContextManagePayload> {
+    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    let response = kernel.execute(KernelRequest {
+        target: "contextq.manage".to_string(),
+        reducer_input: json!({
+            "task_id": request.task_id,
+            "query": request.query,
+            "budget_tokens": request.budget_tokens.unwrap_or_else(broker_default_budget_tokens),
+            "budget_bytes": request.budget_bytes.unwrap_or_else(broker_default_budget_bytes),
+            "scope": "task_first",
+        }),
+        policy_context: json!({
+            "task_id": request.task_id,
+        }),
+        ..KernelRequest::default()
+    })?;
+    let packet = response
+        .output_packets
+        .first()
+        .ok_or_else(|| anyhow!("kernel returned no context manage packet"))?;
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextManagePayload> =
+        serde_json::from_value(packet.body.clone())
+            .map_err(|source| anyhow!("invalid context manage packet: {source}"))?;
+    Ok(envelope.payload)
+}
+
+fn load_repo_map_for_task(
+    state: &Arc<Mutex<DaemonState>>,
+    request: &BrokerGetContextRequest,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> Result<Option<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>>> {
+    let action = request.action.unwrap_or(BrokerAction::Plan);
+    if !matches!(
+        action,
+        BrokerAction::Plan | BrokerAction::Inspect | BrokerAction::Edit | BrokerAction::Summarize
+    ) {
+        return Ok(None);
+    }
+
+    let root = state.lock().map_err(lock_err)?.root.clone();
+    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    let response = kernel.execute(KernelRequest {
+        target: "mapy.repo".to_string(),
+        reducer_input: json!({
+            "repo_root": root,
+            "focus_paths": merged_unique(&snapshot.focus_paths, &request.focus_paths),
+            "focus_symbols": merged_unique(&snapshot.focus_symbols, &request.focus_symbols),
+            "max_files": 12,
+            "max_symbols": 24,
+            "include_tests": true,
+        }),
+        policy_context: json!({
+            "task_id": request.task_id,
+        }),
+        ..KernelRequest::default()
+    })?;
+    let packet = response.output_packets.first();
+    let Some(packet) = packet else {
+        return Ok(None);
+    };
+    let envelope = serde_json::from_value(packet.body.clone())
+        .map_err(|source| anyhow!("invalid repo map packet: {source}"))?;
+    Ok(Some(envelope))
+}
+
+fn build_repo_map_envelope(
+    root: &Path,
+    focus_paths: &[String],
+    focus_symbols: &[String],
+    max_files: usize,
+    max_symbols: usize,
+) -> Result<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>> {
+    mapy_core::build_repo_map(mapy_core::RepoMapRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        focus_paths: focus_paths.to_vec(),
+        focus_symbols: focus_symbols.to_vec(),
+        max_files,
+        max_symbols,
+        include_tests: true,
+    })
+    .map_err(|source| anyhow!(source.to_string()))
+}
+
+fn load_cached_coverage(root: &Path) -> Result<Option<suite_packet_core::CoverageData>> {
+    let path = root.join(".covy").join("state").join("latest.bin");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read cached coverage state '{}'", path.display()))?;
+    let coverage = suite_foundation_core::cache::deserialize_coverage(&bytes)
+        .map_err(|source| anyhow!(source.to_string()))?;
+    Ok(Some(coverage))
+}
+
+fn load_cached_testmap(root: &Path) -> Result<Option<suite_packet_core::TestMapIndex>> {
+    let path = root.join(".covy").join("state").join("testmap.bin");
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(testy_core::pipeline_testmap::load_testmap(&path)?))
+}
+
+fn normalize_plan_steps(steps: &[BrokerPlanStep]) -> Vec<BrokerPlanStep> {
+    steps
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| {
+            let mut normalized = step.clone();
+            if normalized.id.trim().is_empty() {
+                normalized.id = format!("step-{}", idx + 1);
+            } else {
+                normalized.id = normalized.id.trim().to_string();
+            }
+            normalized.action = normalized.action.trim().to_ascii_lowercase();
+            normalized.description = normalized
+                .description
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            normalized.paths = merged_unique(&[], &step.paths);
+            normalized.symbols = merged_unique(&[], &step.symbols);
+            normalized.depends_on = merged_unique(&[], &step.depends_on);
+            normalized
+        })
+        .collect()
+}
+
+fn is_edit_like_action(action: &str) -> bool {
+    matches!(
+        action,
+        "edit"
+            | "file_edit"
+            | "rename"
+            | "extract"
+            | "split_file"
+            | "merge_files"
+            | "restructure_module"
+    )
+}
+
+fn is_test_like_step(step: &BrokerPlanStep) -> bool {
+    step.action.contains("test")
+        || step
+            .description
+            .as_deref()
+            .is_some_and(|text| text.to_ascii_lowercase().contains("test"))
+        || step.paths.iter().any(|path| {
+            let lower = path.to_ascii_lowercase();
+            lower.contains("test") || lower.contains("/spec") || lower.ends_with("_test.rs")
+        })
+}
+
+fn estimate_plan_step_tokens(step: &BrokerPlanStep) -> u64 {
+    let mut estimate = 48_u64;
+    estimate = estimate.saturating_add((step.paths.len() as u64) * 40);
+    estimate = estimate.saturating_add((step.symbols.len() as u64) * 24);
+    estimate = estimate.saturating_add((step.depends_on.len() as u64) * 8);
+    if let Some(description) = &step.description {
+        estimate = estimate.saturating_add(estimate_text_cost(description).0);
+    }
+    estimate.max(64)
+}
+
+fn tokenize_task_text(task_text: &str) -> Vec<String> {
+    task_text
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .map(str::trim)
+        .filter(|token| token.len() >= 3)
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn infer_scope_paths(
+    task_text: &str,
+    rich_map: &mapy_core::RepoMapPayloadRich,
+    explicit_paths: &[String],
+    explicit_symbols: &[String],
+) -> Vec<String> {
+    if !explicit_paths.is_empty() {
+        return merged_unique(&[], explicit_paths);
+    }
+
+    let tokens = tokenize_task_text(task_text);
+    let explicit_symbol_set = explicit_symbols
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut scored = rich_map
+        .files_ranked
+        .iter()
+        .map(|file| {
+            let lower_path = file.path.to_ascii_lowercase();
+            let token_matches = tokens
+                .iter()
+                .filter(|token| lower_path.contains(token.as_str()))
+                .count();
+            let symbol_matches = rich_map
+                .symbols_ranked
+                .iter()
+                .filter(|symbol| {
+                    symbol.file == file.path
+                        && explicit_symbol_set.contains(&symbol.name.to_ascii_lowercase())
+                })
+                .count();
+            let score = token_matches + symbol_matches;
+            (score, file.score, file.path.clone())
+        })
+        .filter(|(score, _, _)| *score > 0)
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    scored
+        .into_iter()
+        .map(|(_, _, path)| path)
+        .take(6)
+        .collect()
+}
+
+fn find_candidate_test_paths(
+    path: &str,
+    rich_map: &mapy_core::RepoMapPayloadRich,
+    testmap: Option<&suite_packet_core::TestMapIndex>,
+) -> Vec<String> {
+    let lower = path.to_ascii_lowercase();
+    let mut candidates = HashMap::<String, usize>::new();
+    for file in &rich_map.files_ranked {
+        let file_lower = file.path.to_ascii_lowercase();
+        if !(file_lower.contains("test") || file_lower.contains("/spec")) {
+            continue;
+        }
+        let score = if file_lower.contains(lower.as_str()) {
+            3
+        } else if Path::new(&file.path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|stem| lower.contains(&stem.to_ascii_lowercase()))
+        {
+            2
+        } else {
+            1
+        };
+        candidates.insert(file.path.clone(), score);
+    }
+    if let Some(testmap) = testmap {
+        if let Some(mapped) = testmap.file_to_tests.get(path) {
+            for test_id in mapped {
+                candidates.entry(test_id.clone()).or_insert(4);
+            }
+        }
+    }
+    let mut ranked = candidates.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.into_iter().map(|(path, _)| path).take(3).collect()
+}
+
+fn coverage_gap_for_path(coverage: Option<&suite_packet_core::CoverageData>, path: &str) -> bool {
+    let Some(coverage) = coverage else {
+        return false;
+    };
+    coverage
+        .files
+        .get(path)
+        .and_then(|file| file.line_coverage_pct())
+        .map(|pct| pct < 80.0)
+        .unwrap_or(true)
+}
+
+fn current_deleted_paths(root: &Path) -> HashSet<String> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output();
+    let Ok(output) = output else {
+        return HashSet::new();
+    };
+    if !output.status.success() {
+        return HashSet::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_end();
+            if trimmed.len() < 4 {
+                return None;
+            }
+            let status = &trimmed[..2];
+            if !status.contains('D') {
+                return None;
+            }
+            Some(trimmed[3..].trim().to_string())
+        })
+        .collect()
+}
+
+fn merged_unique(current: &[String], requested: &[String]) -> Vec<String> {
+    let mut values = std::collections::BTreeSet::new();
+    for value in current {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            values.insert(trimmed.to_string());
+        }
+    }
+    for value in requested {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            values.insert(trimmed.to_string());
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn broker_objective(
+    state: &Arc<Mutex<DaemonState>>,
+    request: &BrokerGetContextRequest,
+) -> Option<String> {
+    if let Some(query) = request
+        .query
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(query.to_string());
+    }
+    let guard = state.lock().ok()?;
+    guard
+        .tasks
+        .tasks
+        .get(&request.task_id)
+        .and_then(|task| task.latest_broker_request.as_ref())
+        .and_then(|previous| previous.query.as_ref())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn broker_request_response_mode(request: &BrokerGetContextRequest) -> BrokerResponseMode {
+    request.response_mode.unwrap_or(BrokerResponseMode::Full)
+}
+
+#[derive(Debug, Clone)]
+struct BrokerEffectiveLimits {
+    max_sections: usize,
+    default_max_items_per_section: usize,
+    section_item_limits: BTreeMap<String, usize>,
+}
+
+fn estimate_text_cost(text: &str) -> (u64, u64) {
+    let est_bytes = text.len() as u64;
+    let est_tokens = est_bytes.saturating_add(3) / 4;
+    (est_tokens.max(1), est_bytes)
+}
+
+fn packet_source_kind(packet: &suite_packet_core::ContextManagePacketRef) -> BrokerSourceKind {
+    if packet.target.starts_with("agenty.state.") {
+        BrokerSourceKind::SelfAuthored
+    } else if packet.target.starts_with("contextq.")
+        || packet.target.starts_with("mapy.")
+        || packet.target.starts_with("context.")
+    {
+        BrokerSourceKind::Derived
+    } else {
+        BrokerSourceKind::External
+    }
+}
+
+fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
+    match action {
+        BrokerAction::Plan => &[
+            "task_objective",
+            "active_decisions",
+            "open_questions",
+            "current_focus",
+            "repo_map",
+            "relevant_context",
+            "recommended_actions",
+        ],
+        BrokerAction::Inspect => &[
+            "task_objective",
+            "current_focus",
+            "repo_map",
+            "relevant_context",
+            "checkpoint_deltas",
+            "active_decisions",
+            "open_questions",
+        ],
+        BrokerAction::ChooseTool => &[
+            "task_objective",
+            "recommended_actions",
+            "relevant_context",
+            "open_questions",
+            "active_decisions",
+        ],
+        BrokerAction::Interpret => &[
+            "task_objective",
+            "recommended_actions",
+            "relevant_context",
+            "active_decisions",
+            "open_questions",
+            "resolved_questions",
+        ],
+        BrokerAction::Edit => &[
+            "task_objective",
+            "current_focus",
+            "checkpoint_deltas",
+            "active_decisions",
+            "repo_map",
+            "relevant_context",
+            "resolved_questions",
+        ],
+        BrokerAction::Summarize => &[
+            "task_objective",
+            "progress",
+            "active_decisions",
+            "resolved_questions",
+            "open_questions",
+            "checkpoint_deltas",
+        ],
+    }
+}
+
+fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
+    let mut section_item_limits = BTreeMap::new();
+    match action {
+        BrokerAction::Plan => {
+            section_item_limits.insert("active_decisions".to_string(), 8);
+            section_item_limits.insert("open_questions".to_string(), 8);
+            section_item_limits.insert("current_focus".to_string(), 8);
+            section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("relevant_context".to_string(), 6);
+            section_item_limits.insert("recommended_actions".to_string(), 6);
+            BrokerEffectiveLimits {
+                max_sections: 6,
+                default_max_items_per_section: 8,
+                section_item_limits,
+            }
+        }
+        BrokerAction::Inspect => {
+            section_item_limits.insert("current_focus".to_string(), 8);
+            section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("relevant_context".to_string(), 6);
+            section_item_limits.insert("checkpoint_deltas".to_string(), 8);
+            BrokerEffectiveLimits {
+                max_sections: 6,
+                default_max_items_per_section: 8,
+                section_item_limits,
+            }
+        }
+        BrokerAction::ChooseTool => {
+            section_item_limits.insert("recommended_actions".to_string(), 4);
+            section_item_limits.insert("relevant_context".to_string(), 4);
+            section_item_limits.insert("open_questions".to_string(), 4);
+            BrokerEffectiveLimits {
+                max_sections: 5,
+                default_max_items_per_section: 4,
+                section_item_limits,
+            }
+        }
+        BrokerAction::Interpret => {
+            section_item_limits.insert("recommended_actions".to_string(), 4);
+            section_item_limits.insert("relevant_context".to_string(), 4);
+            section_item_limits.insert("resolved_questions".to_string(), 4);
+            BrokerEffectiveLimits {
+                max_sections: 5,
+                default_max_items_per_section: 4,
+                section_item_limits,
+            }
+        }
+        BrokerAction::Edit => {
+            section_item_limits.insert("current_focus".to_string(), 8);
+            section_item_limits.insert("checkpoint_deltas".to_string(), 8);
+            section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("relevant_context".to_string(), 5);
+            BrokerEffectiveLimits {
+                max_sections: 6,
+                default_max_items_per_section: 8,
+                section_item_limits,
+            }
+        }
+        BrokerAction::Summarize => {
+            section_item_limits.insert("progress".to_string(), 3);
+            section_item_limits.insert("resolved_questions".to_string(), 6);
+            section_item_limits.insert("checkpoint_deltas".to_string(), 8);
+            BrokerEffectiveLimits {
+                max_sections: 6,
+                default_max_items_per_section: 8,
+                section_item_limits,
+            }
+        }
+    }
+}
+
+fn legacy_verbosity_limits(
+    action: BrokerAction,
+    verbosity: BrokerVerbosity,
+) -> BrokerEffectiveLimits {
+    let mut limits = default_limits_for_action(action);
+    match verbosity {
+        BrokerVerbosity::Compact => {
+            limits.max_sections = limits.max_sections.min(4);
+            limits.default_max_items_per_section = 3;
+            for value in limits.section_item_limits.values_mut() {
+                *value = (*value).min(3);
+            }
+        }
+        BrokerVerbosity::Standard => {}
+        BrokerVerbosity::Rich => {
+            limits.max_sections = limits.max_sections.max(8);
+            limits.default_max_items_per_section = 12;
+            for value in limits.section_item_limits.values_mut() {
+                *value = (*value).max(10);
+            }
+        }
+    }
+    limits
+}
+
+fn resolve_effective_limits(
+    action: BrokerAction,
+    verbosity: Option<BrokerVerbosity>,
+    max_sections: Option<usize>,
+    default_max_items_per_section: Option<usize>,
+    section_item_limits: &BTreeMap<String, usize>,
+) -> BrokerEffectiveLimits {
+    let has_explicit_limits = max_sections.is_some()
+        || default_max_items_per_section.is_some()
+        || !section_item_limits.is_empty();
+    let mut limits = if has_explicit_limits {
+        default_limits_for_action(action)
+    } else {
+        legacy_verbosity_limits(action, verbosity.unwrap_or(BrokerVerbosity::Standard))
+    };
+    if let Some(value) = max_sections.filter(|value| *value > 0) {
+        limits.max_sections = value;
+    }
+    if let Some(value) = default_max_items_per_section.filter(|value| *value > 0) {
+        limits.default_max_items_per_section = value;
+    }
+    for (section_id, limit) in section_item_limits {
+        if *limit > 0 {
+            limits
+                .section_item_limits
+                .insert(section_id.clone(), *limit);
+        }
+    }
+    limits
+}
+
+fn section_item_limit(limits: &BrokerEffectiveLimits, section_id: &str) -> usize {
+    limits
+        .section_item_limits
+        .get(section_id)
+        .copied()
+        .unwrap_or(limits.default_max_items_per_section)
+}
+
+fn truncate_lines(lines: Vec<String>, max_lines: usize) -> String {
+    lines
+        .into_iter()
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn filter_requested_section_ids(
+    action: BrokerAction,
+    include_sections: &[String],
+    exclude_sections: &[String],
+) -> HashSet<String> {
+    let mut allowed = section_ids_for_action(action)
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<HashSet<_>>();
+    if !include_sections.is_empty() {
+        allowed = include_sections
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .collect();
+    }
+    for excluded in exclude_sections {
+        allowed.remove(excluded.trim());
+    }
+    allowed
+}
+
+fn load_task_record(state: &Arc<Mutex<DaemonState>>, task_id: &str) -> Option<TaskRecord> {
+    state.lock().ok()?.tasks.tasks.get(task_id).cloned()
+}
+
+fn build_resolved_questions(
+    task: Option<&TaskRecord>,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> Vec<BrokerResolvedQuestion> {
+    let Some(task) = task else {
+        return Vec::new();
+    };
+    let active_decisions = snapshot
+        .active_decisions
+        .iter()
+        .map(|decision| (decision.id.as_str(), decision.text.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    task.resolved_questions
+        .iter()
+        .map(|(question_id, decision_id)| BrokerResolvedQuestion {
+            id: question_id.clone(),
+            text: task
+                .question_texts
+                .get(question_id)
+                .cloned()
+                .unwrap_or_else(|| "resolved question".to_string()),
+            resolved_by_decision_id: (!decision_id.trim().is_empty()).then(|| decision_id.clone()),
+            resolution_text: (!decision_id.trim().is_empty())
+                .then(|| {
+                    active_decisions
+                        .get(decision_id.as_str())
+                        .map(|value| (*value).to_string())
+                })
+                .flatten(),
+        })
+        .collect()
+}
+
+fn build_broker_sections(
+    state: &Arc<Mutex<DaemonState>>,
+    request: &BrokerGetContextRequest,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    manage: &suite_packet_core::ContextManagePayload,
+    repo_map: Option<&suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>>,
+) -> Vec<BrokerSection> {
+    let action = request.action.unwrap_or(BrokerAction::Plan);
+    let effective_limits = resolve_effective_limits(
+        action,
+        request.verbosity,
+        request.max_sections,
+        request.default_max_items_per_section,
+        &request.section_item_limits,
+    );
+    let allowed_sections =
+        filter_requested_section_ids(action, &request.include_sections, &request.exclude_sections);
+    let task = load_task_record(state, &request.task_id);
+    let resolved_questions = build_resolved_questions(task.as_ref(), snapshot);
+    let mut sections = Vec::new();
+
+    if let Some(objective) = broker_objective(state, request) {
+        sections.push(BrokerSection {
+            id: "task_objective".to_string(),
+            title: "Task Objective".to_string(),
+            body: objective,
+            priority: 1,
+            source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
+    if !snapshot.active_decisions.is_empty() {
+        sections.push(BrokerSection {
+            id: "active_decisions".to_string(),
+            title: "Active Decisions".to_string(),
+            body: truncate_lines(
+                snapshot
+                    .active_decisions
+                    .iter()
+                    .map(|decision| {
+                        let suffix = task
+                            .as_ref()
+                            .and_then(|task| task.linked_decisions.get(&decision.id))
+                            .map(|question_id| format!(" (answers {question_id})"))
+                            .unwrap_or_default();
+                        format!("- {}: {}{}", decision.id, decision.text, suffix)
+                    })
+                    .collect(),
+                section_item_limit(&effective_limits, "active_decisions"),
+            ),
+            priority: 1,
+            source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
+    if !snapshot.open_questions.is_empty() {
+        sections.push(BrokerSection {
+            id: "open_questions".to_string(),
+            title: "Open Questions".to_string(),
+            body: truncate_lines(
+                snapshot
+                    .open_questions
+                    .iter()
+                    .map(|question| format!("- {}: {}", question.id, question.text))
+                    .collect(),
+                section_item_limit(&effective_limits, "open_questions"),
+            ),
+            priority: 1,
+            source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
+    if !resolved_questions.is_empty() {
+        sections.push(BrokerSection {
+            id: "resolved_questions".to_string(),
+            title: "Resolved Questions".to_string(),
+            body: truncate_lines(
+                resolved_questions
+                    .iter()
+                    .map(|question| {
+                        match (&question.resolved_by_decision_id, &question.resolution_text) {
+                            (Some(decision_id), Some(text)) => {
+                                format!(
+                                    "- {}: {} -> {} ({})",
+                                    question.id, question.text, decision_id, text
+                                )
+                            }
+                            (Some(decision_id), None) => {
+                                format!("- {}: {} -> {}", question.id, question.text, decision_id)
+                            }
+                            _ => format!("- {}: {}", question.id, question.text),
+                        }
+                    })
+                    .collect(),
+                section_item_limit(&effective_limits, "resolved_questions"),
+            ),
+            priority: if matches!(action, BrokerAction::Interpret | BrokerAction::Summarize) {
+                1
+            } else {
+                2
+            },
+            source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
+    let focus_lines = merged_unique(&snapshot.focus_paths, &request.focus_paths)
+        .into_iter()
+        .map(|path| format!("- path: {path}"))
+        .chain(
+            merged_unique(&snapshot.focus_symbols, &request.focus_symbols)
+                .into_iter()
+                .map(|symbol| format!("- symbol: {symbol}")),
+        )
+        .collect::<Vec<_>>();
+    if !focus_lines.is_empty() {
+        sections.push(BrokerSection {
+            id: "current_focus".to_string(),
+            title: "Current Focus".to_string(),
+            body: truncate_lines(
+                focus_lines,
+                section_item_limit(&effective_limits, "current_focus"),
+            ),
+            priority: if matches!(action, BrokerAction::Inspect | BrokerAction::Edit) {
+                1
+            } else {
+                2
+            },
+            source_kind: BrokerSourceKind::SelfAuthored,
+        });
+    }
+
+    if !snapshot.changed_paths_since_checkpoint.is_empty()
+        || !snapshot.changed_symbols_since_checkpoint.is_empty()
+    {
+        let body = snapshot
+            .changed_paths_since_checkpoint
+            .iter()
+            .map(|path| format!("- changed path: {path}"))
+            .chain(
+                snapshot
+                    .changed_symbols_since_checkpoint
+                    .iter()
+                    .map(|symbol| format!("- changed symbol: {symbol}")),
+            )
+            .collect::<Vec<_>>();
+        sections.push(BrokerSection {
+            id: "checkpoint_deltas".to_string(),
+            title: "Checkpoint Deltas".to_string(),
+            body: truncate_lines(
+                body,
+                section_item_limit(&effective_limits, "checkpoint_deltas"),
+            ),
+            priority: if matches!(action, BrokerAction::Edit | BrokerAction::Summarize) {
+                1
+            } else {
+                2
+            },
+            source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
+    if let Some(repo_map) = repo_map {
+        let lines = repo_map
+            .files
+            .iter()
+            .map(|file| format!("- file: {}", file.path))
+            .chain(
+                repo_map
+                    .symbols
+                    .iter()
+                    .map(|symbol| format!("- symbol: {}", symbol.name)),
+            )
+            .collect::<Vec<_>>();
+        if !lines.is_empty() {
+            sections.push(BrokerSection {
+                id: "repo_map".to_string(),
+                title: "Repo Anchors".to_string(),
+                body: truncate_lines(lines, section_item_limit(&effective_limits, "repo_map")),
+                priority: if matches!(action, BrokerAction::Plan | BrokerAction::Inspect) {
+                    1
+                } else {
+                    2
+                },
+                source_kind: BrokerSourceKind::Derived,
+            });
+        }
+    }
+
+    if !manage.working_set.is_empty() || !manage.recommended_packets.is_empty() {
+        let packets = if !manage.working_set.is_empty() {
+            &manage.working_set
+        } else {
+            &manage.recommended_packets
+        };
+        let visible_packets = packets
+            .iter()
+            .filter(|packet| {
+                request.include_self_context
+                    || packet_source_kind(packet) != BrokerSourceKind::SelfAuthored
+            })
+            .map(|packet| {
+                let summary = packet.summary.as_deref().unwrap_or("no summary");
+                format!("- {} [{}] {}", packet.target, packet.cache_key, summary)
+            })
+            .collect::<Vec<_>>();
+        if !visible_packets.is_empty() {
+            sections.push(BrokerSection {
+                id: "relevant_context".to_string(),
+                title: "Relevant Context".to_string(),
+                body: truncate_lines(
+                    visible_packets,
+                    section_item_limit(&effective_limits, "relevant_context"),
+                ),
+                priority: if matches!(
+                    action,
+                    BrokerAction::Plan | BrokerAction::Interpret | BrokerAction::ChooseTool
+                ) {
+                    1
+                } else {
+                    2
+                },
+                source_kind: BrokerSourceKind::External,
+            });
+        }
+    }
+
+    if !manage.recommended_actions.is_empty() {
+        let title = match request
+            .tool_result_kind
+            .unwrap_or(BrokerToolResultKind::Generic)
+        {
+            BrokerToolResultKind::Build => "Build Guidance",
+            BrokerToolResultKind::Stack => "Stack Guidance",
+            BrokerToolResultKind::Test => "Test Guidance",
+            BrokerToolResultKind::Diff => "Diff Guidance",
+            BrokerToolResultKind::Generic => "Recommended Actions",
+        };
+        sections.push(BrokerSection {
+            id: "recommended_actions".to_string(),
+            title: title.to_string(),
+            body: truncate_lines(
+                manage
+                    .recommended_actions
+                    .iter()
+                    .map(|action| format!("- {}: {}", action.kind, action.summary))
+                    .collect(),
+                section_item_limit(&effective_limits, "recommended_actions"),
+            ),
+            priority: if matches!(action, BrokerAction::ChooseTool | BrokerAction::Interpret) {
+                1
+            } else {
+                2
+            },
+            source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
+    if matches!(action, BrokerAction::Summarize) {
+        let progress = vec![
+            format!("- completed steps: {}", snapshot.completed_steps.len()),
+            format!("- files read: {}", snapshot.files_read.len()),
+            format!("- files edited: {}", snapshot.files_edited.len()),
+        ];
+        sections.push(BrokerSection {
+            id: "progress".to_string(),
+            title: "Progress".to_string(),
+            body: progress.join("\n"),
+            priority: 1,
+            source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
+    sections.retain(|section| allowed_sections.contains(&section.id));
+    sections.sort_by_key(|section| (section.priority, section.id.clone()));
+    sections.truncate(effective_limits.max_sections);
+    sections
+}
+
+fn render_brief(task_id: &str, context_version: &str, sections: &[BrokerSection]) -> String {
+    let mut blocks = vec![format!(
+        "[Packet28 Context v{context_version} — current Packet28 context for task {task_id}; supersedes all prior Packet28 context for this task]"
+    )];
+    blocks.extend(
+        sections
+            .iter()
+            .map(|section| format!("## {}\n{}", section.title, section.body)),
+    );
+    blocks.join("\n\n")
+}
+
+fn load_versioned_broker_response(
+    root: &Path,
+    task_id: &str,
+    context_version: &str,
+) -> Result<Option<BrokerGetContextResponse>> {
+    let path = task_version_json_path(root, task_id, context_version);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "failed to read versioned broker response '{}'",
+            path.display()
+        )
+    })?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn build_delta(
+    current: &[BrokerSection],
+    previous: Option<&BrokerGetContextResponse>,
+) -> BrokerDeltaResponse {
+    let Some(previous) = previous else {
+        return BrokerDeltaResponse {
+            changed_sections: current.to_vec(),
+            removed_section_ids: Vec::new(),
+            unchanged_section_ids: Vec::new(),
+            full_refresh_required: true,
+        };
+    };
+    let current_by_id = current
+        .iter()
+        .map(|section| (section.id.as_str(), section))
+        .collect::<BTreeMap<_, _>>();
+    let previous_by_id = previous
+        .sections
+        .iter()
+        .map(|section| (section.id.as_str(), section))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut changed_sections = Vec::new();
+    let mut unchanged_section_ids = Vec::new();
+    for section in current {
+        match previous_by_id.get(section.id.as_str()) {
+            Some(old) if *old == section => unchanged_section_ids.push(section.id.clone()),
+            _ => changed_sections.push(section.clone()),
+        }
+    }
+    let removed_section_ids = previous
+        .sections
+        .iter()
+        .filter(|section| !current_by_id.contains_key(section.id.as_str()))
+        .map(|section| section.id.clone())
+        .collect::<Vec<_>>();
+    BrokerDeltaResponse {
+        changed_sections,
+        removed_section_ids,
+        unchanged_section_ids,
+        full_refresh_required: false,
+    }
+}
+
+fn build_section_estimates(
+    sections: &[BrokerSection],
+    changed_ids: &HashSet<String>,
+) -> Vec<BrokerSectionEstimate> {
+    sections
+        .iter()
+        .map(|section| {
+            let (est_tokens, est_bytes) = estimate_text_cost(&section.body);
+            BrokerSectionEstimate {
+                id: section.id.clone(),
+                est_tokens,
+                est_bytes,
+                source_kind: section.source_kind,
+                changed: changed_ids.contains(&section.id),
+            }
+        })
+        .collect()
+}
+
+fn build_eviction_candidates(sections: &[BrokerSection]) -> Vec<BrokerEvictionCandidate> {
+    sections
+        .iter()
+        .filter(|section| {
+            matches!(
+                section.id.as_str(),
+                "relevant_context" | "repo_map" | "checkpoint_deltas" | "recommended_actions"
+            )
+        })
+        .map(|section| {
+            let (est_tokens, _) = estimate_text_cost(&section.body);
+            let reason = match section.id.as_str() {
+                "relevant_context" => "refreshable evidence".to_string(),
+                "repo_map" => "stable repo anchors".to_string(),
+                "checkpoint_deltas" => "checkpoint state can be recomputed".to_string(),
+                "recommended_actions" => "guidance can be regenerated".to_string(),
+                _ => "refreshable section".to_string(),
+            };
+            BrokerEvictionCandidate {
+                section_id: section.id.clone(),
+                reason,
+                est_tokens,
+            }
+        })
+        .collect()
+}
+
+fn should_use_delta_view(
+    request: &BrokerGetContextRequest,
+    delta: &BrokerDeltaResponse,
+    full_sections_len: usize,
+) -> bool {
+    match broker_request_response_mode(request) {
+        BrokerResponseMode::Full => false,
+        BrokerResponseMode::Delta => request.since_version.is_some(),
+        BrokerResponseMode::Auto => {
+            request.since_version.is_some()
+                && !delta.full_refresh_required
+                && !delta.changed_sections.is_empty()
+                && delta.changed_sections.len() < full_sections_len
+        }
+    }
+}
+
+fn write_broker_artifacts(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    response: &BrokerGetContextResponse,
+) -> Result<String> {
+    let root = state.lock().map_err(lock_err)?.root.clone();
+    let brief_md_path = task_brief_markdown_path(&root, task_id);
+    let brief_json_path = task_brief_json_path(&root, task_id);
+    let state_json_path = task_state_json_path(&root, task_id);
+    let version_json_path = task_version_json_path(&root, task_id, &response.context_version);
+    if let Some(parent) = brief_md_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create task artifact dir '{}'", parent.display())
+        })?;
+    }
+    if let Some(parent) = version_json_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create versioned broker artifact dir '{}'",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(&brief_md_path, &response.brief)
+        .with_context(|| format!("failed to write '{}'", brief_md_path.display()))?;
+    fs::write(&brief_json_path, serde_json::to_vec_pretty(response)?)
+        .with_context(|| format!("failed to write '{}'", brief_json_path.display()))?;
+    fs::write(&version_json_path, serde_json::to_vec_pretty(response)?)
+        .with_context(|| format!("failed to write '{}'", version_json_path.display()))?;
+
+    let hash = blake3::hash(serde_json::to_string(response)?.as_bytes())
+        .to_hex()
+        .to_string();
+    let generated_at = now_unix();
+    {
+        let mut guard = state.lock().map_err(lock_err)?;
+        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        task.latest_brief_path = Some(brief_md_path.to_string_lossy().to_string());
+        task.latest_brief_hash = Some(hash.clone());
+        task.latest_brief_generated_at_unix = Some(generated_at);
+        task.last_context_refresh_at_unix = Some(generated_at);
+        let state_value = json!({
+            "task_id": task_id,
+            "context_version": task.latest_context_version,
+            "latest_brief_path": task.latest_brief_path,
+            "latest_brief_hash": task.latest_brief_hash,
+            "latest_brief_generated_at_unix": task.latest_brief_generated_at_unix,
+            "latest_context_reason": task.latest_context_reason,
+            "brief_json_path": brief_json_path.to_string_lossy().to_string(),
+            "event_path": task_event_log_path(&root, task_id).to_string_lossy().to_string(),
+            "supports_push": true,
+        });
+        persist_state(&guard)?;
+        fs::write(&state_json_path, serde_json::to_vec_pretty(&state_value)?)
+            .with_context(|| format!("failed to write '{}'", state_json_path.display()))?;
+    }
+    Ok(hash)
+}
+
+fn compute_broker_response(
+    state: &Arc<Mutex<DaemonState>>,
+    request: &BrokerGetContextRequest,
+) -> Result<BrokerGetContextResponse> {
+    let snapshot = load_agent_snapshot_for_task(state, &request.task_id)?;
+    let manage = load_context_manage_for_task(state, request)?;
+    let repo_map = load_repo_map_for_task(state, request, &snapshot)?;
+    let task = load_task_record(state, &request.task_id);
+    let root = state.lock().map_err(lock_err)?.root.clone();
+    let version = current_context_version(state, &request.task_id)?;
+    let action = request.action.unwrap_or(BrokerAction::Plan);
+    let effective_limits = resolve_effective_limits(
+        action,
+        request.verbosity,
+        request.max_sections,
+        request.default_max_items_per_section,
+        &request.section_item_limits,
+    );
+    let full_sections =
+        build_broker_sections(state, request, &snapshot, &manage, repo_map.as_ref());
+    let previous_response = match request.since_version.as_deref() {
+        Some(since_version) if since_version != version => {
+            load_versioned_broker_response(&root, &request.task_id, since_version)?
+        }
+        _ => None,
+    };
+    let delta = build_delta(&full_sections, previous_response.as_ref());
+    let changed_ids = delta
+        .changed_sections
+        .iter()
+        .map(|section| section.id.clone())
+        .collect::<HashSet<_>>();
+    let use_delta_view = should_use_delta_view(request, &delta, full_sections.len());
+    let sections = if use_delta_view {
+        delta.changed_sections.clone()
+    } else {
+        full_sections.clone()
+    };
+    let brief = render_brief(&request.task_id, &version, &sections);
+    let (est_tokens, est_bytes) = estimate_text_cost(&brief);
+    let budget_tokens = request
+        .budget_tokens
+        .unwrap_or_else(broker_default_budget_tokens);
+    let budget_bytes = request
+        .budget_bytes
+        .unwrap_or_else(broker_default_budget_bytes);
+    let resolved_questions = build_resolved_questions(task.as_ref(), &snapshot);
+    Ok(BrokerGetContextResponse {
+        stale: request
+            .since_version
+            .as_deref()
+            .is_some_and(|since| since != version),
+        invalidates_since_version: request
+            .since_version
+            .as_deref()
+            .is_some_and(|since| since != version),
+        context_version: version.clone(),
+        brief,
+        supersedes_prior_context: true,
+        supersession_mode: BrokerSupersessionMode::Replace,
+        superseded_before_version: version.clone(),
+        sections: sections.clone(),
+        est_tokens,
+        est_bytes,
+        budget_remaining_tokens: budget_tokens.saturating_sub(est_tokens),
+        budget_remaining_bytes: (budget_bytes as u64).saturating_sub(est_bytes),
+        section_estimates: build_section_estimates(&sections, &changed_ids),
+        eviction_candidates: build_eviction_candidates(&full_sections),
+        delta,
+        working_set: manage
+            .working_set
+            .iter()
+            .map(|packet| BrokerPacketRef {
+                cache_key: packet.cache_key.clone(),
+                target: packet.target.clone(),
+                score: packet.score,
+                summary: packet.summary.clone(),
+                packet_types: packet.packet_types.clone(),
+                est_tokens: packet.est_tokens,
+                est_bytes: packet.est_bytes,
+            })
+            .collect(),
+        recommended_actions: manage
+            .recommended_actions
+            .iter()
+            .map(|action| BrokerRecommendedAction {
+                kind: action.kind.clone(),
+                summary: action.summary.clone(),
+                related_paths: action.related_paths.clone(),
+                related_symbols: action.related_symbols.clone(),
+            })
+            .collect(),
+        active_decisions: snapshot
+            .active_decisions
+            .iter()
+            .map(|decision| BrokerDecision {
+                id: decision.id.clone(),
+                text: decision.text.clone(),
+                resolves_question_id: task
+                    .as_ref()
+                    .and_then(|task| task.linked_decisions.get(&decision.id))
+                    .cloned(),
+            })
+            .collect(),
+        open_questions: snapshot
+            .open_questions
+            .iter()
+            .map(|question| BrokerQuestion {
+                id: question.id.clone(),
+                text: question.text.clone(),
+            })
+            .collect(),
+        resolved_questions,
+        changed_paths_since_checkpoint: snapshot.changed_paths_since_checkpoint.clone(),
+        changed_symbols_since_checkpoint: snapshot.changed_symbols_since_checkpoint.clone(),
+        effective_max_sections: effective_limits.max_sections,
+        effective_default_max_items_per_section: effective_limits.default_max_items_per_section,
+        effective_section_item_limits: effective_limits.section_item_limits,
+    })
+}
+
+fn estimate_request_to_get_request(
+    request: &BrokerEstimateContextRequest,
+) -> BrokerGetContextRequest {
+    BrokerGetContextRequest {
+        task_id: request.task_id.clone(),
+        action: request.action,
+        budget_tokens: request.budget_tokens,
+        budget_bytes: request.budget_bytes,
+        since_version: request.since_version.clone(),
+        focus_paths: request.focus_paths.clone(),
+        focus_symbols: request.focus_symbols.clone(),
+        tool_name: request.tool_name.clone(),
+        tool_result_kind: request.tool_result_kind,
+        query: request.query.clone(),
+        include_sections: request.include_sections.clone(),
+        exclude_sections: request.exclude_sections.clone(),
+        verbosity: request.verbosity,
+        response_mode: request.response_mode,
+        include_self_context: request.include_self_context,
+        max_sections: request.max_sections,
+        default_max_items_per_section: request.default_max_items_per_section,
+        section_item_limits: request.section_item_limits.clone(),
+    }
+}
+
+fn refresh_broker_context_for_task(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+) -> Result<Option<BrokerGetContextResponse>> {
+    let request = state
+        .lock()
+        .map_err(lock_err)?
+        .tasks
+        .tasks
+        .get(task_id)
+        .and_then(|task| task.latest_broker_request.clone());
+    let Some(mut request) = request else {
+        return Ok(None);
+    };
+    request.since_version = None;
+    request.response_mode = Some(BrokerResponseMode::Full);
+    let response = compute_broker_response(state, &request)?;
+    write_broker_artifacts(state, task_id, &response)?;
+    Ok(Some(response))
+}
+
+fn broker_get_context(
+    state: Arc<Mutex<DaemonState>>,
+    mut request: BrokerGetContextRequest,
+) -> Result<BrokerGetContextResponse> {
+    if request.task_id.trim().is_empty() {
+        anyhow::bail!("broker get_context requires task_id");
+    }
+    if request.action.is_none() {
+        request.action = Some(BrokerAction::Plan);
+    }
+    if request.budget_tokens.is_none() {
+        request.budget_tokens = Some(broker_default_budget_tokens());
+    }
+    if request.budget_bytes.is_none() {
+        request.budget_bytes = Some(broker_default_budget_bytes());
+    }
+    if request.verbosity.is_none() {
+        request.verbosity = Some(BrokerVerbosity::Standard);
+    }
+    if request.response_mode.is_none() {
+        request.response_mode = Some(BrokerResponseMode::Full);
+    }
+    {
+        let mut guard = state.lock().map_err(lock_err)?;
+        let task = ensure_task_record_mut(&mut guard.tasks, &request.task_id);
+        ensure_context_version(task);
+        let mut session_request = request.clone();
+        session_request.since_version = None;
+        session_request.response_mode = Some(BrokerResponseMode::Full);
+        task.latest_broker_request = Some(session_request);
+        persist_state(&guard)?;
+    }
+    let _ = set_context_reason(&state, &request.task_id, "get_context");
+    let response = compute_broker_response(&state, &request)?;
+    write_broker_artifacts(&state, &request.task_id, &response)?;
+    Ok(response)
+}
+
+fn broker_estimate_context(
+    state: Arc<Mutex<DaemonState>>,
+    mut request: BrokerEstimateContextRequest,
+) -> Result<BrokerEstimateContextResponse> {
+    if request.task_id.trim().is_empty() {
+        anyhow::bail!("broker estimate_context requires task_id");
+    }
+    if request.action.is_none() {
+        request.action = Some(BrokerAction::Plan);
+    }
+    if request.budget_tokens.is_none() {
+        request.budget_tokens = Some(broker_default_budget_tokens());
+    }
+    if request.budget_bytes.is_none() {
+        request.budget_bytes = Some(broker_default_budget_bytes());
+    }
+    let get_request = estimate_request_to_get_request(&request);
+    let response = compute_broker_response(&state, &get_request)?;
+    Ok(BrokerEstimateContextResponse {
+        context_version: response.context_version.clone(),
+        selected_section_ids: response
+            .sections
+            .iter()
+            .map(|section| section.id.clone())
+            .collect(),
+        est_tokens: response.est_tokens,
+        est_bytes: response.est_bytes,
+        budget_remaining_tokens: response.budget_remaining_tokens,
+        budget_remaining_bytes: response.budget_remaining_bytes,
+        section_estimates: response.section_estimates,
+        eviction_candidates: response.eviction_candidates,
+        would_use_delta: should_use_delta_view(
+            &get_request,
+            &response.delta,
+            response.delta.changed_sections.len() + response.delta.unchanged_section_ids.len(),
+        ),
+        would_include_brief: !response.sections.is_empty(),
+        effective_max_sections: response.effective_max_sections,
+        effective_default_max_items_per_section: response.effective_default_max_items_per_section,
+        effective_section_item_limits: response.effective_section_item_limits,
+    })
+}
+
+fn broker_validate_plan(
+    state: Arc<Mutex<DaemonState>>,
+    request: BrokerValidatePlanRequest,
+) -> Result<BrokerValidatePlanResponse> {
+    if request.task_id.trim().is_empty() {
+        anyhow::bail!("broker validate_plan requires task_id");
+    }
+    let root = state.lock().map_err(lock_err)?.root.clone();
+    let snapshot = load_agent_snapshot_for_task(&state, &request.task_id)?;
+    let normalized_steps = normalize_plan_steps(&request.steps);
+    let coverage = load_cached_coverage(&root)?;
+    let _testmap = load_cached_testmap(&root)?;
+    let focus_paths = normalized_steps
+        .iter()
+        .flat_map(|step| step.paths.iter().cloned())
+        .collect::<Vec<_>>();
+    let focus_symbols = normalized_steps
+        .iter()
+        .flat_map(|step| step.symbols.iter().cloned())
+        .collect::<Vec<_>>();
+    let repo_map = mapy_core::expand_repo_map_payload(&build_repo_map_envelope(
+        &root,
+        &focus_paths,
+        &focus_symbols,
+        48,
+        96,
+    )?);
+    let deleted_files = current_deleted_paths(&root);
+    let completed_steps = snapshot
+        .completed_steps
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let files_read = snapshot.files_read.iter().cloned().collect::<HashSet<_>>();
+    let step_index = normalized_steps
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| (step.id.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut touched_paths = HashMap::<String, usize>::new();
+    for (idx, step) in normalized_steps.iter().enumerate() {
+        for path in &step.paths {
+            touched_paths.entry(path.clone()).or_insert(idx);
+        }
+    }
+
+    let mut violations = Vec::new();
+    let mut warnings = Vec::new();
+
+    for step in &normalized_steps {
+        for path in &step.paths {
+            if !root.join(path).exists() {
+                let rule = if deleted_files.contains(path) {
+                    "deleted_path"
+                } else {
+                    "unknown_path"
+                };
+                let message = if deleted_files.contains(path) {
+                    format!("step targets '{path}', which is deleted in the current diff")
+                } else {
+                    format!("step targets '{path}', which does not exist in the current workspace")
+                };
+                violations.push(BrokerPlanViolation {
+                    step_id: step.id.clone(),
+                    rule: rule.to_string(),
+                    severity: "error".to_string(),
+                    message,
+                    related_paths: vec![path.clone()],
+                    related_symbols: Vec::new(),
+                });
+            }
+        }
+
+        for dependency in &step.depends_on {
+            if completed_steps.contains(dependency) {
+                warnings.push(BrokerPlanViolation {
+                    step_id: step.id.clone(),
+                    rule: "redundant_dependency".to_string(),
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "step depends on '{dependency}', but that step is already completed"
+                    ),
+                    related_paths: step.paths.clone(),
+                    related_symbols: step.symbols.clone(),
+                });
+            } else if !step_index.contains_key(dependency) {
+                violations.push(BrokerPlanViolation {
+                    step_id: step.id.clone(),
+                    rule: "missing_dependency".to_string(),
+                    severity: "error".to_string(),
+                    message: format!("step depends on unknown step '{dependency}'"),
+                    related_paths: step.paths.clone(),
+                    related_symbols: step.symbols.clone(),
+                });
+            }
+        }
+
+        if request.require_read_before_edit.unwrap_or(true) && is_edit_like_action(&step.action) {
+            for path in &step.paths {
+                if !files_read.contains(path) {
+                    violations.push(BrokerPlanViolation {
+                        step_id: step.id.clone(),
+                        rule: "read_before_edit".to_string(),
+                        severity: "error".to_string(),
+                        message: format!(
+                            "step edits '{path}' before the agent has recorded a file_read for it"
+                        ),
+                        related_paths: vec![path.clone()],
+                        related_symbols: step.symbols.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    for edge in &repo_map.edges {
+        let Some(importer_idx) = touched_paths.get(&edge.from).copied() else {
+            continue;
+        };
+        let Some(imported_idx) = touched_paths.get(&edge.to).copied() else {
+            continue;
+        };
+        if importer_idx < imported_idx {
+            let importer_step = &normalized_steps[importer_idx];
+            let imported_step = &normalized_steps[imported_idx];
+            let importer_depends = importer_step
+                .depends_on
+                .iter()
+                .any(|id| id == &imported_step.id);
+            let imported_depends = imported_step
+                .depends_on
+                .iter()
+                .any(|id| id == &importer_step.id);
+            if !importer_depends && !imported_depends {
+                violations.push(BrokerPlanViolation {
+                    step_id: importer_step.id.clone(),
+                    rule: "dependency_order".to_string(),
+                    severity: "error".to_string(),
+                    message: format!(
+                        "step touches '{}' before its dependency '{}'; add a dependency or reorder the plan",
+                        edge.from, edge.to
+                    ),
+                    related_paths: vec![edge.from.clone(), edge.to.clone()],
+                    related_symbols: Vec::new(),
+                });
+            }
+        }
+    }
+
+    if request.require_test_gate.unwrap_or(true) {
+        for (idx, step) in normalized_steps.iter().enumerate() {
+            if !is_edit_like_action(&step.action) {
+                continue;
+            }
+            for path in &step.paths {
+                if !coverage_gap_for_path(coverage.as_ref(), path) {
+                    continue;
+                }
+                let has_following_test_gate =
+                    normalized_steps.iter().skip(idx + 1).any(is_test_like_step);
+                if !has_following_test_gate {
+                    violations.push(BrokerPlanViolation {
+                        step_id: step.id.clone(),
+                        rule: "missing_test_gate".to_string(),
+                        severity: "error".to_string(),
+                        message: format!(
+                            "step edits uncovered path '{path}' without a later test-focused step"
+                        ),
+                        related_paths: vec![path.clone()],
+                        related_symbols: step.symbols.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    let est_plan_tokens = normalized_steps
+        .iter()
+        .map(estimate_plan_step_tokens)
+        .sum::<u64>();
+    if let Some(budget_tokens) = request.budget_tokens {
+        if est_plan_tokens > budget_tokens {
+            violations.push(BrokerPlanViolation {
+                step_id: "plan".to_string(),
+                rule: "budget_exceeded".to_string(),
+                severity: "error".to_string(),
+                message: format!(
+                    "normalized plan is estimated at ~{est_plan_tokens} tokens, over the requested budget of {budget_tokens}"
+                ),
+                related_paths: normalized_steps
+                    .iter()
+                    .flat_map(|step| step.paths.iter().cloned())
+                    .collect(),
+                related_symbols: Vec::new(),
+            });
+        }
+    }
+
+    Ok(BrokerValidatePlanResponse {
+        valid: violations.is_empty(),
+        violations,
+        warnings,
+        normalized_steps,
+        est_plan_tokens: Some(est_plan_tokens),
+    })
+}
+
+fn broker_decompose(
+    state: Arc<Mutex<DaemonState>>,
+    request: BrokerDecomposeRequest,
+) -> Result<BrokerDecomposeResponse> {
+    if request.task_id.trim().is_empty() {
+        anyhow::bail!("broker decompose requires task_id");
+    }
+    if request.task_text.trim().is_empty() {
+        anyhow::bail!("broker decompose requires task_text");
+    }
+    let Some(intent) = request.intent else {
+        return Ok(BrokerDecomposeResponse {
+            steps: Vec::new(),
+            assumptions: Vec::new(),
+            unresolved: vec!["intent is required for deterministic decomposition".to_string()],
+            selected_scope_paths: Vec::new(),
+        });
+    };
+
+    let root = state.lock().map_err(lock_err)?.root.clone();
+    let snapshot = load_agent_snapshot_for_task(&state, &request.task_id)?;
+    let repo_map = build_repo_map_envelope(
+        &root,
+        &merged_unique(&snapshot.focus_paths, &request.scope_paths),
+        &merged_unique(&snapshot.focus_symbols, &request.scope_symbols),
+        64,
+        128,
+    )?;
+    let rich_map = mapy_core::expand_repo_map_payload(&repo_map);
+    let coverage = load_cached_coverage(&root)?;
+    let testmap = load_cached_testmap(&root)?;
+    let selected_scope_paths = infer_scope_paths(
+        &request.task_text,
+        &rich_map,
+        &request.scope_paths,
+        &request.scope_symbols,
+    );
+    if selected_scope_paths.is_empty() {
+        return Ok(BrokerDecomposeResponse {
+            steps: Vec::new(),
+            assumptions: vec![format!(
+                "intent locked to {:?} for deterministic decomposition",
+                intent
+            )],
+            unresolved: vec![
+                "unable to resolve scope paths from task text; supply scope_paths or scope_symbols"
+                    .to_string(),
+            ],
+            selected_scope_paths,
+        });
+    }
+
+    let max_steps = request.max_steps.unwrap_or(8).max(1);
+    let edge_map = rich_map
+        .edges
+        .iter()
+        .filter(|edge| {
+            selected_scope_paths.contains(&edge.from) && selected_scope_paths.contains(&edge.to)
+        })
+        .fold(BTreeMap::<String, Vec<String>>::new(), |mut acc, edge| {
+            acc.entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
+            acc
+        });
+    let mut ordered_paths = selected_scope_paths.clone();
+    ordered_paths.sort_by_key(|path| edge_map.get(path).map(|deps| deps.len()).unwrap_or(0));
+
+    let mut steps = Vec::new();
+    let mut path_to_step = BTreeMap::<String, String>::new();
+    let action = match intent {
+        BrokerDecomposeIntent::Rename => "rename",
+        BrokerDecomposeIntent::Extract => "extract",
+        BrokerDecomposeIntent::SplitFile => "split_file",
+        BrokerDecomposeIntent::MergeFiles => "merge_files",
+        BrokerDecomposeIntent::RestructureModule => "restructure_module",
+    };
+
+    for (idx, path) in ordered_paths.iter().enumerate() {
+        if steps.len() >= max_steps {
+            break;
+        }
+        let step_id = format!("step-{}", idx + 1);
+        let depends_on = edge_map
+            .get(path)
+            .into_iter()
+            .flatten()
+            .filter_map(|dependency| path_to_step.get(dependency).cloned())
+            .collect::<Vec<_>>();
+        let related_symbols = rich_map
+            .symbols_ranked
+            .iter()
+            .filter(|symbol| symbol.file == *path)
+            .take(3)
+            .map(|symbol| symbol.name.clone())
+            .collect::<Vec<_>>();
+        let description = match intent {
+            BrokerDecomposeIntent::Rename => format!("Rename identifiers and references in {path}"),
+            BrokerDecomposeIntent::Extract => {
+                format!("Extract focused logic from {path} into a smaller unit")
+            }
+            BrokerDecomposeIntent::SplitFile => {
+                format!("Split {path} into smaller responsibility-focused files")
+            }
+            BrokerDecomposeIntent::MergeFiles => {
+                format!("Merge related logic centered on {path}")
+            }
+            BrokerDecomposeIntent::RestructureModule => {
+                format!("Restructure module boundaries around {path}")
+            }
+        };
+        let coverage_gap = coverage_gap_for_path(coverage.as_ref(), path);
+        let step = BrokerDecomposedStep {
+            id: step_id.clone(),
+            action: action.to_string(),
+            description,
+            paths: vec![path.clone()],
+            symbols: related_symbols.clone(),
+            depends_on,
+            coverage_gap,
+            est_tokens: 120 + (related_symbols.len() as u64 * 24),
+        };
+        path_to_step.insert(path.clone(), step_id);
+        steps.push(step);
+    }
+
+    let mut test_targets = Vec::new();
+    for step in &steps {
+        if !step.coverage_gap {
+            continue;
+        }
+        for path in &step.paths {
+            test_targets.extend(find_candidate_test_paths(path, &rich_map, testmap.as_ref()));
+        }
+    }
+    let test_targets = merged_unique(&[], &test_targets);
+    if !test_targets.is_empty() && steps.len() < max_steps {
+        let depends_on = steps.iter().map(|step| step.id.clone()).collect::<Vec<_>>();
+        steps.push(BrokerDecomposedStep {
+            id: format!("step-{}", steps.len() + 1),
+            action: "add_tests".to_string(),
+            description: "Add or update tests to cover the decomposed scope".to_string(),
+            paths: test_targets,
+            symbols: Vec::new(),
+            depends_on,
+            coverage_gap: false,
+            est_tokens: 160,
+        });
+    }
+
+    Ok(BrokerDecomposeResponse {
+        steps,
+        assumptions: vec![format!(
+            "intent constrained to {}",
+            action.replace('_', " ")
+        )],
+        unresolved: Vec::new(),
+        selected_scope_paths,
+    })
+}
+
+fn event_id_for_write(request: &BrokerWriteStateRequest) -> String {
+    let payload = serde_json::to_string(request).unwrap_or_else(|_| request.task_id.clone());
+    let hash = blake3::hash(payload.as_bytes()).to_hex().to_string();
+    format!("broker-{}", &hash[..16])
+}
+
+fn material_write_is_noop(
+    request: &BrokerWriteStateRequest,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> bool {
+    let op = request.op.unwrap_or(BrokerWriteOp::FileRead);
+    match op {
+        BrokerWriteOp::FocusSet => {
+            request
+                .paths
+                .iter()
+                .all(|path| snapshot.focus_paths.iter().any(|existing| existing == path))
+                && request.symbols.iter().all(|symbol| {
+                    snapshot
+                        .focus_symbols
+                        .iter()
+                        .any(|existing| existing == symbol)
+                })
+        }
+        BrokerWriteOp::FocusClear => {
+            if request.paths.is_empty() && request.symbols.is_empty() {
+                snapshot.focus_paths.is_empty() && snapshot.focus_symbols.is_empty()
+            } else {
+                request
+                    .paths
+                    .iter()
+                    .all(|path| !snapshot.focus_paths.iter().any(|existing| existing == path))
+                    && request.symbols.iter().all(|symbol| {
+                        !snapshot
+                            .focus_symbols
+                            .iter()
+                            .any(|existing| existing == symbol)
+                    })
+            }
+        }
+        BrokerWriteOp::FileRead => request
+            .paths
+            .iter()
+            .all(|path| snapshot.files_read.iter().any(|existing| existing == path)),
+        BrokerWriteOp::FileEdit => {
+            request.paths.iter().all(|path| {
+                snapshot
+                    .files_edited
+                    .iter()
+                    .any(|existing| existing == path)
+                    && snapshot
+                        .changed_paths_since_checkpoint
+                        .iter()
+                        .any(|existing| existing == path)
+            }) && request.symbols.iter().all(|symbol| {
+                snapshot
+                    .changed_symbols_since_checkpoint
+                    .iter()
+                    .any(|existing| existing == symbol)
+            })
+        }
+        BrokerWriteOp::CheckpointSave => request
+            .checkpoint_id
+            .as_ref()
+            .zip(snapshot.latest_checkpoint_id.as_ref())
+            .is_some_and(|(next, current)| next == current),
+        BrokerWriteOp::DecisionAdd => request
+            .decision_id
+            .as_ref()
+            .zip(request.text.as_ref())
+            .is_some_and(|(decision_id, text)| {
+                let exists = snapshot
+                    .active_decisions
+                    .iter()
+                    .any(|decision| decision.id == *decision_id && decision.text == *text);
+                let question_already_closed =
+                    request
+                        .resolves_question_id
+                        .as_ref()
+                        .is_none_or(|question_id| {
+                            !snapshot
+                                .open_questions
+                                .iter()
+                                .any(|question| question.id == *question_id)
+                        });
+                exists && question_already_closed
+            }),
+        BrokerWriteOp::DecisionSupersede => {
+            request.decision_id.as_ref().is_some_and(|decision_id| {
+                !snapshot
+                    .active_decisions
+                    .iter()
+                    .any(|decision| decision.id == *decision_id)
+            })
+        }
+        BrokerWriteOp::StepComplete => request.step_id.as_ref().is_some_and(|step_id| {
+            snapshot
+                .completed_steps
+                .iter()
+                .any(|existing| existing == step_id)
+        }),
+        BrokerWriteOp::QuestionOpen => request
+            .question_id
+            .as_ref()
+            .zip(request.text.as_ref())
+            .is_some_and(|(question_id, text)| {
+                snapshot
+                    .open_questions
+                    .iter()
+                    .any(|question| question.id == *question_id && question.text == *text)
+            }),
+        BrokerWriteOp::QuestionResolve => request.question_id.as_ref().is_some_and(|question_id| {
+            !snapshot
+                .open_questions
+                .iter()
+                .any(|question| question.id == *question_id)
+        }),
+    }
+}
+
+fn broker_write_to_event(
+    request: &BrokerWriteStateRequest,
+) -> Result<suite_packet_core::AgentStateEventPayload> {
+    let task_id = request.task_id.trim();
+    if task_id.is_empty() {
+        anyhow::bail!("broker write_state requires task_id");
+    }
+    let op = request.op.unwrap_or(BrokerWriteOp::FileRead);
+    let (kind, data) = match op {
+        BrokerWriteOp::FocusSet => (
+            suite_packet_core::AgentStateEventKind::FocusSet,
+            suite_packet_core::AgentStateEventData::FocusSet {
+                note: request.note.clone(),
+            },
+        ),
+        BrokerWriteOp::FocusClear => (
+            suite_packet_core::AgentStateEventKind::FocusCleared,
+            suite_packet_core::AgentStateEventData::FocusCleared {
+                clear_all: request.paths.is_empty() && request.symbols.is_empty(),
+            },
+        ),
+        BrokerWriteOp::FileRead => (
+            suite_packet_core::AgentStateEventKind::FileRead,
+            suite_packet_core::AgentStateEventData::FileRead {},
+        ),
+        BrokerWriteOp::FileEdit => (
+            suite_packet_core::AgentStateEventKind::FileEdited,
+            suite_packet_core::AgentStateEventData::FileEdited {
+                regions: request.regions.clone(),
+            },
+        ),
+        BrokerWriteOp::CheckpointSave => (
+            suite_packet_core::AgentStateEventKind::CheckpointSaved,
+            suite_packet_core::AgentStateEventData::CheckpointSaved {
+                checkpoint_id: request
+                    .checkpoint_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("checkpoint_save requires checkpoint_id"))?,
+                note: request.note.clone(),
+            },
+        ),
+        BrokerWriteOp::DecisionAdd => (
+            suite_packet_core::AgentStateEventKind::DecisionAdded,
+            suite_packet_core::AgentStateEventData::DecisionAdded {
+                decision_id: request
+                    .decision_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("decision_add requires decision_id"))?,
+                text: request
+                    .text
+                    .clone()
+                    .ok_or_else(|| anyhow!("decision_add requires text"))?,
+                supersedes: None,
+            },
+        ),
+        BrokerWriteOp::DecisionSupersede => (
+            suite_packet_core::AgentStateEventKind::DecisionSuperseded,
+            suite_packet_core::AgentStateEventData::DecisionSuperseded {
+                decision_id: request
+                    .decision_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("decision_supersede requires decision_id"))?,
+                superseded_by: request.note.clone(),
+            },
+        ),
+        BrokerWriteOp::StepComplete => (
+            suite_packet_core::AgentStateEventKind::StepCompleted,
+            suite_packet_core::AgentStateEventData::StepCompleted {
+                step_id: request
+                    .step_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("step_complete requires step_id"))?,
+            },
+        ),
+        BrokerWriteOp::QuestionOpen => (
+            suite_packet_core::AgentStateEventKind::QuestionOpened,
+            suite_packet_core::AgentStateEventData::QuestionOpened {
+                question_id: request
+                    .question_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("question_open requires question_id"))?,
+                text: request
+                    .text
+                    .clone()
+                    .ok_or_else(|| anyhow!("question_open requires text"))?,
+            },
+        ),
+        BrokerWriteOp::QuestionResolve => (
+            suite_packet_core::AgentStateEventKind::QuestionResolved,
+            suite_packet_core::AgentStateEventData::QuestionResolved {
+                question_id: request
+                    .question_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("question_resolve requires question_id"))?,
+            },
+        ),
+    };
+    Ok(suite_packet_core::AgentStateEventPayload {
+        task_id: request.task_id.clone(),
+        event_id: event_id_for_write(request),
+        occurred_at_unix: now_unix(),
+        actor: "packet28.broker".to_string(),
+        kind,
+        paths: request.paths.clone(),
+        symbols: request.symbols.clone(),
+        data,
+    })
+}
+
+fn broker_write_state(
+    state: Arc<Mutex<DaemonState>>,
+    request: BrokerWriteStateRequest,
+) -> Result<BrokerWriteStateResponse> {
+    let snapshot = load_agent_snapshot_for_task(&state, &request.task_id)?;
+    if material_write_is_noop(&request, &snapshot) {
+        update_broker_link_state(&state, &request)?;
+        let version = current_context_version(&state, &request.task_id)?;
+        return Ok(BrokerWriteStateResponse {
+            event_id: event_id_for_write(&request),
+            context_version: version,
+            accepted: true,
+        });
+    }
+
+    let event = broker_write_to_event(&request)?;
+    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    kernel.execute(KernelRequest {
+        target: "agenty.state.write".to_string(),
+        reducer_input: serde_json::to_value(&event)?,
+        policy_context: json!({
+            "task_id": request.task_id,
+        }),
+        ..KernelRequest::default()
+    })?;
+    if let Some(question_id) = &request.resolves_question_id {
+        if snapshot
+            .open_questions
+            .iter()
+            .any(|question| question.id == *question_id)
+        {
+            let question_resolved_event = suite_packet_core::AgentStateEventPayload {
+                task_id: request.task_id.clone(),
+                event_id: format!("{}-resolve", event.event_id),
+                occurred_at_unix: now_unix(),
+                actor: "packet28.broker".to_string(),
+                kind: suite_packet_core::AgentStateEventKind::QuestionResolved,
+                paths: Vec::new(),
+                symbols: Vec::new(),
+                data: suite_packet_core::AgentStateEventData::QuestionResolved {
+                    question_id: question_id.clone(),
+                },
+            };
+            kernel.execute(KernelRequest {
+                target: "agenty.state.write".to_string(),
+                reducer_input: serde_json::to_value(&question_resolved_event)?,
+                policy_context: json!({
+                    "task_id": request.task_id,
+                }),
+                ..KernelRequest::default()
+            })?;
+        }
+    }
+    update_broker_link_state(&state, &request)?;
+    let reason = format!(
+        "state_write:{}",
+        serde_json::to_string(&request.op.unwrap_or(BrokerWriteOp::FileRead))?.trim_matches('"')
+    );
+    let _ = set_context_reason(&state, &request.task_id, reason);
+
+    let version = bump_context_version(&state, &request.task_id)?;
+    if let Some(response) = refresh_broker_context_for_task(&state, &request.task_id)? {
+        let changed_section_ids = response
+            .delta
+            .changed_sections
+            .iter()
+            .map(|section| section.id.clone())
+            .collect::<Vec<_>>();
+        let _ = emit_task_event(
+            state.clone(),
+            &request.task_id,
+            "context_updated",
+            json!({
+                "context_version": response.context_version,
+                "changed_section_ids": changed_section_ids,
+                "removed_section_ids": response.delta.removed_section_ids,
+                "reason": state.lock().ok()
+                    .and_then(|guard| guard.tasks.tasks.get(&request.task_id).and_then(|task| task.latest_context_reason.clone()))
+                    .unwrap_or_else(|| "state_write".to_string()),
+                "summary": response
+                    .sections
+                    .first()
+                    .map(|section| section.title.clone())
+                    .unwrap_or_else(|| "broker refresh".to_string()),
+            }),
+        );
+    }
+
+    Ok(BrokerWriteStateResponse {
+        event_id: event.event_id,
+        context_version: version,
+        accepted: true,
+    })
+}
+
+fn broker_task_status(
+    state: Arc<Mutex<DaemonState>>,
+    request: BrokerTaskStatusRequest,
+) -> Result<BrokerTaskStatusResponse> {
+    let root = state.lock().map_err(lock_err)?.root.clone();
+    let task = state
+        .lock()
+        .map_err(lock_err)?
+        .tasks
+        .tasks
+        .get(&request.task_id)
+        .cloned();
+    Ok(BrokerTaskStatusResponse {
+        latest_context_version: task
+            .as_ref()
+            .and_then(|task| task.latest_context_version.clone()),
+        last_refresh_at_unix: task
+            .as_ref()
+            .and_then(|task| task.last_context_refresh_at_unix),
+        latest_context_reason: task
+            .as_ref()
+            .and_then(|task| task.latest_context_reason.clone()),
+        supports_push: true,
+        task,
+        brief_path: task_brief_markdown_path(&root, &request.task_id)
+            .exists()
+            .then(|| {
+                task_brief_markdown_path(&root, &request.task_id)
+                    .to_string_lossy()
+                    .to_string()
+            }),
+        state_path: task_state_json_path(&root, &request.task_id)
+            .exists()
+            .then(|| {
+                task_state_json_path(&root, &request.task_id)
+                    .to_string_lossy()
+                    .to_string()
+            }),
+        event_path: task_event_log_path(&root, &request.task_id)
+            .exists()
+            .then(|| {
+                task_event_log_path(&root, &request.task_id)
+                    .to_string_lossy()
+                    .to_string()
+            }),
+    })
+}
+
 fn register_task_and_watches(
     state: Arc<Mutex<DaemonState>>,
     watch_tx: Sender<WatchEventMsg>,
@@ -707,6 +2971,15 @@ fn register_task_and_watches(
             evictable_est_tokens: 0,
             changed_since_checkpoint_paths: 0,
             changed_since_checkpoint_symbols: 0,
+            latest_context_version: None,
+            latest_brief_path: None,
+            latest_brief_hash: None,
+            latest_brief_generated_at_unix: None,
+            latest_context_reason: None,
+            latest_broker_request: None,
+            linked_decisions: BTreeMap::new(),
+            resolved_questions: BTreeMap::new(),
+            question_texts: BTreeMap::new(),
         };
         guard.tasks.tasks.insert(spec.task_id.clone(), task.clone());
     }
@@ -816,9 +3089,55 @@ fn run_sequence_for_task(
         };
 
         if let Ok(_response) = &result {
-            if let Ok(Some(summary)) = refresh_task_context_summary(state.clone(), task_id) {
-                let _ = emit_task_event(state.clone(), task_id, "context_updated", summary);
+            let mut summary =
+                refresh_task_context_summary(state.clone(), task_id)?.unwrap_or_else(|| json!({}));
+            let _ = set_context_reason(&state, task_id, "replan_applied");
+            if let Some(response) = refresh_broker_context_for_task(&state, task_id)? {
+                if let Some(object) = summary.as_object_mut() {
+                    object.insert(
+                        "changed_section_ids".to_string(),
+                        Value::Array(
+                            response
+                                .delta
+                                .changed_sections
+                                .iter()
+                                .map(|section| Value::String(section.id.clone()))
+                                .collect(),
+                        ),
+                    );
+                    object.insert(
+                        "removed_section_ids".to_string(),
+                        Value::Array(
+                            response
+                                .delta
+                                .removed_section_ids
+                                .iter()
+                                .map(|id| Value::String(id.clone()))
+                                .collect(),
+                        ),
+                    );
+                    object.insert(
+                        "reason".to_string(),
+                        Value::String("replan_applied".to_string()),
+                    );
+                    object.insert(
+                        "context_version".to_string(),
+                        Value::String(response.context_version.clone()),
+                    );
+                    object.insert(
+                        "brief_path".to_string(),
+                        Value::String(
+                            task_brief_markdown_path(
+                                &state.lock().map_err(lock_err)?.root.clone(),
+                                task_id,
+                            )
+                            .to_string_lossy()
+                            .to_string(),
+                        ),
+                    );
+                }
             }
+            let _ = emit_task_event(state.clone(), task_id, "context_updated", summary);
         }
 
         match result {
@@ -1097,6 +3416,8 @@ fn process_watch_event(state: Arc<Mutex<DaemonState>>, message: WatchEventMsg) -
     );
 
     if sequence_present {
+        let _ = set_context_reason(&state, &task_id, "watch_triggered");
+        let context_version = bump_context_version(&state, &task_id)?;
         let mut spawn_replan = false;
         {
             let mut guard = state.lock().map_err(lock_err)?;
@@ -1114,7 +3435,7 @@ fn process_watch_event(state: Arc<Mutex<DaemonState>>, message: WatchEventMsg) -
             state.clone(),
             &task_id,
             "replan_requested",
-            json!({"task_id": task_id}),
+            json!({"task_id": task_id, "context_version": context_version}),
         );
         if spawn_replan {
             let state_clone = state.clone();
@@ -1736,5 +4057,100 @@ fn parse_format(value: &str) -> Result<Option<CoverageFormat>> {
         "gocov" => Ok(Some(CoverageFormat::GoCov)),
         "llvm-cov" | "llvmcov" => Ok(Some(CoverageFormat::LlvmCov)),
         other => Err(anyhow!("unsupported coverage format '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_limits_override_verbosity_alias() {
+        let mut section_limits = BTreeMap::new();
+        section_limits.insert("relevant_context".to_string(), 2);
+        let limits = resolve_effective_limits(
+            BrokerAction::Plan,
+            Some(BrokerVerbosity::Rich),
+            Some(3),
+            Some(5),
+            &section_limits,
+        );
+        assert_eq!(limits.max_sections, 3);
+        assert_eq!(limits.default_max_items_per_section, 5);
+        assert_eq!(limits.section_item_limits["relevant_context"], 2);
+    }
+
+    #[test]
+    fn omitted_explicit_limits_use_deterministic_action_defaults() {
+        let plan_limits =
+            resolve_effective_limits(BrokerAction::Plan, None, None, None, &BTreeMap::new());
+        let choose_tool_limits =
+            resolve_effective_limits(BrokerAction::ChooseTool, None, None, None, &BTreeMap::new());
+        assert_eq!(plan_limits.max_sections, 6);
+        assert_eq!(plan_limits.default_max_items_per_section, 8);
+        assert_eq!(choose_tool_limits.max_sections, 5);
+        assert_eq!(choose_tool_limits.default_max_items_per_section, 4);
+    }
+
+    #[test]
+    fn brief_always_starts_with_supersession_header() {
+        let brief = render_brief(
+            "task-123",
+            "7",
+            &[BrokerSection {
+                id: "task_objective".to_string(),
+                title: "Task Objective".to_string(),
+                body: "Investigate auth flow".to_string(),
+                priority: 1,
+                source_kind: BrokerSourceKind::Derived,
+            }],
+        );
+        assert!(brief.starts_with("[Packet28 Context v7"));
+        assert!(brief.contains("supersedes all prior Packet28 context"));
+    }
+
+    #[test]
+    fn normalize_plan_steps_trims_and_assigns_missing_ids() {
+        let normalized = normalize_plan_steps(&[BrokerPlanStep {
+            id: " ".to_string(),
+            action: " Edit ".to_string(),
+            description: Some(" touch auth ".to_string()),
+            paths: vec!["src/auth.rs".to_string(), "src/auth.rs".to_string()],
+            symbols: vec![" Login ".to_string()],
+            depends_on: vec![" prev ".to_string(), "prev".to_string()],
+        }]);
+        assert_eq!(normalized[0].id, "step-1");
+        assert_eq!(normalized[0].action, "edit");
+        assert_eq!(normalized[0].description.as_deref(), Some("touch auth"));
+        assert_eq!(normalized[0].paths, vec!["src/auth.rs".to_string()]);
+        assert_eq!(normalized[0].symbols, vec!["Login".to_string()]);
+        assert_eq!(normalized[0].depends_on, vec!["prev".to_string()]);
+    }
+
+    #[test]
+    fn infer_scope_paths_prefers_explicit_paths() {
+        let inferred = infer_scope_paths(
+            "refactor auth module",
+            &mapy_core::RepoMapPayloadRich {
+                files_ranked: vec![
+                    mapy_core::RankedFileRich {
+                        path: "src/auth.rs".to_string(),
+                        score: 1.0,
+                        symbol_count: 1,
+                        import_count: 0,
+                    },
+                    mapy_core::RankedFileRich {
+                        path: "src/session.rs".to_string(),
+                        score: 0.8,
+                        symbol_count: 1,
+                        import_count: 0,
+                    },
+                ],
+                ..Default::default()
+            },
+            &["src/session.rs".to_string()],
+            &[],
+        );
+        assert_eq!(inferred, vec!["src/session.rs".to_string()]);
     }
 }

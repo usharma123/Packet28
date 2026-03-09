@@ -11,9 +11,101 @@ All Packet28 machine-mode commands emit `suite.packet.v1` JSON wrappers. Parse p
 
 ## Agent Integration
 
-### Preflight (Recommended Entry Point)
+### Live Broker (Recommended Entry Point)
 
-Preflight is the primary agent integration surface. It classifies a natural language task, selects the right reducers, runs them, and returns one bounded JSON payload.
+Packet28 is now intended to sit in the live agent loop, not just before it starts. The normal loop is:
+
+1. Start `Packet28 mcp serve`
+2. Keep `task_id`, `context_version`, and a local section cache
+3. Call `packet28.estimate_context` before cheap or budget-constrained actions
+4. For constrained refactors, call `packet28.decompose`, refine the steps locally, then run `packet28.validate_plan`
+5. Call `packet28.get_context(..., since_version, response_mode="auto")`
+6. Patch the local section cache from `delta.changed_sections` and `delta.removed_section_ids`
+7. Replace the prior Packet28 context block instead of appending old Packet28 briefs
+8. Call `packet28.write_state` after file reads, edits, checkpoints, decisions, and question updates
+9. Listen for `notifications/packet28.context_updated`, with polling fallback via `since_version`
+
+### MCP Startup
+
+```bash
+# Start Packet28 as an MCP server for the current repo
+Packet28 mcp serve --root .
+```
+
+### Cost Preview
+
+Ask Packet28 whether a full fetch is worth it before spending tokens:
+
+```json
+{
+  "name": "packet28.estimate_context",
+  "arguments": {
+    "task_id": "task-auth-broker",
+    "action": "plan",
+    "budget_tokens": 4000,
+    "response_mode": "auto",
+    "include_sections": ["task_objective", "repo_map", "recommended_actions"]
+  }
+}
+```
+
+The estimate response includes `selected_section_ids`, `est_tokens`, `budget_remaining_tokens`, `section_estimates`, and `eviction_candidates`.
+
+### Deterministic Planning
+
+Use Packet28 to generate and validate constrained refactor plans before execution. `packet28.decompose` is experimental and intentionally narrow in this milestone:
+
+```json
+{
+  "name": "packet28.decompose",
+  "arguments": {
+    "task_id": "task-auth-broker",
+    "task_text": "restructure auth module",
+    "intent": "restructure_module",
+    "max_steps": 6
+  }
+}
+```
+
+```json
+{
+  "name": "packet28.validate_plan",
+  "arguments": {
+    "task_id": "task-auth-broker",
+    "steps": [
+      {"id": "step-1", "action": "edit", "paths": ["src/auth.rs"]},
+      {"id": "step-2", "action": "add_tests", "paths": ["tests/auth_test.rs"], "depends_on": ["step-1"]}
+    ],
+    "require_read_before_edit": true,
+    "require_test_gate": true
+  }
+}
+```
+
+### Full Context Fetch
+
+Fetch the rendered brief plus the structured delta payload only when needed:
+
+```json
+{
+  "name": "packet28.get_context",
+  "arguments": {
+    "task_id": "task-auth-broker",
+    "action": "edit",
+    "since_version": "12",
+    "response_mode": "auto",
+    "include_sections": ["task_objective", "current_focus", "checkpoint_deltas", "repo_map"],
+    "section_item_limits": {
+      "repo_map": 6,
+      "checkpoint_deltas": 6
+    }
+  }
+}
+```
+
+### Preflight (Compatibility Path)
+
+Preflight remains available for one-shot startup context and compatibility wrappers.
 
 ```bash
 # Run preflight for a task
@@ -47,6 +139,40 @@ Packet28 agent-prompt --format agents
 # Generate .cursorrules fragment
 Packet28 agent-prompt --format cursor
 ```
+
+### Runtime Adapter Examples
+
+#### Claude
+
+- Start `Packet28 mcp serve`
+- Keep `task_id`, `context_version`, and a local section cache in the agent session
+- Treat the latest Packet28 brief as the only canonical Packet28 context block; replace older Packet28 briefs instead of appending them
+- Call `packet28.estimate_context` before low-cost planning or summarization steps
+- Use `packet28.decompose` and `packet28.validate_plan` for constrained refactors before execution
+- Call `packet28.get_context(..., since_version, response_mode="auto")` before each substantive invocation
+- Patch the local section cache from `delta.changed_sections` and `delta.removed_section_ids`
+- On `notifications/packet28.context_updated`, refresh on the next invocation
+- If notifications are unavailable, fall back to polling with `since_version`
+
+#### Codex / AGENTS.md
+
+- Use `Packet28 agent-prompt --format agents` to seed the runtime instructions
+- Keep the local section cache as the authoritative broker state inside the session
+- Keep one mutable Packet28 block in the prompt and replace it when a newer brief supersedes the old one
+- Use `packet28.decompose` and `packet28.validate_plan` for constrained planning flows
+- Prefer explicit `include_sections`, `exclude_sections`, and `section_item_limits`
+- Use `packet28.write_state` after file reads, edits, checkpoints, decisions, and question changes
+- Poll with `since_version` whenever notification delivery is unavailable or disabled
+
+#### Cursor
+
+- Start MCP once per workspace
+- Use `packet28.estimate_context` when near the model budget
+- Use `packet28.decompose` and `packet28.validate_plan` before executing constrained refactors
+- Use `packet28.get_context(..., response_mode="auto")` for full or delta fetches
+- Replace the prior Packet28 context block instead of appending Packet28 history
+- Keep `.packet28/task/<task_id>/brief.md` only as a fallback bridge
+- Treat `verbosity` as a compatibility alias; prefer explicit section limits
 
 ### Wrapper Binary
 

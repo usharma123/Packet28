@@ -2,7 +2,9 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::{json, Value};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
@@ -12,6 +14,10 @@ fn suite_cmd() -> Command {
 
 fn agent_cmd() -> Command {
     assert_cmd::cargo::cargo_bin_cmd!("packet28-agent")
+}
+
+fn mcp_cmd() -> std::process::Command {
+    std::process::Command::new(env!("CARGO_BIN_EXE_Packet28"))
 }
 
 fn ensure_packet28d_built() {
@@ -70,6 +76,65 @@ policy:
 "#,
     )
     .unwrap();
+}
+
+fn write_mcp_message(stdin: &mut ChildStdin, value: &Value) {
+    let body = serde_json::to_vec(value).unwrap();
+    write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
+    stdin.write_all(&body).unwrap();
+    stdin.flush().unwrap();
+}
+
+fn read_mcp_message(stdout: &mut BufReader<ChildStdout>) -> Value {
+    let mut content_length = None::<usize>;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+    }
+    let mut body = vec![0_u8; content_length.unwrap()];
+    stdout.read_exact(&mut body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn read_mcp_message_for_id(stdout: &mut BufReader<ChildStdout>, expected_id: u64) -> Value {
+    loop {
+        let value = read_mcp_message(stdout);
+        if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            return value;
+        }
+    }
+}
+
+fn read_mcp_notification(stdout: &mut BufReader<ChildStdout>, method: &str) -> Value {
+    loop {
+        let value = read_mcp_message(stdout);
+        if value.get("method").and_then(Value::as_str) == Some(method) {
+            return value;
+        }
+    }
+}
+
+fn start_mcp_server(root: &Path) -> (Child, ChildStdin, BufReader<ChildStdout>) {
+    let mut child = mcp_cmd()
+        .current_dir(root)
+        .args(["mcp", "serve", "--root", root.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    (child, stdin, stdout)
 }
 
 fn write_invalid_guard_context(path: &Path) {
@@ -368,6 +433,13 @@ fn parse_preflight_response(output: &[u8]) -> Value {
     value
 }
 
+fn parse_broker_response(output: &[u8]) -> Value {
+    let value: Value = serde_json::from_slice(output).unwrap();
+    assert!(value.get("context_version").is_some());
+    assert!(value.get("brief").is_some());
+    value
+}
+
 fn packet_payload<'a>(wrapper: &'a Value) -> &'a Value {
     wrapper
         .get("packet")
@@ -389,6 +461,17 @@ fn write_cached_coverage_state(root: &Path) {
     let state_dir = root.join(".covy").join("state");
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(state_dir.join("latest.bin"), bytes).unwrap();
+}
+
+fn write_cached_testmap_state(root: &Path) {
+    let mut index = suite_packet_core::TestMapIndex::default();
+    index.file_to_tests.insert(
+        "src/alpha.rs".to_string(),
+        ["tests/alpha_test.rs".to_string()].into_iter().collect(),
+    );
+    let state_dir = root.join(".covy").join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    testy_core::pipeline_testmap::write_testmap(&state_dir.join("testmap.bin"), &index).unwrap();
 }
 
 fn write_state_event(path: &Path, content: &str) {
@@ -2466,6 +2549,618 @@ fn test_suite_daemon_start_status_stop_cycle() {
 }
 
 #[test]
+#[cfg(unix)]
+fn test_packet28_agent_bootstraps_broker_session() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let output = agent_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--task",
+            "design auth broker",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PACKET28_TASK_ID\" \"$PACKET28_BROKER_BRIEF_PATH\" \"$PACKET28_BROKER_STATE_PATH\" \"$PACKET28_MCP_COMMAND\" \"$PACKET28_BROKER_ESTIMATE_TOOL\" \"$PACKET28_BROKER_POLL_FIELD\" \"$PACKET28_BROKER_WINDOW_MODE\" \"$PACKET28_BROKER_SUPERSESSION\" \"$PACKET28_BROKER_VALIDATE_PLAN_TOOL\" \"$PACKET28_BROKER_DECOMPOSE_TOOL\"",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let lines = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 10);
+    assert!(lines[0].starts_with("task-"));
+    assert!(Path::new(&lines[1]).exists(), "brief path should exist");
+    assert!(Path::new(&lines[2]).exists(), "state path should exist");
+    assert!(lines[3].contains("Packet28 mcp serve --root"));
+    assert_eq!(lines[4], "packet28.estimate_context");
+    assert_eq!(lines[5], "since_version");
+    assert_eq!(lines[6], "replace");
+    assert_eq!(lines[7], "1");
+    assert_eq!(lines[8], "packet28.validate_plan");
+    assert_eq!(lines[9], "packet28.decompose");
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_get_context_write_state_and_read_brief() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    git(dir.path(), &["add", "src/alpha.rs", "src/beta.rs"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    fs::remove_file(dir.path().join("src/beta.rs")).unwrap();
+    write_cached_coverage_state(dir.path());
+    write_cached_testmap_state(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let initialize = read_mcp_message_for_id(&mut stdout, 1);
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "action":"plan",
+                    "query":"design auth broker",
+                    "verbosity":"compact",
+                    "include_sections":["task_objective","repo_map","relevant_context"],
+                    "max_sections":2,
+                    "default_max_items_per_section":2,
+                    "section_item_limits":{"repo_map":1}
+                }
+            }
+        }),
+    );
+    let first = read_mcp_message_for_id(&mut stdout, 2);
+    let first_context = &first["result"]["structuredContent"];
+    assert_eq!(
+        first["result"]["content"][0]["text"].as_str().unwrap(),
+        first_context["brief"].as_str().unwrap()
+    );
+    assert!(first_context["brief"]
+        .as_str()
+        .unwrap()
+        .starts_with("[Packet28 Context v"));
+    let first_version = first_context["context_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(first_context["supersedes_prior_context"], true);
+    assert_eq!(first_context["supersession_mode"], "replace");
+    assert_eq!(
+        first_context["superseded_before_version"].as_str().unwrap(),
+        first_version
+    );
+    assert!(first_context["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Task Objective"));
+    assert!(first_context["est_tokens"].as_u64().unwrap() > 0);
+    assert!(first_context["budget_remaining_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(first_context["effective_max_sections"].as_u64().unwrap(), 2);
+    assert_eq!(
+        first_context["effective_default_max_items_per_section"]
+            .as_u64()
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        first_context["effective_section_item_limits"]["repo_map"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert!(first_context["sections"].as_array().unwrap().len() <= 2);
+    assert!(first_context["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|section| {
+            matches!(
+                section["id"].as_str().unwrap_or_default(),
+                "task_objective" | "repo_map" | "relevant_context"
+            )
+        }));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.estimate_context",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "action":"plan",
+                    "include_sections":["task_objective","repo_map"],
+                    "max_sections":2,
+                    "default_max_items_per_section":2
+                }
+            }
+        }),
+    );
+    let estimate = read_mcp_message_for_id(&mut stdout, 3);
+    let estimate_context = &estimate["result"]["structuredContent"];
+    assert!(estimate["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("context estimate"));
+    assert!(estimate_context["selected_section_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "task_objective"));
+    assert!(estimate_context["est_tokens"].as_u64().unwrap() > 0);
+    assert!(estimate_context.get("brief").is_none());
+    assert!(estimate_context.get("sections").is_none());
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "op":"decision_add",
+                    "decision_id":"decision-1",
+                    "text":"Use brokered context"
+                }
+            }
+        }),
+    );
+    let write_response = read_mcp_message_for_id(&mut stdout, 4);
+    assert_eq!(
+        write_response["result"]["structuredContent"]["accepted"],
+        true
+    );
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":5,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "action":"summarize",
+                    "since_version": first_version,
+                    "response_mode":"delta"
+                }
+            }
+        }),
+    );
+    let second = read_mcp_message_for_id(&mut stdout, 5);
+    let second_context = &second["result"]["structuredContent"];
+    assert_eq!(second_context["invalidates_since_version"], true);
+    assert!(second_context["active_decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "decision-1"));
+    assert!(second_context["delta"]["changed_sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "active_decisions"));
+    assert!(
+        second_context["sections"].as_array().unwrap().len()
+            <= second_context["delta"]["changed_sections"]
+                .as_array()
+                .unwrap()
+                .len()
+    );
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":6,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.capabilities",
+                "arguments":{}
+            }
+        }),
+    );
+    let capabilities = read_mcp_message_for_id(&mut stdout, 6);
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["push_notifications"]["supported"],
+        true
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["estimate_context"],
+        true
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["planning_tools"]["validate_plan"],
+        true
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["planning_tools"]["decompose"],
+        true
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["supersession"]["mode"],
+        "replace"
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["section_limits"]["explicit_limits_supported"],
+        true
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["planning_tools"]["validate_plan"],
+        true
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["planning_tools"]["decompose"],
+        true
+    );
+    assert!(capabilities["result"]["structuredContent"]["section_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "resolved_questions"));
+
+    let notification = read_mcp_notification(&mut stdout, "notifications/packet28.context_updated");
+    assert_eq!(
+        notification["params"]["task_id"].as_str().unwrap(),
+        "task-mcp"
+    );
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":7,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.validate_plan",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "steps":[
+                        {
+                            "id":"step-edit-deleted",
+                            "action":"edit",
+                            "paths":["src/beta.rs"]
+                        }
+                    ],
+                    "require_read_before_edit":true,
+                    "require_test_gate":true
+                }
+            }
+        }),
+    );
+    let validate = read_mcp_message_for_id(&mut stdout, 7);
+    let validate_payload = &validate["result"]["structuredContent"];
+    assert_eq!(validate_payload["valid"], false);
+    assert!(validate_payload["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["rule"] == "deleted_path"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":8,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.decompose",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "task_text":"restructure alpha module",
+                    "intent":"restructure_module",
+                    "scope_paths":["src/alpha.rs"],
+                    "max_steps":4
+                }
+            }
+        }),
+    );
+    let decompose = read_mcp_message_for_id(&mut stdout, 8);
+    let decompose_payload = &decompose["result"]["structuredContent"];
+    assert!(decompose_payload["steps"].as_array().unwrap().len() >= 1);
+    assert_eq!(
+        decompose_payload["steps"][0]["action"].as_str().unwrap(),
+        "restructure_module"
+    );
+    assert!(decompose_payload["selected_scope_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "src/alpha.rs"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":9,
+            "method":"resources/read",
+            "params":{"uri":"packet28://task/task-mcp/brief"}
+        }),
+    );
+    let brief = read_mcp_message_for_id(&mut stdout, 9);
+    assert!(brief["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Use brokered context"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":10,
+            "method":"resources/read",
+            "params":{"uri":"packet28://task/task-mcp/state"}
+        }),
+    );
+    let state = read_mcp_message_for_id(&mut stdout, 10);
+    assert!(state["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("\"supports_push\": true"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_links_decisions_and_questions() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-links",
+                    "op":"question_open",
+                    "question_id":"q1",
+                    "text":"Should Packet28 auto-resolve linked questions?"
+                }
+            }
+        }),
+    );
+    let open = read_mcp_message_for_id(&mut stdout, 2);
+    assert_eq!(open["result"]["structuredContent"]["accepted"], true);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-links",
+                    "op":"decision_add",
+                    "decision_id":"d1",
+                    "text":"Yes, resolve via broker write",
+                    "resolves_question_id":"q1"
+                }
+            }
+        }),
+    );
+    let decision = read_mcp_message_for_id(&mut stdout, 3);
+    assert_eq!(decision["result"]["structuredContent"]["accepted"], true);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-links",
+                    "action":"summarize"
+                }
+            }
+        }),
+    );
+    let context = read_mcp_message_for_id(&mut stdout, 4);
+    let payload = &context["result"]["structuredContent"];
+    assert!(payload["open_questions"].as_array().unwrap().is_empty());
+    assert!(payload["resolved_questions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "q1" && item["resolved_by_decision_id"] == "d1"));
+    assert!(payload["active_decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "d1" && item["resolves_question_id"] == "q1"));
+    assert!(payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Resolved Questions"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_decompose_and_validate_plan() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    write_cached_coverage_state(dir.path());
+    write_cached_testmap_state(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.decompose",
+                "arguments":{
+                    "task_id":"task-plan",
+                    "task_text":"restructure beta module",
+                    "intent":"restructure_module",
+                    "max_steps":4
+                }
+            }
+        }),
+    );
+    let decompose = read_mcp_message_for_id(&mut stdout, 2);
+    let decompose_payload = &decompose["result"]["structuredContent"];
+    assert!(decompose["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("decomposition returned"));
+    assert!(decompose_payload["selected_scope_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "src/beta.rs"));
+    assert!(decompose_payload["steps"].as_array().unwrap().len() >= 1);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.validate_plan",
+                "arguments":{
+                    "task_id":"task-plan",
+                    "steps":[
+                        {
+                            "id":"step-1",
+                            "action":"edit",
+                            "paths":["src/beta.rs"]
+                        }
+                    ],
+                    "require_read_before_edit":true,
+                    "require_test_gate":true
+                }
+            }
+        }),
+    );
+    let validate = read_mcp_message_for_id(&mut stdout, 3);
+    let validate_payload = &validate["result"]["structuredContent"];
+    assert_eq!(validate_payload["valid"], false);
+    assert!(validate_payload["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["rule"] == "read_before_edit"));
+    assert!(validate_payload["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["rule"] == "missing_test_gate"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
 fn test_suite_preflight_json_selects_expected_reducers() {
     let dir = TempDir::new().unwrap();
     setup_changed_repo(dir.path());
@@ -2660,8 +3355,9 @@ fn test_suite_agent_prompt_outputs_all_supported_fragments() {
             .clone();
         let rendered = String::from_utf8(output).unwrap();
         assert!(!rendered.trim().is_empty());
-        assert!(rendered.contains("Packet28 preflight"));
-        assert!(rendered.contains("--json=compact"));
+        assert!(rendered.contains("Packet28 mcp serve"));
+        assert!(rendered.contains("packet28.get_context"));
+        assert!(rendered.contains("packet28.validate_plan"));
         assert!(rendered
             .to_ascii_lowercase()
             .contains("fall back to direct file reads"));
@@ -2720,17 +3416,9 @@ fn test_packet28_agent_persists_preflight_and_exports_env() {
         persisted_path.canonicalize().unwrap()
     );
 
-    let value = parse_preflight_response(&fs::read(&persisted_path).unwrap());
-    let selected = value
-        .get("selection")
-        .and_then(|selection| selection.get("selected_reducers"))
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    assert!(selected.contains(&"map"));
-    assert!(selected.contains(&"recall"));
+    let value = parse_broker_response(&fs::read(&persisted_path).unwrap());
+    assert!(value["brief"].as_str().unwrap().contains("Task Objective"));
+    assert!(value["sections"].as_array().unwrap().len() >= 2);
 }
 
 #[test]
@@ -2757,11 +3445,9 @@ fn test_packet28_agent_requires_child_command() {
 
 #[test]
 #[cfg(unix)]
-fn test_packet28_agent_preflight_failure_skips_child_process() {
+fn test_packet28_agent_runs_without_cached_coverage_state() {
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("child-ran.txt");
-    let state_dir = dir.path().join(".covy").join("state");
-    fs::create_dir_all(state_dir.join("latest.bin")).unwrap();
 
     agent_cmd()
         .current_dir(dir.path())
@@ -2776,9 +3462,9 @@ fn test_packet28_agent_preflight_failure_skips_child_process() {
             marker.to_str().unwrap(),
         ])
         .assert()
-        .failure();
+        .success();
 
-    assert!(!marker.exists());
+    assert!(marker.exists());
 }
 
 #[test]

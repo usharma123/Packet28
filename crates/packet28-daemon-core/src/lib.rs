@@ -23,6 +23,10 @@ pub const LOG_FILE_NAME: &str = "packet28d.log";
 pub const WATCH_REGISTRY_FILE_NAME: &str = "watch-registry-v1.json";
 pub const TASK_REGISTRY_FILE_NAME: &str = "task-registry-v1.json";
 pub const TASK_EVENTS_DIR_NAME: &str = "tasks";
+pub const TASK_ARTIFACTS_DIR_NAME: &str = "task";
+pub const TASK_BRIEF_MARKDOWN_FILE_NAME: &str = "brief.md";
+pub const TASK_BRIEF_JSON_FILE_NAME: &str = "brief.json";
+pub const TASK_STATE_JSON_FILE_NAME: &str = "state.json";
 pub const MAX_SOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,6 +256,383 @@ pub struct ContextRecallResponse {
     pub hits: Vec<RecallHit>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerAction {
+    Plan,
+    Inspect,
+    ChooseTool,
+    Interpret,
+    Edit,
+    Summarize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerToolResultKind {
+    Build,
+    Stack,
+    Test,
+    Diff,
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerVerbosity {
+    Compact,
+    #[default]
+    Standard,
+    Rich,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerResponseMode {
+    #[default]
+    Full,
+    Delta,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerSourceKind {
+    #[serde(rename = "self")]
+    SelfAuthored,
+    #[default]
+    Derived,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerSupersessionMode {
+    #[default]
+    Replace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct BrokerSection {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub priority: u8,
+    pub source_kind: BrokerSourceKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerGetContextRequest {
+    pub task_id: String,
+    pub action: Option<BrokerAction>,
+    pub budget_tokens: Option<u64>,
+    pub budget_bytes: Option<usize>,
+    pub since_version: Option<String>,
+    pub focus_paths: Vec<String>,
+    pub focus_symbols: Vec<String>,
+    pub tool_name: Option<String>,
+    pub tool_result_kind: Option<BrokerToolResultKind>,
+    pub query: Option<String>,
+    pub include_sections: Vec<String>,
+    pub exclude_sections: Vec<String>,
+    pub verbosity: Option<BrokerVerbosity>,
+    pub response_mode: Option<BrokerResponseMode>,
+    pub include_self_context: bool,
+    pub max_sections: Option<usize>,
+    pub default_max_items_per_section: Option<usize>,
+    pub section_item_limits: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerPacketRef {
+    pub cache_key: String,
+    pub target: String,
+    pub score: f64,
+    pub summary: Option<String>,
+    pub packet_types: Vec<String>,
+    pub est_tokens: u64,
+    pub est_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerSectionEstimate {
+    pub id: String,
+    pub est_tokens: u64,
+    pub est_bytes: u64,
+    pub source_kind: BrokerSourceKind,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerEvictionCandidate {
+    pub section_id: String,
+    pub reason: String,
+    pub est_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerRecommendedAction {
+    pub kind: String,
+    pub summary: String,
+    pub related_paths: Vec<String>,
+    pub related_symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerDecision {
+    pub id: String,
+    pub text: String,
+    pub resolves_question_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerQuestion {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerResolvedQuestion {
+    pub id: String,
+    pub text: String,
+    pub resolved_by_decision_id: Option<String>,
+    pub resolution_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerDeltaResponse {
+    pub changed_sections: Vec<BrokerSection>,
+    pub removed_section_ids: Vec<String>,
+    pub unchanged_section_ids: Vec<String>,
+    pub full_refresh_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerGetContextResponse {
+    pub context_version: String,
+    pub stale: bool,
+    pub brief: String,
+    pub supersedes_prior_context: bool,
+    pub supersession_mode: BrokerSupersessionMode,
+    pub superseded_before_version: String,
+    pub sections: Vec<BrokerSection>,
+    pub est_tokens: u64,
+    pub est_bytes: u64,
+    pub budget_remaining_tokens: u64,
+    pub budget_remaining_bytes: u64,
+    pub section_estimates: Vec<BrokerSectionEstimate>,
+    pub eviction_candidates: Vec<BrokerEvictionCandidate>,
+    pub delta: BrokerDeltaResponse,
+    pub working_set: Vec<BrokerPacketRef>,
+    pub recommended_actions: Vec<BrokerRecommendedAction>,
+    pub active_decisions: Vec<BrokerDecision>,
+    pub open_questions: Vec<BrokerQuestion>,
+    pub resolved_questions: Vec<BrokerResolvedQuestion>,
+    pub changed_paths_since_checkpoint: Vec<String>,
+    pub changed_symbols_since_checkpoint: Vec<String>,
+    pub invalidates_since_version: bool,
+    pub effective_max_sections: usize,
+    pub effective_default_max_items_per_section: usize,
+    pub effective_section_item_limits: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct BrokerPlanStep {
+    pub id: String,
+    pub action: String,
+    pub description: Option<String>,
+    pub paths: Vec<String>,
+    pub symbols: Vec<String>,
+    pub depends_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct BrokerPlanViolation {
+    pub step_id: String,
+    pub rule: String,
+    pub severity: String,
+    pub message: String,
+    pub related_paths: Vec<String>,
+    pub related_symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerValidatePlanRequest {
+    pub task_id: String,
+    pub steps: Vec<BrokerPlanStep>,
+    pub budget_tokens: Option<u64>,
+    pub require_read_before_edit: Option<bool>,
+    pub require_test_gate: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerValidatePlanResponse {
+    pub valid: bool,
+    pub violations: Vec<BrokerPlanViolation>,
+    pub warnings: Vec<BrokerPlanViolation>,
+    pub normalized_steps: Vec<BrokerPlanStep>,
+    pub est_plan_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerDecomposeIntent {
+    Rename,
+    Extract,
+    SplitFile,
+    MergeFiles,
+    RestructureModule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct BrokerDecomposedStep {
+    pub id: String,
+    pub action: String,
+    pub description: String,
+    pub paths: Vec<String>,
+    pub symbols: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub coverage_gap: bool,
+    pub est_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerDecomposeRequest {
+    pub task_id: String,
+    pub task_text: String,
+    pub intent: Option<BrokerDecomposeIntent>,
+    pub scope_paths: Vec<String>,
+    pub scope_symbols: Vec<String>,
+    pub max_steps: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerDecomposeResponse {
+    pub steps: Vec<BrokerDecomposedStep>,
+    pub assumptions: Vec<String>,
+    pub unresolved: Vec<String>,
+    pub selected_scope_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerEstimateContextRequest {
+    pub task_id: String,
+    pub action: Option<BrokerAction>,
+    pub budget_tokens: Option<u64>,
+    pub budget_bytes: Option<usize>,
+    pub since_version: Option<String>,
+    pub focus_paths: Vec<String>,
+    pub focus_symbols: Vec<String>,
+    pub tool_name: Option<String>,
+    pub tool_result_kind: Option<BrokerToolResultKind>,
+    pub query: Option<String>,
+    pub include_sections: Vec<String>,
+    pub exclude_sections: Vec<String>,
+    pub verbosity: Option<BrokerVerbosity>,
+    pub response_mode: Option<BrokerResponseMode>,
+    pub include_self_context: bool,
+    pub max_sections: Option<usize>,
+    pub default_max_items_per_section: Option<usize>,
+    pub section_item_limits: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerEstimateContextResponse {
+    pub context_version: String,
+    pub selected_section_ids: Vec<String>,
+    pub est_tokens: u64,
+    pub est_bytes: u64,
+    pub budget_remaining_tokens: u64,
+    pub budget_remaining_bytes: u64,
+    pub section_estimates: Vec<BrokerSectionEstimate>,
+    pub eviction_candidates: Vec<BrokerEvictionCandidate>,
+    pub would_use_delta: bool,
+    pub would_include_brief: bool,
+    pub effective_max_sections: usize,
+    pub effective_default_max_items_per_section: usize,
+    pub effective_section_item_limits: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerWriteOp {
+    FocusSet,
+    FocusClear,
+    FileRead,
+    FileEdit,
+    CheckpointSave,
+    DecisionAdd,
+    DecisionSupersede,
+    StepComplete,
+    QuestionOpen,
+    QuestionResolve,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerWriteStateRequest {
+    pub task_id: String,
+    pub op: Option<BrokerWriteOp>,
+    pub paths: Vec<String>,
+    pub symbols: Vec<String>,
+    pub note: Option<String>,
+    pub decision_id: Option<String>,
+    pub question_id: Option<String>,
+    pub checkpoint_id: Option<String>,
+    pub step_id: Option<String>,
+    pub text: Option<String>,
+    pub regions: Vec<String>,
+    pub resolves_question_id: Option<String>,
+    pub resolution_decision_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerWriteStateResponse {
+    pub event_id: String,
+    pub context_version: String,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerTaskStatusRequest {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerTaskStatusResponse {
+    pub task: Option<TaskRecord>,
+    pub brief_path: Option<String>,
+    pub state_path: Option<String>,
+    pub event_path: Option<String>,
+    pub latest_context_version: Option<String>,
+    pub last_refresh_at_unix: Option<u64>,
+    pub latest_context_reason: Option<String>,
+    pub supports_push: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -305,6 +686,24 @@ pub enum DaemonRequest {
     },
     ContextRecall {
         request: ContextRecallRequest,
+    },
+    BrokerGetContext {
+        request: BrokerGetContextRequest,
+    },
+    BrokerEstimateContext {
+        request: BrokerEstimateContextRequest,
+    },
+    BrokerValidatePlan {
+        request: BrokerValidatePlanRequest,
+    },
+    BrokerDecompose {
+        request: BrokerDecomposeRequest,
+    },
+    BrokerWriteState {
+        request: BrokerWriteStateRequest,
+    },
+    BrokerTaskStatus {
+        request: BrokerTaskStatusRequest,
     },
 }
 
@@ -369,6 +768,24 @@ pub enum DaemonResponse {
     ContextRecall {
         response: ContextRecallResponse,
     },
+    BrokerGetContext {
+        response: BrokerGetContextResponse,
+    },
+    BrokerEstimateContext {
+        response: BrokerEstimateContextResponse,
+    },
+    BrokerValidatePlan {
+        response: BrokerValidatePlanResponse,
+    },
+    BrokerDecompose {
+        response: BrokerDecomposeResponse,
+    },
+    BrokerWriteState {
+        response: BrokerWriteStateResponse,
+    },
+    BrokerTaskStatus {
+        response: BrokerTaskStatusResponse,
+    },
     Error {
         message: String,
     },
@@ -407,6 +824,15 @@ pub struct TaskRecord {
     pub evictable_est_tokens: u64,
     pub changed_since_checkpoint_paths: usize,
     pub changed_since_checkpoint_symbols: usize,
+    pub latest_context_version: Option<String>,
+    pub latest_brief_path: Option<String>,
+    pub latest_brief_hash: Option<String>,
+    pub latest_brief_generated_at_unix: Option<u64>,
+    pub latest_context_reason: Option<String>,
+    pub latest_broker_request: Option<BrokerGetContextRequest>,
+    pub linked_decisions: BTreeMap<String, String>,
+    pub resolved_questions: BTreeMap<String, String>,
+    pub question_texts: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -497,7 +923,40 @@ pub fn task_events_dir(root: &Path) -> PathBuf {
     daemon_dir(root).join(TASK_EVENTS_DIR_NAME)
 }
 
+pub fn task_artifacts_dir(root: &Path) -> PathBuf {
+    root.join(".packet28").join(TASK_ARTIFACTS_DIR_NAME)
+}
+
 pub fn task_event_log_path(root: &Path, task_id: &str) -> PathBuf {
+    let safe = safe_task_id(task_id);
+    task_events_dir(root).join(format!("{safe}.events.jsonl"))
+}
+
+pub fn task_artifact_dir(root: &Path, task_id: &str) -> PathBuf {
+    task_artifacts_dir(root).join(safe_task_id(task_id))
+}
+
+pub fn task_brief_markdown_path(root: &Path, task_id: &str) -> PathBuf {
+    task_artifact_dir(root, task_id).join(TASK_BRIEF_MARKDOWN_FILE_NAME)
+}
+
+pub fn task_brief_json_path(root: &Path, task_id: &str) -> PathBuf {
+    task_artifact_dir(root, task_id).join(TASK_BRIEF_JSON_FILE_NAME)
+}
+
+pub fn task_state_json_path(root: &Path, task_id: &str) -> PathBuf {
+    task_artifact_dir(root, task_id).join(TASK_STATE_JSON_FILE_NAME)
+}
+
+pub fn task_versions_dir(root: &Path, task_id: &str) -> PathBuf {
+    task_artifact_dir(root, task_id).join("versions")
+}
+
+pub fn task_version_json_path(root: &Path, task_id: &str, context_version: &str) -> PathBuf {
+    task_versions_dir(root, task_id).join(format!("{}.json", safe_task_id(context_version)))
+}
+
+fn safe_task_id(task_id: &str) -> String {
     let safe = task_id
         .chars()
         .map(|ch| {
@@ -508,7 +967,11 @@ pub fn task_event_log_path(root: &Path, task_id: &str) -> PathBuf {
             }
         })
         .collect::<String>();
-    task_events_dir(root).join(format!("{safe}.events.jsonl"))
+    if safe.is_empty() {
+        "task".to_string()
+    } else {
+        safe
+    }
 }
 
 pub fn ensure_daemon_dir(root: &Path) -> Result<PathBuf> {

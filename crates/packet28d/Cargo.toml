@@ -20,6 +20,7 @@ context-memory-core = { version = "0.2.0", path = "../context-memory-core" }
 diffy-core = { version = "0.2.0", path = "../diffy-core" }
 suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
 covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
+mapy-core = { version = "0.2.0", path = "../mapy-core" }
 glob.workspace = true
 notify.workspace = true
 packet28-daemon-core = { version = "0.2.0", path = "../packet28-daemon-core" }
