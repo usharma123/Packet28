@@ -1,0 +1,39 @@
+{
+  "name": "packet28",
+  "version": "0.2.0",
+  "description": "Context broker for AI coding agents — manages your agent's context window so it conserves tokens",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/usharma123/Covy.git"
+  },
+  "homepage": "https://github.com/usharma123/Covy",
+  "bin": {
+    "packet28": "bin/packet28.js",
+    "packet28-mcp": "bin/packet28-mcp.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "vendor"
+  ],
+  "optionalDependencies": {
+    "@packet28/darwin-arm64": "0.2.0",
+    "@packet28/darwin-x64": "0.2.0",
+    "@packet28/linux-x64": "0.2.0",
+    "@packet28/linux-arm64": "0.2.0"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "context",
+    "mcp",
+    "llm",
+    "coverage",
+    "coding-agent",
+    "token-management"
+  ]
+}

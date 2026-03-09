@@ -25,3 +25,7 @@ hyperfine/results/packet28-javatest/
 # Packet28 local cache artifacts
 .packet28/
 crates/suite-cli/.packet28/
+
+# npm build artifacts
+npm/packet28/vendor/
+dist/

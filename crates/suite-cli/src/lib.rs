@@ -15,6 +15,7 @@ pub mod cmd_mcp;
 pub mod cmd_packet;
 pub mod cmd_preflight;
 pub mod cmd_proxy;
+pub mod cmd_setup;
 pub mod cmd_shard;
 pub mod cmd_stack;
 pub mod packet28_agent;
@@ -83,6 +84,8 @@ pub enum Commands {
     Mcp(cmd_mcp::McpArgs),
     /// Daemon lifecycle and task commands
     Daemon(cmd_daemon::DaemonArgs),
+    /// Configure Packet28 for your agent runtimes (Claude Code, Cursor, Codex)
+    Setup(cmd_setup::SetupArgs),
 }
 
 #[derive(Args)]
@@ -287,6 +290,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         Commands::AgentPrompt(args) => cmd_agent_prompt::run(args),
         Commands::Mcp(args) => cmd_mcp::run(args),
         Commands::Daemon(daemon) => cmd_daemon::run(daemon),
+        Commands::Setup(args) => cmd_setup::run(args),
     }
 }
 
@@ -527,9 +531,11 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
             "preflight",
         )),
         Commands::Preflight(_) => None,
-        Commands::Daemon(_) | Commands::Guard(_) | Commands::AgentPrompt(_) | Commands::Mcp(_) => {
-            None
-        }
+        Commands::Daemon(_)
+        | Commands::Guard(_)
+        | Commands::AgentPrompt(_)
+        | Commands::Mcp(_)
+        | Commands::Setup(_) => None,
     }
 }
 
