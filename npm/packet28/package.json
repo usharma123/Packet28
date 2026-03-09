@@ -5,9 +5,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/usharma123/Covy.git"
+    "url": "git+https://github.com/usharma123/Packet28.git"
   },
-  "homepage": "https://github.com/usharma123/Covy",
+  "homepage": "https://github.com/usharma123/Packet28",
   "bin": {
     "packet28": "bin/packet28.js",
     "packet28-mcp": "bin/packet28-mcp.js"
