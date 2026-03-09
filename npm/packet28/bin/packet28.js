@@ -3,7 +3,7 @@
 // Resolves the correct platform-specific binary and spawns it.
 
 import { execSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -79,6 +79,21 @@ function findBinary(name) {
 }
 
 const binaryPath = findBinary("Packet28");
+
+// npm strips execute permissions from tarballs — fix on first run
+try {
+  const mode = statSync(binaryPath).mode;
+  if (!(mode & 0o111)) {
+    chmodSync(binaryPath, mode | 0o755);
+    // Also fix packet28d (daemon) in the same directory
+    const daemonPath = path.join(path.dirname(binaryPath), "packet28d");
+    if (existsSync(daemonPath)) {
+      chmodSync(daemonPath, 0o755);
+    }
+  }
+} catch {
+  // ignore — will fail at spawn if truly broken
+}
 
 const child = spawn(binaryPath, process.argv.slice(2), {
   stdio: "inherit",
