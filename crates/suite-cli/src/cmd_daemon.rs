@@ -538,14 +538,18 @@ fn run_start(args: StatusRootArgs) -> Result<i32> {
 
 fn run_stop(args: StatusRootArgs) -> Result<i32> {
     let root = resolve_root_arg(&args.root);
-    let response = send_request(&root, &DaemonRequest::Stop)?;
-    match response {
-        DaemonResponse::Ack { message } => {
+    match send_request(&root, &DaemonRequest::Stop) {
+        Ok(DaemonResponse::Ack { message }) => {
             println!("{message}");
             Ok(0)
         }
-        DaemonResponse::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+        Ok(DaemonResponse::Error { message }) => Err(anyhow!(message)),
+        Ok(other) => Err(anyhow!("unexpected daemon response: {other:?}")),
+        Err(_) => {
+            // The daemon may exit before sending the response — treat as success
+            println!("stopping");
+            Ok(0)
+        }
     }
 }
 

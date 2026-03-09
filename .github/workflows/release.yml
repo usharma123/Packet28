@@ -145,5 +145,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Build all binaries first
+        run: cargo build --workspace
       - name: Run tests
         run: cargo test --workspace
