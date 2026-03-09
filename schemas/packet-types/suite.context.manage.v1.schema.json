@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.context.manage.v1.schema.json",
+  "title": "Packet Type Contract: suite.context.manage.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.context.manage.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["task_id", "budget", "working_set", "eviction_candidates"],
+          "properties": {
+            "task_id": {},
+            "budget": {},
+            "working_set": {},
+            "eviction_candidates": {},
+            "query": {},
+            "recommended_packets": {},
+            "recommended_actions": {},
+            "changed_paths_since_checkpoint": {},
+            "changed_symbols_since_checkpoint": {},
+            "open_questions": {},
+            "active_decisions": {},
+            "debug": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["task_id", "budget", "working_set", "eviction_candidates"],
+  "x-optional_payload_fields": [
+    "query",
+    "recommended_packets",
+    "recommended_actions",
+    "changed_paths_since_checkpoint",
+    "changed_symbols_since_checkpoint",
+    "open_questions",
+    "active_decisions",
+    "debug",
+    "artifact_handle"
+  ],
+  "x-boundedness_rules": ["working set and eviction lists bounded by requested budgets"],
+  "x-compatibility_notes": ["v1 task-scoped context management contract"]
+}

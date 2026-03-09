@@ -1,0 +1,67 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.context.manage.v1",
+  "packet": {
+    "version": "1",
+    "tool": "contextq",
+    "kind": "suite.context.manage.v1",
+    "hash": "hash-handle-example",
+    "summary": "suite.context.manage.v1 handle snapshot",
+    "budget_cost": {
+      "est_tokens": 88,
+      "est_bytes": 352,
+      "runtime_ms": 11,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["task:example"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-example",
+      "budget": {
+        "requested_tokens": 4000,
+        "requested_bytes": 32000,
+        "working_set_tokens": 880,
+        "working_set_bytes": 3520,
+        "evictable_tokens": 220,
+        "evictable_bytes": 880,
+        "reserved_headroom_tokens": 800,
+        "reserved_headroom_bytes": 6400
+      },
+      "working_set": [
+        {
+          "cache_key": "pkt-auth",
+          "target": "contextq.manage",
+          "score": 1.0,
+          "summary": "Task-scoped broker context for auth investigation",
+          "packet_types": ["suite.context.manage.v1"],
+          "est_tokens": 220,
+          "est_bytes": 880,
+          "runtime_ms": 2
+        }
+      ],
+      "eviction_candidates": [
+        {
+          "cache_key": "pkt-recall",
+          "target": "context.recall",
+          "score": 0.33,
+          "summary": "Prior context can be recalled later",
+          "reason": "outside_working_set_budget",
+          "packet_types": ["suite.context.manage.v1"],
+          "est_tokens": 220,
+          "est_bytes": 880,
+          "runtime_ms": 2
+        }
+      ],
+      "artifact_handle": {
+        "handle_id": "handle-suite.context.manage.v1",
+        "packet_type": "suite.context.manage.v1",
+        "packet_hash": "hash-handle",
+        "artifact_sha256": "sha256-example",
+        "path": ".packet28/artifacts/handle-suite.context.manage.v1.json",
+        "created_at_unix": 1700000000
+      }
+    }
+  }
+}

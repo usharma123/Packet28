@@ -1,0 +1,60 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.context.manage.v1",
+  "packet": {
+    "version": "1",
+    "tool": "contextq",
+    "kind": "suite.context.manage.v1",
+    "hash": "hash-compact-example",
+    "summary": "suite.context.manage.v1 compact snapshot",
+    "budget_cost": {
+      "est_tokens": 96,
+      "est_bytes": 384,
+      "runtime_ms": 12,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["task:example"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-example",
+      "query": "investigate auth broker regressions",
+      "budget": {
+        "requested_tokens": 4000,
+        "requested_bytes": 32000,
+        "working_set_tokens": 960,
+        "working_set_bytes": 3840,
+        "evictable_tokens": 240,
+        "evictable_bytes": 960,
+        "reserved_headroom_tokens": 800,
+        "reserved_headroom_bytes": 6400
+      },
+      "working_set": [
+        {
+          "cache_key": "pkt-auth",
+          "target": "diffy.analyze",
+          "score": 0.98,
+          "summary": "Auth diff touches login and token refresh flows",
+          "packet_types": ["suite.diff.analyze.v1"],
+          "est_tokens": 320,
+          "est_bytes": 1280,
+          "runtime_ms": 4
+        }
+      ],
+      "eviction_candidates": [
+        {
+          "cache_key": "pkt-map",
+          "target": "mapy.repo",
+          "score": 0.44,
+          "summary": "Repo anchors can be refreshed on demand",
+          "reason": "outside_working_set_budget",
+          "packet_types": ["suite.map.repo.v1"],
+          "est_tokens": 240,
+          "est_bytes": 960,
+          "runtime_ms": 3
+        }
+      ]
+    }
+  }
+}

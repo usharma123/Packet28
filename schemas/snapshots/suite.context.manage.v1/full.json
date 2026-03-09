@@ -1,0 +1,105 @@
+{
+  "schema_version": "suite.packet.v1",
+  "packet_type": "suite.context.manage.v1",
+  "packet": {
+    "version": "1",
+    "tool": "contextq",
+    "kind": "suite.context.manage.v1",
+    "hash": "hash-full-example",
+    "summary": "suite.context.manage.v1 full snapshot",
+    "budget_cost": {
+      "est_tokens": 160,
+      "est_bytes": 640,
+      "runtime_ms": 16,
+      "tool_calls": 1
+    },
+    "provenance": {
+      "inputs": ["task:example"],
+      "generated_at_unix": 1700000000
+    },
+    "payload": {
+      "task_id": "task-example",
+      "query": "investigate auth broker regressions",
+      "budget": {
+        "requested_tokens": 4000,
+        "requested_bytes": 32000,
+        "working_set_tokens": 1320,
+        "working_set_bytes": 5280,
+        "evictable_tokens": 480,
+        "evictable_bytes": 1920,
+        "reserved_headroom_tokens": 800,
+        "reserved_headroom_bytes": 6400
+      },
+      "working_set": [
+        {
+          "cache_key": "pkt-auth-diff",
+          "target": "diffy.analyze",
+          "score": 0.98,
+          "summary": "Auth diff touches login and token refresh flows",
+          "packet_types": ["suite.diff.analyze.v1"],
+          "est_tokens": 320,
+          "est_bytes": 1280,
+          "runtime_ms": 4
+        },
+        {
+          "cache_key": "pkt-auth-stack",
+          "target": "stacky.slice",
+          "score": 0.91,
+          "summary": "Stack slice points to auth middleware panic",
+          "packet_types": ["suite.stack.slice.v1"],
+          "est_tokens": 280,
+          "est_bytes": 1120,
+          "runtime_ms": 5
+        }
+      ],
+      "eviction_candidates": [
+        {
+          "cache_key": "pkt-map",
+          "target": "mapy.repo",
+          "score": 0.44,
+          "summary": "Repo anchors can be refreshed on demand",
+          "reason": "outside_working_set_budget",
+          "packet_types": ["suite.map.repo.v1"],
+          "est_tokens": 240,
+          "est_bytes": 960,
+          "runtime_ms": 3
+        }
+      ],
+      "recommended_packets": [
+        {
+          "cache_key": "pkt-impact",
+          "target": "testy.impact",
+          "score": 0.78,
+          "summary": "Impacted tests include auth integration cases",
+          "reason": "high_relevance",
+          "packet_types": ["suite.test.impact.v1"],
+          "est_tokens": 200,
+          "est_bytes": 800,
+          "runtime_ms": 3
+        }
+      ],
+      "recommended_actions": [
+        {
+          "kind": "inspect_failure",
+          "summary": "Inspect the auth middleware panic before editing",
+          "related_paths": ["src/auth.rs", "src/middleware.rs"],
+          "related_symbols": ["authenticate", "authorize"]
+        }
+      ],
+      "changed_paths_since_checkpoint": ["src/auth.rs"],
+      "changed_symbols_since_checkpoint": ["authenticate"],
+      "open_questions": [
+        {
+          "id": "q1",
+          "text": "Should auth retries stay in middleware?"
+        }
+      ],
+      "active_decisions": [
+        {
+          "id": "d1",
+          "text": "Keep token parsing in auth.rs"
+        }
+      ]
+    }
+  }
+}
