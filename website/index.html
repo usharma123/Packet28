@@ -82,74 +82,6 @@ body::after {
   text-transform: uppercase;
 }
 
-/* ═══ NAV ═══ */
-nav {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 100;
-  background: var(--bg);
-  border-bottom: 1px solid var(--border);
-  padding: 0 24px;
-  display: flex;
-  align-items: stretch;
-  height: 48px;
-}
-
-.nav-logo {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  text-decoration: none;
-  color: var(--highlight);
-  font-weight: 700;
-  font-size: 14px;
-  letter-spacing: -0.5px;
-  padding-right: 24px;
-  border-right: 1px solid var(--border);
-}
-
-.nav-logo .cursor {
-  display: inline-block;
-  width: 8px;
-  height: 16px;
-  background: var(--highlight);
-  animation: blink 1s step-end infinite;
-}
-
-@keyframes blink {
-  50% { opacity: 0; }
-}
-
-.nav-links {
-  display: flex;
-  align-items: stretch;
-  list-style: none;
-  margin-left: auto;
-}
-
-.nav-links li {
-  display: flex;
-  align-items: center;
-}
-
-.nav-links a {
-  display: flex;
-  align-items: center;
-  padding: 0 16px;
-  color: var(--dim);
-  text-decoration: none;
-  font-size: 12px;
-  letter-spacing: 0.5px;
-  height: 100%;
-  border-left: 1px solid var(--border);
-  transition: color 0.15s, background 0.15s;
-}
-.nav-links a:hover {
-  color: var(--highlight);
-  background: rgba(255,255,255,0.03);
-}
 
 /* ═══ HERO ═══ */
 .hero {
@@ -157,7 +89,7 @@ nav {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 120px 24px 80px;
+  padding: 80px 24px 80px;
   position: relative;
 }
 
@@ -700,7 +632,6 @@ footer {
 
 /* ═══ RESPONSIVE ═══ */
 @media (max-width: 768px) {
-  .nav-links { display: none; }
   .pipeline {
     grid-template-columns: 1fr;
   }
@@ -721,20 +652,6 @@ footer {
 </style>
 </head>
 <body>
-
-<!-- ═══ NAV ═══ -->
-<nav>
-  <a href="#" class="nav-logo">
-    packet28<span class="cursor"></span>
-  </a>
-  <ul class="nav-links">
-    <li><a href="#how">HOW_IT_WORKS</a></li>
-    <li><a href="#features">FEATURES</a></li>
-    <li><a href="#benchmark">BENCHMARK</a></li>
-    <li><a href="#quickstart">QUICK_START</a></li>
-    <li><a href="https://github.com/usharma123/Packet28" target="_blank">GITHUB</a></li>
-  </ul>
-</nav>
 
 <!-- ═══ HERO ═══ -->
 <section class="hero">
