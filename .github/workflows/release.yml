@@ -71,6 +71,9 @@ jobs:
           cp target/${{ matrix.target }}/release/Packet28 "$PKG_DIR/bin/"
           cp target/${{ matrix.target }}/release/packet28d "$PKG_DIR/bin/"
 
+          # Ensure binaries are executable
+          chmod +x "$PKG_DIR/bin/Packet28" "$PKG_DIR/bin/packet28d"
+
           # Strip binaries to reduce size
           if command -v strip &> /dev/null; then
             strip "$PKG_DIR/bin/Packet28" "$PKG_DIR/bin/packet28d" 2>/dev/null || true
