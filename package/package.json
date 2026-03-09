@@ -1,0 +1,16 @@
+{
+  "name": "@packet28/darwin-arm64",
+  "version": "0.2.1",
+  "description": "Platform-specific binaries for packet28 (darwin-arm64)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/usharma123/Packet28.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": [
+    "bin"
+  ],
+  "preferUnplugged": true
+}

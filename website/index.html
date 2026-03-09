@@ -1,0 +1,1098 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Packet28 — Context Broker for AI Coding Agents</title>
+<meta name="description" content="Packet28 manages your agent's context window so it conserves tokens. 164x fewer tokens on large codebases.">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap');
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #000000;
+  --fg: #e0e0e0;
+  --dim: #8a8a8a;
+  --muted: #555555;
+  --border: #2a2a2a;
+  --highlight: #ffffff;
+  --font: 'IBM Plex Mono', monospace;
+  --cell: 20px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--fg);
+  color: var(--bg);
+}
+
+/* ═══ SCANLINE OVERLAY ═══ */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 3px,
+    rgba(0, 0, 0, 0.03) 3px,
+    rgba(0, 0, 0, 0.03) 4px
+  );
+  transform: translateZ(0);
+}
+
+/* ═══ CONTAINER ═══ */
+.container {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* ═══ TUI BOX DRAWING ═══ */
+.tui-box {
+  border: 1px solid var(--border);
+  position: relative;
+}
+
+.tui-box::before {
+  content: attr(data-title);
+  position: absolute;
+  top: -1px;
+  left: 16px;
+  transform: translateY(-50%);
+  background: var(--bg);
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--dim);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+/* ═══ NAV ═══ */
+nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 0 24px;
+  display: flex;
+  align-items: stretch;
+  height: 48px;
+}
+
+.nav-logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  color: var(--highlight);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: -0.5px;
+  padding-right: 24px;
+  border-right: 1px solid var(--border);
+}
+
+.nav-logo .cursor {
+  display: inline-block;
+  width: 8px;
+  height: 16px;
+  background: var(--highlight);
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+.nav-links {
+  display: flex;
+  align-items: stretch;
+  list-style: none;
+  margin-left: auto;
+}
+
+.nav-links li {
+  display: flex;
+  align-items: center;
+}
+
+.nav-links a {
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  color: var(--dim);
+  text-decoration: none;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  height: 100%;
+  border-left: 1px solid var(--border);
+  transition: color 0.15s, background 0.15s;
+}
+.nav-links a:hover {
+  color: var(--highlight);
+  background: rgba(255,255,255,0.03);
+}
+
+/* ═══ HERO ═══ */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 120px 24px 80px;
+  position: relative;
+}
+
+.hero-content {
+  max-width: 720px;
+  width: 100%;
+}
+
+.hero-ascii {
+  font-size: clamp(6px, 1.4vw, 12px);
+  line-height: 1.15;
+  color: var(--highlight);
+  margin-bottom: 48px;
+  white-space: pre;
+  overflow: hidden;
+  text-shadow: 0 0 20px rgba(255,255,255,0.15), 0 0 60px rgba(255,255,255,0.05);
+  letter-spacing: 1px;
+  animation: asciiFade 0.8s ease-out 0.2s both;
+}
+
+@keyframes asciiFade {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.hero h1 {
+  font-size: clamp(32px, 5.5vw, 56px);
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -2px;
+  color: var(--highlight);
+  margin-bottom: 20px;
+}
+
+.hero-sub {
+  font-size: 15px;
+  color: var(--dim);
+  max-width: 480px;
+  margin-bottom: 40px;
+  line-height: 1.7;
+  font-weight: 300;
+}
+
+.hero-sub strong {
+  color: var(--highlight);
+  font-weight: 600;
+}
+
+.install-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  margin-bottom: 32px;
+  max-width: 480px;
+}
+
+.install-cmd {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: transparent;
+  border: 1px solid var(--border);
+  font-family: var(--font);
+  font-size: 14px;
+  cursor: pointer;
+  transition: border-color 0.2s;
+  position: relative;
+}
+.install-cmd:hover { border-color: var(--dim); }
+.install-cmd .prompt { color: var(--dim); }
+.install-cmd .cmd { color: var(--fg); }
+
+.install-copy {
+  padding: 12px 16px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-left: none;
+  color: var(--dim);
+  font-family: var(--font);
+  font-size: 11px;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  transition: all 0.15s;
+}
+.install-copy:hover {
+  color: var(--highlight);
+  background: rgba(255,255,255,0.03);
+}
+
+.hero-links {
+  display: flex;
+  gap: 24px;
+}
+.hero-links a {
+  color: var(--dim);
+  text-decoration: none;
+  font-size: 13px;
+  transition: color 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.hero-links a:hover { color: var(--highlight); }
+.hero-links a::before {
+  content: '>';
+  color: var(--muted);
+}
+
+/* ═══ MATRIX RAIN (hero bg) ═══ */
+#matrix {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.04;
+}
+
+/* ═══ SECTION DIVIDER ═══ */
+.divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0;
+  position: relative;
+}
+
+/* ═══ SECTION STYLES ═══ */
+.section {
+  padding: 80px 0;
+  position: relative;
+}
+
+.section-header {
+  margin-bottom: 48px;
+}
+
+.section-label {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+.section-label::before {
+  content: '// ';
+  color: var(--muted);
+}
+
+.section-title {
+  font-size: clamp(22px, 3.5vw, 32px);
+  font-weight: 700;
+  letter-spacing: -1px;
+  color: var(--highlight);
+}
+
+.section-desc {
+  color: var(--dim);
+  font-size: 14px;
+  max-width: 480px;
+  margin-top: 8px;
+}
+
+/* ═══ TOOLS ═══ */
+.tools-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+}
+
+.tool-item {
+  padding: 14px 20px;
+  border: 1px solid var(--border);
+  margin-right: -1px;
+  margin-bottom: -1px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: background 0.15s;
+  min-width: 180px;
+}
+.tool-item:hover {
+  background: rgba(255,255,255,0.02);
+}
+
+.tool-dot {
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--dim);
+}
+
+.tool-name {
+  font-size: 13px;
+  color: var(--fg);
+}
+
+/* ═══ HOW IT WORKS — PIPELINE ═══ */
+.pipeline {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr auto 1fr;
+  align-items: start;
+  gap: 0;
+  margin-top: 48px;
+}
+
+.pipe-step {
+  border: 1px solid var(--border);
+  padding: 24px 20px;
+}
+
+.pipe-num {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 12px;
+  letter-spacing: 1px;
+}
+
+.pipe-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--highlight);
+  margin-bottom: 8px;
+}
+
+.pipe-desc {
+  font-size: 12px;
+  color: var(--dim);
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.pipe-code {
+  font-size: 12px;
+  color: var(--fg);
+  padding: 8px 12px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+}
+
+.pipe-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 8px;
+  color: var(--muted);
+  font-size: 16px;
+  align-self: center;
+}
+
+/* ═══ FEATURES ═══ */
+.features-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+}
+
+.feature-item {
+  border: 1px solid var(--border);
+  padding: 28px 24px;
+  margin-right: -1px;
+  margin-bottom: -1px;
+  transition: background 0.2s;
+}
+.feature-item:hover {
+  background: rgba(255,255,255,0.015);
+}
+
+.feature-tag {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+
+.feature-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--highlight);
+  margin-bottom: 8px;
+  letter-spacing: -0.3px;
+}
+
+.feature-desc {
+  font-size: 13px;
+  color: var(--dim);
+  line-height: 1.6;
+}
+
+/* ═══ BENCHMARK ═══ */
+.bench-display {
+  margin-top: 48px;
+}
+
+.bench-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-bottom: 2px;
+}
+
+.bench-label {
+  width: 200px;
+  flex-shrink: 0;
+  padding: 14px 16px;
+  font-size: 12px;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  letter-spacing: 0.3px;
+}
+
+.bench-bar-track {
+  flex: 1;
+  height: 50px;
+  border: 1px solid var(--border);
+  border-left: none;
+  position: relative;
+  overflow: hidden;
+}
+
+.bench-bar {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding-left: 16px;
+  font-size: 13px;
+  font-weight: 600;
+  transition: width 2s cubic-bezier(0.16, 1, 0.3, 1);
+  position: relative;
+}
+
+.bench-bar--naive {
+  width: 0;
+  background: repeating-linear-gradient(
+    90deg,
+    rgba(255,255,255,0.04) 0px,
+    rgba(255,255,255,0.04) 2px,
+    transparent 2px,
+    transparent 4px
+  );
+  color: var(--fg);
+}
+.bench-bar--naive.animated { width: 100%; }
+
+.bench-bar--p28 {
+  width: 0;
+  background: var(--highlight);
+  color: var(--bg);
+  transition: width 1.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.bench-bar--p28.animated { width: 12%; min-width: 120px; }
+
+.bench-stat {
+  margin-top: 32px;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.bench-number {
+  font-size: clamp(48px, 8vw, 80px);
+  font-weight: 700;
+  color: var(--highlight);
+  letter-spacing: -4px;
+  line-height: 1;
+}
+
+.bench-unit {
+  font-size: 16px;
+  color: var(--dim);
+  font-weight: 300;
+}
+
+.bench-footnote {
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.7;
+  padding: 16px;
+  border: 1px solid var(--border);
+}
+
+/* ═══ QUICK START — TERMINAL ═══ */
+.term {
+  margin-top: 48px;
+  max-width: 640px;
+  border: 1px solid var(--border);
+}
+
+.term-bar {
+  display: flex;
+  align-items: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  gap: 12px;
+}
+
+.term-bar-title {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.5px;
+}
+
+.term-bar-dots {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.term-bar-dot {
+  width: 8px;
+  height: 8px;
+  border: 1px solid var(--muted);
+}
+
+.term-body {
+  padding: 20px;
+  font-size: 13px;
+  line-height: 2.2;
+}
+
+.term-line {
+  opacity: 0;
+  transform: translateX(-8px);
+  animation: termSlide 0.3s ease-out forwards;
+}
+.term-line:nth-child(1) { animation-delay: 0.2s; }
+.term-line:nth-child(2) { animation-delay: 0.5s; }
+.term-line:nth-child(3) { animation-delay: 0.8s; }
+.term-line:nth-child(4) { animation-delay: 1.1s; }
+.term-line:nth-child(5) { animation-delay: 1.4s; }
+.term-line:nth-child(6) { animation-delay: 1.7s; }
+.term-line:nth-child(7) { animation-delay: 2.0s; }
+
+@keyframes termSlide {
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.t-prompt { color: var(--dim); }
+.t-cmd { color: var(--fg); }
+.t-comment { color: var(--muted); }
+.t-output { color: var(--highlight); }
+.t-flag { color: var(--dim); font-style: italic; }
+
+/* ═══ ARCHITECTURE — ASCII DIAGRAM ═══ */
+.arch-ascii {
+  margin-top: 48px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre;
+  color: var(--dim);
+  overflow-x: auto;
+  padding: 24px;
+  border: 1px solid var(--border);
+}
+
+.arch-ascii .highlight { color: var(--highlight); }
+.arch-ascii .label { color: var(--fg); }
+
+/* ═══ FOOTER ═══ */
+footer {
+  padding: 40px 0;
+  border-top: 1px solid var(--border);
+}
+
+.footer-inner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+/* ═══ FOUNDER ═══ */
+.founder-card {
+  border: 1px solid var(--border);
+  padding: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.founder-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--highlight);
+  margin-bottom: 4px;
+}
+
+.founder-role {
+  font-size: 12px;
+  color: var(--dim);
+  margin-bottom: 10px;
+}
+
+.founder-link {
+  font-size: 12px;
+  color: var(--dim);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+.founder-link:hover { color: var(--highlight); }
+
+.footer-left {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.footer-links {
+  display: flex;
+  gap: 20px;
+  list-style: none;
+}
+
+.footer-links a {
+  color: var(--dim);
+  text-decoration: none;
+  font-size: 12px;
+  transition: color 0.15s;
+}
+.footer-links a:hover { color: var(--highlight); }
+
+/* ═══ REVEAL ANIMATIONS ═══ */
+.reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  transition: opacity 0.5s ease-out, transform 0.5s ease-out;
+  will-change: opacity, transform;
+}
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ═══ RESPONSIVE ═══ */
+@media (max-width: 768px) {
+  .nav-links { display: none; }
+  .pipeline {
+    grid-template-columns: 1fr;
+  }
+  .pipe-arrow {
+    transform: rotate(90deg);
+    padding: 12px;
+  }
+  .features-grid { grid-template-columns: 1fr; }
+  .bench-row { flex-direction: column; }
+  .bench-label { width: 100%; }
+  .bench-bar-track { width: 100%; }
+  .hero-ascii { font-size: 7px; }
+  .install-row { flex-direction: column; }
+  .install-copy { border-left: 1px solid var(--border); border-top: none; }
+  .arch-ascii { font-size: 11px; }
+  .footer-inner { flex-direction: column; text-align: center; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ NAV ═══ -->
+<nav>
+  <a href="#" class="nav-logo">
+    packet28<span class="cursor"></span>
+  </a>
+  <ul class="nav-links">
+    <li><a href="#how">HOW_IT_WORKS</a></li>
+    <li><a href="#features">FEATURES</a></li>
+    <li><a href="#benchmark">BENCHMARK</a></li>
+    <li><a href="#quickstart">QUICK_START</a></li>
+    <li><a href="https://github.com/usharma123/Packet28" target="_blank">GITHUB</a></li>
+  </ul>
+</nav>
+
+<!-- ═══ HERO ═══ -->
+<section class="hero">
+  <canvas id="matrix"></canvas>
+  <div class="hero-content">
+    <div class="hero-ascii" id="ascii-art"></div>
+    <h1>Context broker for<br>AI coding agents</h1>
+    <p class="hero-sub">
+      Manages your agent's context window so it reads only what matters.
+      <strong>164x fewer tokens</strong> on large codebases.
+    </p>
+    <div class="install-row">
+      <div class="install-cmd" id="install-box">
+        <span class="prompt">$</span>
+        <span class="cmd">npm install -g packet28</span>
+      </div>
+      <button class="install-copy" onclick="copyCmd()">COPY</button>
+    </div>
+    <div class="hero-links">
+      <a href="#quickstart">Get started</a>
+      <a href="https://github.com/usharma123/Packet28" target="_blank">View source</a>
+      <a href="https://www.npmjs.com/package/packet28" target="_blank">npm</a>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ═══ SUPPORTED TOOLS ═══ -->
+<section class="section" id="tools">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-label">integrations</div>
+      <h2 class="section-title">Works with your tools</h2>
+      <p class="section-desc">Auto-detects your runtime. One command to configure MCP servers.</p>
+    </div>
+    <div class="tools-list reveal">
+      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">Claude Code</span></div>
+      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">Cursor</span></div>
+      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">Codex</span></div>
+      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">GitHub Copilot</span></div>
+      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">Windsurf</span></div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ═══ HOW IT WORKS ═══ -->
+<section class="section" id="how">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-label">pipeline</div>
+      <h2 class="section-title">Three steps to focused context</h2>
+    </div>
+    <div class="pipeline reveal">
+      <div class="pipe-step">
+        <div class="pipe-num">01</div>
+        <h3 class="pipe-title">Setup</h3>
+        <p class="pipe-desc">Auto-detects runtimes, configures MCP servers, starts the daemon.</p>
+        <div class="pipe-code">$ packet28 setup --root .</div>
+      </div>
+      <div class="pipe-arrow">&rarr;</div>
+      <div class="pipe-step">
+        <div class="pipe-num">02</div>
+        <h3 class="pipe-title">Agent calls MCP</h3>
+        <p class="pipe-desc">Your AI agent calls get_context with an action: plan, inspect, edit.</p>
+        <div class="pipe-code">get_context({ action: "plan" })</div>
+      </div>
+      <div class="pipe-arrow">&rarr;</div>
+      <div class="pipe-step">
+        <div class="pipe-num">03</div>
+        <h3 class="pipe-title">Focused context</h3>
+        <p class="pipe-desc">Returns only what matters &mdash; repo anchors, focus sets, coverage data.</p>
+        <div class="pipe-code">~849 tokens (not ~139,000)</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ═══ FEATURES ═══ -->
+<section class="section" id="features">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-label">capabilities</div>
+      <h2 class="section-title">Everything your agent needs</h2>
+    </div>
+    <div class="features-grid reveal">
+      <div class="feature-item">
+        <div class="feature-tag">01 MAP</div>
+        <h3 class="feature-title">Repo Mapping</h3>
+        <p class="feature-desc">Builds a structural map of your codebase &mdash; files, symbols, dependencies &mdash; so the agent navigates directly to what matters.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">02 COV</div>
+        <h3 class="feature-title">Coverage-Aware</h3>
+        <p class="feature-desc">Ingests test coverage data to show which lines are tested vs untested. Agents know exactly where to add tests.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">03 BUD</div>
+        <h3 class="feature-title">Token Budgeting</h3>
+        <p class="feature-desc">Each response stays within a configurable token budget. No more blowing through context windows on a single file read.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">04 FOC</div>
+        <h3 class="feature-title">Focus Sets</h3>
+        <p class="feature-desc">Agents mark files and symbols as "in focus." Packet28 tracks what the agent cares about across tool calls.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">05 DMN</div>
+        <h3 class="feature-title">Daemon State</h3>
+        <p class="feature-desc">The packet28d daemon persists state across agent sessions. Start, stop, resume &mdash; your context survives restarts.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">06 MRT</div>
+        <h3 class="feature-title">Multi-Runtime</h3>
+        <p class="feature-desc">One setup command detects Claude Code, Cursor, Codex, and more. Configures MCP servers for each automatically.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ═══ BENCHMARK ═══ -->
+<section class="section" id="benchmark">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-label">benchmark</div>
+      <h2 class="section-title">The numbers</h2>
+      <p class="section-desc">Tested on Apache Commons Lang &mdash; 534 Java files, 12MB.</p>
+    </div>
+    <div class="bench-display reveal">
+      <div class="bench-row">
+        <div class="bench-label">WITHOUT PACKET28</div>
+        <div class="bench-bar-track">
+          <div class="bench-bar bench-bar--naive" id="bar-naive">139,000 tokens</div>
+        </div>
+      </div>
+      <div class="bench-row">
+        <div class="bench-label">WITH PACKET28</div>
+        <div class="bench-bar-track">
+          <div class="bench-bar bench-bar--p28" id="bar-p28">849</div>
+        </div>
+      </div>
+      <div class="bench-stat">
+        <div class="bench-number">164x</div>
+        <div class="bench-unit">fewer tokens consumed</div>
+      </div>
+      <div class="bench-footnote">
+        Task: "Understand StringUtils.wrap and fix null delimiter handling"<br>
+        Naive agent reads entire 9,243-line files. Packet28 serves ~40 relevant lines + anchors.
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ═══ QUICK START ═══ -->
+<section class="section" id="quickstart">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-label">quick start</div>
+      <h2 class="section-title">Up and running in 30 seconds</h2>
+    </div>
+    <div class="term reveal">
+      <div class="term-bar">
+        <span class="term-bar-title">TERMINAL</span>
+        <div class="term-bar-dots">
+          <div class="term-bar-dot"></div>
+          <div class="term-bar-dot"></div>
+          <div class="term-bar-dot"></div>
+        </div>
+      </div>
+      <div class="term-body">
+        <div class="term-line"><span class="t-comment"># install globally</span></div>
+        <div class="term-line"><span class="t-prompt">$</span> <span class="t-cmd">npm install <span class="t-flag">-g</span> packet28</span></div>
+        <div class="term-line"></div>
+        <div class="term-line"><span class="t-comment"># set up in your project</span></div>
+        <div class="term-line"><span class="t-prompt">$</span> <span class="t-cmd">packet28 setup <span class="t-flag">--root</span> .</span></div>
+        <div class="term-line"><span class="t-output">  Detected runtimes: Claude Code, Cursor</span></div>
+        <div class="term-line"><span class="t-output">  Setup complete. MCP servers configured.</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ═══ ARCHITECTURE ═══ -->
+<section class="section" id="architecture">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-label">architecture</div>
+      <h2 class="section-title">How the pieces fit</h2>
+    </div>
+    <div class="arch-ascii reveal" id="arch-diagram"></div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ═══ FOUNDER ═══ -->
+<section class="section" id="founder">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-label">founder</div>
+      <h2 class="section-title">Built by</h2>
+    </div>
+    <div class="founder-card reveal">
+      <div class="founder-info">
+        <div class="founder-name">Utsav Sharma</div>
+        <div class="founder-role">Founder</div>
+        <a href="https://www.linkedin.com/in/usharma124" target="_blank" class="founder-link">linkedin &rarr;</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ═══ FOOTER ═══ -->
+<footer>
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-left">packet28 &mdash; MIT License &mdash; 2024</div>
+      <ul class="footer-links">
+        <li><a href="https://github.com/usharma123/Packet28" target="_blank">github</a></li>
+        <li><a href="https://www.npmjs.com/package/packet28" target="_blank">npm</a></li>
+        <li><a href="#quickstart">docs</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script>
+// ═══ COPY COMMAND ═══
+function copyCmd() {
+  navigator.clipboard.writeText('npm install -g packet28');
+  const btn = document.querySelector('.install-copy');
+  btn.textContent = 'COPIED';
+  setTimeout(() => btn.textContent = 'COPY', 1500);
+}
+
+// ═══ ASCII ART — STATIC, CSS ANIMATED ═══
+document.getElementById('ascii-art').textContent = [
+  ' ██████╗  █████╗  ██████╗██╗  ██╗███████╗████████╗██████╗  █████╗ ',
+  ' ██╔══██╗██╔══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝╚════██╗██╔══██╗',
+  ' ██████╔╝███████║██║     █████╔╝ █████╗     ██║    █████╔╝╚█████╔╝',
+  ' ██╔═══╝ ██╔══██║██║     ██╔═██╗ ██╔══╝     ██║   ██╔═══╝ ██╔══██╗',
+  ' ██║     ██║  ██║╚██████╗██║  ██╗███████╗   ██║   ███████╗╚█████╔╝',
+  ' ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝ ╚════╝',
+].join('\n');
+
+// ═══ MATRIX RAIN (throttled to ~20fps) ═══
+(function() {
+  const canvas = document.getElementById('matrix');
+  const ctx = canvas.getContext('2d');
+  let columns, drops;
+  const chars = '01';
+  const fontSize = 18;
+  let last = 0;
+  const interval = 50; // ~20fps
+
+  function resize() {
+    const hero = canvas.parentElement;
+    canvas.width = hero.offsetWidth;
+    canvas.height = hero.offsetHeight;
+    columns = Math.floor(canvas.width / fontSize);
+    drops = Array(columns).fill(0).map(() => Math.floor(Math.random() * canvas.height / fontSize));
+  }
+
+  function draw(ts) {
+    requestAnimationFrame(draw);
+    if (ts - last < interval) return;
+    last = ts;
+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = fontSize + 'px monospace';
+
+    for (let i = 0; i < drops.length; i++) {
+      const char = chars[Math.floor(Math.random() * 2)];
+      ctx.fillText(char, i * fontSize, drops[i] * fontSize);
+      if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) {
+        drops[i] = 0;
+      }
+      drops[i]++;
+    }
+  }
+
+  resize();
+  requestAnimationFrame(draw);
+  window.addEventListener('resize', resize);
+})();
+
+// ═══ INTERSECTION OBSERVER ═══
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) e.target.classList.add('visible');
+  });
+}, { threshold: 0.1, rootMargin: '0px 0px -30px 0px' });
+
+document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+// ═══ BENCHMARK BARS ═══
+const benchObs = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      document.getElementById('bar-naive').classList.add('animated');
+      document.getElementById('bar-p28').classList.add('animated');
+    }
+  });
+}, { threshold: 0.3 });
+
+const benchEl = document.querySelector('.bench-display');
+if (benchEl) benchObs.observe(benchEl);
+
+// ═══ ARCHITECTURE ASCII DIAGRAM ═══
+(function() {
+  const el = document.getElementById('arch-diagram');
+  if (!el) return;
+  // Build diagram as plain text, then highlight keywords
+  const lines = [
+    '┌───────────────────┐           ┌───────────────────┐           ┌───────────────────┐',
+    '│                   │    MCP    │                   │   daemon  │                   │',
+    '│    AI  Agent      │ ────────> │    Packet28       │ ────────> │    Codebase       │',
+    '│                   │   stdio   │                   │ packet28d │                   │',
+    '│  Claude Code      │           │  context broker   │           │  repo + coverage  │',
+    '│  Cursor           │ <──────── │  token budget     │ <──────── │  file system      │',
+    '│  Codex            │  focused  │  focus sets       │   maps    │  test results     │',
+    '│                   │  context  │  repo map         │           │                   │',
+    '└───────────────────┘           └───────────────────┘           └───────────────────┘',
+    '',
+    'actions:  plan  |  inspect  |  choose_tool  |  interpret  |  edit  |  summarize',
+  ];
+  const highlights = ['AI  Agent', 'Packet28', 'Codebase', 'plan', 'inspect', 'choose_tool', 'interpret', 'edit', 'summarize'];
+
+  function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  const html = lines.map(line => {
+    let escaped = escHtml(line);
+    highlights.forEach(kw => {
+      const ekw = escHtml(kw);
+      escaped = escaped.replaceAll(ekw, `<span class="highlight">${ekw}</span>`);
+    });
+    return escaped;
+  }).join('\n');
+
+  el.innerHTML = html;
+})();
+</script>
+
+</body>
+</html>
