@@ -37,6 +37,13 @@ struct McpSessionState {
     initialized: bool,
     shutdown: bool,
     tracked_tasks: BTreeMap<String, u64>,
+    framing: Option<McpMessageFraming>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpMessageFraming {
+    ContentLength,
+    NewlineJson,
 }
 
 const BROKER_SECTION_IDS: &[&str] = &[
@@ -73,9 +80,12 @@ fn serve_stdio(root: PathBuf) -> Result<()> {
     start_notification_thread(root.clone(), writer.clone(), session.clone());
 
     loop {
-        let Some(request) = read_message(&mut reader)? else {
+        let Some((request, framing)) = read_message(&mut reader)? else {
             break;
         };
+        if let Ok(mut guard) = session.lock() {
+            guard.framing = Some(framing);
+        }
         let method = request
             .get("method")
             .and_then(Value::as_str)
@@ -102,7 +112,7 @@ fn serve_stdio(root: PathBuf) -> Result<()> {
         let mut guard = writer
             .lock()
             .map_err(|_| anyhow!("failed to lock MCP stdout"))?;
-        write_message(&mut *guard, &response)?;
+        write_message(&mut *guard, &response, framing)?;
     }
 
     if let Ok(mut guard) = session.lock() {
@@ -117,21 +127,23 @@ fn start_notification_thread(
     session: Arc<Mutex<McpSessionState>>,
 ) {
     thread::spawn(move || loop {
-        let (initialized, shutdown, tracked_tasks) = match session.lock() {
+        let (initialized, shutdown, tracked_tasks, framing) = match session.lock() {
             Ok(guard) => (
                 guard.initialized,
                 guard.shutdown,
                 guard.tracked_tasks.clone(),
+                guard.framing,
             ),
             Err(_) => return,
         };
         if shutdown {
             return;
         }
-        if !initialized {
+        if !initialized || framing.is_none() {
             thread::sleep(Duration::from_millis(250));
             continue;
         }
+        let framing = framing.unwrap_or(McpMessageFraming::ContentLength);
 
         for (task_id, last_seen_seq) in tracked_tasks {
             let frames = match load_task_events(&root, &task_id) {
@@ -167,7 +179,7 @@ fn start_notification_thread(
                     "params": Value::Object(params),
                 });
                 if let Ok(mut guard) = writer.lock() {
-                    let _ = write_message(&mut *guard, &notification);
+                    let _ = write_message(&mut *guard, &notification, framing);
                 }
             }
             if newest_seq > last_seen_seq {
@@ -182,8 +194,32 @@ fn start_notification_thread(
     });
 }
 
-fn read_message(reader: &mut impl BufRead) -> Result<Option<Value>> {
+fn read_message(reader: &mut impl BufRead) -> Result<Option<(Value, McpMessageFraming)>> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            let value = serde_json::from_str(trimmed)?;
+            return Ok(Some((value, McpMessageFraming::NewlineJson)));
+        }
+        return read_header_framed_message(reader, trimmed);
+    }
+}
+
+fn read_header_framed_message(
+    reader: &mut impl BufRead,
+    first_line: &str,
+) -> Result<Option<(Value, McpMessageFraming)>> {
     let mut content_length = None::<usize>;
+    parse_header_line(first_line, &mut content_length)?;
     let mut line = String::new();
     loop {
         line.clear();
@@ -196,9 +232,7 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<Value>> {
             break;
         }
         if let Some((name, value)) = trimmed.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = Some(value.trim().parse::<usize>()?);
-            }
+            parse_header(name, value, &mut content_length)?;
         }
     }
 
@@ -206,13 +240,42 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<Value>> {
         content_length.ok_or_else(|| anyhow!("missing Content-Length header in MCP request"))?;
     let mut body = vec![0_u8; content_length];
     reader.read_exact(&mut body)?;
-    Ok(Some(serde_json::from_slice(&body)?))
+    Ok(Some((
+        serde_json::from_slice(&body)?,
+        McpMessageFraming::ContentLength,
+    )))
 }
 
-fn write_message(writer: &mut impl Write, value: &Value) -> Result<()> {
+fn parse_header_line(line: &str, content_length: &mut Option<usize>) -> Result<()> {
+    let Some((name, value)) = line.split_once(':') else {
+        return Err(anyhow!("missing Content-Length header in MCP request"));
+    };
+    parse_header(name, value, content_length)
+}
+
+fn parse_header(name: &str, value: &str, content_length: &mut Option<usize>) -> Result<()> {
+    if name.eq_ignore_ascii_case("content-length") {
+        *content_length = Some(value.trim().parse::<usize>()?);
+    }
+    Ok(())
+}
+
+fn write_message(
+    writer: &mut impl Write,
+    value: &Value,
+    framing: McpMessageFraming,
+) -> Result<()> {
     let body = serde_json::to_vec(value)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
+    match framing {
+        McpMessageFraming::ContentLength => {
+            write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+            writer.write_all(&body)?;
+        }
+        McpMessageFraming::NewlineJson => {
+            writer.write_all(&body)?;
+            writer.write_all(b"\n")?;
+        }
+    }
     writer.flush()?;
     Ok(())
 }
@@ -248,10 +311,7 @@ fn handle_method(
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {},
-                    "resources": {},
-                    "experimental": {
-                        "packet28_context_notifications": true
-                    }
+                    "resources": {}
                 },
                 "serverInfo": {
                     "name": "Packet28",

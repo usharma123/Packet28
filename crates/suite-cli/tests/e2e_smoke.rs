@@ -85,6 +85,13 @@ fn write_mcp_message(stdin: &mut ChildStdin, value: &Value) {
     stdin.flush().unwrap();
 }
 
+fn write_mcp_message_newline(stdin: &mut ChildStdin, value: &Value) {
+    let body = serde_json::to_vec(value).unwrap();
+    stdin.write_all(&body).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+}
+
 fn read_mcp_message(stdout: &mut BufReader<ChildStdout>) -> Value {
     let mut content_length = None::<usize>;
     let mut line = String::new();
@@ -104,6 +111,19 @@ fn read_mcp_message(stdout: &mut BufReader<ChildStdout>) -> Value {
     let mut body = vec![0_u8; content_length.unwrap()];
     stdout.read_exact(&mut body).unwrap();
     serde_json::from_slice(&body).unwrap()
+}
+
+fn read_mcp_message_newline(stdout: &mut BufReader<ChildStdout>) -> Value {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return serde_json::from_str(trimmed).unwrap();
+    }
 }
 
 fn read_mcp_message_for_id(stdout: &mut BufReader<ChildStdout>, expected_id: u64) -> Value {
@@ -2955,6 +2975,47 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_accepts_newline_json_stdio() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+
+    write_mcp_message_newline(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{}},"clientInfo":{"name":"claude-code","version":"2.1.72"}}
+        }),
+    );
+    let initialize = read_mcp_message_newline(&mut stdout);
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+    assert_eq!(initialize["result"]["protocolVersion"], "2024-11-05");
+    assert!(initialize["result"]["capabilities"]["experimental"].is_null());
+
+    write_mcp_message_newline(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/list"
+        }),
+    );
+    let tools = read_mcp_message_newline(&mut stdout);
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.get_context"));
+
+    let _ = child.kill();
 }
 
 #[test]
