@@ -39,6 +39,8 @@ pub struct ToolInvocationSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symbols: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -191,6 +193,8 @@ pub enum AgentStateEventData {
         command: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         artifact_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        regions: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },

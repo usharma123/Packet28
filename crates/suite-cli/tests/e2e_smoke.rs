@@ -3187,6 +3187,306 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
 
 #[test]
 #[cfg(unix)]
+fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    git(dir.path(), &["add", "src/alpha.rs", "src/beta.rs"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    write_cached_coverage_state(dir.path());
+    write_cached_testmap_state(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let initialize = read_mcp_message_for_id(&mut stdout, 1);
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/list"
+        }),
+    );
+    let tools = read_mcp_message_for_id(&mut stdout, 2);
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.grep"));
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.read"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.grep",
+                "arguments":{
+                    "task_id":"task-native-grep",
+                    "pattern":"Alpha",
+                    "paths":["src"],
+                    "whole_word":true
+                }
+            }
+        }),
+    );
+    let grep = read_mcp_message_for_id(&mut stdout, 3);
+    let grep_payload = &grep["result"]["structuredContent"];
+    assert_eq!(grep_payload["pattern"].as_str().unwrap(), "Alpha");
+    assert_eq!(grep_payload["match_count"].as_u64().unwrap(), 1);
+    assert_eq!(grep_payload["returned_match_count"].as_u64().unwrap(), 1);
+    assert_eq!(grep_payload["truncated"], false);
+    assert!(grep_payload["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "src/alpha.rs"));
+    assert!(grep_payload["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("src/alpha.rs:")));
+    assert!(grep_payload["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "Alpha"));
+    assert!(grep_payload["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["text"].as_str().unwrap_or_default().contains("Alpha")));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-native-grep",
+                    "action":"inspect",
+                    "query":"Where is Alpha defined?",
+                    "response_mode":"full",
+                    "include_sections":["task_objective","discovered_scope","recent_tool_activity","code_evidence","repo_map"]
+                }
+            }
+        }),
+    );
+    let inspect = read_mcp_message_for_id(&mut stdout, 4);
+    let inspect_payload = &inspect["result"]["structuredContent"];
+    assert!(inspect_payload["recent_tool_invocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| {
+            item["tool_name"] == "packet28.grep"
+                && item["regions"]
+                    .as_array()
+                    .is_some_and(|regions| !regions.is_empty())
+        }));
+    assert!(inspect_payload["discovered_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "src/alpha.rs"));
+    assert!(inspect_payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Recent Tool Activity"));
+    assert!(inspect_payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Discovered Scope"));
+    assert!(inspect_payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Code Evidence"));
+    assert!(inspect_payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("struct Alpha;"));
+    let repo_map_section = inspect_payload["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["id"] == "repo_map")
+        .unwrap();
+    assert!(repo_map_section["body"]
+        .as_str()
+        .unwrap()
+        .contains("src/alpha.rs"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_native_read_auto_captures_regions() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    git(dir.path(), &["add", "src/alpha.rs", "src/beta.rs"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    write_cached_coverage_state(dir.path());
+    write_cached_testmap_state(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let initialize = read_mcp_message_for_id(&mut stdout, 1);
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.read",
+                "arguments":{
+                    "task_id":"task-native-read",
+                    "path":"src/alpha.rs",
+                    "regions":["src/alpha.rs:4-5"]
+                }
+            }
+        }),
+    );
+    let read = read_mcp_message_for_id(&mut stdout, 2);
+    let read_payload = &read["result"]["structuredContent"];
+    assert_eq!(read_payload["path"].as_str().unwrap(), "src/alpha.rs");
+    assert!(read_payload["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "src/alpha.rs:4-5"));
+    assert_eq!(read_payload["lines"].as_array().unwrap().len(), 2);
+    assert!(read_payload["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "Alpha"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-native-read",
+                    "action":"inspect",
+                    "query":"Where is Alpha defined?",
+                    "response_mode":"full",
+                    "include_sections":["task_objective","discovered_scope","recent_tool_activity","code_evidence","repo_map"]
+                }
+            }
+        }),
+    );
+    let inspect = read_mcp_message_for_id(&mut stdout, 3);
+    let inspect_payload = &inspect["result"]["structuredContent"];
+    assert!(inspect_payload["recent_tool_invocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| {
+            item["tool_name"] == "packet28.read"
+                && item["regions"].as_array().is_some_and(|regions| {
+                    regions.iter().any(|region| region == "src/alpha.rs:4-5")
+                })
+        }));
+    assert!(inspect_payload["discovered_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "src/alpha.rs"));
+    assert!(inspect_payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Code Evidence"));
+    assert!(inspect_payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("src/alpha.rs:5"));
+    assert!(inspect_payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("struct Alpha;"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
 fn test_packet28_mcp_accepts_newline_json_stdio() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();

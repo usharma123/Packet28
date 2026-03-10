@@ -16,6 +16,7 @@ use packet28_daemon_core::{
     BrokerValidatePlanRequest, BrokerWriteOp, BrokerWriteStateRequest, DaemonRequest,
     DaemonResponse,
 };
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 #[derive(Args)]
@@ -75,6 +76,30 @@ struct McpProxyConfig {
     mcp_servers: BTreeMap<String, McpProxyServerConfig>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct Packet28GrepArgs {
+    task_id: String,
+    pattern: String,
+    paths: Vec<String>,
+    fixed_string: bool,
+    case_sensitive: Option<bool>,
+    whole_word: bool,
+    context_lines: Option<usize>,
+    max_matches_per_file: Option<usize>,
+    max_total_matches: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct Packet28ReadArgs {
+    task_id: String,
+    path: String,
+    regions: Vec<String>,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+}
+
 impl Default for McpProxyConfig {
     fn default() -> Self {
         Self {
@@ -101,6 +126,7 @@ struct UpstreamClient {
 
 const BROKER_SECTION_IDS: &[&str] = &[
     "task_objective",
+    "budget_notes",
     "active_decisions",
     "open_questions",
     "resolved_questions",
@@ -1351,6 +1377,40 @@ fn handle_method(
                     }
                 },
                 {
+                    "name": "packet28.grep",
+                    "description": "Search repository files under the Packet28 root and auto-capture the result into broker state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["task_id", "pattern"],
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "pattern": {"type":"string"},
+                            "paths": {"type":"array","items":{"type":"string"}},
+                            "fixed_string": {"type":"boolean"},
+                            "case_sensitive": {"type":"boolean"},
+                            "whole_word": {"type":"boolean"},
+                            "context_lines": {"type":"number"},
+                            "max_matches_per_file": {"type":"number"},
+                            "max_total_matches": {"type":"number"}
+                        }
+                    }
+                },
+                {
+                    "name": "packet28.read",
+                    "description": "Read file content under the Packet28 root and auto-capture the result into broker state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["task_id", "path"],
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "path": {"type":"string"},
+                            "regions": {"type":"array","items":{"type":"string"}},
+                            "line_start": {"type":"number"},
+                            "line_end": {"type":"number"}
+                        }
+                    }
+                },
+                {
                     "name": "packet28.write_state",
                     "description": "Write one structured agent-state update into Packet28.",
                     "inputSchema": {
@@ -1501,6 +1561,16 @@ fn handle_tool_call(
             track_task(session, root, &request.task_id)?;
             serde_json::to_value(crate::broker_client::estimate_context(root, request)?)?
         }
+        "packet28.grep" => {
+            let request: Packet28GrepArgs = serde_json::from_value(arguments)?;
+            track_task(session, root, &request.task_id)?;
+            handle_packet28_grep(root, session, request)?
+        }
+        "packet28.read" => {
+            let request: Packet28ReadArgs = serde_json::from_value(arguments)?;
+            track_task(session, root, &request.task_id)?;
+            handle_packet28_read(root, session, request)?
+        }
         "packet28.write_state" => {
             let request: BrokerWriteStateRequest = serde_json::from_value(arguments)?;
             track_task(session, root, &request.task_id)?;
@@ -1544,7 +1614,7 @@ fn capabilities_payload() -> Value {
         "section_ids": BROKER_SECTION_IDS,
         "verbosity_modes": ["compact", "standard", "rich"],
         "response_modes": ["full", "delta", "auto"],
-        "tools": ["packet28.get_context", "packet28.estimate_context", "packet28.validate_plan", "packet28.decompose", "packet28.write_state", "packet28.task_status", "packet28.capabilities"],
+        "tools": ["packet28.get_context", "packet28.estimate_context", "packet28.grep", "packet28.read", "packet28.validate_plan", "packet28.decompose", "packet28.write_state", "packet28.task_status", "packet28.capabilities"],
         "tool_result_kinds": ["build", "stack", "test", "diff", "generic"],
         "push_notifications": {
             "supported": true,
@@ -1604,6 +1674,30 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
                 .unwrap_or(0);
             format!("Packet28 context estimate with {sections} section(s), ~{est_tokens} tokens.")
         }
+        "packet28.grep" => {
+            let matches = payload
+                .get("match_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let files = payload
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0);
+            format!("Packet28 grep found {matches} match(es) across {files} file(s).")
+        }
+        "packet28.read" => {
+            let path = payload
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let lines = payload
+                .get("lines")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0);
+            format!("Packet28 read returned {lines} line(s) from {path}.")
+        }
         "packet28.write_state" => {
             let accepted = payload
                 .get("accepted")
@@ -1654,6 +1748,562 @@ fn track_task(session: &Arc<Mutex<McpSessionState>>, root: &Path, task_id: &str)
         .entry(task_id.to_string())
         .or_insert(latest_seq);
     Ok(())
+}
+
+fn next_task_invocation(
+    session: &Arc<Mutex<McpSessionState>>,
+    task_id: &str,
+) -> Result<(u64, String)> {
+    let mut guard = session
+        .lock()
+        .map_err(|_| anyhow!("failed to lock MCP session"))?;
+    guard.next_invocation_seq = guard.next_invocation_seq.saturating_add(1).max(1);
+    let sequence = guard.next_invocation_seq;
+    let _ = task_id;
+    Ok((sequence, format!("tool-invocation-{sequence}")))
+}
+
+fn infer_symbols_from_pattern(pattern: &str) -> Vec<String> {
+    let candidate = pattern
+        .trim()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | ':' | '.'));
+    if candidate.len() < 3 || !candidate.chars().any(|ch| ch.is_ascii_alphabetic()) {
+        return Vec::new();
+    }
+    vec![candidate.to_string()]
+}
+
+fn infer_symbols_from_lines(lines: &[String]) -> Vec<String> {
+    let mut symbols = BTreeMap::<String, ()>::new();
+    for line in lines {
+        let trimmed = line.trim();
+        let token = if let Some(rest) = trimmed.strip_prefix("pub struct ") {
+            rest.split_whitespace().next()
+        } else if let Some(rest) = trimmed.strip_prefix("struct ") {
+            rest.split_whitespace().next()
+        } else if let Some(rest) = trimmed.strip_prefix("pub enum ") {
+            rest.split_whitespace().next()
+        } else if let Some(rest) = trimmed.strip_prefix("enum ") {
+            rest.split_whitespace().next()
+        } else if let Some(rest) = trimmed.strip_prefix("pub trait ") {
+            rest.split_whitespace().next()
+        } else if let Some(rest) = trimmed.strip_prefix("trait ") {
+            rest.split_whitespace().next()
+        } else if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+            rest.split('(').next()
+        } else if let Some(rest) = trimmed.strip_prefix("fn ") {
+            rest.split('(').next()
+        } else if let Some(rest) = trimmed.strip_prefix("class ") {
+            rest.split_whitespace().next()
+        } else if let Some(rest) = trimmed.strip_prefix("interface ") {
+            rest.split_whitespace().next()
+        } else if trimmed.contains('(') && trimmed.ends_with('{') {
+            trimmed
+                .split('(')
+                .next()
+                .and_then(|prefix| prefix.split_whitespace().last())
+        } else {
+            None
+        };
+        if let Some(token) = token {
+            let cleaned = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
+            if cleaned.len() >= 3 && cleaned.chars().any(|ch| ch.is_ascii_alphabetic()) {
+                symbols.insert(cleaned.to_string(), ());
+            }
+        }
+    }
+    symbols.into_keys().take(8).collect()
+}
+
+fn json_array_strings(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+fn parse_line_range_spec(value: &str) -> Option<(usize, usize)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (start, end) = if let Some((start, end)) = trimmed.split_once('-') {
+        (
+            start.trim().parse::<usize>().ok()?,
+            end.trim().parse::<usize>().ok()?,
+        )
+    } else {
+        let line = trimmed.parse::<usize>().ok()?;
+        (line, line)
+    };
+    if start == 0 || end == 0 {
+        return None;
+    }
+    Some((start.min(end), start.max(end)))
+}
+
+fn parse_region_for_path(region: &str, path: &str) -> Option<(usize, usize)> {
+    let trimmed = region.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((start, end)) = parse_line_range_spec(trimmed) {
+        return Some((start, end));
+    }
+    let (region_path, range) = trimmed.rsplit_once(':')?;
+    if normalize_capture_path(Path::new(""), region_path) != path {
+        return None;
+    }
+    parse_line_range_spec(range)
+}
+
+fn format_region(path: &str, start: usize, end: usize) -> String {
+    format!("{path}:{start}-{end}")
+}
+
+fn grep_request_summary(args: &Packet28GrepArgs) -> String {
+    if args.paths.is_empty() {
+        format!("grep '{}' across repo", args.pattern)
+    } else {
+        format!("grep '{}' in {} path(s)", args.pattern, args.paths.len())
+    }
+}
+
+fn read_request_summary(args: &Packet28ReadArgs, path: &str) -> String {
+    if !args.regions.is_empty() {
+        format!("read {path} using {} region hint(s)", args.regions.len())
+    } else if args.line_start.is_some() || args.line_end.is_some() {
+        format!(
+            "read {path} lines {}-{}",
+            args.line_start.unwrap_or(1),
+            args.line_end.unwrap_or(args.line_start.unwrap_or(1))
+        )
+    } else {
+        format!("read {path}")
+    }
+}
+
+fn write_native_tool_result(
+    root: &Path,
+    task_id: &str,
+    invocation_id: &str,
+    sequence: u64,
+    tool_name: &str,
+    operation_kind: suite_packet_core::ToolOperationKind,
+    request_summary: String,
+    result_summary: String,
+    search_query: Option<String>,
+    command: Option<String>,
+    paths: Vec<String>,
+    regions: Vec<String>,
+    symbols: Vec<String>,
+    artifact_id: Option<String>,
+    duration_ms: u64,
+) -> Result<()> {
+    write_auto_capture_state(
+        root,
+        BrokerWriteStateRequest {
+            task_id: task_id.to_string(),
+            op: Some(BrokerWriteOp::ToolResult),
+            invocation_id: Some(invocation_id.to_string()),
+            tool_name: Some(tool_name.to_string()),
+            operation_kind: Some(operation_kind),
+            request_summary: Some(request_summary),
+            result_summary: Some(result_summary),
+            search_query,
+            command,
+            sequence: Some(sequence),
+            duration_ms: Some(duration_ms),
+            paths,
+            regions,
+            symbols,
+            artifact_id,
+            ..BrokerWriteStateRequest::default()
+        },
+    )
+}
+
+fn write_native_tool_failure(
+    root: &Path,
+    task_id: &str,
+    invocation_id: &str,
+    sequence: u64,
+    tool_name: &str,
+    operation_kind: suite_packet_core::ToolOperationKind,
+    request_summary: String,
+    error_message: String,
+    command: Option<String>,
+    duration_ms: u64,
+) -> Result<()> {
+    write_auto_capture_state(
+        root,
+        BrokerWriteStateRequest {
+            task_id: task_id.to_string(),
+            op: Some(BrokerWriteOp::ToolInvocationFailed),
+            invocation_id: Some(invocation_id.to_string()),
+            tool_name: Some(tool_name.to_string()),
+            operation_kind: Some(operation_kind),
+            request_summary: Some(request_summary),
+            error_class: Some(classify_error_message(&error_message)),
+            error_message: Some(error_message.clone()),
+            retryable: Some(is_retryable_error(&error_message)),
+            sequence: Some(sequence),
+            duration_ms: Some(duration_ms),
+            command,
+            ..BrokerWriteStateRequest::default()
+        },
+    )
+}
+
+fn handle_packet28_grep(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    args: Packet28GrepArgs,
+) -> Result<Value> {
+    let task_id = args.task_id.trim();
+    if task_id.is_empty() {
+        return Err(anyhow!("packet28.grep requires task_id"));
+    }
+    let pattern = args.pattern.trim();
+    if pattern.is_empty() {
+        return Err(anyhow!("packet28.grep requires pattern"));
+    }
+    let (sequence, invocation_id) = next_task_invocation(session, task_id)?;
+    let request_summary = grep_request_summary(&args);
+    write_auto_capture_state(
+        root,
+        BrokerWriteStateRequest {
+            task_id: task_id.to_string(),
+            op: Some(BrokerWriteOp::ToolInvocationStarted),
+            invocation_id: Some(invocation_id.clone()),
+            tool_name: Some("packet28.grep".to_string()),
+            operation_kind: Some(suite_packet_core::ToolOperationKind::Search),
+            request_summary: Some(request_summary.clone()),
+            sequence: Some(sequence),
+            ..BrokerWriteStateRequest::default()
+        },
+    )?;
+
+    let mut command = Command::new("rg");
+    command
+        .current_dir(root)
+        .arg("--line-number")
+        .arg("--no-heading")
+        .arg("--color")
+        .arg("never");
+    if args.fixed_string {
+        command.arg("-F");
+    }
+    if matches!(args.case_sensitive, Some(false)) {
+        command.arg("-i");
+    }
+    if args.whole_word {
+        command.arg("-w");
+    }
+    if let Some(context_lines) = args.context_lines {
+        command.arg("-C").arg(context_lines.to_string());
+    }
+    if let Some(max_matches_per_file) = args.max_matches_per_file {
+        command
+            .arg("--max-count")
+            .arg(max_matches_per_file.to_string());
+    }
+    command.arg(pattern);
+    let normalized_paths = args
+        .paths
+        .iter()
+        .map(|path| normalize_capture_path(root, path))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    for path in &normalized_paths {
+        command.arg(path);
+    }
+    let command_summary = format!("rg {}", pattern);
+    let started_at = Instant::now();
+    let output = command.output();
+    let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            write_native_tool_failure(
+                root,
+                task_id,
+                &invocation_id,
+                sequence,
+                "packet28.grep",
+                suite_packet_core::ToolOperationKind::Search,
+                request_summary,
+                error.to_string(),
+                Some(command_summary),
+                duration_ms,
+            )?;
+            return Err(error.into());
+        }
+    };
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        let error_message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let error_message = if error_message.is_empty() {
+            format!("rg exited with status {}", output.status)
+        } else {
+            error_message
+        };
+        write_native_tool_failure(
+            root,
+            task_id,
+            &invocation_id,
+            sequence,
+            "packet28.grep",
+            suite_packet_core::ToolOperationKind::Search,
+            request_summary,
+            error_message.clone(),
+            Some(command_summary),
+            duration_ms,
+        )?;
+        return Err(anyhow!(error_message));
+    }
+
+    let max_total_matches = args.max_total_matches.unwrap_or(24).clamp(1, 200);
+    let mut matches = Vec::new();
+    let mut matched_paths = BTreeMap::<String, ()>::new();
+    let mut regions = BTreeMap::<String, ()>::new();
+    let mut total_match_count = 0_usize;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.trim().is_empty() || line == "--" {
+            continue;
+        }
+        let mut parts = line.splitn(3, ':');
+        let Some(path) = parts.next() else {
+            continue;
+        };
+        let Some(line_no) = parts.next().and_then(|value| value.parse::<usize>().ok()) else {
+            continue;
+        };
+        let text = parts.next().unwrap_or_default();
+        let normalized_path = normalize_capture_path(root, path);
+        if normalized_path.is_empty() {
+            continue;
+        }
+        total_match_count = total_match_count.saturating_add(1);
+        matched_paths.insert(normalized_path.clone(), ());
+        regions.insert(format_region(&normalized_path, line_no, line_no), ());
+        if matches.len() < max_total_matches {
+            matches.push(json!({
+                "path": normalized_path,
+                "line": line_no,
+                "text": text,
+            }));
+        }
+    }
+    let paths = matched_paths.into_keys().collect::<Vec<_>>();
+    let regions = regions.into_keys().collect::<Vec<_>>();
+    let symbols = infer_symbols_from_pattern(pattern);
+    let preview = matches
+        .iter()
+        .take(3)
+        .filter_map(|item| {
+            Some(format!(
+                "{}:{}",
+                item.get("path")?.as_str()?,
+                item.get("line")?.as_u64()?
+            ))
+        })
+        .collect::<Vec<_>>();
+    let result_summary = if matches.is_empty() {
+        if normalized_paths.is_empty() {
+            format!("No matches for '{}' across repo", pattern)
+        } else {
+            format!(
+                "No matches for '{}' in {} path(s)",
+                pattern,
+                normalized_paths.len()
+            )
+        }
+    } else {
+        let base = format!(
+            "Found {} matches across {} files for '{}': {}",
+            total_match_count,
+            paths.len(),
+            pattern,
+            preview.join(", ")
+        );
+        if total_match_count > matches.len() {
+            format!("{base} (showing first {} matches)", matches.len())
+        } else {
+            base
+        }
+    };
+    let payload = json!({
+        "task_id": task_id,
+        "invocation_id": invocation_id,
+        "sequence": sequence,
+        "pattern": pattern,
+        "match_count": total_match_count,
+        "returned_match_count": matches.len(),
+        "truncated": total_match_count > matches.len(),
+        "paths": paths,
+        "regions": regions,
+        "symbols": symbols,
+        "matches": matches,
+    });
+    let artifact_id = maybe_store_result_artifact(
+        root,
+        task_id,
+        payload["invocation_id"].as_str().unwrap_or_default(),
+        &payload,
+        payload["match_count"].as_u64().unwrap_or(0) > 0,
+    )?;
+    write_native_tool_result(
+        root,
+        task_id,
+        payload["invocation_id"].as_str().unwrap_or_default(),
+        sequence,
+        "packet28.grep",
+        suite_packet_core::ToolOperationKind::Search,
+        request_summary,
+        result_summary,
+        Some(pattern.to_string()),
+        Some(command_summary),
+        json_array_strings(&payload, "paths"),
+        json_array_strings(&payload, "regions"),
+        json_array_strings(&payload, "symbols"),
+        artifact_id,
+        duration_ms,
+    )?;
+    Ok(payload)
+}
+
+fn handle_packet28_read(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    args: Packet28ReadArgs,
+) -> Result<Value> {
+    let task_id = args.task_id.trim();
+    if task_id.is_empty() {
+        return Err(anyhow!("packet28.read requires task_id"));
+    }
+    let path = normalize_capture_path(root, &args.path);
+    if path.is_empty() {
+        return Err(anyhow!("packet28.read requires a valid path"));
+    }
+    let (sequence, invocation_id) = next_task_invocation(session, task_id)?;
+    let request_summary = read_request_summary(&args, &path);
+    write_auto_capture_state(
+        root,
+        BrokerWriteStateRequest {
+            task_id: task_id.to_string(),
+            op: Some(BrokerWriteOp::ToolInvocationStarted),
+            invocation_id: Some(invocation_id.clone()),
+            tool_name: Some("packet28.read".to_string()),
+            operation_kind: Some(suite_packet_core::ToolOperationKind::Read),
+            request_summary: Some(request_summary.clone()),
+            sequence: Some(sequence),
+            paths: vec![path.clone()],
+            ..BrokerWriteStateRequest::default()
+        },
+    )?;
+
+    let started_at = Instant::now();
+    let contents = fs::read_to_string(root.join(&path));
+    let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let contents = match contents {
+        Ok(contents) => contents,
+        Err(error) => {
+            write_native_tool_failure(
+                root,
+                task_id,
+                &invocation_id,
+                sequence,
+                "packet28.read",
+                suite_packet_core::ToolOperationKind::Read,
+                request_summary,
+                error.to_string(),
+                None,
+                duration_ms,
+            )?;
+            return Err(error.into());
+        }
+    };
+    let all_lines = contents
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let mut ranges = args
+        .regions
+        .iter()
+        .filter_map(|region| parse_region_for_path(region, &path))
+        .collect::<Vec<_>>();
+    if ranges.is_empty() {
+        match (args.line_start, args.line_end) {
+            (Some(start), Some(end)) if start > 0 && end > 0 => {
+                ranges.push((start.min(end), start.max(end)));
+            }
+            (Some(start), None) if start > 0 => ranges.push((start, start)),
+            (None, Some(end)) if end > 0 => ranges.push((end, end)),
+            _ => ranges.push((1, all_lines.len().min(120).max(1))),
+        }
+    }
+    let mut rendered = Vec::new();
+    let mut selected_text = Vec::new();
+    let mut normalized_regions = Vec::new();
+    for (start, end) in ranges {
+        let start = start.min(all_lines.len().max(1));
+        let end = end.min(all_lines.len().max(1)).max(start);
+        normalized_regions.push(format_region(&path, start, end));
+        for line_no in start..=end {
+            if let Some(line) = all_lines.get(line_no - 1) {
+                rendered.push(json!({
+                    "line": line_no,
+                    "text": line,
+                }));
+                selected_text.push(line.clone());
+            }
+        }
+    }
+    let symbols = infer_symbols_from_lines(&selected_text);
+    let result_summary = format!(
+        "Read {} line(s) from {} across {} region(s)",
+        rendered.len(),
+        path,
+        normalized_regions.len()
+    );
+    let payload = json!({
+        "task_id": task_id,
+        "invocation_id": invocation_id,
+        "sequence": sequence,
+        "path": path,
+        "regions": normalized_regions,
+        "symbols": symbols,
+        "lines": rendered,
+    });
+    let artifact_id = maybe_store_result_artifact(
+        root,
+        task_id,
+        payload["invocation_id"].as_str().unwrap_or_default(),
+        &payload,
+        true,
+    )?;
+    write_native_tool_result(
+        root,
+        task_id,
+        payload["invocation_id"].as_str().unwrap_or_default(),
+        sequence,
+        "packet28.read",
+        suite_packet_core::ToolOperationKind::Read,
+        request_summary,
+        result_summary,
+        None,
+        None,
+        vec![payload["path"].as_str().unwrap_or_default().to_string()],
+        json_array_strings(&payload, "regions"),
+        json_array_strings(&payload, "symbols"),
+        artifact_id,
+        duration_ms,
+    )?;
+    Ok(payload)
 }
 
 fn handle_resources_list(root: &Path) -> Result<Value> {

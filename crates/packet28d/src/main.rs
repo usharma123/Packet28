@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, BufWriter, ErrorKind};
 use std::os::unix::net::UnixListener;
@@ -1419,12 +1419,58 @@ fn truncate_evidence_line(line: &str, max_len: usize) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceMatchKind {
+    DefinesSymbol,
+    CallsSymbol,
+    ReferencesSymbol,
+    Signature,
+    Fallback,
+}
+
+impl EvidenceMatchKind {
+    fn priority(self) -> u8 {
+        match self {
+            EvidenceMatchKind::DefinesSymbol => 6,
+            EvidenceMatchKind::CallsSymbol => 5,
+            EvidenceMatchKind::ReferencesSymbol => 4,
+            EvidenceMatchKind::Signature => 2,
+            EvidenceMatchKind::Fallback => 1,
+        }
+    }
+
+    fn repo_reason_label(self) -> &'static str {
+        match self {
+            EvidenceMatchKind::DefinesSymbol => "defines",
+            EvidenceMatchKind::CallsSymbol => "calls",
+            EvidenceMatchKind::ReferencesSymbol => "references",
+            EvidenceMatchKind::Signature => "declares",
+            EvidenceMatchKind::Fallback => "shows",
+        }
+    }
+}
+
+impl Default for EvidenceMatchKind {
+    fn default() -> Self {
+        Self::Fallback
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolResultProvenance {
+    operation_kind: suite_packet_core::ToolOperationKind,
+    symbols: Vec<String>,
+    regions: Vec<String>,
+    result_summary_present: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct CodeEvidenceMatch {
     line_no: usize,
     priority: u8,
-    reason: &'static str,
+    match_kind: EvidenceMatchKind,
     matched_symbol: Option<String>,
+    from_region_hint: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1432,6 +1478,9 @@ struct CodeEvidenceSummary {
     rendered_lines: Vec<String>,
     first_match_line: Option<usize>,
     primary_match_symbol: Option<String>,
+    primary_match_kind: Option<EvidenceMatchKind>,
+    from_region_hint: bool,
+    from_tool_result_path: bool,
 }
 
 fn looks_like_signature(line: &str) -> bool {
@@ -1487,6 +1536,15 @@ fn looks_like_low_signal_line(line: &str) -> bool {
         || trimmed.starts_with("package ")
 }
 
+fn is_comment_reference_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("/*")
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+}
+
 fn contains_identifier_term(line: &str, term: &str) -> bool {
     if term.is_empty() {
         return false;
@@ -1509,17 +1567,54 @@ fn contains_identifier_term(line: &str, term: &str) -> bool {
     false
 }
 
+fn looks_like_symbol_call(line: &str, symbol: &str) -> bool {
+    if symbol.trim().is_empty() || looks_like_signature(line) {
+        return false;
+    }
+    let line_lower = line.to_ascii_lowercase();
+    let symbol_lower = symbol.to_ascii_lowercase();
+    let mut start_at = 0;
+    while let Some(found) = line_lower[start_at..].find(&symbol_lower) {
+        let start = start_at + found;
+        let end = start + symbol_lower.len();
+        let prev = line_lower[..start].chars().next_back();
+        let next = line_lower[end..].chars().next();
+        let prev_is_ident = prev.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        let next_is_ident = next.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if !prev_is_ident && !next_is_ident {
+            let trailing = line_lower[end..].trim_start();
+            if trailing.starts_with('(') {
+                return true;
+            }
+        }
+        start_at = start + 1;
+    }
+    false
+}
+
+fn classify_symbol_match(line: &str, symbol: &str) -> EvidenceMatchKind {
+    if looks_like_signature(line) {
+        EvidenceMatchKind::DefinesSymbol
+    } else if looks_like_symbol_call(line, symbol) {
+        EvidenceMatchKind::CallsSymbol
+    } else {
+        EvidenceMatchKind::ReferencesSymbol
+    }
+}
+
 fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEvidenceMatch> {
     if let Some(symbol) = query_focus
         .symbol_terms
         .iter()
         .find(|symbol| contains_identifier_term(line, symbol))
     {
+        let match_kind = classify_symbol_match(line, symbol);
         return Some(CodeEvidenceMatch {
             line_no: 0,
-            priority: if looks_like_signature(line) { 4 } else { 3 },
-            reason: "exact_symbol_match",
+            priority: match_kind.priority(),
+            match_kind,
             matched_symbol: Some(symbol.clone()),
+            from_region_hint: false,
         });
     }
     if let Some(symbol) = query_focus
@@ -1527,11 +1622,13 @@ fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEv
         .iter()
         .find(|symbol| contains_identifier_term(line, symbol))
     {
+        let match_kind = classify_symbol_match(line, symbol);
         return Some(CodeEvidenceMatch {
             line_no: 0,
-            priority: if looks_like_signature(line) { 4 } else { 3 },
-            reason: "full_symbol_match",
+            priority: match_kind.priority(),
+            match_kind,
             matched_symbol: Some(symbol.clone()),
+            from_region_hint: false,
         });
     }
     if looks_like_signature(line)
@@ -1540,9 +1637,10 @@ fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEv
     {
         return Some(CodeEvidenceMatch {
             line_no: 0,
-            priority: 2,
-            reason: "signature_match",
+            priority: EvidenceMatchKind::Signature.priority(),
+            match_kind: EvidenceMatchKind::Signature,
             matched_symbol: None,
+            from_region_hint: false,
         });
     }
     None
@@ -1577,29 +1675,112 @@ fn collapse_evidence_windows(
     collapsed
 }
 
-fn extract_code_evidence(
-    root: &Path,
-    relative_path: &str,
-    query_focus: &QueryFocus,
-    max_windows: usize,
-    max_lines: usize,
-) -> CodeEvidenceSummary {
-    let Ok(contents) = fs::read_to_string(root.join(relative_path)) else {
-        return CodeEvidenceSummary::default();
+fn parse_region_line_range(value: &str) -> Option<(usize, usize)> {
+    let trimmed = value.trim().trim_start_matches('L');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (start, end) = if let Some((start, end)) = trimmed.split_once('-') {
+        (
+            start.trim().trim_start_matches('L'),
+            end.trim().trim_start_matches('L'),
+        )
+    } else {
+        (trimmed, trimmed)
     };
-    let lines = contents.lines().collect::<Vec<_>>();
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    if start == 0 || end == 0 {
+        return None;
+    }
+    Some((start.min(end), start.max(end)))
+}
+
+fn parse_region_hint_for_path(region: &str, path: &str) -> Option<(usize, usize)> {
+    let trimmed = region.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(range) = parse_region_line_range(trimmed) {
+        return Some(range);
+    }
+    let (maybe_path, maybe_range) = trimmed.rsplit_once(':')?;
+    let normalized_path = maybe_path.trim().replace('\\', "/");
+    let current_path = path.replace('\\', "/");
+    if normalized_path != current_path {
+        return None;
+    }
+    parse_region_line_range(maybe_range)
+}
+
+fn collect_tool_result_provenance(
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    path: &str,
+) -> Vec<ToolResultProvenance> {
+    snapshot
+        .recent_tool_invocations
+        .iter()
+        .rev()
+        .filter(|invocation| invocation.paths.iter().any(|candidate| candidate == path))
+        .map(|invocation| ToolResultProvenance {
+            operation_kind: invocation.operation_kind,
+            symbols: invocation.symbols.clone(),
+            regions: invocation.regions.clone(),
+            result_summary_present: invocation
+                .result_summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty()),
+        })
+        .collect()
+}
+
+fn collect_region_hint_lines(
+    provenance: &[ToolResultProvenance],
+    path: &str,
+    total_lines: usize,
+) -> BTreeSet<usize> {
+    let mut hinted = BTreeSet::new();
+    for hint in provenance {
+        for region in &hint.regions {
+            if let Some((start, end)) = parse_region_hint_for_path(region, path) {
+                for line_no in start.min(total_lines)..=end.min(total_lines) {
+                    hinted.insert(line_no);
+                }
+            }
+        }
+    }
+    hinted
+}
+
+fn collect_evidence_matches(
+    lines: &[&str],
+    query_focus: &QueryFocus,
+    candidate_lines: Option<&BTreeSet<usize>>,
+    from_region_hint: bool,
+) -> Vec<CodeEvidenceMatch> {
     let mut matches = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        if candidate_lines.is_some_and(|allowed| !allowed.contains(&line_no)) {
+            continue;
+        }
         let mut matched = match_query_focus_line(line, query_focus);
         if let Some(current) = matched.as_mut() {
-            current.line_no = idx + 1;
+            current.line_no = line_no;
+            current.from_region_hint = from_region_hint;
+            if from_region_hint {
+                current.priority = current.priority.saturating_add(1);
+            }
         } else if !query_focus.symbol_terms.is_empty() || !query_focus.full_symbol_terms.is_empty()
         {
             continue;
         }
         if looks_like_low_signal_line(line)
-            && matched.as_ref().is_none_or(|current| {
-                !matches!(current.reason, "exact_symbol_match" | "full_symbol_match")
+            && matched.as_ref().is_some_and(|current| {
+                !matches!(
+                    current.match_kind,
+                    EvidenceMatchKind::DefinesSymbol | EvidenceMatchKind::CallsSymbol
+                ) && !is_comment_reference_line(line)
             })
         {
             continue;
@@ -1608,21 +1789,70 @@ fn extract_code_evidence(
             matches.push(matched);
         }
     }
+    matches
+}
+
+fn extract_code_evidence(
+    root: &Path,
+    relative_path: &str,
+    query_focus: &QueryFocus,
+    provenance: &[ToolResultProvenance],
+    max_windows: usize,
+    max_lines: usize,
+) -> CodeEvidenceSummary {
+    let Ok(contents) = fs::read_to_string(root.join(relative_path)) else {
+        return CodeEvidenceSummary::default();
+    };
+    let lines = contents.lines().collect::<Vec<_>>();
+    let hint_lines = collect_region_hint_lines(provenance, relative_path, lines.len());
+    let mut matches = if !hint_lines.is_empty() {
+        collect_evidence_matches(lines.as_slice(), query_focus, Some(&hint_lines), true)
+    } else {
+        Vec::new()
+    };
+    if matches.is_empty() {
+        matches = collect_evidence_matches(lines.as_slice(), query_focus, None, false);
+    }
 
     if matches.is_empty()
         && (query_focus.symbol_terms.is_empty() && query_focus.full_symbol_terms.is_empty())
     {
+        let fallback_candidates = if hint_lines.is_empty() {
+            None
+        } else {
+            Some(&hint_lines)
+        };
         for (idx, line) in lines.iter().enumerate() {
+            let line_no = idx + 1;
+            if fallback_candidates.is_some_and(|allowed| !allowed.contains(&line_no)) {
+                continue;
+            }
             if looks_like_low_signal_line(line) {
                 continue;
             }
             matches.push(CodeEvidenceMatch {
-                line_no: idx + 1,
-                priority: 1,
-                reason: "fallback",
+                line_no,
+                priority: EvidenceMatchKind::Fallback.priority(),
+                match_kind: EvidenceMatchKind::Fallback,
                 matched_symbol: None,
+                from_region_hint: fallback_candidates.is_some(),
             });
             break;
+        }
+        if matches.is_empty() && fallback_candidates.is_some() {
+            for (idx, line) in lines.iter().enumerate() {
+                if looks_like_low_signal_line(line) {
+                    continue;
+                }
+                matches.push(CodeEvidenceMatch {
+                    line_no: idx + 1,
+                    priority: EvidenceMatchKind::Fallback.priority(),
+                    match_kind: EvidenceMatchKind::Fallback,
+                    matched_symbol: None,
+                    from_region_hint: false,
+                });
+                break;
+            }
         }
     }
 
@@ -1630,14 +1860,19 @@ fn extract_code_evidence(
         return CodeEvidenceSummary::default();
     }
 
-    let primary_match_symbol = matches
-        .iter()
-        .find_map(|matched| matched.matched_symbol.clone());
     matches.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
+            .then_with(|| b.from_region_hint.cmp(&a.from_region_hint))
             .then_with(|| a.line_no.cmp(&b.line_no))
     });
+    let primary_match_symbol = matches
+        .iter()
+        .find_map(|matched| matched.matched_symbol.clone());
+    let primary_match_kind = matches.first().map(|matched| matched.match_kind);
+    let primary_from_region_hint = matches
+        .first()
+        .is_some_and(|matched| matched.from_region_hint);
     let windows = collapse_evidence_windows(&matches, lines.len())
         .into_iter()
         .take(max_windows)
@@ -1662,6 +1897,9 @@ fn extract_code_evidence(
                 return CodeEvidenceSummary {
                     first_match_line: matches.first().map(|matched| matched.line_no),
                     primary_match_symbol,
+                    primary_match_kind,
+                    from_region_hint: primary_from_region_hint,
+                    from_tool_result_path: !provenance.is_empty(),
                     rendered_lines,
                 };
             }
@@ -1672,6 +1910,9 @@ fn extract_code_evidence(
         rendered_lines,
         first_match_line: matches.first().map(|matched| matched.line_no),
         primary_match_symbol,
+        primary_match_kind,
+        from_region_hint: primary_from_region_hint,
+        from_tool_result_path: !provenance.is_empty(),
     }
 }
 
@@ -1825,6 +2066,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
     match action {
         BrokerAction::Plan => &[
             "task_objective",
+            "budget_notes",
             "active_decisions",
             "open_questions",
             "current_focus",
@@ -1837,6 +2079,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         ],
         BrokerAction::Inspect => &[
             "task_objective",
+            "budget_notes",
             "current_focus",
             "discovered_scope",
             "recent_tool_activity",
@@ -1850,6 +2093,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         ],
         BrokerAction::ChooseTool => &[
             "task_objective",
+            "budget_notes",
             "recent_tool_activity",
             "tool_failures",
             "discovered_scope",
@@ -1860,6 +2104,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         ],
         BrokerAction::Interpret => &[
             "task_objective",
+            "budget_notes",
             "recent_tool_activity",
             "tool_failures",
             "code_evidence",
@@ -1871,6 +2116,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         ],
         BrokerAction::Edit => &[
             "task_objective",
+            "budget_notes",
             "current_focus",
             "discovered_scope",
             "recent_tool_activity",
@@ -1885,6 +2131,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         ],
         BrokerAction::Summarize => &[
             "task_objective",
+            "budget_notes",
             "progress",
             "recent_tool_activity",
             "tool_failures",
@@ -1900,6 +2147,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
     let mut section_item_limits = BTreeMap::new();
     match action {
         BrokerAction::Plan => {
+            section_item_limits.insert("budget_notes".to_string(), 4);
             section_item_limits.insert("active_decisions".to_string(), 8);
             section_item_limits.insert("open_questions".to_string(), 8);
             section_item_limits.insert("current_focus".to_string(), 8);
@@ -1916,6 +2164,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             }
         }
         BrokerAction::Inspect => {
+            section_item_limits.insert("budget_notes".to_string(), 4);
             section_item_limits.insert("current_focus".to_string(), 8);
             section_item_limits.insert("discovered_scope".to_string(), 8);
             section_item_limits.insert("recent_tool_activity".to_string(), 6);
@@ -1931,6 +2180,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             }
         }
         BrokerAction::ChooseTool => {
+            section_item_limits.insert("budget_notes".to_string(), 4);
             section_item_limits.insert("recent_tool_activity".to_string(), 4);
             section_item_limits.insert("tool_failures".to_string(), 4);
             section_item_limits.insert("discovered_scope".to_string(), 6);
@@ -1944,6 +2194,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             }
         }
         BrokerAction::Interpret => {
+            section_item_limits.insert("budget_notes".to_string(), 4);
             section_item_limits.insert("recent_tool_activity".to_string(), 4);
             section_item_limits.insert("tool_failures".to_string(), 4);
             section_item_limits.insert("code_evidence".to_string(), 6);
@@ -1957,6 +2208,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             }
         }
         BrokerAction::Edit => {
+            section_item_limits.insert("budget_notes".to_string(), 4);
             section_item_limits.insert("current_focus".to_string(), 8);
             section_item_limits.insert("discovered_scope".to_string(), 8);
             section_item_limits.insert("recent_tool_activity".to_string(), 6);
@@ -1973,6 +2225,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             }
         }
         BrokerAction::Summarize => {
+            section_item_limits.insert("budget_notes".to_string(), 4);
             section_item_limits.insert("progress".to_string(), 3);
             section_item_limits.insert("recent_tool_activity".to_string(), 6);
             section_item_limits.insert("tool_failures".to_string(), 4);
@@ -2059,6 +2312,137 @@ fn truncate_lines(lines: Vec<String>, max_lines: usize) -> String {
         .join("\n")
 }
 
+fn render_recent_tool_activity_lines(
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    compact: bool,
+) -> Vec<String> {
+    snapshot
+        .recent_tool_invocations
+        .iter()
+        .rev()
+        .map(|invocation| {
+            let request = invocation
+                .request_summary
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("no request summary");
+            let operation_kind = serde_json::to_string(&invocation.operation_kind)
+                .unwrap_or_else(|_| "\"generic\"".to_string())
+                .trim_matches('"')
+                .to_string();
+            if compact {
+                let mut metadata = vec![
+                    format!("paths={}", invocation.paths.len()),
+                    format!("symbols={}", invocation.symbols.len()),
+                ];
+                if !invocation.regions.is_empty() {
+                    metadata.push(format!("regions={}", invocation.regions.len()));
+                }
+                if let Some(duration_ms) = invocation.duration_ms {
+                    metadata.push(format!("duration={}ms", duration_ms));
+                }
+                format!(
+                    "- #{} {} [{}] {} ({})",
+                    invocation.sequence,
+                    invocation.tool_name,
+                    operation_kind,
+                    request,
+                    metadata.join(", ")
+                )
+            } else {
+                let result = invocation
+                    .result_summary
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("no result summary");
+                format!(
+                    "- #{} {} [{}] {} -> {}",
+                    invocation.sequence, invocation.tool_name, operation_kind, request, result
+                )
+            }
+        })
+        .collect()
+}
+
+fn build_budget_notes_section(
+    pruned: &[BrokerEvictionCandidate],
+    effective_limits: &BrokerEffectiveLimits,
+) -> Option<BrokerSection> {
+    let mut saved_by_section = BTreeMap::<String, u64>::new();
+    for candidate in pruned
+        .iter()
+        .filter(|candidate| candidate.reason == "budget_pruned")
+    {
+        saved_by_section
+            .entry(candidate.section_id.clone())
+            .and_modify(|saved| *saved = (*saved).max(candidate.est_tokens))
+            .or_insert(candidate.est_tokens);
+    }
+    let lines = saved_by_section
+        .into_iter()
+        .map(|(section_id, est_tokens)| {
+            format!(
+                "- {} omitted due to budget (saved ~{} tokens)",
+                section_id, est_tokens
+            )
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(BrokerSection {
+        id: "budget_notes".to_string(),
+        title: "Budget Notes".to_string(),
+        body: truncate_lines(lines, section_item_limit(effective_limits, "budget_notes")),
+        priority: 1,
+        source_kind: BrokerSourceKind::Derived,
+    })
+}
+
+fn postprocess_selected_sections(
+    mut sections: Vec<BrokerSection>,
+    pruned: &[BrokerEvictionCandidate],
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    effective_limits: &BrokerEffectiveLimits,
+) -> Vec<BrokerSection> {
+    let has_code_evidence = sections.iter().any(|section| section.id == "code_evidence");
+    if has_code_evidence {
+        if let Some(section) = sections
+            .iter_mut()
+            .find(|section| section.id == "recent_tool_activity")
+        {
+            section.body = truncate_lines(
+                render_recent_tool_activity_lines(snapshot, true),
+                section_item_limit(effective_limits, "recent_tool_activity"),
+            );
+        }
+    }
+
+    if let Some(note) = build_budget_notes_section(pruned, effective_limits) {
+        if sections.len() >= effective_limits.max_sections {
+            if let Some(idx) = sections
+                .iter()
+                .rposition(|section| section.priority > 1 && section.id != "task_objective")
+            {
+                sections.remove(idx);
+            } else if let Some(idx) = sections
+                .iter()
+                .rposition(|section| section.id != "task_objective")
+            {
+                sections.remove(idx);
+            }
+        }
+        let insert_at = sections
+            .iter()
+            .position(|section| section.id == "task_objective")
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        sections.insert(insert_at, note);
+    }
+
+    sections
+}
+
 fn filter_requested_section_ids(
     action: BrokerAction,
     include_sections: &[String],
@@ -2129,13 +2513,35 @@ fn render_repo_map_reason(
     snapshot: &suite_packet_core::AgentSnapshotPayload,
     edges: &[mapy_core::RepoEdgeRich],
     evidence: Option<&CodeEvidenceSummary>,
+    has_tool_result_path: bool,
 ) -> String {
     let lower_path = path.to_ascii_lowercase();
-    if let Some(symbol) = evidence
-        .and_then(|summary| summary.primary_match_symbol.as_ref())
-        .filter(|symbol| !symbol.trim().is_empty())
-    {
-        return format!("contains {symbol}");
+    if let Some(summary) = evidence {
+        if let Some(symbol) = summary
+            .primary_match_symbol
+            .as_ref()
+            .filter(|symbol| !symbol.trim().is_empty())
+        {
+            match summary.primary_match_kind {
+                Some(EvidenceMatchKind::DefinesSymbol)
+                | Some(EvidenceMatchKind::CallsSymbol)
+                | Some(EvidenceMatchKind::ReferencesSymbol) => {
+                    let base = format!(
+                        "{} {}",
+                        summary.primary_match_kind.unwrap().repo_reason_label(),
+                        symbol
+                    );
+                    if has_tool_result_path && summary.from_region_hint {
+                        return format!("{base} (from tool_result)");
+                    }
+                    return base;
+                }
+                _ => {}
+            }
+        }
+        if has_tool_result_path || summary.from_tool_result_path {
+            return "explicit path from tool_result".to_string();
+        }
     }
     if let Some(token) = query_focus
         .path_terms
@@ -2174,9 +2580,219 @@ fn render_repo_map_reason(
         (edge.from == path && snapshot.focus_paths.iter().any(|focus| focus == &edge.to))
             || (edge.to == path && snapshot.focus_paths.iter().any(|focus| focus == &edge.from))
     }) {
-        return "connected by import edge to focused file".to_string();
+        return "structural fallback via import edge".to_string();
     }
     "high repo-map relevance".to_string()
+}
+
+#[derive(Debug, Clone)]
+struct RepoMapDisplayEntry {
+    path: String,
+    raw_score: f64,
+    display_score: f64,
+    reason: String,
+    line_hint: Option<usize>,
+    structural_only: bool,
+}
+
+fn has_focus_import_edge(
+    path: &str,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    edges: &[mapy_core::RepoEdgeRich],
+) -> bool {
+    edges.iter().any(|edge| {
+        (edge.from == path && snapshot.focus_paths.iter().any(|focus| focus == &edge.to))
+            || (edge.to == path && snapshot.focus_paths.iter().any(|focus| focus == &edge.from))
+    })
+}
+
+fn repo_map_query_path_token<'a>(path: &str, query_focus: &'a QueryFocus) -> Option<&'a str> {
+    let lower_path = path.to_ascii_lowercase();
+    query_focus
+        .path_terms
+        .iter()
+        .find(|token| lower_path.contains(&token.to_ascii_lowercase()))
+        .map(String::as_str)
+        .or_else(|| {
+            query_focus
+                .text_tokens
+                .iter()
+                .find(|token| lower_path.contains(token.as_str()))
+                .map(String::as_str)
+        })
+}
+
+fn is_test_like_path(path: &str) -> bool {
+    let lower_path = path.to_ascii_lowercase();
+    lower_path.contains("test") || lower_path.contains("/spec")
+}
+
+fn build_repo_map_display_entries(
+    rich_repo_map: &mapy_core::RepoMapPayloadRich,
+    query_focus: &QueryFocus,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    evidence_by_file: &BTreeMap<String, CodeEvidenceSummary>,
+    provenance_by_file: &BTreeMap<String, Vec<ToolResultProvenance>>,
+    max_entries: usize,
+) -> Vec<RepoMapDisplayEntry> {
+    let has_symbol_focus =
+        !query_focus.symbol_terms.is_empty() || !query_focus.full_symbol_terms.is_empty();
+    let mut entries = rich_repo_map
+        .files_ranked
+        .iter()
+        .map(|file| {
+            let evidence = evidence_by_file.get(&file.path);
+            let provenance = provenance_by_file.get(&file.path);
+            let query_path_token = repo_map_query_path_token(&file.path, query_focus);
+            let explicit_focus = snapshot.focus_paths.iter().any(|focus| focus == &file.path);
+            let read_via_tool = snapshot.read_paths_by_tool.iter().any(|summary| {
+                summary
+                    .paths
+                    .iter()
+                    .any(|candidate| candidate == &file.path)
+            });
+            let edited_via_tool = snapshot.edited_paths_by_tool.iter().any(|summary| {
+                summary
+                    .paths
+                    .iter()
+                    .any(|candidate| candidate == &file.path)
+            });
+            let import_edge = has_focus_import_edge(&file.path, snapshot, &rich_repo_map.edges);
+            let evidence_lines = evidence.map_or(0, |summary| summary.rendered_lines.len());
+            let has_symbol_evidence = evidence.and_then(|summary| summary.primary_match_kind);
+            let has_tool_result_path = provenance.is_some_and(|items| !items.is_empty());
+            let has_search_or_read_provenance = provenance.is_some_and(|items| {
+                items.iter().any(|item| {
+                    matches!(
+                        item.operation_kind,
+                        suite_packet_core::ToolOperationKind::Search
+                            | suite_packet_core::ToolOperationKind::Read
+                    )
+                })
+            });
+            let has_matching_tool_symbol = provenance.is_some_and(|items| {
+                items
+                    .iter()
+                    .flat_map(|item| item.symbols.iter())
+                    .any(|symbol| {
+                        query_focus
+                            .symbol_terms
+                            .iter()
+                            .chain(query_focus.full_symbol_terms.iter())
+                            .any(|needle| symbol.eq_ignore_ascii_case(needle))
+                    })
+            });
+            let has_result_summary = provenance
+                .is_some_and(|items| items.iter().any(|item| item.result_summary_present));
+            let has_direct_signal = has_symbol_evidence.is_some()
+                || evidence_lines > 0
+                || has_tool_result_path
+                || query_path_token.is_some()
+                || explicit_focus
+                || read_via_tool
+                || edited_via_tool;
+            let structural_only = import_edge && !has_direct_signal;
+
+            let mut display_score = file.score;
+            match has_symbol_evidence {
+                Some(EvidenceMatchKind::DefinesSymbol) => display_score += 0.40,
+                Some(EvidenceMatchKind::CallsSymbol) => display_score += 0.32,
+                Some(EvidenceMatchKind::ReferencesSymbol) => display_score += 0.16,
+                Some(EvidenceMatchKind::Signature) => display_score += 0.12,
+                Some(EvidenceMatchKind::Fallback) | None => {}
+            }
+            if has_tool_result_path {
+                display_score += 0.16;
+            }
+            if has_search_or_read_provenance {
+                display_score += 0.04;
+            }
+            if has_matching_tool_symbol {
+                display_score += 0.08;
+            }
+            if evidence.is_some_and(|summary| summary.from_region_hint) {
+                display_score += 0.10;
+            } else if evidence_lines > 0 {
+                display_score += 0.18;
+            }
+            if query_path_token.is_some() {
+                display_score += if is_test_like_path(&file.path) {
+                    0.08
+                } else {
+                    0.14
+                };
+            }
+            if explicit_focus {
+                display_score += 0.10;
+            }
+            if read_via_tool || edited_via_tool {
+                display_score += 0.04;
+            }
+            if import_edge {
+                display_score += if structural_only { -0.30 } else { 0.02 };
+            }
+            if has_symbol_focus && has_symbol_evidence.is_none() && evidence_lines == 0 {
+                display_score -= if structural_only { 0.18 } else { 0.08 };
+            }
+            if has_symbol_focus && is_test_like_path(&file.path) && has_symbol_evidence.is_none() {
+                display_score -= 0.06;
+            }
+            if has_tool_result_path && has_result_summary {
+                display_score += 0.03;
+            }
+
+            RepoMapDisplayEntry {
+                path: file.path.clone(),
+                raw_score: file.score,
+                display_score: display_score.clamp(0.0, 1.5),
+                reason: if structural_only {
+                    "structural fallback via import edge".to_string()
+                } else {
+                    render_repo_map_reason(
+                        &file.path,
+                        query_focus,
+                        snapshot,
+                        &rich_repo_map.edges,
+                        evidence,
+                        has_tool_result_path,
+                    )
+                },
+                line_hint: evidence
+                    .and_then(|summary| summary.primary_match_kind.and(summary.first_match_line)),
+                structural_only,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| {
+        a.structural_only
+            .cmp(&b.structural_only)
+            .then_with(|| {
+                b.display_score
+                    .partial_cmp(&a.display_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.raw_score
+                    .partial_cmp(&a.raw_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let strong_matches = entries
+        .iter()
+        .filter(|entry| !entry.structural_only)
+        .count();
+    let filtered = if strong_matches >= max_entries {
+        entries
+            .into_iter()
+            .filter(|entry| !entry.structural_only)
+            .collect::<Vec<_>>()
+    } else {
+        entries
+    };
+
+    filtered.into_iter().take(max_entries).collect()
 }
 
 fn shrink_section_to_budget(
@@ -2216,21 +2832,43 @@ fn shrink_section_to_budget(
 
 fn action_critical_section_ids(action: BrokerAction) -> &'static [&'static str] {
     match action {
-        BrokerAction::Plan => &["repo_map", "relevant_context", "recommended_actions"],
-        BrokerAction::Inspect => &["code_evidence", "repo_map", "relevant_context"],
+        BrokerAction::Plan => &[
+            "budget_notes",
+            "repo_map",
+            "relevant_context",
+            "recommended_actions",
+        ],
+        BrokerAction::Inspect => &[
+            "budget_notes",
+            "code_evidence",
+            "repo_map",
+            "relevant_context",
+        ],
         BrokerAction::ChooseTool => &[
+            "budget_notes",
             "recent_tool_activity",
             "tool_failures",
             "recommended_actions",
         ],
-        BrokerAction::Interpret => &["recent_tool_activity", "tool_failures", "code_evidence"],
+        BrokerAction::Interpret => &[
+            "budget_notes",
+            "recent_tool_activity",
+            "tool_failures",
+            "code_evidence",
+        ],
         BrokerAction::Edit => &[
+            "budget_notes",
             "code_evidence",
             "current_focus",
             "checkpoint_deltas",
             "evidence_cache",
         ],
-        BrokerAction::Summarize => &["progress", "recent_tool_activity", "tool_failures"],
+        BrokerAction::Summarize => &[
+            "budget_notes",
+            "progress",
+            "recent_tool_activity",
+            "tool_failures",
+        ],
     }
 }
 
@@ -2553,33 +3191,7 @@ fn build_broker_sections(
     }
 
     if !snapshot.recent_tool_invocations.is_empty() {
-        let lines = snapshot
-            .recent_tool_invocations
-            .iter()
-            .rev()
-            .map(|invocation| {
-                let request = invocation
-                    .request_summary
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("no request summary");
-                let result = invocation
-                    .result_summary
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("no result summary");
-                format!(
-                    "- #{} {} [{}] {} -> {}",
-                    invocation.sequence,
-                    invocation.tool_name,
-                    serde_json::to_string(&invocation.operation_kind)
-                        .unwrap_or_else(|_| "\"generic\"".to_string())
-                        .trim_matches('"'),
-                    request,
-                    result
-                )
-            })
-            .collect::<Vec<_>>();
+        let lines = render_recent_tool_activity_lines(snapshot, false);
         sections.push(BrokerSection {
             id: "recent_tool_activity".to_string(),
             title: "Recent Tool Activity".to_string(),
@@ -2689,50 +3301,64 @@ fn build_broker_sections(
 
     if let Some(repo_map) = repo_map {
         let rich_repo_map = mapy_core::expand_repo_map_payload(repo_map);
-        let evidence_by_file = rich_repo_map
+        let candidate_paths = rich_repo_map
             .files_ranked
             .iter()
-            .take(5)
-            .map(|file| {
+            .take(8)
+            .map(|file| file.path.clone())
+            .chain(
+                snapshot
+                    .recent_tool_invocations
+                    .iter()
+                    .flat_map(|invocation| invocation.paths.iter().cloned()),
+            )
+            .chain(snapshot.focus_paths.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let provenance_by_file = candidate_paths
+            .iter()
+            .map(|path| (path.clone(), collect_tool_result_provenance(snapshot, path)))
+            .collect::<BTreeMap<_, _>>();
+        let evidence_by_file = candidate_paths
+            .iter()
+            .map(|path| {
                 (
-                    file.path.clone(),
+                    path.clone(),
                     extract_code_evidence(
                         root,
-                        &file.path,
+                        path,
                         &query_focus,
+                        provenance_by_file
+                            .get(path)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
                         3,
                         section_item_limit(&effective_limits, "code_evidence").min(15),
                     ),
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let lines = rich_repo_map
-            .files_ranked
+        let repo_map_entries = build_repo_map_display_entries(
+            &rich_repo_map,
+            &query_focus,
+            snapshot,
+            &evidence_by_file,
+            &provenance_by_file,
+            section_item_limit(&effective_limits, "repo_map"),
+        );
+        let lines = repo_map_entries
             .iter()
-            .filter_map(|file| {
-                let evidence = evidence_by_file.get(&file.path);
-                let line_hint = evidence
-                    .and_then(|summary| {
-                        summary
-                            .primary_match_symbol
-                            .as_ref()
-                            .and(summary.first_match_line)
-                    })
+            .map(|entry| {
+                let line_hint = entry
+                    .line_hint
                     .map(|line| format!(":{line}"))
                     .unwrap_or_default();
-                Some(format!(
+                format!(
                     "- {}{} [score={}] — {}",
-                    file.path,
+                    entry.path,
                     line_hint,
-                    score_to_string(file.score),
-                    render_repo_map_reason(
-                        &file.path,
-                        &query_focus,
-                        snapshot,
-                        &rich_repo_map.edges,
-                        evidence,
-                    )
-                ))
+                    score_to_string(entry.display_score),
+                    entry.reason
+                )
             })
             .collect::<Vec<_>>();
         if !lines.is_empty() {
@@ -2749,13 +3375,11 @@ fn build_broker_sections(
             });
         }
 
-        let evidence_lines = rich_repo_map
-            .files_ranked
+        let evidence_lines = repo_map_entries
             .iter()
-            .take(5)
-            .flat_map(|file| {
+            .flat_map(|entry| {
                 evidence_by_file
-                    .get(&file.path)
+                    .get(&entry.path)
                     .map(|summary| summary.rendered_lines.clone())
                     .unwrap_or_default()
             })
@@ -3100,6 +3724,12 @@ fn compute_broker_response(
         budget_tokens,
         budget_bytes as u64,
         effective_limits.max_sections,
+    );
+    let selected_sections = postprocess_selected_sections(
+        selected_sections,
+        &budget_pruned_evictions,
+        &snapshot,
+        &effective_limits,
     );
     let previous_response = match request.since_version.as_deref() {
         Some(since_version) if since_version != version => {
@@ -4046,6 +4676,7 @@ fn broker_write_to_event(
                 search_query: request.search_query.clone(),
                 command: request.command.clone(),
                 artifact_id: request.artifact_id.clone(),
+                regions: request.regions.clone(),
                 duration_ms: request.duration_ms,
             },
         ),
@@ -4066,6 +4697,7 @@ fn broker_write_to_event(
                 search_query: request.search_query.clone(),
                 command: request.command.clone(),
                 artifact_id: request.artifact_id.clone(),
+                regions: request.regions.clone(),
                 duration_ms: request.duration_ms,
             },
         ),
@@ -5691,6 +6323,7 @@ mod tests {
             &root,
             "src/lib.rs",
             &derive_query_focus(Some("Diffy.analyze")),
+            &[],
             3,
             6,
         );
@@ -5734,7 +6367,7 @@ mod tests {
         focus.full_symbol_terms.clear();
         focus.symbol_terms.clear();
         let focus = merge_query_focus_with_symbols(focus, &["isBlank".to_string()]);
-        let evidence = extract_code_evidence(&root, "src/StringUtils.java", &focus, 3, 6);
+        let evidence = extract_code_evidence(&root, "src/StringUtils.java", &focus, &[], 3, 6);
         assert!(evidence
             .rendered_lines
             .iter()
@@ -5767,7 +6400,48 @@ mod tests {
         focus.full_symbol_terms.clear();
         focus.symbol_terms.clear();
         let focus = merge_query_focus_with_symbols(focus, &["isBlank".to_string()]);
-        let evidence = extract_code_evidence(&root, "src/StringUtils.java", &focus, 1, 3);
+        let evidence = extract_code_evidence(&root, "src/StringUtils.java", &focus, &[], 1, 3);
+        assert!(evidence
+            .rendered_lines
+            .iter()
+            .any(|line| line.contains("isBlank(final CharSequence cs)")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_code_evidence_prefers_region_hints_when_present() {
+        let root = std::env::temp_dir().join(format!(
+            "packet28d-code-evidence-region-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("src/StringUtils.java");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "package org.example;\n\npublic final class StringUtils {\n    /** Mention isBlank in docs before the definition. */\n    public static String describe() { return \"isBlank docs\"; }\n\n    public static boolean isBlank(final CharSequence cs) {\n        return cs == null || cs.length() == 0;\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut focus = derive_query_focus(Some(
+            "Where is StringUtils.isBlank defined and used across the codebase?",
+        ));
+        focus.full_symbol_terms.clear();
+        focus.symbol_terms.clear();
+        let focus = merge_query_focus_with_symbols(focus, &["isBlank".to_string()]);
+        let provenance = vec![ToolResultProvenance {
+            operation_kind: suite_packet_core::ToolOperationKind::Search,
+            symbols: vec!["isBlank".to_string()],
+            regions: vec!["src/StringUtils.java:7-8".to_string()],
+            result_summary_present: true,
+        }];
+        let evidence =
+            extract_code_evidence(&root, "src/StringUtils.java", &focus, &provenance, 1, 3);
+        assert!(evidence.from_region_hint);
+        assert_eq!(
+            evidence.primary_match_kind,
+            Some(EvidenceMatchKind::DefinesSymbol)
+        );
         assert!(evidence
             .rendered_lines
             .iter()
@@ -5796,10 +6470,224 @@ mod tests {
         focus.full_symbol_terms.clear();
         focus.symbol_terms.clear();
         let focus = merge_query_focus_with_symbols(focus, &["isBlank".to_string()]);
-        let evidence = extract_code_evidence(&root, "src/ArrayUtils.java", &focus, 3, 6);
+        let evidence = extract_code_evidence(&root, "src/ArrayUtils.java", &focus, &[], 3, 6);
         assert!(evidence.rendered_lines.is_empty());
         assert!(evidence.primary_match_symbol.is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repo_map_display_drops_structural_only_files_when_direct_matches_exist() {
+        let rich_repo_map = mapy_core::RepoMapPayloadRich {
+            files_ranked: vec![
+                mapy_core::RankedFileRich {
+                    path: "src/test/java/org/apache/commons/lang3/AbstractLangTest.java"
+                        .to_string(),
+                    score: 0.90,
+                    symbol_count: 0,
+                    import_count: 1,
+                },
+                mapy_core::RankedFileRich {
+                    path: "src/main/java/org/apache/commons/lang3/math/NumberUtils.java"
+                        .to_string(),
+                    score: 0.88,
+                    symbol_count: 3,
+                    import_count: 0,
+                },
+                mapy_core::RankedFileRich {
+                    path: "src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java"
+                        .to_string(),
+                    score: 0.84,
+                    symbol_count: 2,
+                    import_count: 0,
+                },
+            ],
+            edges: vec![mapy_core::RepoEdgeRich {
+                from: "src/test/java/org/apache/commons/lang3/AbstractLangTest.java".to_string(),
+                to: "src/main/java/org/apache/commons/lang3/math/NumberUtils.java".to_string(),
+                kind: "import".to_string(),
+            }],
+            ..Default::default()
+        };
+        let mut query_focus =
+            derive_query_focus(Some("Where is NumberUtils.createNumber defined and used?"));
+        query_focus.full_symbol_terms.clear();
+        query_focus.symbol_terms.clear();
+        let query_focus =
+            merge_query_focus_with_symbols(query_focus, &["createNumber".to_string()]);
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            focus_paths: vec![
+                "src/main/java/org/apache/commons/lang3/math/NumberUtils.java".to_string(),
+            ],
+            ..Default::default()
+        };
+        let evidence_by_file = BTreeMap::from([
+            (
+                "src/main/java/org/apache/commons/lang3/math/NumberUtils.java".to_string(),
+                CodeEvidenceSummary {
+                    rendered_lines: vec![
+                        "- src/main/java/org/apache/commons/lang3/math/NumberUtils.java:189 public static Number createNumber(final String str) {".to_string(),
+                    ],
+                    first_match_line: Some(189),
+                    primary_match_symbol: Some("createNumber".to_string()),
+                    primary_match_kind: Some(EvidenceMatchKind::DefinesSymbol),
+                    from_region_hint: true,
+                    from_tool_result_path: true,
+                },
+            ),
+            (
+                "src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java".to_string(),
+                CodeEvidenceSummary {
+                    rendered_lines: vec![
+                        "- src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java:42 assertEquals(... createNumber(\"1\"));".to_string(),
+                    ],
+                    first_match_line: Some(42),
+                    primary_match_symbol: Some("createNumber".to_string()),
+                    primary_match_kind: Some(EvidenceMatchKind::CallsSymbol),
+                    from_region_hint: true,
+                    from_tool_result_path: true,
+                },
+            ),
+            (
+                "src/test/java/org/apache/commons/lang3/AbstractLangTest.java".to_string(),
+                CodeEvidenceSummary::default(),
+            ),
+        ]);
+
+        let provenance_by_file = BTreeMap::from([
+            (
+                "src/main/java/org/apache/commons/lang3/math/NumberUtils.java".to_string(),
+                vec![ToolResultProvenance {
+                    operation_kind: suite_packet_core::ToolOperationKind::Search,
+                    symbols: vec!["createNumber".to_string()],
+                    regions: vec![
+                        "src/main/java/org/apache/commons/lang3/math/NumberUtils.java:189-191"
+                            .to_string(),
+                    ],
+                    result_summary_present: true,
+                }],
+            ),
+            (
+                "src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java".to_string(),
+                vec![ToolResultProvenance {
+                    operation_kind: suite_packet_core::ToolOperationKind::Search,
+                    symbols: vec!["createNumber".to_string()],
+                    regions: vec![
+                        "src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java:42-42"
+                            .to_string(),
+                    ],
+                    result_summary_present: true,
+                }],
+            ),
+            (
+                "src/test/java/org/apache/commons/lang3/AbstractLangTest.java".to_string(),
+                Vec::new(),
+            ),
+        ]);
+
+        let entries = build_repo_map_display_entries(
+            &rich_repo_map,
+            &query_focus,
+            &snapshot,
+            &evidence_by_file,
+            &provenance_by_file,
+            2,
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| !entry.structural_only));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path.ends_with("NumberUtils.java")));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path.ends_with("NumberUtilsTest.java")));
+        assert!(entries
+            .iter()
+            .all(|entry| !entry.path.ends_with("AbstractLangTest.java")));
+    }
+
+    #[test]
+    fn build_budget_notes_section_is_empty_without_budget_pruning() {
+        let limits =
+            resolve_effective_limits(BrokerAction::Inspect, None, None, None, &BTreeMap::new());
+        assert!(build_budget_notes_section(&[], &limits).is_none());
+        assert!(build_budget_notes_section(
+            &[BrokerEvictionCandidate {
+                section_id: "repo_map".to_string(),
+                reason: "stable repo anchors".to_string(),
+                est_tokens: 12,
+            }],
+            &limits
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn postprocess_selected_sections_adds_budget_notes_and_compacts_tool_activity() {
+        let limits =
+            resolve_effective_limits(BrokerAction::Inspect, None, None, None, &BTreeMap::new());
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            recent_tool_invocations: vec![suite_packet_core::ToolInvocationSummary {
+                invocation_id: "tool-1".to_string(),
+                sequence: 7,
+                tool_name: "grep".to_string(),
+                operation_kind: suite_packet_core::ToolOperationKind::Search,
+                request_summary: Some("search for isBlank".to_string()),
+                result_summary: Some("Validate.java:806 calls isBlank".to_string()),
+                paths: vec!["src/Validate.java".to_string()],
+                regions: vec!["src/Validate.java:806-806".to_string()],
+                symbols: vec!["isBlank".to_string()],
+                duration_ms: Some(12),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let sections = vec![
+            BrokerSection {
+                id: "task_objective".to_string(),
+                title: "Task Objective".to_string(),
+                body: "Where is StringUtils.isBlank defined and used?".to_string(),
+                priority: 1,
+                source_kind: BrokerSourceKind::Derived,
+            },
+            BrokerSection {
+                id: "recent_tool_activity".to_string(),
+                title: "Recent Tool Activity".to_string(),
+                body: "- #7 grep [search] search for isBlank -> Validate.java:806 calls isBlank"
+                    .to_string(),
+                priority: 1,
+                source_kind: BrokerSourceKind::Derived,
+            },
+            BrokerSection {
+                id: "code_evidence".to_string(),
+                title: "Code Evidence".to_string(),
+                body: "- src/Validate.java:806 if (StringUtils.isBlank(chars))".to_string(),
+                priority: 1,
+                source_kind: BrokerSourceKind::Derived,
+            },
+        ];
+        let pruned = vec![BrokerEvictionCandidate {
+            section_id: "repo_map".to_string(),
+            reason: "budget_pruned".to_string(),
+            est_tokens: 491,
+        }];
+
+        let processed = postprocess_selected_sections(sections, &pruned, &snapshot, &limits);
+        let budget_notes = processed
+            .iter()
+            .find(|section| section.id == "budget_notes")
+            .expect("budget notes should be inserted");
+        assert!(budget_notes.body.contains("repo_map omitted due to budget"));
+        assert!(budget_notes.body.contains("491"));
+        let tool_activity = processed
+            .iter()
+            .find(|section| section.id == "recent_tool_activity")
+            .expect("tool activity should remain");
+        assert!(tool_activity.body.contains("paths=1"));
+        assert!(tool_activity.body.contains("regions=1"));
+        assert!(tool_activity.body.contains("duration=12ms"));
+        assert!(!tool_activity.body.contains("->"));
     }
 
     #[test]

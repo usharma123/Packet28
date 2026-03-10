@@ -4649,6 +4649,7 @@ fn derive_agent_snapshot(
                 search_query,
                 command,
                 artifact_id,
+                regions,
                 duration_ms,
             } => {
                 if !event.paths.is_empty() || !event.symbols.is_empty() {
@@ -4713,6 +4714,7 @@ fn derive_agent_snapshot(
                     command: command.clone(),
                     artifact_id: artifact_id.clone(),
                     paths: event.paths.clone(),
+                    regions: regions.clone(),
                     symbols: event.symbols.clone(),
                     duration_ms: *duration_ms,
                     occurred_at_unix: event.occurred_at_unix,
