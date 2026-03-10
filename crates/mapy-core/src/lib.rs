@@ -264,7 +264,8 @@ pub fn build_repo_map(req: RepoMapRequest) -> Result<EnvelopeV1<RepoMapPayload>,
     let focus_symbols = req
         .focus_symbols
         .iter()
-        .map(|v| v.trim().to_string())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>();
 
     let mut ranked_files_tmp = Vec::<RankedFileTmp>::new();
@@ -292,7 +293,10 @@ pub fn build_repo_map(req: RepoMapRequest) -> Result<EnvelopeV1<RepoMapPayload>,
         });
 
         for (kind, name) in &scan.symbols {
-            let symbol_focus = if focus_symbols.contains(name) {
+            let symbol_focus = if focus_symbols
+                .iter()
+                .any(|candidate| focus_term_matches(name, candidate))
+            {
                 1.0
             } else {
                 0.0
@@ -357,7 +361,7 @@ pub fn build_repo_map(req: RepoMapRequest) -> Result<EnvelopeV1<RepoMapPayload>,
         .iter()
         .map(|s| SymbolRef {
             name: s.name.clone(),
-            file: None,
+            file: Some(s.file.clone()),
             kind: Some(s.kind.clone()),
             relevance: Some(s.score),
             source: None,
@@ -909,13 +913,26 @@ fn file_focus_match(
     focus_paths: &[String],
     focus_symbols: &BTreeSet<String>,
 ) -> f64 {
-    let path_match: f64 = if focus_paths.iter().any(|p| path == p || path.starts_with(p)) {
+    let normalized_path = normalize_path(path).to_ascii_lowercase();
+    let path_match: f64 = if focus_paths.iter().any(|p| {
+        let candidate = normalize_path(p).to_ascii_lowercase();
+        normalized_path == candidate
+            || normalized_path.starts_with(&candidate)
+            || candidate.starts_with(&normalized_path)
+    }) || focus_symbols
+        .iter()
+        .any(|candidate| focus_term_matches(&normalized_path, candidate))
+    {
         1.0
     } else {
         0.0
     };
 
-    let symbol_match: f64 = if symbols.iter().any(|(_, name)| focus_symbols.contains(name)) {
+    let symbol_match: f64 = if symbols.iter().any(|(_, name)| {
+        focus_symbols
+            .iter()
+            .any(|candidate| focus_term_matches(name, candidate))
+    }) {
         1.0
     } else {
         0.0
@@ -939,6 +956,16 @@ fn proximity_score(path: &str, focus_paths: &[String]) -> f64 {
         }
     }
     best
+}
+
+fn focus_term_matches(candidate: &str, focus_term: &str) -> bool {
+    let candidate = candidate.trim().to_ascii_lowercase();
+    let focus_term = focus_term.trim().to_ascii_lowercase();
+    !candidate.is_empty()
+        && !focus_term.is_empty()
+        && (candidate == focus_term
+            || candidate.contains(&focus_term)
+            || focus_term.contains(&candidate))
 }
 
 fn common_prefix_segments(a: &str, b: &str) -> usize {
@@ -1622,5 +1649,48 @@ public class Calculator {
         assert!(names.contains("parse_input") || names.contains("ParseInput"));
         assert!(names.contains("Engine"));
         assert!(names.contains("Parser") || names.contains("Handler"));
+    }
+
+    #[test]
+    fn focus_symbols_boost_matching_crate_paths_and_attach_symbol_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/diffy-core/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/testy-core/src")).unwrap();
+        std::fs::write(
+            root.join("crates/diffy-core/src/lib.rs"),
+            "pub fn analyze_diffy() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/testy-core/src/lib.rs"),
+            "pub fn analyze_tests() {}\n",
+        )
+        .unwrap();
+
+        let env = build_repo_map(RepoMapRequest {
+            repo_root: root.to_string_lossy().to_string(),
+            focus_symbols: vec!["diffy".to_string()],
+            max_files: 4,
+            max_symbols: 8,
+            ..RepoMapRequest::default()
+        })
+        .unwrap();
+
+        let top_file = env
+            .payload
+            .files_ranked
+            .first()
+            .and_then(|ranked| env.files.get(ranked.file_idx))
+            .map(|file| file.path.clone())
+            .unwrap_or_default();
+        assert!(
+            top_file.contains("diffy-core"),
+            "expected diffy crate to outrank unrelated files, got {top_file}"
+        );
+        assert!(env.symbols.iter().any(|symbol| symbol
+            .file
+            .as_deref()
+            .is_some_and(|file| file.contains("diffy-core"))));
     }
 }

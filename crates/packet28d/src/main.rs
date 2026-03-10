@@ -811,10 +811,11 @@ fn load_agent_snapshot_for_task(
 }
 
 fn load_context_manage_for_task(
-    state: &Arc<Mutex<DaemonState>>,
+    kernel: &Arc<context_kernel_core::Kernel>,
     request: &BrokerGetContextRequest,
+    focus_paths: &[String],
+    focus_symbols: &[String],
 ) -> Result<suite_packet_core::ContextManagePayload> {
-    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
     let response = kernel.execute(KernelRequest {
         target: "contextq.manage".to_string(),
         reducer_input: json!({
@@ -823,6 +824,8 @@ fn load_context_manage_for_task(
             "budget_tokens": request.budget_tokens.unwrap_or_else(broker_default_budget_tokens),
             "budget_bytes": request.budget_bytes.unwrap_or_else(broker_default_budget_bytes),
             "scope": "task_first",
+            "focus_paths": focus_paths,
+            "focus_symbols": focus_symbols,
         }),
         policy_context: json!({
             "task_id": request.task_id,
@@ -840,9 +843,10 @@ fn load_context_manage_for_task(
 }
 
 fn load_repo_map_for_task(
-    state: &Arc<Mutex<DaemonState>>,
     request: &BrokerGetContextRequest,
-    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    focus_paths: &[String],
+    focus_symbols: &[String],
+    root: &Path,
 ) -> Result<Option<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>>> {
     let action = request.action.unwrap_or(BrokerAction::Plan);
     if !matches!(
@@ -852,30 +856,13 @@ fn load_repo_map_for_task(
         return Ok(None);
     }
 
-    let root = state.lock().map_err(lock_err)?.root.clone();
-    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
-    let response = kernel.execute(KernelRequest {
-        target: "mapy.repo".to_string(),
-        reducer_input: json!({
-            "repo_root": root,
-            "focus_paths": merged_unique(&snapshot.focus_paths, &request.focus_paths),
-            "focus_symbols": merged_unique(&snapshot.focus_symbols, &request.focus_symbols),
-            "max_files": 12,
-            "max_symbols": 24,
-            "include_tests": true,
-        }),
-        policy_context: json!({
-            "task_id": request.task_id,
-        }),
-        ..KernelRequest::default()
-    })?;
-    let packet = response.output_packets.first();
-    let Some(packet) = packet else {
-        return Ok(None);
-    };
-    let envelope = serde_json::from_value(packet.body.clone())
-        .map_err(|source| anyhow!("invalid repo map packet: {source}"))?;
-    Ok(Some(envelope))
+    Ok(Some(build_repo_map_envelope(
+        root,
+        focus_paths,
+        focus_symbols,
+        12,
+        24,
+    )?))
 }
 
 fn build_repo_map_envelope(
@@ -988,6 +975,189 @@ fn tokenize_task_text(task_text: &str) -> Vec<String> {
         .collect()
 }
 
+fn scope_group(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if let Some((prefix, _)) = normalized.split_once("/src/") {
+        return prefix.to_string();
+    }
+    Path::new(&normalized)
+        .parent()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn parent_dir(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn role_file_weight(path: &str) -> usize {
+    let Some(file_name) = Path::new(path).file_name().and_then(|value| value.to_str()) else {
+        return 0;
+    };
+    if file_name.starts_with("cmd_") || file_name == "report.rs" {
+        3
+    } else if matches!(file_name, "lib.rs" | "main.rs" | "mod.rs") {
+        2
+    } else {
+        0
+    }
+}
+
+fn expand_scope_paths(
+    task_text: &str,
+    rich_map: &mapy_core::RepoMapPayloadRich,
+    primary_paths: &[String],
+    explicit_symbols: &[String],
+    max_paths: usize,
+) -> Vec<String> {
+    if primary_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let primary_set = primary_paths
+        .iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let primary_scopes = primary_paths
+        .iter()
+        .map(|path| scope_group(path))
+        .collect::<HashSet<_>>();
+    let primary_dirs = primary_paths
+        .iter()
+        .map(|path| parent_dir(path))
+        .collect::<HashSet<_>>();
+    let task_tokens = tokenize_task_text(task_text);
+    let explicit_symbols = explicit_symbols
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    let mut edge_counts = HashMap::<String, usize>::new();
+    for edge in &rich_map.edges {
+        let from_is_primary = primary_set.contains(&edge.from.to_ascii_lowercase());
+        let to_is_primary = primary_set.contains(&edge.to.to_ascii_lowercase());
+        if from_is_primary && !to_is_primary {
+            *edge_counts.entry(edge.to.clone()).or_insert(0) += 1;
+        }
+        if to_is_primary && !from_is_primary {
+            *edge_counts.entry(edge.from.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut symbol_hits = HashMap::<String, usize>::new();
+    for symbol in &rich_map.symbols_ranked {
+        let symbol_name = symbol.name.to_ascii_lowercase();
+        if task_tokens
+            .iter()
+            .any(|token| symbol_name.contains(token.as_str()))
+            || explicit_symbols
+                .iter()
+                .any(|token| symbol_name.contains(token.as_str()))
+        {
+            *symbol_hits.entry(symbol.file.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut scored = rich_map
+        .files_ranked
+        .iter()
+        .map(|file| {
+            let lower_path = file.path.to_ascii_lowercase();
+            let scope = scope_group(&file.path);
+            let dir = parent_dir(&file.path);
+            let path_token_hits = task_tokens
+                .iter()
+                .filter(|token| lower_path.contains(token.as_str()))
+                .count();
+            let explicit_symbol_hits = explicit_symbols
+                .iter()
+                .filter(|token| lower_path.contains(token.as_str()))
+                .count();
+
+            let mut score = 0usize;
+            if primary_set.contains(&lower_path) {
+                score += 1000;
+            }
+            score += edge_counts.get(&file.path).copied().unwrap_or(0) * 220;
+            if primary_scopes.contains(&scope) {
+                score += 120;
+            }
+            if primary_dirs.contains(&dir) {
+                score += 60;
+            }
+            score += (path_token_hits + explicit_symbol_hits) * 35;
+            score += symbol_hits.get(&file.path).copied().unwrap_or(0) * 30;
+            score += role_file_weight(&file.path)
+                * if primary_scopes.contains(&scope) {
+                    25
+                } else {
+                    10
+                };
+
+            (score, file.score, file.path.clone())
+        })
+        .filter(|(score, _, _)| *score > 0)
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    scored
+        .into_iter()
+        .map(|(_, _, path)| path)
+        .take(max_paths.max(primary_paths.len()))
+        .collect()
+}
+
+fn derive_broker_focus_symbols(
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    request: &BrokerGetContextRequest,
+) -> Vec<String> {
+    merged_unique(&snapshot.focus_symbols, &request.focus_symbols)
+}
+
+fn derive_broker_focus_paths(
+    root: &Path,
+    objective: Option<&str>,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    request: &BrokerGetContextRequest,
+    max_paths: usize,
+) -> Result<Vec<String>> {
+    let explicit_paths = merged_unique(&snapshot.focus_paths, &request.focus_paths);
+    let explicit_symbols = derive_broker_focus_symbols(snapshot, request);
+    if explicit_paths.is_empty() && explicit_symbols.is_empty() && objective.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let wide_map = mapy_core::expand_repo_map_payload(&build_repo_map_envelope(
+        root,
+        &explicit_paths,
+        &explicit_symbols,
+        64,
+        128,
+    )?);
+    let primary_paths = infer_scope_paths(
+        objective.unwrap_or_default(),
+        &wide_map,
+        &explicit_paths,
+        &explicit_symbols,
+    );
+    let expanded = expand_scope_paths(
+        objective.unwrap_or_default(),
+        &wide_map,
+        &primary_paths,
+        &explicit_symbols,
+        max_paths,
+    );
+    Ok(merged_unique(&explicit_paths, &expanded))
+}
+
 fn infer_scope_paths(
     task_text: &str,
     rich_map: &mapy_core::RepoMapPayloadRich,
@@ -1035,6 +1205,83 @@ fn infer_scope_paths(
         .map(|(_, _, path)| path)
         .take(6)
         .collect()
+}
+
+fn truncate_evidence_line(line: &str, max_len: usize) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= max_len {
+        trimmed.to_string()
+    } else {
+        let shortened = trimmed
+            .chars()
+            .take(max_len.saturating_sub(3))
+            .collect::<String>();
+        format!("{shortened}...")
+    }
+}
+
+fn looks_like_signature(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+        return false;
+    }
+    let prefixes = [
+        "pub fn ",
+        "fn ",
+        "pub struct ",
+        "struct ",
+        "pub enum ",
+        "enum ",
+        "pub trait ",
+        "trait ",
+        "impl ",
+        "pub mod ",
+        "mod ",
+        "class ",
+        "interface ",
+        "export function ",
+        "export class ",
+        "def ",
+    ];
+    prefixes.iter().any(|prefix| trimmed.starts_with(prefix))
+        || (trimmed.contains(" fn ")
+            || trimmed.contains(" class ")
+            || trimmed.contains(" interface "))
+}
+
+fn extract_code_evidence_lines(root: &Path, relative_path: &str, max_lines: usize) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(root.join(relative_path)) else {
+        return Vec::new();
+    };
+    let mut evidence = Vec::new();
+    for (idx, line) in contents.lines().enumerate() {
+        if !looks_like_signature(line) {
+            continue;
+        }
+        evidence.push(format!(
+            "- {relative_path}:{} {}",
+            idx + 1,
+            truncate_evidence_line(line, 120)
+        ));
+        if evidence.len() >= max_lines {
+            break;
+        }
+    }
+    if evidence.is_empty() {
+        for (idx, line) in contents.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            evidence.push(format!(
+                "- {relative_path}:{} {}",
+                idx + 1,
+                truncate_evidence_line(trimmed, 120)
+            ));
+            break;
+        }
+    }
+    evidence
 }
 
 fn find_candidate_test_paths(
@@ -1191,6 +1438,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
             "open_questions",
             "current_focus",
             "repo_map",
+            "code_evidence",
             "relevant_context",
             "recommended_actions",
         ],
@@ -1198,6 +1446,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
             "task_objective",
             "current_focus",
             "repo_map",
+            "code_evidence",
             "relevant_context",
             "checkpoint_deltas",
             "active_decisions",
@@ -1212,6 +1461,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         ],
         BrokerAction::Interpret => &[
             "task_objective",
+            "code_evidence",
             "recommended_actions",
             "relevant_context",
             "active_decisions",
@@ -1224,6 +1474,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
             "checkpoint_deltas",
             "active_decisions",
             "repo_map",
+            "code_evidence",
             "relevant_context",
             "resolved_questions",
         ],
@@ -1246,10 +1497,11 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             section_item_limits.insert("open_questions".to_string(), 8);
             section_item_limits.insert("current_focus".to_string(), 8);
             section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("code_evidence".to_string(), 6);
             section_item_limits.insert("relevant_context".to_string(), 6);
             section_item_limits.insert("recommended_actions".to_string(), 6);
             BrokerEffectiveLimits {
-                max_sections: 6,
+                max_sections: 7,
                 default_max_items_per_section: 8,
                 section_item_limits,
             }
@@ -1257,10 +1509,11 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
         BrokerAction::Inspect => {
             section_item_limits.insert("current_focus".to_string(), 8);
             section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("code_evidence".to_string(), 6);
             section_item_limits.insert("relevant_context".to_string(), 6);
             section_item_limits.insert("checkpoint_deltas".to_string(), 8);
             BrokerEffectiveLimits {
-                max_sections: 6,
+                max_sections: 7,
                 default_max_items_per_section: 8,
                 section_item_limits,
             }
@@ -1276,11 +1529,12 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             }
         }
         BrokerAction::Interpret => {
+            section_item_limits.insert("code_evidence".to_string(), 6);
             section_item_limits.insert("recommended_actions".to_string(), 4);
             section_item_limits.insert("relevant_context".to_string(), 4);
             section_item_limits.insert("resolved_questions".to_string(), 4);
             BrokerEffectiveLimits {
-                max_sections: 5,
+                max_sections: 6,
                 default_max_items_per_section: 4,
                 section_item_limits,
             }
@@ -1289,9 +1543,10 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             section_item_limits.insert("current_focus".to_string(), 8);
             section_item_limits.insert("checkpoint_deltas".to_string(), 8);
             section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("code_evidence".to_string(), 6);
             section_item_limits.insert("relevant_context".to_string(), 5);
             BrokerEffectiveLimits {
-                max_sections: 6,
+                max_sections: 7,
                 default_max_items_per_section: 8,
                 section_item_limits,
             }
@@ -1442,6 +1697,7 @@ fn build_resolved_questions(
 }
 
 fn build_broker_sections(
+    root: &Path,
     state: &Arc<Mutex<DaemonState>>,
     request: &BrokerGetContextRequest,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
@@ -1611,7 +1867,12 @@ fn build_broker_sections(
                 repo_map
                     .symbols
                     .iter()
-                    .map(|symbol| format!("- symbol: {}", symbol.name)),
+                    .map(|symbol| match symbol.file.as_deref() {
+                        Some(file) if !file.trim().is_empty() => {
+                            format!("- symbol: {} ({file})", symbol.name)
+                        }
+                        _ => format!("- symbol: {}", symbol.name),
+                    }),
             )
             .collect::<Vec<_>>();
         if !lines.is_empty() {
@@ -1620,6 +1881,36 @@ fn build_broker_sections(
                 title: "Repo Anchors".to_string(),
                 body: truncate_lines(lines, section_item_limit(&effective_limits, "repo_map")),
                 priority: if matches!(action, BrokerAction::Plan | BrokerAction::Inspect) {
+                    1
+                } else {
+                    2
+                },
+                source_kind: BrokerSourceKind::Derived,
+            });
+        }
+
+        let evidence_lines = repo_map
+            .files
+            .iter()
+            .take(3)
+            .flat_map(|file| {
+                extract_code_evidence_lines(
+                    root,
+                    &file.path,
+                    section_item_limit(&effective_limits, "code_evidence").min(2),
+                )
+            })
+            .take(section_item_limit(&effective_limits, "code_evidence"))
+            .collect::<Vec<_>>();
+        if !evidence_lines.is_empty() {
+            sections.push(BrokerSection {
+                id: "code_evidence".to_string(),
+                title: "Code Evidence".to_string(),
+                body: evidence_lines.join("\n"),
+                priority: if matches!(
+                    action,
+                    BrokerAction::Inspect | BrokerAction::Interpret | BrokerAction::Edit
+                ) {
                     1
                 } else {
                     2
@@ -1920,10 +2211,15 @@ fn compute_broker_response(
     request: &BrokerGetContextRequest,
 ) -> Result<BrokerGetContextResponse> {
     let snapshot = load_agent_snapshot_for_task(state, &request.task_id)?;
-    let manage = load_context_manage_for_task(state, request)?;
-    let repo_map = load_repo_map_for_task(state, request, &snapshot)?;
     let task = load_task_record(state, &request.task_id);
     let root = state.lock().map_err(lock_err)?.root.clone();
+    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    let objective = broker_objective(state, request);
+    let focus_symbols = derive_broker_focus_symbols(&snapshot, request);
+    let focus_paths =
+        derive_broker_focus_paths(&root, objective.as_deref(), &snapshot, request, 8)?;
+    let manage = load_context_manage_for_task(&kernel, request, &focus_paths, &focus_symbols)?;
+    let repo_map = load_repo_map_for_task(request, &focus_paths, &focus_symbols, &root)?;
     let version = current_context_version(state, &request.task_id)?;
     let action = request.action.unwrap_or(BrokerAction::Plan);
     let effective_limits = resolve_effective_limits(
@@ -1934,7 +2230,7 @@ fn compute_broker_response(
         &request.section_item_limits,
     );
     let full_sections =
-        build_broker_sections(state, request, &snapshot, &manage, repo_map.as_ref());
+        build_broker_sections(&root, state, request, &snapshot, &manage, repo_map.as_ref());
     let previous_response = match request.since_version.as_deref() {
         Some(since_version) if since_version != version => {
             load_versioned_broker_response(&root, &request.task_id, since_version)?
@@ -2401,11 +2697,18 @@ fn broker_decompose(
     let rich_map = mapy_core::expand_repo_map_payload(&repo_map);
     let coverage = load_cached_coverage(&root)?;
     let testmap = load_cached_testmap(&root)?;
-    let selected_scope_paths = infer_scope_paths(
+    let primary_scope_paths = infer_scope_paths(
         &request.task_text,
         &rich_map,
         &request.scope_paths,
         &request.scope_symbols,
+    );
+    let selected_scope_paths = expand_scope_paths(
+        &request.task_text,
+        &rich_map,
+        &primary_scope_paths,
+        &request.scope_symbols,
+        8,
     );
     if selected_scope_paths.is_empty() {
         return Ok(BrokerDecomposeResponse {
@@ -4086,8 +4389,9 @@ mod tests {
             resolve_effective_limits(BrokerAction::Plan, None, None, None, &BTreeMap::new());
         let choose_tool_limits =
             resolve_effective_limits(BrokerAction::ChooseTool, None, None, None, &BTreeMap::new());
-        assert_eq!(plan_limits.max_sections, 6);
+        assert_eq!(plan_limits.max_sections, 7);
         assert_eq!(plan_limits.default_max_items_per_section, 8);
+        assert_eq!(plan_limits.section_item_limits["code_evidence"], 6);
         assert_eq!(choose_tool_limits.max_sections, 5);
         assert_eq!(choose_tool_limits.default_max_items_per_section, 4);
     }
@@ -4152,5 +4456,92 @@ mod tests {
             &[],
         );
         assert_eq!(inferred, vec!["src/session.rs".to_string()]);
+    }
+
+    #[test]
+    fn expand_scope_paths_pulls_adjacent_role_files() {
+        let expanded = expand_scope_paths(
+            "explain what diffy does",
+            &mapy_core::RepoMapPayloadRich {
+                files_ranked: vec![
+                    mapy_core::RankedFileRich {
+                        path: "crates/diffy-core/src/lib.rs".to_string(),
+                        score: 1.0,
+                        symbol_count: 2,
+                        import_count: 1,
+                    },
+                    mapy_core::RankedFileRich {
+                        path: "crates/diffy-core/src/report.rs".to_string(),
+                        score: 0.7,
+                        symbol_count: 2,
+                        import_count: 0,
+                    },
+                    mapy_core::RankedFileRich {
+                        path: "crates/diffy-cli/src/cmd_analyze.rs".to_string(),
+                        score: 0.65,
+                        symbol_count: 2,
+                        import_count: 1,
+                    },
+                    mapy_core::RankedFileRich {
+                        path: "crates/testy-core/src/lib.rs".to_string(),
+                        score: 0.6,
+                        symbol_count: 2,
+                        import_count: 0,
+                    },
+                ],
+                symbols_ranked: vec![
+                    mapy_core::RankedSymbolRich {
+                        name: "analyze".to_string(),
+                        file: "crates/diffy-cli/src/cmd_analyze.rs".to_string(),
+                        kind: "function".to_string(),
+                        score: 0.9,
+                    },
+                    mapy_core::RankedSymbolRich {
+                        name: "render_report".to_string(),
+                        file: "crates/diffy-core/src/report.rs".to_string(),
+                        kind: "function".to_string(),
+                        score: 0.8,
+                    },
+                ],
+                edges: vec![
+                    mapy_core::RepoEdgeRich {
+                        from: "crates/diffy-cli/src/cmd_analyze.rs".to_string(),
+                        to: "crates/diffy-core/src/lib.rs".to_string(),
+                        kind: "import".to_string(),
+                    },
+                    mapy_core::RepoEdgeRich {
+                        from: "crates/diffy-core/src/report.rs".to_string(),
+                        to: "crates/diffy-core/src/lib.rs".to_string(),
+                        kind: "import".to_string(),
+                    },
+                ],
+                ..Default::default()
+            },
+            &["crates/diffy-core/src/lib.rs".to_string()],
+            &["diffy".to_string()],
+            6,
+        );
+        assert!(expanded.contains(&"crates/diffy-core/src/report.rs".to_string()));
+        assert!(expanded.contains(&"crates/diffy-cli/src/cmd_analyze.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_code_evidence_lines_prefers_signatures() {
+        let root =
+            std::env::temp_dir().join(format!("packet28d-code-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("src/lib.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "use std::fmt;\n\npub struct Diffy;\nimpl Diffy {\n    pub fn analyze() {}\n}\n",
+        )
+        .unwrap();
+
+        let evidence = extract_code_evidence_lines(&root, "src/lib.rs", 2);
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence[0].contains("pub struct Diffy"));
+        assert!(evidence[1].contains("impl Diffy") || evidence[1].contains("pub fn analyze"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

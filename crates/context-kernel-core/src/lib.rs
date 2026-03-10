@@ -1110,6 +1110,8 @@ struct ContextManageRequest {
     budget_bytes: usize,
     scope: RecallScope,
     checkpoint_id: Option<String>,
+    focus_paths: Vec<String>,
+    focus_symbols: Vec<String>,
 }
 
 impl Default for ContextManageRequest {
@@ -1121,6 +1123,8 @@ impl Default for ContextManageRequest {
             budget_bytes: contextq_core::DEFAULT_BUDGET_BYTES,
             scope: RecallScope::TaskFirst,
             checkpoint_id: None,
+            focus_paths: Vec::new(),
+            focus_symbols: Vec::new(),
         }
     }
 }
@@ -2837,6 +2841,8 @@ fn derive_manage_query(
     let mut tokens = Vec::new();
     tokens.extend(snapshot.changed_paths_since_checkpoint.iter().cloned());
     tokens.extend(snapshot.changed_symbols_since_checkpoint.iter().cloned());
+    tokens.extend(request.focus_paths.iter().take(4).cloned());
+    tokens.extend(request.focus_symbols.iter().take(4).cloned());
     tokens.extend(snapshot.focus_paths.iter().take(4).cloned());
     tokens.extend(snapshot.focus_symbols.iter().take(4).cloned());
     tokens.extend(
@@ -2878,6 +2884,8 @@ fn run_contextq_manage(
             limit: 32,
             task_id: Some(request.task_id.clone()),
             scope: request.scope,
+            path_filters: request.focus_paths.clone(),
+            symbol_filters: request.focus_symbols.clone(),
             ..RecallOptions::default()
         },
     )?;
@@ -3029,6 +3037,8 @@ fn augment_assemble_with_task_memory(
             budget_bytes,
             scope: RecallScope::TaskFirst,
             checkpoint_id: None,
+            focus_paths: Vec::new(),
+            focus_symbols: Vec::new(),
         },
         snapshot,
     );
@@ -6830,6 +6840,139 @@ java.lang.IllegalStateException: boom
             .changed_paths_since_checkpoint
             .contains(&"src/auth.rs".to_string()));
         assert!(!envelope.payload.working_set.is_empty());
+    }
+
+    #[test]
+    fn contextq_manage_uses_focus_filters_to_prefer_matching_packets() {
+        let dir = tempdir().unwrap();
+        let mut kernel =
+            Kernel::with_v1_reducers_and_persistence(PersistConfig::new(dir.path().to_path_buf()));
+        kernel.register_reducer("test.auth_packet", |ctx, _packets| {
+            let envelope = suite_packet_core::EnvelopeV1 {
+                version: "1".to_string(),
+                tool: "contextq".to_string(),
+                kind: "context_manage".to_string(),
+                hash: String::new(),
+                summary: "investigation notes".to_string(),
+                files: vec![suite_packet_core::FileRef {
+                    path: "src/auth.rs".to_string(),
+                    relevance: Some(1.0),
+                    source: Some("test.auth_packet".to_string()),
+                }],
+                symbols: vec![suite_packet_core::SymbolRef {
+                    name: "authenticate".to_string(),
+                    file: Some("src/auth.rs".to_string()),
+                    kind: Some("function".to_string()),
+                    relevance: Some(1.0),
+                    source: Some("test.auth_packet".to_string()),
+                }],
+                risk: None,
+                confidence: Some(1.0),
+                budget_cost: suite_packet_core::BudgetCost {
+                    est_tokens: 48,
+                    est_bytes: 256,
+                    runtime_ms: 3,
+                    tool_calls: 1,
+                    payload_est_tokens: Some(24),
+                    payload_est_bytes: Some(128),
+                },
+                provenance: suite_packet_core::Provenance {
+                    inputs: vec!["task:task-manage".to_string()],
+                    git_base: None,
+                    git_head: None,
+                    generated_at_unix: 1,
+                },
+                payload: json!({"task_id":"task-manage","summary":"investigation notes"}),
+            }
+            .with_canonical_hash_and_real_budget();
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(
+                    serde_json::to_value(envelope).unwrap(),
+                    Some(format!("packet-auth-{}", ctx.request_id)),
+                )],
+                metadata: json!({"task_id":"task-manage"}),
+            })
+        });
+        kernel.register_reducer("test.other_packet", |ctx, _packets| {
+            let envelope = suite_packet_core::EnvelopeV1 {
+                version: "1".to_string(),
+                tool: "contextq".to_string(),
+                kind: "context_manage".to_string(),
+                hash: String::new(),
+                summary: "investigation notes".to_string(),
+                files: vec![suite_packet_core::FileRef {
+                    path: "src/billing.rs".to_string(),
+                    relevance: Some(1.0),
+                    source: Some("test.other_packet".to_string()),
+                }],
+                symbols: vec![suite_packet_core::SymbolRef {
+                    name: "invoice".to_string(),
+                    file: Some("src/billing.rs".to_string()),
+                    kind: Some("function".to_string()),
+                    relevance: Some(1.0),
+                    source: Some("test.other_packet".to_string()),
+                }],
+                risk: None,
+                confidence: Some(1.0),
+                budget_cost: suite_packet_core::BudgetCost {
+                    est_tokens: 48,
+                    est_bytes: 256,
+                    runtime_ms: 3,
+                    tool_calls: 1,
+                    payload_est_tokens: Some(24),
+                    payload_est_bytes: Some(128),
+                },
+                provenance: suite_packet_core::Provenance {
+                    inputs: vec!["task:task-manage".to_string()],
+                    git_base: None,
+                    git_head: None,
+                    generated_at_unix: 1,
+                },
+                payload: json!({"task_id":"task-manage","summary":"investigation notes"}),
+            }
+            .with_canonical_hash_and_real_budget();
+            Ok(ReducerResult {
+                output_packets: vec![KernelPacket::from_value(
+                    serde_json::to_value(envelope).unwrap(),
+                    Some(format!("packet-other-{}", ctx.request_id)),
+                )],
+                metadata: json!({"task_id":"task-manage"}),
+            })
+        });
+
+        kernel
+            .execute(KernelRequest {
+                target: "test.auth_packet".to_string(),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        kernel
+            .execute(KernelRequest {
+                target: "test.other_packet".to_string(),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+
+        let response = kernel
+            .execute(KernelRequest {
+                target: "contextq.manage".to_string(),
+                reducer_input: json!({
+                    "task_id": "task-manage",
+                    "query": "investigation notes",
+                    "budget_tokens": 256,
+                    "budget_bytes": 4096,
+                    "scope": "task_first",
+                    "focus_paths": ["src/auth.rs"],
+                    "focus_symbols": ["authenticate"]
+                }),
+                ..KernelRequest::default()
+            })
+            .unwrap();
+        let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::ContextManagePayload> =
+            serde_json::from_value(response.output_packets[0].body.clone()).unwrap();
+
+        assert_eq!(envelope.payload.working_set.len(), 1);
+        assert_eq!(envelope.payload.working_set[0].target, "test.auth_packet");
     }
 
     #[test]

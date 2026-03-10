@@ -1,6 +1,6 @@
 {
   "name": "@packet28/PLATFORM",
-  "version": "0.2.0",
+  "version": "0.2.5",
   "description": "Platform-specific binaries for packet28 (PLATFORM)",
   "license": "MIT",
   "repository": {
