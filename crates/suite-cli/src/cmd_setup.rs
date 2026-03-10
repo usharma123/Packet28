@@ -293,8 +293,9 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<bool> {
         root.display().to_string()
     };
 
+    let command = resolve_packet28_mcp_command();
     let packet28_entry = json!({
-        "command": "packet28-mcp",
+        "command": command,
         "args": ["--root", root_arg]
     });
 
@@ -312,12 +313,6 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<bool> {
         .entry("mcpServers".to_string())
         .or_insert_with(|| json!({}));
 
-    if let Some(obj) = servers.as_object() {
-        if obj.contains_key("packet28") {
-            return Ok(false); // already configured
-        }
-    }
-
     if !auto_yes {
         eprint!(
             "    Write MCP config to {}? [Y/n] ",
@@ -333,6 +328,10 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<bool> {
 
     // Insert packet28 server
     if let Some(obj) = servers.as_object_mut() {
+        let needs_write = obj.get("packet28") != Some(&packet28_entry);
+        if !needs_write {
+            return Ok(false);
+        }
         obj.insert("packet28".to_string(), packet28_entry);
     }
 
@@ -344,6 +343,21 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<bool> {
     fs::write(path, format!("{content}\n"))?;
 
     Ok(true)
+}
+
+fn resolve_packet28_mcp_command() -> String {
+    let output = std::process::Command::new("which")
+        .arg("packet28-mcp")
+        .output();
+    if let Ok(output) = output {
+        if output.status.success() {
+            let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !command.is_empty() {
+                return command;
+            }
+        }
+    }
+    "packet28-mcp".to_string()
 }
 
 fn write_agent_file(path: &Path, content: &str) -> Result<bool> {
