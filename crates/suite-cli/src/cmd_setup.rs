@@ -37,6 +37,12 @@ struct RuntimeInfo {
     detected: bool,
 }
 
+enum McpConfigStatus {
+    Written,
+    AlreadyConfigured,
+    Declined,
+}
+
 pub fn run(args: SetupArgs) -> Result<i32> {
     let root = crate::cmd_daemon::resolve_root_arg(&args.root);
     let root_display = root.display().to_string();
@@ -75,18 +81,22 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     }
     println!();
 
-    let any_detected = runtimes.iter().any(|r| r.detected);
+    let selected_runtimes = select_setup_runtimes(&runtimes, args.runtime != "all");
+    let mut agent_targets = Vec::new();
+    let mut mcp_configured = false;
+    let mut agent_files_ready = false;
 
     // Phase 1: MCP config
     if !args.fallback_only {
-        let mcp_targets: Vec<&RuntimeInfo> = runtimes
+        let mcp_targets: Vec<&RuntimeInfo> = selected_runtimes
             .iter()
-            .filter(|r| r.detected && r.mcp_config_path.is_some())
+            .copied()
+            .filter(|r| r.mcp_config_path.is_some())
             .collect();
 
         if mcp_targets.is_empty() {
             println!(
-                "  {} No MCP-capable runtimes detected. Generating fallback files.",
+                "  {} No MCP-capable runtimes selected. Generating fallback files.",
                 "→".yellow()
             );
             println!();
@@ -94,20 +104,37 @@ pub fn run(args: SetupArgs) -> Result<i32> {
             println!("  {}", "Configuring MCP servers:".bold());
             for rt in &mcp_targets {
                 let config_path = rt.mcp_config_path.as_ref().unwrap();
-                let wrote = write_mcp_config(config_path, &root, args.yes)?;
-                if wrote {
-                    println!(
-                        "    {} {} → {}",
-                        "✓".green().bold(),
-                        rt.name,
-                        config_path.display().to_string().dimmed()
-                    );
-                } else {
-                    println!("    {} {} (already configured)", "·".dimmed(), rt.name,);
+                match write_mcp_config(config_path, &root, args.yes)? {
+                    McpConfigStatus::Written => {
+                        mcp_configured = true;
+                        push_unique_runtime(&mut agent_targets, rt);
+                        println!(
+                            "    {} {} → {}",
+                            "✓".green().bold(),
+                            rt.name,
+                            config_path.display().to_string().dimmed()
+                        );
+                    }
+                    McpConfigStatus::AlreadyConfigured => {
+                        mcp_configured = true;
+                        push_unique_runtime(&mut agent_targets, rt);
+                        println!("    {} {} (already configured)", "·".dimmed(), rt.name,);
+                    }
+                    McpConfigStatus::Declined => {
+                        println!("    {} {} (skipped)", "·".dimmed(), rt.name);
+                    }
                 }
             }
             println!();
         }
+    }
+
+    for rt in selected_runtimes
+        .iter()
+        .copied()
+        .filter(|r| args.fallback_only || r.mcp_config_path.is_none())
+    {
+        push_unique_runtime(&mut agent_targets, rt);
     }
 
     // Phase 2: Agent fallback files
@@ -118,11 +145,12 @@ pub fn run(args: SetupArgs) -> Result<i32> {
         Some(root_display.as_str())
     };
 
-    for rt in &runtimes {
+    for rt in &agent_targets {
         let content = agent_surface::render_prompt_fragment(rt.agent_format, root_str);
         let path = &rt.agent_file_path;
 
         let wrote = write_agent_file(path, &content)?;
+        agent_files_ready = true;
         if wrote {
             println!(
                 "    {} {} → {}",
@@ -135,21 +163,28 @@ pub fn run(args: SetupArgs) -> Result<i32> {
         }
     }
 
-    // Also write a generic agent.md if no specific runtime detected
-    if !any_detected {
-        let generic_path = root.join("agent.md");
-        let content = agent_surface::render_prompt_fragment(
-            agent_surface::AgentPromptFormat::Agents,
-            root_str,
-        );
-        let wrote = write_agent_file(&generic_path, &content)?;
-        if wrote {
-            println!(
-                "    {} {} → {}",
-                "✓".green().bold(),
-                "generic",
-                generic_path.display().to_string().dimmed()
+    // Write a generic fallback only when no runtime-specific target was selected.
+    if agent_targets.is_empty() {
+        if selected_runtimes.is_empty() {
+            let generic_path = root.join("agent.md");
+            let content = agent_surface::render_prompt_fragment(
+                agent_surface::AgentPromptFormat::Agents,
+                root_str,
             );
+            let wrote = write_agent_file(&generic_path, &content)?;
+            agent_files_ready = true;
+            if wrote {
+                println!(
+                    "    {} {} → {}",
+                    "✓".green().bold(),
+                    "generic",
+                    generic_path.display().to_string().dimmed()
+                );
+            } else {
+                println!("    {} {} (already up to date)", "·".dimmed(), "generic");
+            }
+        } else {
+            println!("    {} no runtime instruction files selected", "·".dimmed());
         }
     }
     println!();
@@ -176,12 +211,15 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     println!();
     println!("  {}", "Quick start:".bold());
 
-    if any_detected && !args.fallback_only {
+    if mcp_configured && !args.fallback_only {
         println!("    Your agent runtimes are configured to use Packet28 via MCP.");
         println!("    Start a new session and Packet28 context tools will be available.");
-    } else {
+    } else if agent_files_ready {
         println!("    Agent instruction files have been written.");
         println!("    Include them in your agent's context or system prompt.");
+    } else {
+        println!("    No runtime artifacts were written.");
+        println!("    Re-run setup and select a runtime to configure.");
     }
 
     println!();
@@ -263,7 +301,27 @@ fn find_cursor_mcp_config(root: &Path) -> Option<PathBuf> {
     Some(root.join(".cursor").join("mcp.json"))
 }
 
-fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<bool> {
+fn select_setup_runtimes<'a>(
+    runtimes: &'a [RuntimeInfo],
+    explicit_runtime_selection: bool,
+) -> Vec<&'a RuntimeInfo> {
+    if explicit_runtime_selection {
+        return runtimes.iter().collect();
+    }
+    runtimes.iter().filter(|runtime| runtime.detected).collect()
+}
+
+fn push_unique_runtime<'a>(targets: &mut Vec<&'a RuntimeInfo>, runtime: &'a RuntimeInfo) {
+    if targets
+        .iter()
+        .any(|candidate| candidate.slug == runtime.slug)
+    {
+        return;
+    }
+    targets.push(runtime);
+}
+
+fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<McpConfigStatus> {
     let root_arg = if root == Path::new(".") {
         ".".to_string()
     } else {
@@ -299,7 +357,7 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<bool> {
         std::io::stdin().read_line(&mut input).ok();
         let trimmed = input.trim().to_lowercase();
         if !trimmed.is_empty() && trimmed != "y" && trimmed != "yes" {
-            return Ok(false);
+            return Ok(McpConfigStatus::Declined);
         }
     }
 
@@ -307,7 +365,7 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<bool> {
     if let Some(obj) = servers.as_object_mut() {
         let needs_write = obj.get("packet28") != Some(&packet28_entry);
         if !needs_write {
-            return Ok(false);
+            return Ok(McpConfigStatus::AlreadyConfigured);
         }
         obj.insert("packet28".to_string(), packet28_entry);
     }
@@ -319,7 +377,7 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<bool> {
     let content = serde_json::to_string_pretty(&config)?;
     fs::write(path, format!("{content}\n"))?;
 
-    Ok(true)
+    Ok(McpConfigStatus::Written)
 }
 
 fn resolve_packet28_mcp_command() -> String {
@@ -361,4 +419,49 @@ fn write_agent_file(path: &Path, content: &str) -> Result<bool> {
     }
     fs::write(path, format!("{content}\n"))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime(
+        name: &'static str,
+        slug: &'static str,
+        detected: bool,
+        has_mcp: bool,
+    ) -> RuntimeInfo {
+        RuntimeInfo {
+            name,
+            slug,
+            mcp_config_path: has_mcp.then(|| PathBuf::from(format!("{slug}.json"))),
+            agent_file_path: PathBuf::from(format!("{slug}.md")),
+            agent_format: agent_surface::AgentPromptFormat::Agents,
+            detected,
+        }
+    }
+
+    #[test]
+    fn select_setup_runtimes_prefers_detected_runtimes_for_all() {
+        let runtimes = vec![
+            runtime("Claude Code", "claude", false, true),
+            runtime("Cursor", "cursor", false, true),
+            runtime("Codex", "codex", true, false),
+        ];
+
+        let selected = select_setup_runtimes(&runtimes, false);
+        let slugs: Vec<&str> = selected.iter().map(|runtime| runtime.slug).collect();
+
+        assert_eq!(slugs, vec!["codex"]);
+    }
+
+    #[test]
+    fn select_setup_runtimes_keeps_explicit_runtime_requests() {
+        let runtimes = vec![runtime("Claude Code", "claude", false, true)];
+
+        let selected = select_setup_runtimes(&runtimes, true);
+        let slugs: Vec<&str> = selected.iter().map(|runtime| runtime.slug).collect();
+
+        assert_eq!(slugs, vec!["claude"]);
+    }
 }
