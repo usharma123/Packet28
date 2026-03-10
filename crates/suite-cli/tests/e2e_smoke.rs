@@ -2814,8 +2814,14 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         .iter()
         .find(|section| section["id"] == "repo_map")
         .unwrap();
-    assert_eq!(repo_map_section["title"].as_str().unwrap(), "Relevant Files");
-    assert!(repo_map_section["body"].as_str().unwrap().contains("[score="));
+    assert_eq!(
+        repo_map_section["title"].as_str().unwrap(),
+        "Relevant Files"
+    );
+    assert!(repo_map_section["body"]
+        .as_str()
+        .unwrap()
+        .contains("[score="));
     assert!(repo_map_section["body"]
         .as_str()
         .unwrap()
@@ -2939,10 +2945,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         }),
     );
     let tool_result = read_mcp_message_for_id(&mut stdout, 6);
-    assert_eq!(
-        tool_result["result"]["structuredContent"]["accepted"],
-        true
-    );
+    assert_eq!(tool_result["result"]["structuredContent"]["accepted"], true);
 
     write_mcp_message(
         &mut stdin,

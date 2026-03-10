@@ -970,9 +970,60 @@ fn tokenize_task_text(task_text: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|token| token.len() >= 3)
         .map(|token| token.to_ascii_lowercase())
+        .filter(|token| !is_low_signal_query_token(token))
         .collect::<HashSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn is_low_signal_query_token(token: &str) -> bool {
+    matches!(
+        token,
+        "about"
+            | "across"
+            | "all"
+            | "and"
+            | "are"
+            | "code"
+            | "codebase"
+            | "defined"
+            | "do"
+            | "does"
+            | "file"
+            | "files"
+            | "find"
+            | "for"
+            | "from"
+            | "function"
+            | "functions"
+            | "how"
+            | "into"
+            | "is"
+            | "line"
+            | "lines"
+            | "me"
+            | "method"
+            | "methods"
+            | "not"
+            | "show"
+            | "symbol"
+            | "symbols"
+            | "task"
+            | "test"
+            | "tests"
+            | "the"
+            | "this"
+            | "those"
+            | "usage"
+            | "usages"
+            | "used"
+            | "uses"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "with"
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -982,6 +1033,60 @@ struct QueryFocus {
     full_symbol_terms: Vec<String>,
     symbol_terms: Vec<String>,
     path_terms: Vec<String>,
+}
+
+fn add_focus_symbol_terms(
+    full_symbol_terms: &mut Vec<String>,
+    symbol_terms: &mut Vec<String>,
+    seen_full: &mut HashSet<String>,
+    seen_symbols: &mut HashSet<String>,
+    raw_symbol: &str,
+) {
+    let cleaned = trim_query_fragment(raw_symbol);
+    if cleaned.is_empty() {
+        return;
+    }
+    let normalized = cleaned.to_ascii_lowercase();
+    if !is_low_signal_query_token(&normalized) && seen_full.insert(normalized) {
+        full_symbol_terms.push(cleaned.clone());
+    }
+    for piece in cleaned
+        .replace("::", ".")
+        .replace(['/', '\\', '.', '_', '-'], " ")
+        .split_whitespace()
+    {
+        let lowered = piece.to_ascii_lowercase();
+        if piece.len() >= 3 && !is_low_signal_query_token(&lowered) && seen_symbols.insert(lowered)
+        {
+            symbol_terms.push(piece.to_string());
+        }
+    }
+}
+
+fn merge_query_focus_with_symbols(
+    mut query_focus: QueryFocus,
+    focus_symbols: &[String],
+) -> QueryFocus {
+    let mut seen_full = query_focus
+        .full_symbol_terms
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut seen_symbols = query_focus
+        .symbol_terms
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for focus_symbol in focus_symbols {
+        add_focus_symbol_terms(
+            &mut query_focus.full_symbol_terms,
+            &mut query_focus.symbol_terms,
+            &mut seen_full,
+            &mut seen_symbols,
+            focus_symbol,
+        );
+    }
+    query_focus
 }
 
 fn derive_query_focus(query: Option<&str>) -> QueryFocus {
@@ -1010,15 +1115,13 @@ fn derive_query_focus(query: Option<&str>) -> QueryFocus {
             path_terms.push(cleaned.clone());
         }
         if looks_like_symbol_term(&cleaned) {
-            if seen_full.insert(cleaned.to_ascii_lowercase()) {
-                full_symbol_terms.push(cleaned.clone());
-            }
-            for piece in expand_identifier_pieces(&cleaned) {
-                let lowered = piece.to_ascii_lowercase();
-                if piece.len() >= 3 && seen_symbols.insert(lowered) {
-                    symbol_terms.push(piece);
-                }
-            }
+            add_focus_symbol_terms(
+                &mut full_symbol_terms,
+                &mut symbol_terms,
+                &mut seen_full,
+                &mut seen_symbols,
+                &cleaned,
+            );
         }
     }
 
@@ -1040,8 +1143,7 @@ fn derive_query_focus(query: Option<&str>) -> QueryFocus {
 fn trim_query_fragment(fragment: &str) -> String {
     fragment
         .trim_matches(|ch: char| {
-            !ch.is_ascii_alphanumeric()
-                && !matches!(ch, '_' | '-' | '.' | '/' | '\\' | ':' )
+            !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '-' | '.' | '/' | '\\' | ':')
         })
         .trim_end_matches("()")
         .to_string()
@@ -1062,63 +1164,8 @@ fn looks_like_symbol_term(value: &str) -> bool {
     value.contains('.')
         || value.contains("::")
         || value.contains('_')
-        || value
-            .chars()
-            .any(|ch| ch.is_ascii_uppercase())
-        || value
-            .chars()
-            .any(|ch| ch.is_ascii_alphabetic())
-}
-
-fn expand_identifier_pieces(value: &str) -> Vec<String> {
-    let mut pieces = Vec::new();
-    for part in value
-        .replace("::", ".")
-        .replace(['/', '\\', '.', '_', '-'], " ")
-        .split_whitespace()
-    {
-        if !part.is_empty() {
-            pieces.push(part.to_string());
-        }
-        pieces.extend(split_camel_identifier(part));
-    }
-    pieces
-        .into_iter()
-        .filter(|piece| !piece.trim().is_empty())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn split_camel_identifier(value: &str) -> Vec<String> {
-    if value.is_empty() {
-        return Vec::new();
-    }
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let chars = value.chars().collect::<Vec<_>>();
-    for (idx, ch) in chars.iter().enumerate() {
-        let prev = idx.checked_sub(1).and_then(|pos| chars.get(pos));
-        let next = chars.get(idx + 1);
-        let boundary = prev.is_some_and(|prev_ch| {
-            (prev_ch.is_ascii_lowercase() && ch.is_ascii_uppercase())
-                || (prev_ch.is_ascii_alphabetic()
-                    && ch.is_ascii_digit())
-                || (prev_ch.is_ascii_digit()
-                    && ch.is_ascii_alphabetic())
-                || (prev_ch.is_ascii_uppercase()
-                    && ch.is_ascii_uppercase()
-                    && next.is_some_and(|next_ch| next_ch.is_ascii_lowercase()))
-        });
-        if boundary && !current.is_empty() {
-            parts.push(std::mem::take(&mut current));
-        }
-        current.push(*ch);
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
+        || value.chars().any(|ch| ch.is_ascii_uppercase())
+        || value.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
 fn scope_group(path: &str) -> String {
@@ -1375,6 +1422,7 @@ fn truncate_evidence_line(line: &str, max_len: usize) -> String {
 #[derive(Debug, Clone, Default)]
 struct CodeEvidenceMatch {
     line_no: usize,
+    priority: u8,
     reason: &'static str,
     matched_symbol: Option<String>,
 }
@@ -1409,15 +1457,29 @@ fn looks_like_signature(line: &str) -> bool {
         "export class ",
         "def ",
     ];
+    let looks_like_java_method = trimmed.contains('(')
+        && trimmed.contains(')')
+        && trimmed.ends_with('{')
+        && !trimmed.ends_with(");")
+        && !trimmed.starts_with('@')
+        && ![
+            "if ", "for ", "while ", "switch ", "catch ", "return ", "new ",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix));
     prefixes.iter().any(|prefix| trimmed.starts_with(prefix))
         || (trimmed.contains(" fn ")
             || trimmed.contains(" class ")
             || trimmed.contains(" interface "))
+        || looks_like_java_method
 }
 
 fn looks_like_low_signal_line(line: &str) -> bool {
     let trimmed = line.trim();
     trimmed.is_empty()
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with('*')
         || trimmed.starts_with("//")
         || trimmed.starts_with('#')
         || trimmed.starts_with("use ")
@@ -1425,15 +1487,37 @@ fn looks_like_low_signal_line(line: &str) -> bool {
         || trimmed.starts_with("package ")
 }
 
+fn contains_identifier_term(line: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+    let line_lower = line.to_ascii_lowercase();
+    let term_lower = term.to_ascii_lowercase();
+    let mut start_at = 0;
+    while let Some(found) = line_lower[start_at..].find(&term_lower) {
+        let start = start_at + found;
+        let end = start + term_lower.len();
+        let prev = line_lower[..start].chars().next_back();
+        let next = line_lower[end..].chars().next();
+        let prev_is_ident = prev.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        let next_is_ident = next.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if !prev_is_ident && !next_is_ident {
+            return true;
+        }
+        start_at = start + 1;
+    }
+    false
+}
+
 fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEvidenceMatch> {
-    let lower = line.to_ascii_lowercase();
     if let Some(symbol) = query_focus
         .symbol_terms
         .iter()
-        .find(|symbol| lower.contains(&symbol.to_ascii_lowercase()))
+        .find(|symbol| contains_identifier_term(line, symbol))
     {
         return Some(CodeEvidenceMatch {
             line_no: 0,
+            priority: if looks_like_signature(line) { 4 } else { 3 },
             reason: "exact_symbol_match",
             matched_symbol: Some(symbol.clone()),
         });
@@ -1441,17 +1525,22 @@ fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEv
     if let Some(symbol) = query_focus
         .full_symbol_terms
         .iter()
-        .find(|symbol| lower.contains(&symbol.to_ascii_lowercase()))
+        .find(|symbol| contains_identifier_term(line, symbol))
     {
         return Some(CodeEvidenceMatch {
             line_no: 0,
+            priority: if looks_like_signature(line) { 4 } else { 3 },
             reason: "full_symbol_match",
             matched_symbol: Some(symbol.clone()),
         });
     }
-    if looks_like_signature(line) {
+    if looks_like_signature(line)
+        && query_focus.symbol_terms.is_empty()
+        && query_focus.full_symbol_terms.is_empty()
+    {
         return Some(CodeEvidenceMatch {
             line_no: 0,
+            priority: 2,
             reason: "signature_match",
             matched_symbol: None,
         });
@@ -1459,16 +1548,22 @@ fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEv
     None
 }
 
-fn collapse_evidence_windows(matches: &[CodeEvidenceMatch], total_lines: usize) -> Vec<(usize, usize)> {
-    let mut windows = matches
+fn collapse_evidence_windows(
+    matches: &[CodeEvidenceMatch],
+    total_lines: usize,
+) -> Vec<(usize, usize)> {
+    let windows = matches
         .iter()
         .map(|matched| {
-            let start = matched.line_no.saturating_sub(1).max(1);
+            let start = if matched.priority >= 4 {
+                matched.line_no.max(1)
+            } else {
+                matched.line_no.saturating_sub(1).max(1)
+            };
             let end = (matched.line_no + 1).min(total_lines.max(1));
             (start, end)
         })
         .collect::<Vec<_>>();
-    windows.sort_unstable();
     let mut collapsed: Vec<(usize, usize)> = Vec::new();
     for (start, end) in windows {
         if let Some((_, current_end)) = collapsed.last_mut() {
@@ -1498,13 +1593,14 @@ fn extract_code_evidence(
         let mut matched = match_query_focus_line(line, query_focus);
         if let Some(current) = matched.as_mut() {
             current.line_no = idx + 1;
-        } else if !query_focus.symbol_terms.is_empty() || !query_focus.full_symbol_terms.is_empty() {
+        } else if !query_focus.symbol_terms.is_empty() || !query_focus.full_symbol_terms.is_empty()
+        {
             continue;
         }
         if looks_like_low_signal_line(line)
-            && matched
-                .as_ref()
-                .is_none_or(|current| !matches!(current.reason, "exact_symbol_match" | "full_symbol_match"))
+            && matched.as_ref().is_none_or(|current| {
+                !matches!(current.reason, "exact_symbol_match" | "full_symbol_match")
+            })
         {
             continue;
         }
@@ -1513,13 +1609,16 @@ fn extract_code_evidence(
         }
     }
 
-    if matches.is_empty() {
+    if matches.is_empty()
+        && (query_focus.symbol_terms.is_empty() && query_focus.full_symbol_terms.is_empty())
+    {
         for (idx, line) in lines.iter().enumerate() {
             if looks_like_low_signal_line(line) {
                 continue;
             }
             matches.push(CodeEvidenceMatch {
                 line_no: idx + 1,
+                priority: 1,
                 reason: "fallback",
                 matched_symbol: None,
             });
@@ -1527,9 +1626,18 @@ fn extract_code_evidence(
         }
     }
 
+    if matches.is_empty() {
+        return CodeEvidenceSummary::default();
+    }
+
     let primary_match_symbol = matches
         .iter()
         .find_map(|matched| matched.matched_symbol.clone());
+    matches.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.line_no.cmp(&b.line_no))
+    });
     let windows = collapse_evidence_windows(&matches, lines.len())
         .into_iter()
         .take(max_windows)
@@ -1541,9 +1649,7 @@ fn extract_code_evidence(
                 continue;
             };
             if looks_like_low_signal_line(line)
-                && !matches
-                    .iter()
-                    .any(|matched| matched.line_no == line_no)
+                && !matches.iter().any(|matched| matched.line_no == line_no)
             {
                 continue;
             }
@@ -2112,9 +2218,18 @@ fn action_critical_section_ids(action: BrokerAction) -> &'static [&'static str] 
     match action {
         BrokerAction::Plan => &["repo_map", "relevant_context", "recommended_actions"],
         BrokerAction::Inspect => &["code_evidence", "repo_map", "relevant_context"],
-        BrokerAction::ChooseTool => &["recent_tool_activity", "tool_failures", "recommended_actions"],
+        BrokerAction::ChooseTool => &[
+            "recent_tool_activity",
+            "tool_failures",
+            "recommended_actions",
+        ],
         BrokerAction::Interpret => &["recent_tool_activity", "tool_failures", "code_evidence"],
-        BrokerAction::Edit => &["code_evidence", "current_focus", "checkpoint_deltas", "evidence_cache"],
+        BrokerAction::Edit => &[
+            "code_evidence",
+            "current_focus",
+            "checkpoint_deltas",
+            "evidence_cache",
+        ],
         BrokerAction::Summarize => &["progress", "recent_tool_activity", "tool_failures"],
     }
 }
@@ -2179,12 +2294,30 @@ fn prune_sections_for_budget(
         .find(|section| section.id == "task_objective")
         .cloned();
     if let Some(objective) = objective.take() {
-        consider(objective, true, &mut selected, &mut pruned, &mut used_tokens, &mut used_bytes);
+        consider(
+            objective,
+            true,
+            &mut selected,
+            &mut pruned,
+            &mut used_tokens,
+            &mut used_bytes,
+        );
     }
 
     for section_id in action_critical_section_ids(action) {
-        if let Some(section) = sections.iter().find(|section| section.id == *section_id).cloned() {
-            consider(section, true, &mut selected, &mut pruned, &mut used_tokens, &mut used_bytes);
+        if let Some(section) = sections
+            .iter()
+            .find(|section| section.id == *section_id)
+            .cloned()
+        {
+            consider(
+                section,
+                true,
+                &mut selected,
+                &mut pruned,
+                &mut used_tokens,
+                &mut used_bytes,
+            );
         }
     }
 
@@ -2205,7 +2338,14 @@ fn prune_sections_for_budget(
             });
             continue;
         }
-        consider(section, false, &mut selected, &mut pruned, &mut used_tokens, &mut used_bytes);
+        consider(
+            section,
+            false,
+            &mut selected,
+            &mut pruned,
+            &mut used_tokens,
+            &mut used_bytes,
+        );
     }
 
     if selected.len() > max_sections {
@@ -2242,7 +2382,17 @@ fn build_broker_sections(
         filter_requested_section_ids(action, &request.include_sections, &request.exclude_sections);
     let task = load_task_record(state, &request.task_id);
     let resolved_questions = build_resolved_questions(task.as_ref(), snapshot);
-    let query_focus = derive_query_focus(broker_objective(state, request).as_deref());
+    let focus_symbols = if request.focus_symbols.is_empty() {
+        snapshot.focus_symbols.clone()
+    } else {
+        request.focus_symbols.clone()
+    };
+    let mut query_focus = derive_query_focus(broker_objective(state, request).as_deref());
+    if !focus_symbols.is_empty() {
+        query_focus.full_symbol_terms.clear();
+        query_focus.symbol_terms.clear();
+    }
+    let query_focus = merge_query_focus_with_symbols(query_focus, &focus_symbols);
     let mut sections = Vec::new();
 
     if let Some(objective) = query_focus.raw_query.clone() {
@@ -5441,6 +5591,23 @@ mod tests {
     }
 
     #[test]
+    fn derive_query_focus_filters_stopwords_but_keeps_symbols() {
+        let focus = derive_query_focus(Some(
+            "Where is StringUtils.isBlank defined and used across the codebase?",
+        ));
+        assert!(!focus.text_tokens.iter().any(|item| item == "where"));
+        assert!(!focus.text_tokens.iter().any(|item| item == "defined"));
+        assert!(!focus.text_tokens.iter().any(|item| item == "used"));
+        assert!(focus
+            .full_symbol_terms
+            .contains(&"StringUtils.isBlank".to_string()));
+        assert!(focus
+            .symbol_terms
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case("isBlank")));
+    }
+
+    #[test]
     fn expand_scope_paths_pulls_adjacent_role_files() {
         let expanded = expand_scope_paths(
             "explain what diffy does",
@@ -5547,6 +5714,95 @@ mod tests {
     }
 
     #[test]
+    fn extract_code_evidence_ignores_license_headers_and_prefers_focus_symbols() {
+        let root = std::env::temp_dir().join(format!(
+            "packet28d-code-evidence-java-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("src/StringUtils.java");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "/*\n * Licensed to the Apache Software Foundation (ASF)\n */\npackage org.example;\n\npublic class StringUtils {\n    public static boolean isBlank(final CharSequence cs) {\n        return cs == null || cs.length() == 0;\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut focus = derive_query_focus(Some(
+            "Where is StringUtils.isBlank defined and used across the codebase?",
+        ));
+        focus.full_symbol_terms.clear();
+        focus.symbol_terms.clear();
+        let focus = merge_query_focus_with_symbols(focus, &["isBlank".to_string()]);
+        let evidence = extract_code_evidence(&root, "src/StringUtils.java", &focus, 3, 6);
+        assert!(evidence
+            .rendered_lines
+            .iter()
+            .any(|line| line.contains("isBlank(final CharSequence cs)")));
+        assert!(evidence
+            .rendered_lines
+            .iter()
+            .all(|line| !line.contains("Licensed to the Apache")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_code_evidence_prefers_symbol_definitions_over_comment_mentions() {
+        let root = std::env::temp_dir().join(format!(
+            "packet28d-code-evidence-priority-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("src/StringUtils.java");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "package org.example;\n\npublic final class StringUtils {\n    /** Mention isBlank in docs before the definition. */\n    public static boolean isBlank(final CharSequence cs) {\n        return cs == null || cs.length() == 0;\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut focus = derive_query_focus(Some(
+            "Where is StringUtils.isBlank defined and used across the codebase?",
+        ));
+        focus.full_symbol_terms.clear();
+        focus.symbol_terms.clear();
+        let focus = merge_query_focus_with_symbols(focus, &["isBlank".to_string()]);
+        let evidence = extract_code_evidence(&root, "src/StringUtils.java", &focus, 1, 3);
+        assert!(evidence
+            .rendered_lines
+            .iter()
+            .any(|line| line.contains("isBlank(final CharSequence cs)")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_code_evidence_skips_unrelated_signatures_when_symbol_focus_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "packet28d-code-evidence-unrelated-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("src/ArrayUtils.java");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "package org.example;\n\npublic class ArrayUtils {\n    public static void shuffle() {}\n}\n",
+        )
+        .unwrap();
+
+        let mut focus = derive_query_focus(Some(
+            "Where is StringUtils.isBlank defined and used across the codebase?",
+        ));
+        focus.full_symbol_terms.clear();
+        focus.symbol_terms.clear();
+        let focus = merge_query_focus_with_symbols(focus, &["isBlank".to_string()]);
+        let evidence = extract_code_evidence(&root, "src/ArrayUtils.java", &focus, 3, 6);
+        assert!(evidence.rendered_lines.is_empty());
+        assert!(evidence.primary_match_symbol.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn budget_pruning_drops_optional_sections_before_critical_ones() {
         let sections = vec![
             BrokerSection {
@@ -5559,8 +5815,11 @@ mod tests {
             BrokerSection {
                 id: "code_evidence".to_string(),
                 title: "Code Evidence".to_string(),
-                body: ["- src/alpha.rs:1 fn alpha() {}", "- src/alpha.rs:2 struct Alpha;"]
-                    .join("\n"),
+                body: [
+                    "- src/alpha.rs:1 fn alpha() {}",
+                    "- src/alpha.rs:2 struct Alpha;",
+                ]
+                .join("\n"),
                 priority: 1,
                 source_kind: BrokerSourceKind::Derived,
             },
