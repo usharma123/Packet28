@@ -8,8 +8,9 @@ use packet28_daemon_core::{
     ContextStoreGetRequest, ContextStoreGetResponse, ContextStoreListRequest,
     ContextStoreListResponse, ContextStorePruneDaemonRequest, ContextStorePruneResponse,
     ContextStoreStatsRequest, ContextStoreStatsResponse, CoverCheckRequest, CoverCheckResponse,
-    DaemonEventFrame, DaemonRequest, DaemonResponse, PacketFetchRequest, PacketFetchResponse,
-    TaskSubmitSpec, TestMapRequest, TestMapResponse, TestShardRequest, TestShardResponse,
+    DaemonEventFrame, DaemonIndexClearRequest, DaemonIndexRebuildRequest, DaemonIndexStatusRequest,
+    DaemonRequest, DaemonResponse, PacketFetchRequest, PacketFetchResponse, TaskSubmitSpec,
+    TestMapRequest, TestMapResponse, TestShardRequest, TestShardResponse,
 };
 
 #[cfg(unix)]
@@ -28,6 +29,13 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 const DAEMON_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(unix)]
+pub struct PersistentDaemonClient {
+    root: PathBuf,
+    reader: BufReader<UnixStream>,
+    writer: BufWriter<UnixStream>,
+}
+
 #[derive(Args)]
 pub struct DaemonArgs {
     #[command(subcommand)]
@@ -41,6 +49,7 @@ pub enum DaemonCommands {
     Status(JsonRootArgs),
     Task(TaskArgs),
     Watch(WatchArgs),
+    Index(IndexArgs),
 }
 
 #[derive(Args)]
@@ -129,6 +138,33 @@ pub struct WatchArgs {
     pub command: WatchCommands,
 }
 
+#[derive(Args)]
+pub struct IndexArgs {
+    #[command(subcommand)]
+    pub command: IndexCommands,
+}
+
+#[derive(Subcommand)]
+pub enum IndexCommands {
+    Status(JsonRootArgs),
+    Rebuild(IndexRebuildArgs),
+    Clear(JsonRootArgs),
+}
+
+#[derive(Args)]
+pub struct IndexRebuildArgs {
+    #[arg(long, default_value = ".")]
+    pub root: String,
+    #[arg(long)]
+    pub full: bool,
+    #[arg(long = "path")]
+    pub paths: Vec<String>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub pretty: bool,
+}
+
 #[derive(Subcommand)]
 pub enum WatchCommands {
     List(WatchListArgs),
@@ -167,6 +203,7 @@ pub fn run(args: DaemonArgs) -> Result<i32> {
         DaemonCommands::Status(args) => run_status(args),
         DaemonCommands::Task(args) => run_task(args),
         DaemonCommands::Watch(args) => run_watch(args),
+        DaemonCommands::Index(args) => run_index(args),
     }
 }
 
@@ -437,47 +474,8 @@ pub fn execute_context_recall(
 
 #[cfg(unix)]
 pub fn send_request(root: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
-    let root = normalize_daemon_root(root);
-    let socket = socket_path(&root);
-    let stream = UnixStream::connect(&socket)
-        .with_context(|| format!("failed to connect to '{}'", socket.display()))?;
-    stream
-        .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
-        .with_context(|| {
-            format!(
-                "failed to configure read timeout for '{}'",
-                socket.display()
-            )
-        })?;
-    stream
-        .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
-        .with_context(|| {
-            format!(
-                "failed to configure write timeout for '{}'",
-                socket.display()
-            )
-        })?;
-    let reader_stream = stream.try_clone()?;
-    reader_stream
-        .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
-        .with_context(|| {
-            format!(
-                "failed to configure cloned read timeout for '{}'",
-                socket.display()
-            )
-        })?;
-    reader_stream
-        .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
-        .with_context(|| {
-            format!(
-                "failed to configure cloned write timeout for '{}'",
-                socket.display()
-            )
-        })?;
-    let mut reader = BufReader::new(reader_stream);
-    let mut writer = BufWriter::new(stream);
-    write_socket_message(&mut writer, request)?;
-    read_socket_message(&mut reader)
+    let mut client = PersistentDaemonClient::connect(root)?;
+    client.send_request(request)
 }
 
 #[cfg(unix)]
@@ -507,6 +505,64 @@ fn subscribe_task(root: &Path, task_id: &str, replay_last: usize) -> Result<(Uni
 #[cfg(not(unix))]
 pub fn send_request(_root: &Path, _request: &DaemonRequest) -> Result<DaemonResponse> {
     daemon_not_supported()
+}
+
+#[cfg(unix)]
+impl PersistentDaemonClient {
+    pub fn connect(root: &Path) -> Result<Self> {
+        let root = normalize_daemon_root(root);
+        ensure_daemon(&root)?;
+        let socket = socket_path(&root);
+        let stream = UnixStream::connect(&socket)
+            .with_context(|| format!("failed to connect to '{}'", socket.display()))?;
+        stream
+            .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+            .with_context(|| {
+                format!(
+                    "failed to configure read timeout for '{}'",
+                    socket.display()
+                )
+            })?;
+        stream
+            .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+            .with_context(|| {
+                format!(
+                    "failed to configure write timeout for '{}'",
+                    socket.display()
+                )
+            })?;
+        let reader_stream = stream.try_clone()?;
+        reader_stream
+            .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+            .with_context(|| {
+                format!(
+                    "failed to configure cloned read timeout for '{}'",
+                    socket.display()
+                )
+            })?;
+        reader_stream
+            .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+            .with_context(|| {
+                format!(
+                    "failed to configure cloned write timeout for '{}'",
+                    socket.display()
+                )
+            })?;
+        Ok(Self {
+            root,
+            reader: BufReader::new(reader_stream),
+            writer: BufWriter::new(stream),
+        })
+    }
+
+    pub fn send_request(&mut self, request: &DaemonRequest) -> Result<DaemonResponse> {
+        write_socket_message(&mut self.writer, request)?;
+        read_socket_message(&mut self.reader)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 #[cfg(unix)]
@@ -566,11 +622,123 @@ fn run_status(args: JsonRootArgs) -> Result<i32> {
                 println!("log={}", status.log_path);
                 println!("tasks={}", status.tasks.len());
                 println!("watches={}", status.watches.len());
+                if let Some(index) = status.index {
+                    println!(
+                        "index={} generation={} ready={} dirty={}",
+                        index.manifest.status,
+                        index.manifest.generation,
+                        index.ready,
+                        index.dirty_file_count
+                    );
+                }
             }
             Ok(0)
         }
         DaemonResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn run_index(args: IndexArgs) -> Result<i32> {
+    match args.command {
+        IndexCommands::Status(args) => {
+            let root = resolve_root_arg(&args.root);
+            ensure_daemon(&root)?;
+            match send_request(
+                &root,
+                &DaemonRequest::DaemonIndexStatus {
+                    request: DaemonIndexStatusRequest {
+                        root: root.to_string_lossy().to_string(),
+                    },
+                },
+            )? {
+                DaemonResponse::DaemonIndexStatus { response } => {
+                    if args.json {
+                        crate::cmd_common::emit_json(
+                            &serde_json::to_value(response)?,
+                            args.pretty,
+                        )?;
+                    } else {
+                        println!("status={}", response.manifest.status);
+                        println!("generation={}", response.manifest.generation);
+                        println!("ready={}", response.ready);
+                        println!("fallback_mode={}", response.fallback_mode);
+                        println!("dirty_files={}", response.dirty_file_count);
+                        println!("queued_files={}", response.queued_file_count);
+                        println!("indexed_files={}", response.manifest.indexed_files);
+                        println!("total_files={}", response.manifest.total_files);
+                        if let Some(err) = response.manifest.last_error {
+                            println!("last_error={err}");
+                        }
+                    }
+                    Ok(0)
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                other => Err(anyhow!("unexpected daemon response: {other:?}")),
+            }
+        }
+        IndexCommands::Rebuild(args) => {
+            let root = resolve_root_arg(&args.root);
+            ensure_daemon(&root)?;
+            let full = args.full || args.paths.is_empty();
+            match send_request(
+                &root,
+                &DaemonRequest::DaemonIndexRebuild {
+                    request: DaemonIndexRebuildRequest {
+                        root: root.to_string_lossy().to_string(),
+                        full,
+                        paths: args.paths,
+                    },
+                },
+            )? {
+                DaemonResponse::DaemonIndexRebuild { response } => {
+                    if args.json {
+                        crate::cmd_common::emit_json(
+                            &serde_json::to_value(response)?,
+                            args.pretty,
+                        )?;
+                    } else {
+                        println!("accepted={}", response.accepted);
+                        println!("full={}", response.full);
+                        if let Some(generation) = response.generation {
+                            println!("generation={generation}");
+                        }
+                        if !response.queued_paths.is_empty() {
+                            println!("queued_paths={}", response.queued_paths.join(","));
+                        }
+                    }
+                    Ok(0)
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                other => Err(anyhow!("unexpected daemon response: {other:?}")),
+            }
+        }
+        IndexCommands::Clear(args) => {
+            let root = resolve_root_arg(&args.root);
+            ensure_daemon(&root)?;
+            match send_request(
+                &root,
+                &DaemonRequest::DaemonIndexClear {
+                    request: DaemonIndexClearRequest {
+                        root: root.to_string_lossy().to_string(),
+                    },
+                },
+            )? {
+                DaemonResponse::DaemonIndexClear { response } => {
+                    if args.json {
+                        crate::cmd_common::emit_json(
+                            &serde_json::to_value(response)?,
+                            args.pretty,
+                        )?;
+                    } else {
+                        println!("cleared={}", response.cleared);
+                    }
+                    Ok(0)
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                other => Err(anyhow!("unexpected daemon response: {other:?}")),
+            }
+        }
     }
 }
 

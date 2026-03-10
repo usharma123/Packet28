@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn suite_cmd() -> Command {
@@ -2646,6 +2647,77 @@ fn test_suite_daemon_start_status_stop_cycle() {
         .is_some_and(|path| Path::new(path).exists()));
     assert!(dir.path().join(".packet28/daemon/ready").exists());
     assert!(dir.path().join(".packet28/daemon/packet28d.log").exists());
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_suite_daemon_index_rebuild_and_status() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+    init_repo(dir.path());
+
+    suite_cmd()
+        .args(["daemon", "start", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let rebuild_output = suite_cmd()
+        .args([
+            "daemon",
+            "index",
+            "rebuild",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rebuild: Value = serde_json::from_slice(&rebuild_output).unwrap();
+    assert_eq!(rebuild.get("accepted").and_then(Value::as_bool), Some(true));
+    assert_eq!(rebuild.get("full").and_then(Value::as_bool), Some(true));
+
+    let start = std::time::Instant::now();
+    let mut ready = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        let status_output = suite_cmd()
+            .args([
+                "daemon",
+                "index",
+                "status",
+                "--root",
+                dir.path().to_str().unwrap(),
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let status: Value = serde_json::from_slice(&status_output).unwrap();
+        if status.get("ready").and_then(Value::as_bool) == Some(true) {
+            ready = true;
+            assert!(
+                status
+                    .get("manifest")
+                    .and_then(|manifest| manifest.get("indexed_files"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready, "expected daemon index to become ready");
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])

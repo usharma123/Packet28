@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Args;
 use colored::Colorize;
+use packet28_daemon_core::{
+    DaemonIndexRebuildRequest, DaemonIndexStatusRequest, DaemonRequest, DaemonResponse,
+};
 use serde_json::{json, Value};
 
 use crate::agent_surface;
@@ -194,6 +197,56 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     match crate::cmd_daemon::ensure_daemon(&root) {
         Ok(_) => {
             println!("    {} daemon running", "✓".green().bold());
+            println!("  {}", "Preparing repo index:".bold());
+            match crate::cmd_daemon::send_request(
+                &root,
+                &DaemonRequest::DaemonIndexRebuild {
+                    request: DaemonIndexRebuildRequest {
+                        root: root.display().to_string(),
+                        full: true,
+                        paths: Vec::new(),
+                    },
+                },
+            ) {
+                Ok(DaemonResponse::DaemonIndexRebuild { .. }) => {
+                    match crate::cmd_daemon::send_request(
+                        &root,
+                        &DaemonRequest::DaemonIndexStatus {
+                            request: DaemonIndexStatusRequest {
+                                root: root.display().to_string(),
+                            },
+                        },
+                    ) {
+                        Ok(DaemonResponse::DaemonIndexStatus { response }) => {
+                            println!(
+                                "    {} index {} (generation={}, ready={})",
+                                "✓".green().bold(),
+                                response.manifest.status,
+                                response.manifest.generation,
+                                response.ready
+                            );
+                        }
+                        Ok(other) => {
+                            println!(
+                                "    {} unexpected index status response: {other:?}",
+                                "·".dimmed()
+                            );
+                        }
+                        Err(err) => {
+                            println!("    {} index status unavailable: {}", "·".dimmed(), err);
+                        }
+                    }
+                }
+                Ok(other) => {
+                    println!(
+                        "    {} unexpected index rebuild response: {other:?}",
+                        "·".dimmed()
+                    );
+                }
+                Err(err) => {
+                    println!("    {} failed to queue index build: {}", "·".dimmed(), err);
+                }
+            }
         }
         Err(e) => {
             println!("    {} daemon failed to start: {}", "✗".red().bold(), e);

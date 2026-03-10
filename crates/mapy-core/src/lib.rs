@@ -114,11 +114,50 @@ pub struct RepoMapPayloadRich {
     pub truncation: TruncationSummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(default)]
+pub struct IndexedSymbolDef {
+    pub kind: String,
+    pub name: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RepoIndexFileEntry {
+    pub path: String,
+    pub size: u64,
+    pub mtime_secs: u64,
+    pub is_test: bool,
+    pub symbols: Vec<IndexedSymbolDef>,
+    pub imports: Vec<String>,
+    pub token_lines: BTreeMap<String, Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RepoIndexSnapshot {
+    pub version: u32,
+    pub include_tests: bool,
+    pub files: BTreeMap<String, RepoIndexFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RepoIndexUpdateSummary {
+    pub indexed_files: usize,
+    pub removed_files: usize,
+    pub changed_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileScan {
     path: String,
+    size: u64,
     symbols: Vec<(String, String)>,
+    symbol_defs: Vec<IndexedSymbolDef>,
     imports: Vec<String>,
+    token_lines: BTreeMap<String, Vec<usize>>,
     mtime_secs: u64,
 }
 
@@ -151,7 +190,9 @@ struct CacheEntry {
     size: u64,
     mtime_secs: u64,
     symbols: Vec<(String, String)>,
+    symbol_defs: Vec<IndexedSymbolDef>,
     imports: Vec<String>,
+    token_lines: BTreeMap<String, Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -161,13 +202,12 @@ struct RepoScanCache {
     files: BTreeMap<String, CacheEntry>,
 }
 
-const MAP_CACHE_VERSION: u32 = 2;
+const MAP_CACHE_VERSION: u32 = 3;
 const MAP_CACHE_DIR: &str = ".packet28";
 const MAP_CACHE_FILE: &str = "mapy-cache-v1.bin";
 const MAP_CACHE_FILE_LEGACY: &str = "mapy-cache-v1.json";
 
 pub fn build_repo_map(req: RepoMapRequest) -> Result<EnvelopeV1<RepoMapPayload>, CovyError> {
-    let started = Instant::now();
     let root = PathBuf::from(&req.repo_root);
     if !root.exists() {
         return Err(CovyError::Other(format!(
@@ -175,7 +215,40 @@ pub fn build_repo_map(req: RepoMapRequest) -> Result<EnvelopeV1<RepoMapPayload>,
             req.repo_root
         )));
     }
+    let scans = scan_repo(&root, req.include_tests)?;
+    build_repo_map_from_scans(req, scans)
+}
 
+pub fn build_repo_map_from_index(
+    req: RepoMapRequest,
+    snapshot: &RepoIndexSnapshot,
+) -> Result<EnvelopeV1<RepoMapPayload>, CovyError> {
+    let scans = snapshot
+        .files
+        .values()
+        .filter(|entry| snapshot.include_tests || !entry.is_test)
+        .map(|entry| FileScan {
+            path: entry.path.clone(),
+            size: entry.size,
+            symbols: entry
+                .symbols
+                .iter()
+                .map(|symbol| (symbol.kind.clone(), symbol.name.clone()))
+                .collect(),
+            symbol_defs: entry.symbols.clone(),
+            imports: entry.imports.clone(),
+            token_lines: entry.token_lines.clone(),
+            mtime_secs: entry.mtime_secs,
+        })
+        .collect::<Vec<_>>();
+    build_repo_map_from_scans(req, scans)
+}
+
+fn build_repo_map_from_scans(
+    req: RepoMapRequest,
+    files: Vec<FileScan>,
+) -> Result<EnvelopeV1<RepoMapPayload>, CovyError> {
+    let started = Instant::now();
     let max_files = if req.max_files == 0 {
         80
     } else {
@@ -186,8 +259,6 @@ pub fn build_repo_map(req: RepoMapRequest) -> Result<EnvelopeV1<RepoMapPayload>,
     } else {
         req.max_symbols
     };
-
-    let files = scan_repo(&root, req.include_tests)?;
     let mut by_file = BTreeMap::<String, FileScan>::new();
     for file in files {
         by_file.insert(file.path.clone(), file);
@@ -507,6 +578,104 @@ pub fn build_repo_map(req: RepoMapRequest) -> Result<EnvelopeV1<RepoMapPayload>,
     Ok(envelope)
 }
 
+pub fn build_repo_index(root: &Path, include_tests: bool) -> Result<RepoIndexSnapshot, CovyError> {
+    if !root.exists() {
+        return Err(CovyError::Other(format!(
+            "repo_root does not exist: {}",
+            root.display()
+        )));
+    }
+    let files = scan_repo(root, include_tests)?;
+    Ok(repo_index_from_scans(files, include_tests))
+}
+
+pub fn update_repo_index(
+    root: &Path,
+    snapshot: &mut RepoIndexSnapshot,
+    changed_paths: &[String],
+    include_tests: bool,
+) -> Result<RepoIndexUpdateSummary, CovyError> {
+    let mut indexed_files = 0usize;
+    let mut removed_files = 0usize;
+    let mut changed = BTreeSet::new();
+    snapshot.include_tests = include_tests;
+    for raw_path in changed_paths {
+        let relative_path = normalize_path(raw_path);
+        if relative_path.is_empty() {
+            continue;
+        }
+        changed.insert(relative_path.clone());
+        let full_path = root.join(&relative_path);
+        let should_remove = !full_path.exists()
+            || !is_source_file(&full_path)
+            || is_generated_or_vendor_path(&relative_path)
+            || (!include_tests && is_test_path(&relative_path));
+        if should_remove {
+            if snapshot.files.remove(&relative_path).is_some() {
+                removed_files += 1;
+            }
+            continue;
+        }
+        let metadata = std::fs::metadata(&full_path).map_err(|source| {
+            CovyError::Other(format!(
+                "failed to read metadata for '{}': {source}",
+                full_path.display()
+            ))
+        })?;
+        let size = metadata.len();
+        let mtime_secs = metadata_mtime_secs(&metadata);
+        let content = std::fs::read_to_string(&full_path).map_err(|source| {
+            CovyError::Other(format!(
+                "failed to read '{}': {source}",
+                full_path.display()
+            ))
+        })?;
+        let (symbols, imports, token_lines) = extract_index_metadata(&relative_path, &content);
+        snapshot.files.insert(
+            relative_path.clone(),
+            RepoIndexFileEntry {
+                path: relative_path,
+                size,
+                mtime_secs,
+                is_test: is_test_path(raw_path),
+                symbols,
+                imports,
+                token_lines,
+            },
+        );
+        indexed_files += 1;
+    }
+    Ok(RepoIndexUpdateSummary {
+        indexed_files,
+        removed_files,
+        changed_paths: changed.into_iter().collect(),
+    })
+}
+
+fn repo_index_from_scans(files: Vec<FileScan>, include_tests: bool) -> RepoIndexSnapshot {
+    let mut entries = BTreeMap::new();
+    for file in files {
+        let path = file.path.clone();
+        entries.insert(
+            path.clone(),
+            RepoIndexFileEntry {
+                path: path.clone(),
+                size: file.size,
+                mtime_secs: file.mtime_secs,
+                is_test: is_test_path(&path),
+                symbols: file.symbol_defs,
+                imports: file.imports,
+                token_lines: file.token_lines,
+            },
+        );
+    }
+    RepoIndexSnapshot {
+        version: MAP_CACHE_VERSION,
+        include_tests,
+        files: entries,
+    }
+}
+
 pub fn expand_repo_map_payload(envelope: &EnvelopeV1<RepoMapPayload>) -> RepoMapPayloadRich {
     let files_ranked = envelope
         .payload
@@ -645,8 +814,11 @@ fn scan_repo(root: &Path, include_tests: bool) -> Result<Vec<FileScan>, CovyErro
             if entry.size == size && entry.mtime_secs == mtime_secs {
                 out.push(FileScan {
                     path: rel,
+                    size,
                     symbols: entry.symbols.clone(),
+                    symbol_defs: entry.symbol_defs.clone(),
                     imports: entry.imports.clone(),
+                    token_lines: entry.token_lines.clone(),
                     mtime_secs,
                 });
                 continue;
@@ -658,22 +830,31 @@ fn scan_repo(root: &Path, include_tests: bool) -> Result<Vec<FileScan>, CovyErro
             Err(_) => continue,
         };
 
-        let (symbols, imports) = extract_metadata(&rel, &content);
+        let (symbol_defs, imports, token_lines) = extract_index_metadata(&rel, &content);
+        let symbols = symbol_defs
+            .iter()
+            .map(|symbol| (symbol.kind.clone(), symbol.name.clone()))
+            .collect::<Vec<_>>();
         cache.files.insert(
             rel.clone(),
             CacheEntry {
                 size,
                 mtime_secs,
                 symbols: symbols.clone(),
+                symbol_defs: symbol_defs.clone(),
                 imports: imports.clone(),
+                token_lines: token_lines.clone(),
             },
         );
         cache_dirty = true;
 
         out.push(FileScan {
             path: rel,
+            size,
             symbols,
+            symbol_defs,
             imports,
+            token_lines,
             mtime_secs,
         });
     }
@@ -799,39 +980,6 @@ fn is_test_path(path: &str) -> bool {
         || lower.ends_with("test.rs")
 }
 
-fn extract_symbols(_path: &str, content: &str) -> Vec<(String, String)> {
-    let mut out = BTreeSet::<(String, String)>::new();
-
-    for cap in symbol_re().captures_iter(content) {
-        let kind = cap.name("kind").map(|m| m.as_str()).unwrap_or("");
-        let name = cap.name("name").map(|m| m.as_str()).unwrap_or("");
-        if !name.is_empty() {
-            out.insert((kind.to_string(), name.to_string()));
-        }
-    }
-
-    for cap in java_type_re().captures_iter(content) {
-        let kind = cap
-            .name("kind")
-            .map(|m| m.as_str())
-            .unwrap_or("class")
-            .to_ascii_lowercase();
-        let name = cap.name("name").map(|m| m.as_str()).unwrap_or("");
-        if !name.is_empty() {
-            out.insert((kind, name.to_string()));
-        }
-    }
-
-    for cap in java_method_re().captures_iter(content) {
-        let name = cap.name("name").map(|m| m.as_str()).unwrap_or("").trim();
-        if !name.is_empty() && !is_reserved_word(name) {
-            out.insert(("method".to_string(), name.to_string()));
-        }
-    }
-
-    out.into_iter().collect()
-}
-
 fn extract_imports(content: &str) -> Vec<String> {
     let mut out = BTreeSet::<String>::new();
 
@@ -854,14 +1002,111 @@ fn extract_imports(content: &str) -> Vec<String> {
     out.into_iter().collect()
 }
 
-fn extract_metadata(path: &str, content: &str) -> (Vec<(String, String)>, Vec<String>) {
-    if let Some(language) = detect_source_language(path) {
-        if let Some((symbols, imports)) = extract_metadata_ast(language, content) {
-            return (symbols, imports);
+fn extract_index_metadata(
+    path: &str,
+    content: &str,
+) -> (
+    Vec<IndexedSymbolDef>,
+    Vec<String>,
+    BTreeMap<String, Vec<usize>>,
+) {
+    let (symbol_defs, imports) = if let Some(language) = detect_source_language(path) {
+        extract_metadata_ast_with_lines(language, content)
+            .unwrap_or_else(|| extract_metadata_regex_with_lines(path, content))
+    } else {
+        extract_metadata_regex_with_lines(path, content)
+    };
+    let token_lines = extract_token_lines(content, &symbol_defs);
+    (symbol_defs, imports, token_lines)
+}
+
+fn extract_metadata_regex_with_lines(
+    _path: &str,
+    content: &str,
+) -> (Vec<IndexedSymbolDef>, Vec<String>) {
+    let mut out = BTreeSet::<IndexedSymbolDef>::new();
+    for (idx, line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        for cap in symbol_re().captures_iter(line) {
+            let kind = cap.name("kind").map(|m| m.as_str()).unwrap_or("");
+            let name = cap.name("name").map(|m| m.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                out.insert(IndexedSymbolDef {
+                    kind: kind.to_string(),
+                    name: name.to_string(),
+                    line: line_no,
+                });
+            }
+        }
+        for cap in java_type_re().captures_iter(line) {
+            let kind = cap
+                .name("kind")
+                .map(|m| m.as_str())
+                .unwrap_or("class")
+                .to_ascii_lowercase();
+            let name = cap.name("name").map(|m| m.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                out.insert(IndexedSymbolDef {
+                    kind,
+                    name: name.to_string(),
+                    line: line_no,
+                });
+            }
+        }
+        for cap in java_method_re().captures_iter(line) {
+            let name = cap.name("name").map(|m| m.as_str()).unwrap_or("").trim();
+            if !name.is_empty() && !is_reserved_word(name) {
+                out.insert(IndexedSymbolDef {
+                    kind: "method".to_string(),
+                    name: name.to_string(),
+                    line: line_no,
+                });
+            }
         }
     }
+    (out.into_iter().collect(), extract_imports(content))
+}
 
-    (extract_symbols(path, content), extract_imports(content))
+fn extract_token_lines(
+    content: &str,
+    symbol_defs: &[IndexedSymbolDef],
+) -> BTreeMap<String, Vec<usize>> {
+    let mut lines_by_token = BTreeMap::<String, Vec<usize>>::new();
+    let symbol_tokens = symbol_defs
+        .iter()
+        .map(|symbol| symbol.name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    for (idx, line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        for cap in identifier_re().captures_iter(line) {
+            let token = cap
+                .name("token")
+                .map(|m| m.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if token.len() < 3 || is_reserved_word(&token) {
+                continue;
+            }
+            if !symbol_tokens.contains(&token) && token.len() < 4 {
+                continue;
+            }
+            let entry = lines_by_token.entry(token).or_default();
+            if entry.last().copied() == Some(line_no) || entry.len() >= 8 {
+                continue;
+            }
+            entry.push(line_no);
+        }
+    }
+    for symbol in symbol_defs {
+        let key = symbol.name.to_ascii_lowercase();
+        let entry = lines_by_token.entry(key).or_default();
+        if !entry.contains(&symbol.line) {
+            entry.insert(0, symbol.line);
+            entry.truncate(8);
+        }
+    }
+    lines_by_token
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1016,6 +1261,13 @@ fn java_method_re() -> &'static Regex {
     })
 }
 
+fn identifier_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?P<token>[A-Za-z_][A-Za-z0-9_]*)").expect("valid identifier regex")
+    })
+}
+
 thread_local! {
     static JAVA_PARSER: RefCell<Option<Parser>> = RefCell::new(init_java_parser());
     static RUST_PARSER: RefCell<Option<Parser>> = RefCell::new(init_rust_parser());
@@ -1075,10 +1327,10 @@ fn init_cpp_parser() -> Option<Parser> {
     Some(parser)
 }
 
-fn extract_metadata_ast(
+fn extract_metadata_ast_with_lines(
     language: SourceLanguage,
     content: &str,
-) -> Option<(Vec<(String, String)>, Vec<String>)> {
+) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     match language {
         SourceLanguage::Java => extract_java_metadata_ast(content),
         SourceLanguage::Rust => extract_rust_metadata_ast(content),
@@ -1090,13 +1342,13 @@ fn extract_metadata_ast(
     }
 }
 
-fn extract_java_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+fn extract_java_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     JAVA_PARSER.with(|cell| {
         let mut parser = cell.borrow_mut();
         let parser = parser.as_mut()?;
         let tree = parser.parse(content, None)?;
 
-        let mut symbols = BTreeSet::<(String, String)>::new();
+        let mut symbols = BTreeSet::<IndexedSymbolDef>::new();
         let mut imports = BTreeSet::<String>::new();
         walk_java_ast(
             tree.root_node(),
@@ -1108,39 +1360,39 @@ fn extract_java_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Ve
     })
 }
 
-fn extract_rust_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+fn extract_rust_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     RUST_PARSER.with(|cell| extract_with_walker(cell, content, walk_rust_ast))
 }
 
-fn extract_python_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+fn extract_python_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     PYTHON_PARSER.with(|cell| extract_with_walker(cell, content, walk_python_ast))
 }
 
-fn extract_typescript_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+fn extract_typescript_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     TYPESCRIPT_PARSER.with(|cell| extract_with_walker(cell, content, walk_typescript_ast))
 }
 
-fn extract_javascript_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+fn extract_javascript_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     JAVASCRIPT_PARSER.with(|cell| extract_with_walker(cell, content, walk_javascript_ast))
 }
 
-fn extract_go_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+fn extract_go_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     GO_PARSER.with(|cell| extract_with_walker(cell, content, walk_go_ast))
 }
 
-fn extract_cpp_metadata_ast(content: &str) -> Option<(Vec<(String, String)>, Vec<String>)> {
+fn extract_cpp_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     CPP_PARSER.with(|cell| extract_with_walker(cell, content, walk_cpp_ast))
 }
 
 fn extract_with_walker(
     cell: &RefCell<Option<Parser>>,
     content: &str,
-    walker: fn(Node<'_>, &[u8], &mut BTreeSet<(String, String)>, &mut BTreeSet<String>),
-) -> Option<(Vec<(String, String)>, Vec<String>)> {
+    walker: fn(Node<'_>, &[u8], &mut BTreeSet<IndexedSymbolDef>, &mut BTreeSet<String>),
+) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     let mut parser = cell.borrow_mut();
     let parser = parser.as_mut()?;
     let tree = parser.parse(content, None)?;
-    let mut symbols = BTreeSet::<(String, String)>::new();
+    let mut symbols = BTreeSet::<IndexedSymbolDef>::new();
     let mut imports = BTreeSet::<String>::new();
     walker(
         tree.root_node(),
@@ -1154,7 +1406,7 @@ fn extract_with_walker(
 fn walk_java_ast(
     node: Node<'_>,
     src: &[u8],
-    symbols: &mut BTreeSet<(String, String)>,
+    symbols: &mut BTreeSet<IndexedSymbolDef>,
     imports: &mut BTreeSet<String>,
 ) {
     match node.kind() {
@@ -1177,7 +1429,7 @@ fn walk_java_ast(
 fn walk_rust_ast(
     node: Node<'_>,
     src: &[u8],
-    symbols: &mut BTreeSet<(String, String)>,
+    symbols: &mut BTreeSet<IndexedSymbolDef>,
     imports: &mut BTreeSet<String>,
 ) {
     match node.kind() {
@@ -1196,7 +1448,7 @@ fn walk_rust_ast(
 fn walk_python_ast(
     node: Node<'_>,
     src: &[u8],
-    symbols: &mut BTreeSet<(String, String)>,
+    symbols: &mut BTreeSet<IndexedSymbolDef>,
     imports: &mut BTreeSet<String>,
 ) {
     match node.kind() {
@@ -1212,7 +1464,7 @@ fn walk_python_ast(
 fn walk_typescript_ast(
     node: Node<'_>,
     src: &[u8],
-    symbols: &mut BTreeSet<(String, String)>,
+    symbols: &mut BTreeSet<IndexedSymbolDef>,
     imports: &mut BTreeSet<String>,
 ) {
     match node.kind() {
@@ -1232,7 +1484,7 @@ fn walk_typescript_ast(
 fn walk_javascript_ast(
     node: Node<'_>,
     src: &[u8],
-    symbols: &mut BTreeSet<(String, String)>,
+    symbols: &mut BTreeSet<IndexedSymbolDef>,
     imports: &mut BTreeSet<String>,
 ) {
     match node.kind() {
@@ -1249,7 +1501,7 @@ fn walk_javascript_ast(
 fn walk_go_ast(
     node: Node<'_>,
     src: &[u8],
-    symbols: &mut BTreeSet<(String, String)>,
+    symbols: &mut BTreeSet<IndexedSymbolDef>,
     imports: &mut BTreeSet<String>,
 ) {
     match node.kind() {
@@ -1266,7 +1518,7 @@ fn walk_go_ast(
 fn walk_cpp_ast(
     node: Node<'_>,
     src: &[u8],
-    symbols: &mut BTreeSet<(String, String)>,
+    symbols: &mut BTreeSet<IndexedSymbolDef>,
     imports: &mut BTreeSet<String>,
 ) {
     match node.kind() {
@@ -1284,9 +1536,9 @@ fn walk_cpp_ast(
 fn walk_children(
     node: Node<'_>,
     src: &[u8],
-    symbols: &mut BTreeSet<(String, String)>,
+    symbols: &mut BTreeSet<IndexedSymbolDef>,
     imports: &mut BTreeSet<String>,
-    walker: fn(Node<'_>, &[u8], &mut BTreeSet<(String, String)>, &mut BTreeSet<String>),
+    walker: fn(Node<'_>, &[u8], &mut BTreeSet<IndexedSymbolDef>, &mut BTreeSet<String>),
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1298,7 +1550,7 @@ fn insert_named_child(
     node: Node<'_>,
     src: &[u8],
     kind: &str,
-    out: &mut BTreeSet<(String, String)>,
+    out: &mut BTreeSet<IndexedSymbolDef>,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -1308,7 +1560,11 @@ fn insert_named_child(
     };
     let name = name.trim();
     if !name.is_empty() && !is_reserved_word(name) {
-        out.insert((kind.to_string(), name.to_string()));
+        out.insert(IndexedSymbolDef {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            line: node.start_position().row + 1,
+        });
     }
 }
 
@@ -1316,13 +1572,17 @@ fn insert_name_or_identifier(
     node: Node<'_>,
     src: &[u8],
     kind: &str,
-    out: &mut BTreeSet<(String, String)>,
+    out: &mut BTreeSet<IndexedSymbolDef>,
 ) {
     if let Some(name_node) = node.child_by_field_name("name") {
         if let Ok(name) = name_node.utf8_text(src) {
             let trimmed = name.trim();
             if !trimmed.is_empty() && !is_reserved_word(trimmed) {
-                out.insert((kind.to_string(), trimmed.to_string()));
+                out.insert(IndexedSymbolDef {
+                    kind: kind.to_string(),
+                    name: trimmed.to_string(),
+                    line: name_node.start_position().row + 1,
+                });
                 return;
             }
         }
@@ -1330,7 +1590,11 @@ fn insert_name_or_identifier(
 
     if let Some(identifier) = find_identifier(node, src, 0) {
         if !identifier.is_empty() && !is_reserved_word(&identifier) {
-            out.insert((kind.to_string(), identifier));
+            out.insert(IndexedSymbolDef {
+                kind: kind.to_string(),
+                name: identifier,
+                line: node.start_position().row + 1,
+            });
         }
     }
 }
@@ -1692,5 +1956,51 @@ public class Calculator {
             .file
             .as_deref()
             .is_some_and(|file| file.contains("diffy-core"))));
+    }
+
+    #[test]
+    fn build_repo_index_captures_symbol_lines_and_token_regions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Sample.java"),
+            "class Sample {\n  void isBlank() {}\n  void demo() { isBlank(); }\n}\n",
+        )
+        .unwrap();
+
+        let snapshot = build_repo_index(root, true).unwrap();
+        let file = snapshot.files.get("src/Sample.java").unwrap();
+        assert!(file.symbols.iter().any(|symbol| {
+            symbol.name == "isBlank" && symbol.kind == "method" && symbol.line == 2
+        }));
+        assert_eq!(file.token_lines.get("isblank").cloned(), Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn update_repo_index_only_touches_changed_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn beta() {}\n").unwrap();
+
+        let mut snapshot = build_repo_index(root, true).unwrap();
+        let original_beta = snapshot.files.get("src/b.rs").cloned().unwrap();
+
+        std::fs::write(root.join("src/a.rs"), "fn alpha() {}\nfn gamma() {}\n").unwrap();
+        let summary =
+            update_repo_index(root, &mut snapshot, &["src/a.rs".to_string()], true).unwrap();
+
+        assert_eq!(summary.changed_paths, vec!["src/a.rs".to_string()]);
+        assert_eq!(summary.indexed_files, 1);
+        assert_eq!(
+            snapshot.files.get("src/b.rs").cloned().unwrap(),
+            original_beta
+        );
+        assert!(snapshot
+            .files
+            .get("src/a.rs")
+            .is_some_and(|file| file.symbols.iter().any(|symbol| symbol.name == "gamma")));
     }
 }
