@@ -1461,6 +1461,7 @@ mod tests {
                     latest_checkpoint_at_unix: None,
                     changed_paths_since_checkpoint: Vec::new(),
                     changed_symbols_since_checkpoint: Vec::new(),
+                    ..suite_packet_core::AgentSnapshotPayload::default()
                 }),
                 ..AssembleOptions::default()
             },
