@@ -441,6 +441,11 @@ pub struct BrokerGetContextResponse {
     pub resolved_questions: Vec<BrokerResolvedQuestion>,
     pub changed_paths_since_checkpoint: Vec<String>,
     pub changed_symbols_since_checkpoint: Vec<String>,
+    pub recent_tool_invocations: Vec<suite_packet_core::ToolInvocationSummary>,
+    pub tool_failures: Vec<suite_packet_core::ToolFailureSummary>,
+    pub discovered_paths: Vec<String>,
+    pub discovered_symbols: Vec<String>,
+    pub evidence_artifact_ids: Vec<String>,
     pub invalidates_since_version: bool,
     pub effective_max_sections: usize,
     pub effective_default_max_items_per_section: usize,
@@ -586,6 +591,12 @@ pub enum BrokerWriteOp {
     StepComplete,
     QuestionOpen,
     QuestionResolve,
+    ToolInvocationStarted,
+    ToolInvocationCompleted,
+    ToolInvocationFailed,
+    ToolResult,
+    FocusInferred,
+    EvidenceCaptured,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -604,6 +615,21 @@ pub struct BrokerWriteStateRequest {
     pub regions: Vec<String>,
     pub resolves_question_id: Option<String>,
     pub resolution_decision_id: Option<String>,
+    pub invocation_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub server_name: Option<String>,
+    pub operation_kind: Option<suite_packet_core::ToolOperationKind>,
+    pub request_summary: Option<String>,
+    pub result_summary: Option<String>,
+    pub request_fingerprint: Option<String>,
+    pub search_query: Option<String>,
+    pub command: Option<String>,
+    pub sequence: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub error_class: Option<String>,
+    pub error_message: Option<String>,
+    pub retryable: Option<bool>,
+    pub artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

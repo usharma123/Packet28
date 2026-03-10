@@ -32,6 +32,13 @@ pub fn mcp_command_example(root: Option<&str>) -> String {
     format!("Packet28 mcp serve{}", command_root_fragment(root),)
 }
 
+pub fn mcp_proxy_command_example(root: Option<&str>) -> String {
+    format!(
+        "Packet28 mcp proxy{} --upstream-config .mcp.proxy.json",
+        command_root_fragment(root),
+    )
+}
+
 pub fn wrapper_command_example() -> &'static str {
     "packet28-agent --task \"<natural-language task>\" -- <agent command...>"
 }
@@ -39,6 +46,7 @@ pub fn wrapper_command_example() -> &'static str {
 pub fn render_prompt_fragment(format: AgentPromptFormat, root: Option<&str>) -> String {
     let preflight = preflight_command_example(root);
     let mcp = mcp_command_example(root);
+    let proxy = mcp_proxy_command_example(root);
     let root_note = if root.is_some() {
         format!(
             "Use `--root {}` only when the agent is operating outside the repository root.",
@@ -55,6 +63,7 @@ pub fn render_prompt_fragment(format: AgentPromptFormat, root: Option<&str>) -> 
 Use Packet28 as a live context broker for non-trivial coding, debugging, test, review, refactor, or design tasks.\n\
 \n\
 - Prefer `{mcp}` and maintain a local `sections_by_id` cache keyed by `task_id` and `context_version`.\n\
+- When you can put Packet28 in front of your MCP tools, prefer `{proxy}` so tool activity is auto-captured.\n\
 - Treat the latest Packet28 brief as the only canonical Packet28 context block; replace older Packet28 blocks instead of appending them.\n\
 - Call `packet28.estimate_context` before cheap or budget-constrained actions to decide whether a full fetch is worth it.\n\
 - For constrained refactors, `packet28.decompose` is available as an experimental helper; refine the returned steps locally, then run `packet28.validate_plan` before execution.\n\
@@ -75,6 +84,7 @@ Use Packet28 as a live context broker for non-trivial coding, debugging, test, r
 When the task is substantial, use Packet28 as a live broker rather than a one-shot preflight only.\n\
 \n\
 - MCP command: `{mcp}`\n\
+- Preferred MCP endpoint when available: `{proxy}`\n\
 - Keep a local `sections_by_id` cache keyed by `task_id` and `context_version`.\n\
 - Replace the prior Packet28 context block each turn instead of appending historical Packet28 briefs.\n\
 - Call `packet28.estimate_context` before cheap actions or when near budget.\n\
@@ -93,6 +103,7 @@ When the task is substantial, use Packet28 as a live broker rather than a one-sh
         AgentPromptFormat::Cursor => format!(
             "Packet28 integration:\n\
 - Start `{mcp}` and keep a local `sections_by_id` cache keyed by `task_id` and `context_version`.\n\
+- Prefer `{proxy}` when you want Packet28 to auto-capture tool activity.\n\
 - Keep one mutable Packet28 context block and replace it whenever a newer brief supersedes the old one.\n\
 - Call `packet28.estimate_context` before cheap actions or when near budget.\n\
 - For constrained refactors, use the experimental `packet28.decompose` helper, refine the returned steps, then call `packet28.validate_plan` before execution.\n\

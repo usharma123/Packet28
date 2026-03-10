@@ -157,6 +157,91 @@ fn start_mcp_server(root: &Path) -> (Child, ChildStdin, BufReader<ChildStdout>) 
     (child, stdin, stdout)
 }
 
+fn write_mock_mcp_script(path: &Path) {
+    fs::write(
+        path,
+        r#"import json, sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("utf-8").split(":", 1)
+        headers[name.lower().strip()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def write_message(value):
+    body = json.dumps(value).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    params = message.get("params", {})
+    msg_id = message.get("id")
+    if msg_id is None:
+        continue
+    if method == "initialize":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "mock-upstream", "version": "1"}}})
+    elif method == "tools/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "mock.read", "description": "Read a path", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "symbol": {"type": "string"}}}}, {"name": "mock.fail", "description": "Fail intentionally", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}]}})
+    elif method == "resources/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resources": [{"uri": "mock://resource/one", "name": "Mock Resource", "mimeType": "text/plain"}]}})
+    elif method == "resources/templates/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": []}})
+    elif method == "resources/read":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"contents": [{"uri": params.get("uri"), "mimeType": "text/plain", "text": "mock resource"}]}})
+    elif method == "tools/call":
+        if params.get("name") == "mock.read":
+            args = params.get("arguments", {})
+            write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": "mock read ok"}], "structuredContent": {"path": args.get("path"), "symbol": args.get("symbol", "ArraySorter.sorted"), "summary": "read captured by proxy"}}})
+        elif params.get("name") == "mock.fail":
+            write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32001, "message": "temporary upstream failure"}})
+        else:
+            write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown tool"}})
+    else:
+        write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown method"}})
+"#,
+    )
+    .unwrap();
+}
+
+fn start_mcp_proxy_server(
+    root: &Path,
+    config_path: &Path,
+    task_id: &str,
+) -> (Child, ChildStdin, BufReader<ChildStdout>) {
+    let mut child = mcp_cmd()
+        .current_dir(root)
+        .args([
+            "mcp",
+            "proxy",
+            "--root",
+            root.to_str().unwrap(),
+            "--upstream-config",
+            config_path.to_str().unwrap(),
+            "--task-id",
+            task_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    (child, stdin, stdout)
+}
+
 fn write_invalid_guard_context(path: &Path) {
     fs::write(
         path,
@@ -2663,7 +2748,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
                 "arguments":{
                     "task_id":"task-mcp",
                     "action":"plan",
-                    "query":"design auth broker",
+                    "query":"What does Alpha do?",
                     "verbosity":"compact",
                     "include_sections":["task_objective","repo_map","relevant_context"],
                     "max_sections":2,
@@ -2723,6 +2808,18 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
                 "task_objective" | "repo_map" | "relevant_context"
             )
         }));
+    let repo_map_section = first_context["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["id"] == "repo_map")
+        .unwrap();
+    assert_eq!(repo_map_section["title"].as_str().unwrap(), "Relevant Files");
+    assert!(repo_map_section["body"].as_str().unwrap().contains("[score="));
+    assert!(repo_map_section["body"]
+        .as_str()
+        .unwrap()
+        .contains("src/alpha.rs"));
 
     write_mcp_message(
         &mut stdin,
@@ -2825,12 +2922,120 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             "id":6,
             "method":"tools/call",
             "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "op":"tool_result",
+                    "tool_name":"manual.read",
+                    "operation_kind":"read",
+                    "request_summary":"Read alpha implementation",
+                    "result_summary":"Found struct Alpha and alpha function",
+                    "paths":["src/alpha.rs"],
+                    "symbols":["Alpha","alpha"],
+                    "artifact_id":"manual-alpha-evidence",
+                    "sequence":42
+                }
+            }
+        }),
+    );
+    let tool_result = read_mcp_message_for_id(&mut stdout, 6);
+    assert_eq!(
+        tool_result["result"]["structuredContent"]["accepted"],
+        true
+    );
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":7,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "action":"inspect",
+                    "response_mode":"full"
+                }
+            }
+        }),
+    );
+    let inspect = read_mcp_message_for_id(&mut stdout, 7);
+    let inspect_context = &inspect["result"]["structuredContent"];
+    assert!(inspect_context["recent_tool_invocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["tool_name"] == "manual.read"));
+    assert!(inspect_context["discovered_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "src/alpha.rs"));
+    assert!(inspect_context["evidence_artifact_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "manual-alpha-evidence"));
+    assert!(inspect_context["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Recent Tool Activity"));
+    assert!(inspect_context["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Discovered Scope"));
+    assert!(inspect_context["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Code Evidence"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":8,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-mcp",
+                    "action":"inspect",
+                    "query":"Alpha",
+                    "budget_tokens":90,
+                    "budget_bytes":360,
+                    "response_mode":"full",
+                    "include_sections":["task_objective","current_focus","discovered_scope","recent_tool_activity","code_evidence","repo_map","relevant_context"]
+                }
+            }
+        }),
+    );
+    let tight = read_mcp_message_for_id(&mut stdout, 8);
+    let tight_context = &tight["result"]["structuredContent"];
+    assert!(tight_context["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|section| section["id"] == "repo_map"));
+    assert!(tight_context["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|section| section["id"] == "code_evidence"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":9,
+            "method":"tools/call",
+            "params":{
                 "name":"packet28.capabilities",
                 "arguments":{}
             }
         }),
     );
-    let capabilities = read_mcp_message_for_id(&mut stdout, 6);
+    let capabilities = read_mcp_message_for_id(&mut stdout, 9);
     assert_eq!(
         capabilities["result"]["structuredContent"]["push_notifications"]["supported"],
         true
@@ -2879,7 +3084,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":7,
+            "id":10,
             "method":"tools/call",
             "params":{
                 "name":"packet28.validate_plan",
@@ -2898,7 +3103,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             }
         }),
     );
-    let validate = read_mcp_message_for_id(&mut stdout, 7);
+    let validate = read_mcp_message_for_id(&mut stdout, 10);
     let validate_payload = &validate["result"]["structuredContent"];
     assert_eq!(validate_payload["valid"], false);
     assert!(validate_payload["violations"]
@@ -2911,7 +3116,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":8,
+            "id":11,
             "method":"tools/call",
             "params":{
                 "name":"packet28.decompose",
@@ -2925,7 +3130,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             }
         }),
     );
-    let decompose = read_mcp_message_for_id(&mut stdout, 8);
+    let decompose = read_mcp_message_for_id(&mut stdout, 11);
     let decompose_payload = &decompose["result"]["structuredContent"];
     assert!(decompose_payload["steps"].as_array().unwrap().len() >= 1);
     assert_eq!(
@@ -2942,27 +3147,27 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":9,
+            "id":12,
             "method":"resources/read",
             "params":{"uri":"packet28://task/task-mcp/brief"}
         }),
     );
-    let brief = read_mcp_message_for_id(&mut stdout, 9);
+    let brief = read_mcp_message_for_id(&mut stdout, 12);
     assert!(brief["result"]["contents"][0]["text"]
         .as_str()
         .unwrap()
-        .contains("Use brokered context"));
+        .contains("Relevant Files"));
 
     write_mcp_message(
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":10,
+            "id":13,
             "method":"resources/read",
             "params":{"uri":"packet28://task/task-mcp/state"}
         }),
     );
-    let state = read_mcp_message_for_id(&mut stdout, 10);
+    let state = read_mcp_message_for_id(&mut stdout, 13);
     assert!(state["result"]["contents"][0]["text"]
         .as_str()
         .unwrap()
@@ -3016,6 +3221,157 @@ fn test_packet28_mcp_accepts_newline_json_stdio() {
         .any(|tool| tool["name"] == "packet28.get_context"));
 
     let _ = child.kill();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_proxy_auto_captures_tool_activity() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    let script_path = dir.path().join("mock_mcp.py");
+    write_mock_mcp_script(&script_path);
+    let config_path = dir.path().join(".mcp.proxy.json");
+    fs::write(
+        &config_path,
+        json!({
+            "mcpServers": {
+                "mock": {
+                    "command": "python3",
+                    "args": ["-u", script_path.to_str().unwrap()]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (mut child, mut stdin, mut stdout) =
+        start_mcp_proxy_server(dir.path(), &config_path, "task-proxy");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let initialize = read_mcp_message_for_id(&mut stdout, 1);
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/list"
+        }),
+    );
+    let tools = read_mcp_message_for_id(&mut stdout, 2);
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.get_context"));
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "mock.read"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"mock.read",
+                "arguments":{
+                    "path":"src/alpha.rs",
+                    "symbol":"ArraySorter.sorted"
+                }
+            }
+        }),
+    );
+    let read = read_mcp_message_for_id(&mut stdout, 3);
+    assert_eq!(
+        read["result"]["structuredContent"]["path"]
+            .as_str()
+            .unwrap(),
+        "src/alpha.rs"
+    );
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"mock.fail",
+                "arguments":{
+                    "path":"src/beta.rs"
+                }
+            }
+        }),
+    );
+    let failed = read_mcp_message_for_id(&mut stdout, 4);
+    assert_eq!(failed["error"]["message"], "temporary upstream failure");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":5,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-proxy",
+                    "action":"inspect"
+                }
+            }
+        }),
+    );
+    let context = read_mcp_message_for_id(&mut stdout, 5);
+    let payload = &context["result"]["structuredContent"];
+    assert!(payload["recent_tool_invocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["tool_name"] == "mock.read"));
+    assert!(payload["tool_failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["tool_name"] == "mock.fail"));
+    assert!(payload["discovered_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "src/alpha.rs"));
+    assert!(payload["evidence_artifact_ids"].as_array().unwrap().len() >= 1);
+    assert!(payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Recent Tool Activity"));
+    assert!(payload["brief"].as_str().unwrap().contains("Tool Failures"));
+    assert!(payload["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Discovered Scope"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
 }
 
 #[test]

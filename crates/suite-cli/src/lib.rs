@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod agent_surface;
 pub mod broker_client;
 pub mod cmd_agent_prompt;

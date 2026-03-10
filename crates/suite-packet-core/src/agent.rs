@@ -1,5 +1,97 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOperationKind {
+    Search,
+    Read,
+    Edit,
+    Build,
+    Test,
+    Diff,
+    Git,
+    Fetch,
+    #[default]
+    Generic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ToolInvocationSummary {
+    pub invocation_id: String,
+    pub sequence: u64,
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    pub operation_kind: ToolOperationKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub occurred_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ToolFailureSummary {
+    pub invocation_id: String,
+    pub sequence: u64,
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    pub operation_kind: ToolOperationKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_fingerprint: Option<String>,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub occurred_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ToolPathSummary {
+    pub tool_name: String,
+    pub operation_kind: ToolOperationKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct SearchQuerySummary {
+    pub tool_name: String,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ToolKindSuccess {
+    pub operation_kind: ToolOperationKind,
+    pub tool_name: String,
+    pub invocation_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStateEventKind {
@@ -13,6 +105,11 @@ pub enum AgentStateEventKind {
     StepCompleted,
     QuestionOpened,
     QuestionResolved,
+    ToolInvocationStarted,
+    ToolInvocationCompleted,
+    ToolInvocationFailed,
+    FocusInferred,
+    EvidenceCaptured,
 }
 
 impl Default for AgentStateEventKind {
@@ -62,6 +159,69 @@ pub enum AgentStateEventData {
     },
     QuestionResolved {
         question_id: String,
+    },
+    ToolInvocationStarted {
+        invocation_id: String,
+        sequence: u64,
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_name: Option<String>,
+        operation_kind: ToolOperationKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_fingerprint: Option<String>,
+    },
+    ToolInvocationCompleted {
+        invocation_id: String,
+        sequence: u64,
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_name: Option<String>,
+        operation_kind: ToolOperationKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_fingerprint: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_query: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifact_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
+    ToolInvocationFailed {
+        invocation_id: String,
+        sequence: u64,
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_name: Option<String>,
+        operation_kind: ToolOperationKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_class: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_fingerprint: Option<String>,
+        #[serde(default)]
+        retryable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
+    FocusInferred {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    EvidenceCaptured {
+        artifact_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
 }
 
@@ -120,4 +280,18 @@ pub struct AgentSnapshotPayload {
     pub changed_paths_since_checkpoint: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_symbols_since_checkpoint: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_tool_invocations: Vec<ToolInvocationSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_failures: Vec<ToolFailureSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_paths_by_tool: Vec<ToolPathSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edited_paths_by_tool: Vec<ToolPathSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search_queries: Vec<SearchQuerySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_successful_tool_by_kind: Vec<ToolKindSuccess>,
 }

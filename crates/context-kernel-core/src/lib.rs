@@ -4356,6 +4356,70 @@ fn validate_agent_state_event(
                 return Err("question_resolved requires a non-empty question_id".to_string());
             }
         }
+        (
+            suite_packet_core::AgentStateEventKind::ToolInvocationStarted,
+            suite_packet_core::AgentStateEventData::ToolInvocationStarted {
+                invocation_id,
+                sequence,
+                tool_name,
+                ..
+            },
+        ) => {
+            if invocation_id.trim().is_empty() || tool_name.trim().is_empty() || *sequence == 0 {
+                return Err(
+                    "tool_invocation_started requires invocation_id, tool_name, and sequence"
+                        .to_string(),
+                );
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::ToolInvocationCompleted,
+            suite_packet_core::AgentStateEventData::ToolInvocationCompleted {
+                invocation_id,
+                sequence,
+                tool_name,
+                ..
+            },
+        ) => {
+            if invocation_id.trim().is_empty() || tool_name.trim().is_empty() || *sequence == 0 {
+                return Err(
+                    "tool_invocation_completed requires invocation_id, tool_name, and sequence"
+                        .to_string(),
+                );
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::ToolInvocationFailed,
+            suite_packet_core::AgentStateEventData::ToolInvocationFailed {
+                invocation_id,
+                sequence,
+                tool_name,
+                ..
+            },
+        ) => {
+            if invocation_id.trim().is_empty() || tool_name.trim().is_empty() || *sequence == 0 {
+                return Err(
+                    "tool_invocation_failed requires invocation_id, tool_name, and sequence"
+                        .to_string(),
+                );
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::FocusInferred,
+            suite_packet_core::AgentStateEventData::FocusInferred { .. },
+        ) => {
+            if event.paths.is_empty() && event.symbols.is_empty() {
+                return Err("focus_inferred requires paths or symbols".to_string());
+            }
+        }
+        (
+            suite_packet_core::AgentStateEventKind::EvidenceCaptured,
+            suite_packet_core::AgentStateEventData::EvidenceCaptured { artifact_id, .. },
+        ) => {
+            if artifact_id.trim().is_empty() {
+                return Err("evidence_captured requires a non-empty artifact_id".to_string());
+            }
+        }
         _ => {
             return Err(format!(
                 "event kind '{:?}' does not match payload variant",
@@ -4419,6 +4483,45 @@ fn summarize_agent_state_event(event: &suite_packet_core::AgentStateEventPayload
             "question resolved task={} id={}",
             event.task_id, question_id
         ),
+        suite_packet_core::AgentStateEventData::ToolInvocationStarted {
+            tool_name,
+            sequence,
+            ..
+        } => format!(
+            "tool invocation started task={} seq={} tool={}",
+            event.task_id, sequence, tool_name
+        ),
+        suite_packet_core::AgentStateEventData::ToolInvocationCompleted {
+            tool_name,
+            sequence,
+            operation_kind,
+            ..
+        } => format!(
+            "tool invocation completed task={} seq={} tool={} kind={:?}",
+            event.task_id, sequence, tool_name, operation_kind
+        ),
+        suite_packet_core::AgentStateEventData::ToolInvocationFailed {
+            tool_name,
+            sequence,
+            error_class,
+            ..
+        } => format!(
+            "tool invocation failed task={} seq={} tool={} error={}",
+            event.task_id,
+            sequence,
+            tool_name,
+            error_class.as_deref().unwrap_or("unknown")
+        ),
+        suite_packet_core::AgentStateEventData::FocusInferred { .. } => format!(
+            "focus inferred task={} paths={} symbols={}",
+            event.task_id,
+            event.paths.len(),
+            event.symbols.len()
+        ),
+        suite_packet_core::AgentStateEventData::EvidenceCaptured { artifact_id, .. } => format!(
+            "evidence captured task={} artifact={}",
+            event.task_id, artifact_id
+        ),
     }
 }
 
@@ -4450,6 +4553,22 @@ fn derive_agent_snapshot(
     let mut latest_checkpoint_at_unix = None;
     let mut changed_paths_since_checkpoint = std::collections::BTreeSet::new();
     let mut changed_symbols_since_checkpoint = std::collections::BTreeSet::new();
+    let mut recent_tool_invocations = Vec::new();
+    let mut tool_failures = Vec::new();
+    let mut read_paths_by_tool = std::collections::BTreeMap::<
+        (String, suite_packet_core::ToolOperationKind),
+        std::collections::BTreeSet<String>,
+    >::new();
+    let mut edited_paths_by_tool = std::collections::BTreeMap::<
+        (String, suite_packet_core::ToolOperationKind),
+        std::collections::BTreeSet<String>,
+    >::new();
+    let mut search_queries = std::collections::BTreeSet::<(String, String)>::new();
+    let mut evidence_artifact_ids = std::collections::BTreeSet::new();
+    let mut last_successful_tool_by_kind = std::collections::BTreeMap::<
+        suite_packet_core::ToolOperationKind,
+        suite_packet_core::ToolKindSuccess,
+    >::new();
 
     for event in &events {
         last_event_at_unix = Some(event.occurred_at_unix);
@@ -4517,7 +4636,157 @@ fn derive_agent_snapshot(
             suite_packet_core::AgentStateEventData::QuestionResolved { question_id } => {
                 open_questions.remove(question_id);
             }
+            suite_packet_core::AgentStateEventData::ToolInvocationStarted { .. } => {}
+            suite_packet_core::AgentStateEventData::ToolInvocationCompleted {
+                invocation_id,
+                sequence,
+                tool_name,
+                server_name,
+                operation_kind,
+                request_summary,
+                result_summary,
+                request_fingerprint,
+                search_query,
+                command,
+                artifact_id,
+                duration_ms,
+            } => {
+                if !event.paths.is_empty() || !event.symbols.is_empty() {
+                    for path in &event.paths {
+                        focus_paths.insert(path.clone());
+                    }
+                    for symbol in &event.symbols {
+                        focus_symbols.insert(symbol.clone());
+                    }
+                }
+                match operation_kind {
+                    suite_packet_core::ToolOperationKind::Read => {
+                        for path in &event.paths {
+                            files_read.insert(path.clone());
+                        }
+                        let entry = read_paths_by_tool
+                            .entry((tool_name.clone(), *operation_kind))
+                            .or_default();
+                        for path in &event.paths {
+                            entry.insert(path.clone());
+                        }
+                    }
+                    suite_packet_core::ToolOperationKind::Edit => {
+                        for path in &event.paths {
+                            files_edited.insert(path.clone());
+                            changed_paths_since_checkpoint.insert(path.clone());
+                        }
+                        for symbol in &event.symbols {
+                            changed_symbols_since_checkpoint.insert(symbol.clone());
+                        }
+                        let entry = edited_paths_by_tool
+                            .entry((tool_name.clone(), *operation_kind))
+                            .or_default();
+                        for path in &event.paths {
+                            entry.insert(path.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(query) = search_query
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    search_queries.insert((tool_name.clone(), query.clone()));
+                }
+                if let Some(artifact_id) = artifact_id
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    evidence_artifact_ids.insert(artifact_id.clone());
+                }
+                recent_tool_invocations.push(suite_packet_core::ToolInvocationSummary {
+                    invocation_id: invocation_id.clone(),
+                    sequence: *sequence,
+                    tool_name: tool_name.clone(),
+                    server_name: server_name.clone(),
+                    operation_kind: *operation_kind,
+                    request_summary: request_summary.clone(),
+                    result_summary: result_summary.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    search_query: search_query.clone(),
+                    command: command.clone(),
+                    artifact_id: artifact_id.clone(),
+                    paths: event.paths.clone(),
+                    symbols: event.symbols.clone(),
+                    duration_ms: *duration_ms,
+                    occurred_at_unix: event.occurred_at_unix,
+                });
+                last_successful_tool_by_kind.insert(
+                    *operation_kind,
+                    suite_packet_core::ToolKindSuccess {
+                        operation_kind: *operation_kind,
+                        tool_name: tool_name.clone(),
+                        invocation_id: invocation_id.clone(),
+                    },
+                );
+            }
+            suite_packet_core::AgentStateEventData::ToolInvocationFailed {
+                invocation_id,
+                sequence,
+                tool_name,
+                server_name,
+                operation_kind,
+                request_summary,
+                error_class,
+                error_message,
+                request_fingerprint,
+                retryable,
+                duration_ms,
+            } => {
+                tool_failures.push(suite_packet_core::ToolFailureSummary {
+                    invocation_id: invocation_id.clone(),
+                    sequence: *sequence,
+                    tool_name: tool_name.clone(),
+                    server_name: server_name.clone(),
+                    operation_kind: *operation_kind,
+                    request_summary: request_summary.clone(),
+                    error_class: error_class.clone(),
+                    error_message: error_message.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    retryable: *retryable,
+                    duration_ms: *duration_ms,
+                    occurred_at_unix: event.occurred_at_unix,
+                });
+            }
+            suite_packet_core::AgentStateEventData::FocusInferred { .. } => {
+                for path in &event.paths {
+                    focus_paths.insert(path.clone());
+                }
+                for symbol in &event.symbols {
+                    focus_symbols.insert(symbol.clone());
+                }
+            }
+            suite_packet_core::AgentStateEventData::EvidenceCaptured { artifact_id, .. } => {
+                evidence_artifact_ids.insert(artifact_id.clone());
+            }
         }
+    }
+
+    recent_tool_invocations.sort_by(|a, b| {
+        a.sequence
+            .cmp(&b.sequence)
+            .then_with(|| a.occurred_at_unix.cmp(&b.occurred_at_unix))
+            .then_with(|| a.invocation_id.cmp(&b.invocation_id))
+    });
+    if recent_tool_invocations.len() > 12 {
+        let keep_from = recent_tool_invocations.len() - 12;
+        recent_tool_invocations = recent_tool_invocations.split_off(keep_from);
+    }
+    tool_failures.sort_by(|a, b| {
+        a.sequence
+            .cmp(&b.sequence)
+            .then_with(|| a.occurred_at_unix.cmp(&b.occurred_at_unix))
+            .then_with(|| a.invocation_id.cmp(&b.invocation_id))
+    });
+    if tool_failures.len() > 8 {
+        let keep_from = tool_failures.len() - 8;
+        tool_failures = tool_failures.split_off(keep_from);
     }
 
     suite_packet_core::AgentSnapshotPayload {
@@ -4541,6 +4810,34 @@ fn derive_agent_snapshot(
         latest_checkpoint_at_unix,
         changed_paths_since_checkpoint: changed_paths_since_checkpoint.into_iter().collect(),
         changed_symbols_since_checkpoint: changed_symbols_since_checkpoint.into_iter().collect(),
+        recent_tool_invocations,
+        tool_failures,
+        read_paths_by_tool: read_paths_by_tool
+            .into_iter()
+            .map(
+                |((tool_name, operation_kind), paths)| suite_packet_core::ToolPathSummary {
+                    tool_name,
+                    operation_kind,
+                    paths: paths.into_iter().collect(),
+                },
+            )
+            .collect(),
+        edited_paths_by_tool: edited_paths_by_tool
+            .into_iter()
+            .map(
+                |((tool_name, operation_kind), paths)| suite_packet_core::ToolPathSummary {
+                    tool_name,
+                    operation_kind,
+                    paths: paths.into_iter().collect(),
+                },
+            )
+            .collect(),
+        search_queries: search_queries
+            .into_iter()
+            .map(|(tool_name, query)| suite_packet_core::SearchQuerySummary { tool_name, query })
+            .collect(),
+        evidence_artifact_ids: evidence_artifact_ids.into_iter().collect(),
+        last_successful_tool_by_kind: last_successful_tool_by_kind.into_values().collect(),
     }
 }
 

@@ -106,6 +106,23 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
     let brief_json_path = task_brief_json_path(&root, &task_id);
     let brief_md_path = task_brief_markdown_path(&root, &task_id);
     let state_json_path = task_state_json_path(&root, &task_id);
+    let proxy_config = std::env::var_os("PACKET28_MCP_UPSTREAM_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let candidate = root.join(".mcp.proxy.json");
+            candidate.exists().then_some(candidate)
+        });
+    let proxy_command = proxy_config.as_ref().map(|config| {
+        format!(
+            "Packet28 mcp proxy --root {} --upstream-config {} --task-id {}",
+            root.display(),
+            config.display(),
+            task_id
+        )
+    });
+    let mcp_command = proxy_command
+        .clone()
+        .unwrap_or_else(|| format!("Packet28 mcp serve --root {}", root.display()));
 
     let mut child = Command::new(&cli.command[0]);
     child
@@ -144,9 +161,11 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
             "PACKET28_MCP_NOTIFICATION_METHOD",
             "notifications/packet28.context_updated",
         )
+        .env("PACKET28_MCP_COMMAND", mcp_command)
+        .env("PACKET28_MCP_PROXY_TASK_ID", &task_id)
         .env(
-            "PACKET28_MCP_COMMAND",
-            format!("Packet28 mcp serve --root {}", root.display()),
+            "PACKET28_MCP_PROXY_COMMAND",
+            proxy_command.unwrap_or_default(),
         )
         .env("PACKET28_ROOT", &root);
     let status = child
