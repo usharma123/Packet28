@@ -3260,6 +3260,10 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
         }),
     );
     let grep = read_mcp_message_for_id(&mut stdout, 3);
+    assert!(
+        grep.get("error").is_none(),
+        "native grep returned MCP error: {grep}"
+    );
     let grep_payload = &grep["result"]["structuredContent"];
     assert_eq!(grep_payload["pattern"].as_str().unwrap(), "Alpha");
     assert_eq!(grep_payload["match_count"].as_u64().unwrap(), 1);
@@ -3414,6 +3418,10 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
         }),
     );
     let read = read_mcp_message_for_id(&mut stdout, 2);
+    assert!(
+        read.get("error").is_none(),
+        "native read returned MCP error: {read}"
+    );
     let read_payload = &read["result"]["structuredContent"];
     assert_eq!(read_payload["path"].as_str().unwrap(), "src/alpha.rs");
     assert!(read_payload["regions"]

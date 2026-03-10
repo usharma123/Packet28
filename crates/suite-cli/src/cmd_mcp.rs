@@ -2021,9 +2021,46 @@ fn handle_packet28_grep(
     for path in &normalized_paths {
         command.arg(path);
     }
-    let command_summary = format!("rg {}", pattern);
+    let mut command_summary = format!("rg {}", pattern);
     let started_at = Instant::now();
-    let output = command.output();
+    let output = match command.output() {
+        Ok(output) => Ok(output),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut fallback = Command::new("grep");
+            fallback
+                .current_dir(root)
+                .arg("-R")
+                .arg("-n")
+                .arg("-H")
+                .arg("--binary-files=without-match");
+            if args.fixed_string {
+                fallback.arg("-F");
+            }
+            if matches!(args.case_sensitive, Some(false)) {
+                fallback.arg("-i");
+            }
+            if args.whole_word {
+                fallback.arg("-w");
+            }
+            if let Some(context_lines) = args.context_lines {
+                fallback.arg("-C").arg(context_lines.to_string());
+            }
+            if let Some(max_matches_per_file) = args.max_matches_per_file {
+                fallback.arg("-m").arg(max_matches_per_file.to_string());
+            }
+            fallback.arg(pattern);
+            if normalized_paths.is_empty() {
+                fallback.arg(".");
+            } else {
+                for path in &normalized_paths {
+                    fallback.arg(path);
+                }
+            }
+            command_summary = format!("grep -R {}", pattern);
+            fallback.output()
+        }
+        Err(error) => Err(error),
+    };
     let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let output = match output {
         Ok(output) => output,
