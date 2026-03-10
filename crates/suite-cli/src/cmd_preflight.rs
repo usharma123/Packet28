@@ -457,6 +457,7 @@ fn execute(
                 max_sections: None,
                 default_max_items_per_section: None,
                 section_item_limits: std::collections::BTreeMap::new(),
+                persist_artifacts: None,
             },
         )
         .ok(),
@@ -482,6 +483,7 @@ fn execute(
                     max_sections: None,
                     default_max_items_per_section: None,
                     section_item_limits: std::collections::BTreeMap::new(),
+                    persist_artifacts: None,
                 },
             },
         ) {

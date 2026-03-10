@@ -22,6 +22,7 @@ suite-foundation-core = { version = "0.2.0", path = "../suite-foundation-core" }
 covy-ingest = { version = "0.2.0", path = "../covy-ingest" }
 mapy-core = { version = "0.2.0", path = "../mapy-core" }
 glob.workspace = true
+ignore.workspace = true
 notify.workspace = true
 packet28-daemon-core = { version = "0.2.0", path = "../packet28-daemon-core" }
 serde.workspace = true
@@ -29,3 +30,4 @@ serde_json.workspace = true
 suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
 testy-core = { version = "0.2.0", path = "../testy-core" }
 blake3.workspace = true
+bincode.workspace = true

@@ -27,6 +27,9 @@ pub const TASK_ARTIFACTS_DIR_NAME: &str = "task";
 pub const TASK_BRIEF_MARKDOWN_FILE_NAME: &str = "brief.md";
 pub const TASK_BRIEF_JSON_FILE_NAME: &str = "brief.json";
 pub const TASK_STATE_JSON_FILE_NAME: &str = "state.json";
+pub const INDEX_DIR_NAME: &str = ".packet28/index";
+pub const INDEX_MANIFEST_FILE_NAME: &str = "manifest.json";
+pub const INDEX_SNAPSHOT_FILE_NAME: &str = "semantic-index-v1.bin";
 pub const MAX_SOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -343,6 +346,7 @@ pub struct BrokerGetContextRequest {
     pub max_sections: Option<usize>,
     pub default_max_items_per_section: Option<usize>,
     pub section_item_limits: BTreeMap<String, usize>,
+    pub persist_artifacts: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -450,6 +454,7 @@ pub struct BrokerGetContextResponse {
     pub effective_max_sections: usize,
     pub effective_default_max_items_per_section: usize,
     pub effective_section_item_limits: BTreeMap<String, usize>,
+    pub diagnostics_ms: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -558,6 +563,7 @@ pub struct BrokerEstimateContextRequest {
     pub max_sections: Option<usize>,
     pub default_max_items_per_section: Option<usize>,
     pub section_item_limits: BTreeMap<String, usize>,
+    pub persist_artifacts: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -576,6 +582,13 @@ pub struct BrokerEstimateContextResponse {
     pub effective_max_sections: usize,
     pub effective_default_max_items_per_section: usize,
     pub effective_section_item_limits: BTreeMap<String, usize>,
+    pub diagnostics_ms: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerWriteStateBatchRequest {
+    pub requests: Vec<BrokerWriteStateRequest>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -630,6 +643,7 @@ pub struct BrokerWriteStateRequest {
     pub error_message: Option<String>,
     pub retryable: Option<bool>,
     pub artifact_id: Option<String>,
+    pub refresh_context: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -637,6 +651,13 @@ pub struct BrokerWriteStateRequest {
 pub struct BrokerWriteStateResponse {
     pub event_id: String,
     pub context_version: String,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerWriteStateBatchResponse {
+    pub responses: Vec<BrokerWriteStateResponse>,
     pub accepted: bool,
 }
 
@@ -657,6 +678,69 @@ pub struct BrokerTaskStatusResponse {
     pub last_refresh_at_unix: Option<u64>,
     pub latest_context_reason: Option<String>,
     pub supports_push: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonIndexManifest {
+    pub schema_version: u32,
+    pub root: String,
+    pub generation: u64,
+    pub include_tests: bool,
+    pub status: String,
+    pub dirty_paths: Vec<String>,
+    pub queued_paths: Vec<String>,
+    pub total_files: usize,
+    pub indexed_files: usize,
+    pub last_build_started_at_unix: Option<u64>,
+    pub last_build_completed_at_unix: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonIndexStatusRequest {
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonIndexStatusResponse {
+    pub manifest: DaemonIndexManifest,
+    pub ready: bool,
+    pub fallback_mode: bool,
+    pub loaded_generation: Option<u64>,
+    pub dirty_file_count: usize,
+    pub queued_file_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonIndexRebuildRequest {
+    pub root: String,
+    pub full: bool,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonIndexRebuildResponse {
+    pub accepted: bool,
+    pub full: bool,
+    pub generation: Option<u64>,
+    pub queued_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonIndexClearRequest {
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DaemonIndexClearResponse {
+    pub cleared: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,8 +812,20 @@ pub enum DaemonRequest {
     BrokerWriteState {
         request: BrokerWriteStateRequest,
     },
+    BrokerWriteStateBatch {
+        request: BrokerWriteStateBatchRequest,
+    },
     BrokerTaskStatus {
         request: BrokerTaskStatusRequest,
+    },
+    DaemonIndexStatus {
+        request: DaemonIndexStatusRequest,
+    },
+    DaemonIndexRebuild {
+        request: DaemonIndexRebuildRequest,
+    },
+    DaemonIndexClear {
+        request: DaemonIndexClearRequest,
     },
 }
 
@@ -809,8 +905,20 @@ pub enum DaemonResponse {
     BrokerWriteState {
         response: BrokerWriteStateResponse,
     },
+    BrokerWriteStateBatch {
+        response: BrokerWriteStateBatchResponse,
+    },
     BrokerTaskStatus {
         response: BrokerTaskStatusResponse,
+    },
+    DaemonIndexStatus {
+        response: DaemonIndexStatusResponse,
+    },
+    DaemonIndexRebuild {
+        response: DaemonIndexRebuildResponse,
+    },
+    DaemonIndexClear {
+        response: DaemonIndexClearResponse,
     },
     Error {
         message: String,
@@ -895,6 +1003,7 @@ pub struct DaemonStatus {
     pub uptime_secs: u64,
     pub tasks: Vec<TaskRecord>,
     pub watches: Vec<WatchRegistration>,
+    pub index: Option<DaemonIndexStatusResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -915,6 +1024,18 @@ pub struct DaemonEventFrame {
 
 pub fn daemon_dir(root: &Path) -> PathBuf {
     root.join(DAEMON_DIR_NAME)
+}
+
+pub fn index_dir(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR_NAME)
+}
+
+pub fn index_manifest_path(root: &Path) -> PathBuf {
+    index_dir(root).join(INDEX_MANIFEST_FILE_NAME)
+}
+
+pub fn index_snapshot_path(root: &Path) -> PathBuf {
+    index_dir(root).join(INDEX_SNAPSHOT_FILE_NAME)
 }
 
 pub fn socket_path(root: &Path) -> PathBuf {

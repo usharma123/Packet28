@@ -13,8 +13,9 @@ use clap::{Args, Subcommand};
 use packet28_daemon_core::{
     load_task_events, task_artifact_dir, task_brief_markdown_path, task_state_json_path,
     BrokerDecomposeRequest, BrokerEstimateContextRequest, BrokerGetContextRequest,
-    BrokerValidatePlanRequest, BrokerWriteOp, BrokerWriteStateRequest, DaemonRequest,
-    DaemonResponse,
+    BrokerTaskStatusRequest, BrokerTaskStatusResponse, BrokerValidatePlanRequest, BrokerWriteOp,
+    BrokerWriteStateBatchRequest, BrokerWriteStateBatchResponse, BrokerWriteStateRequest,
+    BrokerWriteStateResponse, DaemonRequest, DaemonResponse,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -51,7 +52,6 @@ pub struct McpProxyArgs {
     pub task_id: Option<String>,
 }
 
-#[derive(Default)]
 struct McpSessionState {
     initialized: bool,
     shutdown: bool,
@@ -61,6 +61,25 @@ struct McpSessionState {
     resource_owners: BTreeMap<String, String>,
     proxy_task_id: Option<String>,
     next_invocation_seq: u64,
+    #[cfg(unix)]
+    daemon_client: Option<crate::cmd_daemon::PersistentDaemonClient>,
+}
+
+impl Default for McpSessionState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            shutdown: false,
+            tracked_tasks: BTreeMap::new(),
+            framing: None,
+            tool_owners: BTreeMap::new(),
+            resource_owners: BTreeMap::new(),
+            proxy_task_id: None,
+            next_invocation_seq: 0,
+            #[cfg(unix)]
+            daemon_client: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1055,6 +1074,14 @@ fn write_auto_capture_state(root: &Path, request: BrokerWriteStateRequest) -> Re
     crate::broker_client::write_state(root, request).map(|_| ())
 }
 
+fn write_auto_capture_state_batch_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    requests: Vec<BrokerWriteStateRequest>,
+) -> Result<()> {
+    broker_write_state_batch_via_session(root, session, requests).map(|_| ())
+}
+
 fn classify_tool_operation(name: &str, arguments: &Value) -> suite_packet_core::ToolOperationKind {
     let lower_name = name.to_ascii_lowercase();
     let command = extract_named_string(arguments, &["cmd", "command"])
@@ -1344,7 +1371,8 @@ fn handle_method(
                             "include_self_context": {"type":"boolean"},
                             "max_sections": {"type":"number"},
                             "default_max_items_per_section": {"type":"number"},
-                            "section_item_limits": {"type":"object","additionalProperties":{"type":"number"}}
+                            "section_item_limits": {"type":"object","additionalProperties":{"type":"number"}},
+                            "persist_artifacts": {"type":"boolean"}
                         }
                     }
                 },
@@ -1372,7 +1400,8 @@ fn handle_method(
                             "include_self_context": {"type":"boolean"},
                             "max_sections": {"type":"number"},
                             "default_max_items_per_section": {"type":"number"},
-                            "section_item_limits": {"type":"object","additionalProperties":{"type":"number"}}
+                            "section_item_limits": {"type":"object","additionalProperties":{"type":"number"}},
+                            "persist_artifacts": {"type":"boolean"}
                         }
                     }
                 },
@@ -1435,16 +1464,17 @@ fn handle_method(
                             "server_name": {"type":"string"},
                             "operation_kind": {"type":"string","enum":["search","read","edit","build","test","diff","git","fetch","generic"]},
                             "request_summary": {"type":"string"},
-                            "result_summary": {"type":"string"},
-                            "request_fingerprint": {"type":"string"},
-                            "search_query": {"type":"string"},
-                            "command": {"type":"string"},
-                            "sequence": {"type":"number"},
-                            "duration_ms": {"type":"number"},
-                            "error_class": {"type":"string"},
-                            "error_message": {"type":"string"},
-                            "retryable": {"type":"boolean"},
-                            "artifact_id": {"type":"string"}
+            "result_summary": {"type":"string"},
+            "request_fingerprint": {"type":"string"},
+            "search_query": {"type":"string"},
+            "command": {"type":"string"},
+            "sequence": {"type":"number"},
+            "duration_ms": {"type":"number"},
+            "error_class": {"type":"string"},
+            "error_message": {"type":"string"},
+            "retryable": {"type":"boolean"},
+            "artifact_id": {"type":"string"},
+            "refresh_context": {"type":"boolean"}
                         }
                     }
                 },
@@ -1552,14 +1582,17 @@ fn handle_tool_call(
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     let payload = match name {
         "packet28.get_context" => {
-            let request: BrokerGetContextRequest = serde_json::from_value(arguments)?;
+            let mut request: BrokerGetContextRequest = serde_json::from_value(arguments)?;
             track_task(session, root, &request.task_id)?;
-            serde_json::to_value(crate::broker_client::get_context(root, request)?)?
+            if request.persist_artifacts.is_none() {
+                request.persist_artifacts = Some(false);
+            }
+            serde_json::to_value(broker_get_context_via_session(root, session, request)?)?
         }
         "packet28.estimate_context" => {
             let request: BrokerEstimateContextRequest = serde_json::from_value(arguments)?;
             track_task(session, root, &request.task_id)?;
-            serde_json::to_value(crate::broker_client::estimate_context(root, request)?)?
+            serde_json::to_value(broker_estimate_context_via_session(root, session, request)?)?
         }
         "packet28.grep" => {
             let request: Packet28GrepArgs = serde_json::from_value(arguments)?;
@@ -1574,17 +1607,17 @@ fn handle_tool_call(
         "packet28.write_state" => {
             let request: BrokerWriteStateRequest = serde_json::from_value(arguments)?;
             track_task(session, root, &request.task_id)?;
-            serde_json::to_value(crate::broker_client::write_state(root, request)?)?
+            serde_json::to_value(broker_write_state_via_session(root, session, request)?)?
         }
         "packet28.validate_plan" => {
             let request: BrokerValidatePlanRequest = serde_json::from_value(arguments)?;
             track_task(session, root, &request.task_id)?;
-            serde_json::to_value(crate::broker_client::validate_plan(root, request)?)?
+            serde_json::to_value(broker_validate_plan_via_session(root, session, request)?)?
         }
         "packet28.decompose" => {
             let request: BrokerDecomposeRequest = serde_json::from_value(arguments)?;
             track_task(session, root, &request.task_id)?;
-            serde_json::to_value(crate::broker_client::decompose(root, request)?)?
+            serde_json::to_value(broker_decompose_via_session(root, session, request)?)?
         }
         "packet28.task_status" => {
             let task_id = arguments
@@ -1592,7 +1625,7 @@ fn handle_tool_call(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("packet28.task_status requires task_id"))?;
             track_task(session, root, task_id)?;
-            serde_json::to_value(crate::broker_client::task_status(root, task_id)?)?
+            serde_json::to_value(broker_task_status_via_session(root, session, task_id)?)?
         }
         "packet28.capabilities" => capabilities_payload(),
         _ => return Err(anyhow!("unsupported tool '{name}'")),
@@ -1750,6 +1783,188 @@ fn track_task(session: &Arc<Mutex<McpSessionState>>, root: &Path, task_id: &str)
     Ok(())
 }
 
+#[cfg(unix)]
+fn send_daemon_request_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    request: &DaemonRequest,
+) -> Result<DaemonResponse> {
+    crate::cmd_daemon::ensure_daemon(root)?;
+    let mut guard = session
+        .lock()
+        .map_err(|_| anyhow!("failed to lock MCP session"))?;
+    if guard.daemon_client.is_none() {
+        guard.daemon_client = Some(crate::cmd_daemon::PersistentDaemonClient::connect(root)?);
+    }
+    let first_attempt = guard
+        .daemon_client
+        .as_mut()
+        .ok_or_else(|| anyhow!("failed to initialize persistent daemon client"))?
+        .send_request(request);
+    match first_attempt {
+        Ok(response) => Ok(response),
+        Err(_) => {
+            guard.daemon_client = Some(crate::cmd_daemon::PersistentDaemonClient::connect(root)?);
+            guard
+                .daemon_client
+                .as_mut()
+                .ok_or_else(|| anyhow!("failed to reinitialize persistent daemon client"))?
+                .send_request(request)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn send_daemon_request_via_session(
+    root: &Path,
+    _session: &Arc<Mutex<McpSessionState>>,
+    request: &DaemonRequest,
+) -> Result<DaemonResponse> {
+    crate::cmd_daemon::send_request(root, request)
+}
+
+fn broker_get_context_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    mut request: BrokerGetContextRequest,
+) -> Result<packet28_daemon_core::BrokerGetContextResponse> {
+    if request.task_id.trim().is_empty() {
+        return Err(anyhow!("broker get_context requires task_id"));
+    }
+    if request.action.is_none() {
+        request.action = Some(packet28_daemon_core::BrokerAction::Plan);
+    }
+    if request.budget_tokens.is_none() {
+        request.budget_tokens = Some(crate::broker_client::DEFAULT_BROKER_BUDGET_TOKENS);
+    }
+    if request.budget_bytes.is_none() {
+        request.budget_bytes = Some(crate::broker_client::DEFAULT_BROKER_BUDGET_BYTES);
+    }
+    match send_daemon_request_via_session(
+        root,
+        session,
+        &DaemonRequest::BrokerGetContext { request },
+    )? {
+        DaemonResponse::BrokerGetContext { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn broker_estimate_context_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    mut request: BrokerEstimateContextRequest,
+) -> Result<packet28_daemon_core::BrokerEstimateContextResponse> {
+    if request.task_id.trim().is_empty() {
+        return Err(anyhow!("broker estimate_context requires task_id"));
+    }
+    if request.action.is_none() {
+        request.action = Some(packet28_daemon_core::BrokerAction::Plan);
+    }
+    if request.budget_tokens.is_none() {
+        request.budget_tokens = Some(crate::broker_client::DEFAULT_BROKER_BUDGET_TOKENS);
+    }
+    if request.budget_bytes.is_none() {
+        request.budget_bytes = Some(crate::broker_client::DEFAULT_BROKER_BUDGET_BYTES);
+    }
+    match send_daemon_request_via_session(
+        root,
+        session,
+        &DaemonRequest::BrokerEstimateContext { request },
+    )? {
+        DaemonResponse::BrokerEstimateContext { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn broker_write_state_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    request: BrokerWriteStateRequest,
+) -> Result<BrokerWriteStateResponse> {
+    match send_daemon_request_via_session(
+        root,
+        session,
+        &DaemonRequest::BrokerWriteState { request },
+    )? {
+        DaemonResponse::BrokerWriteState { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn broker_write_state_batch_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    requests: Vec<BrokerWriteStateRequest>,
+) -> Result<BrokerWriteStateBatchResponse> {
+    match send_daemon_request_via_session(
+        root,
+        session,
+        &DaemonRequest::BrokerWriteStateBatch {
+            request: BrokerWriteStateBatchRequest { requests },
+        },
+    )? {
+        DaemonResponse::BrokerWriteStateBatch { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn broker_validate_plan_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    request: BrokerValidatePlanRequest,
+) -> Result<packet28_daemon_core::BrokerValidatePlanResponse> {
+    match send_daemon_request_via_session(
+        root,
+        session,
+        &DaemonRequest::BrokerValidatePlan { request },
+    )? {
+        DaemonResponse::BrokerValidatePlan { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn broker_decompose_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    request: BrokerDecomposeRequest,
+) -> Result<packet28_daemon_core::BrokerDecomposeResponse> {
+    match send_daemon_request_via_session(
+        root,
+        session,
+        &DaemonRequest::BrokerDecompose { request },
+    )? {
+        DaemonResponse::BrokerDecompose { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn broker_task_status_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    task_id: &str,
+) -> Result<BrokerTaskStatusResponse> {
+    match send_daemon_request_via_session(
+        root,
+        session,
+        &DaemonRequest::BrokerTaskStatus {
+            request: BrokerTaskStatusRequest {
+                task_id: task_id.to_string(),
+            },
+        },
+    )? {
+        DaemonResponse::BrokerTaskStatus { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
 fn next_task_invocation(
     session: &Arc<Mutex<McpSessionState>>,
     task_id: &str,
@@ -1888,6 +2103,7 @@ fn read_request_summary(args: &Packet28ReadArgs, path: &str) -> String {
 
 fn write_native_tool_result(
     root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
     task_id: &str,
     invocation_id: &str,
     sequence: u64,
@@ -1903,9 +2119,10 @@ fn write_native_tool_result(
     artifact_id: Option<String>,
     duration_ms: u64,
 ) -> Result<()> {
-    write_auto_capture_state(
+    write_auto_capture_state_batch_via_session(
         root,
-        BrokerWriteStateRequest {
+        session,
+        vec![BrokerWriteStateRequest {
             task_id: task_id.to_string(),
             op: Some(BrokerWriteOp::ToolResult),
             invocation_id: Some(invocation_id.to_string()),
@@ -1921,13 +2138,15 @@ fn write_native_tool_result(
             regions,
             symbols,
             artifact_id,
+            refresh_context: Some(false),
             ..BrokerWriteStateRequest::default()
-        },
+        }],
     )
 }
 
 fn write_native_tool_failure(
     root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
     task_id: &str,
     invocation_id: &str,
     sequence: u64,
@@ -1938,9 +2157,10 @@ fn write_native_tool_failure(
     command: Option<String>,
     duration_ms: u64,
 ) -> Result<()> {
-    write_auto_capture_state(
+    write_auto_capture_state_batch_via_session(
         root,
-        BrokerWriteStateRequest {
+        session,
+        vec![BrokerWriteStateRequest {
             task_id: task_id.to_string(),
             op: Some(BrokerWriteOp::ToolInvocationFailed),
             invocation_id: Some(invocation_id.to_string()),
@@ -1953,8 +2173,9 @@ fn write_native_tool_failure(
             sequence: Some(sequence),
             duration_ms: Some(duration_ms),
             command,
+            refresh_context: Some(false),
             ..BrokerWriteStateRequest::default()
-        },
+        }],
     )
 }
 
@@ -1973,19 +2194,6 @@ fn handle_packet28_grep(
     }
     let (sequence, invocation_id) = next_task_invocation(session, task_id)?;
     let request_summary = grep_request_summary(&args);
-    write_auto_capture_state(
-        root,
-        BrokerWriteStateRequest {
-            task_id: task_id.to_string(),
-            op: Some(BrokerWriteOp::ToolInvocationStarted),
-            invocation_id: Some(invocation_id.clone()),
-            tool_name: Some("packet28.grep".to_string()),
-            operation_kind: Some(suite_packet_core::ToolOperationKind::Search),
-            request_summary: Some(request_summary.clone()),
-            sequence: Some(sequence),
-            ..BrokerWriteStateRequest::default()
-        },
-    )?;
 
     let mut command = Command::new("rg");
     command
@@ -2067,6 +2275,7 @@ fn handle_packet28_grep(
         Err(error) => {
             write_native_tool_failure(
                 root,
+                session,
                 task_id,
                 &invocation_id,
                 sequence,
@@ -2089,6 +2298,7 @@ fn handle_packet28_grep(
         };
         write_native_tool_failure(
             root,
+            session,
             task_id,
             &invocation_id,
             sequence,
@@ -2191,10 +2401,11 @@ fn handle_packet28_grep(
         task_id,
         payload["invocation_id"].as_str().unwrap_or_default(),
         &payload,
-        payload["match_count"].as_u64().unwrap_or(0) > 0,
+        false,
     )?;
     write_native_tool_result(
         root,
+        session,
         task_id,
         payload["invocation_id"].as_str().unwrap_or_default(),
         sequence,
@@ -2228,20 +2439,6 @@ fn handle_packet28_read(
     }
     let (sequence, invocation_id) = next_task_invocation(session, task_id)?;
     let request_summary = read_request_summary(&args, &path);
-    write_auto_capture_state(
-        root,
-        BrokerWriteStateRequest {
-            task_id: task_id.to_string(),
-            op: Some(BrokerWriteOp::ToolInvocationStarted),
-            invocation_id: Some(invocation_id.clone()),
-            tool_name: Some("packet28.read".to_string()),
-            operation_kind: Some(suite_packet_core::ToolOperationKind::Read),
-            request_summary: Some(request_summary.clone()),
-            sequence: Some(sequence),
-            paths: vec![path.clone()],
-            ..BrokerWriteStateRequest::default()
-        },
-    )?;
 
     let started_at = Instant::now();
     let contents = fs::read_to_string(root.join(&path));
@@ -2251,6 +2448,7 @@ fn handle_packet28_read(
         Err(error) => {
             write_native_tool_failure(
                 root,
+                session,
                 task_id,
                 &invocation_id,
                 sequence,
@@ -2321,10 +2519,11 @@ fn handle_packet28_read(
         task_id,
         payload["invocation_id"].as_str().unwrap_or_default(),
         &payload,
-        true,
+        false,
     )?;
     write_native_tool_result(
         root,
+        session,
         task_id,
         payload["invocation_id"].as_str().unwrap_or_default(),
         sequence,
@@ -2390,6 +2589,7 @@ fn handle_resource_read(
     track_task(session, root, task_id)?;
     if uri.ends_with("/brief") {
         let path = task_brief_markdown_path(root, task_id);
+        materialize_task_artifacts(root, session, task_id)?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
         return Ok(json!({
@@ -2416,6 +2616,7 @@ fn handle_resource_read(
     }
     if uri.ends_with("/state") {
         let path = task_state_json_path(root, task_id);
+        materialize_task_artifacts(root, session, task_id)?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
         return Ok(json!({
@@ -2429,4 +2630,21 @@ fn handle_resource_read(
         }));
     }
     Err(anyhow!("unsupported Packet28 resource URI '{uri}'"))
+}
+
+fn materialize_task_artifacts(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    task_id: &str,
+) -> Result<()> {
+    let status = broker_task_status_via_session(root, session, task_id)?;
+    let mut request = status
+        .task
+        .and_then(|task| task.latest_broker_request)
+        .ok_or_else(|| anyhow!("no latest broker request for task '{task_id}'"))?;
+    request.persist_artifacts = Some(true);
+    request.since_version = None;
+    request.response_mode = Some(packet28_daemon_core::BrokerResponseMode::Full);
+    let _ = broker_get_context_via_session(root, session, request)?;
+    Ok(())
 }

@@ -22,28 +22,32 @@ use context_memory_core::{
 };
 use diffy_core::model::CoverageFormat;
 use glob::Pattern;
+use ignore::WalkBuilder;
 use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
 use packet28_daemon_core::{
-    append_task_event, ensure_daemon_dir, load_task_events, load_task_registry,
-    load_watch_registry, log_path, now_unix, read_socket_message, ready_path, remove_runtime_files,
-    save_task_registry, save_watch_registry, socket_path, task_brief_json_path,
-    task_brief_markdown_path, task_event_log_path, task_state_json_path, task_version_json_path,
-    write_runtime_info, write_socket_message, BrokerAction, BrokerDecision, BrokerDecomposeIntent,
-    BrokerDecomposeRequest, BrokerDecomposeResponse, BrokerDecomposedStep, BrokerDeltaResponse,
+    append_task_event, ensure_daemon_dir, index_dir, index_manifest_path, index_snapshot_path,
+    load_task_events, load_task_registry, load_watch_registry, log_path, now_unix,
+    read_socket_message, ready_path, remove_runtime_files, save_task_registry, save_watch_registry,
+    socket_path, task_brief_json_path, task_brief_markdown_path, task_event_log_path,
+    task_state_json_path, task_version_json_path, write_runtime_info, write_socket_message,
+    BrokerAction, BrokerDecision, BrokerDecomposeIntent, BrokerDecomposeRequest,
+    BrokerDecomposeResponse, BrokerDecomposedStep, BrokerDeltaResponse,
     BrokerEstimateContextRequest, BrokerEstimateContextResponse, BrokerEvictionCandidate,
     BrokerGetContextRequest, BrokerGetContextResponse, BrokerPacketRef, BrokerPlanStep,
     BrokerPlanViolation, BrokerQuestion, BrokerRecommendedAction, BrokerResolvedQuestion,
     BrokerResponseMode, BrokerSection, BrokerSectionEstimate, BrokerSourceKind,
     BrokerSupersessionMode, BrokerTaskStatusRequest, BrokerTaskStatusResponse,
     BrokerToolResultKind, BrokerValidatePlanRequest, BrokerValidatePlanResponse, BrokerVerbosity,
-    BrokerWriteOp, BrokerWriteStateRequest, BrokerWriteStateResponse, ContextRecallRequest,
-    ContextRecallResponse, ContextStoreGetRequest, ContextStoreGetResponse,
-    ContextStoreListRequest, ContextStoreListResponse, ContextStorePruneDaemonRequest,
-    ContextStorePruneResponse, ContextStoreStatsRequest, ContextStoreStatsResponse,
-    CoverCheckRequest, CoverCheckResponse, DaemonEvent, DaemonEventFrame, DaemonRequest,
-    DaemonResponse, DaemonRuntimeInfo, DaemonStatus, PacketFetchResponse, TaskRecord, TaskRegistry,
-    TaskSubmitSpec, TestMapRequest, TestMapResponse, TestMapSummary, TestShardRequest,
-    TestShardResponse, WatchKind, WatchRegistration, WatchRegistry, WatchSpec,
+    BrokerWriteOp, BrokerWriteStateBatchRequest, BrokerWriteStateBatchResponse,
+    BrokerWriteStateRequest, BrokerWriteStateResponse, ContextRecallRequest, ContextRecallResponse,
+    ContextStoreGetRequest, ContextStoreGetResponse, ContextStoreListRequest,
+    ContextStoreListResponse, ContextStorePruneDaemonRequest, ContextStorePruneResponse,
+    ContextStoreStatsRequest, ContextStoreStatsResponse, CoverCheckRequest, CoverCheckResponse,
+    DaemonEvent, DaemonEventFrame, DaemonIndexClearResponse, DaemonIndexManifest,
+    DaemonIndexRebuildRequest, DaemonIndexRebuildResponse, DaemonIndexStatusResponse,
+    DaemonRequest, DaemonResponse, DaemonRuntimeInfo, DaemonStatus, PacketFetchResponse,
+    TaskRecord, TaskRegistry, TaskSubmitSpec, TestMapRequest, TestMapResponse, TestMapSummary,
+    TestShardRequest, TestShardResponse, WatchKind, WatchRegistration, WatchRegistry, WatchSpec,
 };
 use serde_json::{json, Value};
 
@@ -76,14 +80,66 @@ struct PendingWatchEvent {
     due_at: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RepoMapCacheKey {
+    include_tests: bool,
+    focus_paths: Vec<String>,
+    focus_symbols: Vec<String>,
+    max_files: usize,
+    max_symbols: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SourceMetadataEntry {
+    size: u64,
+    mtime_secs: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RepoSourceManifest {
+    files: BTreeMap<String, SourceMetadataEntry>,
+    dirs: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+struct RepoMapCacheEntry {
+    manifest: RepoSourceManifest,
+    envelope: suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CachedSourceFile {
+    size: u64,
+    mtime_secs: u64,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InteractiveIndexRuntime {
+    manifest: DaemonIndexManifest,
+    snapshot: Option<Arc<mapy_core::RepoIndexSnapshot>>,
+}
+
+enum IndexCommand {
+    RebuildFull,
+    ReindexPaths(Vec<String>),
+    Clear,
+    Shutdown,
+}
+
 struct DaemonState {
     root: PathBuf,
     kernel: Arc<Kernel>,
     runtime: DaemonRuntimeInfo,
     tasks: TaskRegistry,
+    agent_snapshots: BTreeMap<String, suite_packet_core::AgentSnapshotPayload>,
     watches: WatchRegistry,
     watcher_handles: HashMap<String, PollWatcher>,
     subscribers: HashMap<String, Vec<Sender<DaemonEventFrame>>>,
+    repo_map_cache: BTreeMap<RepoMapCacheKey, RepoMapCacheEntry>,
+    source_file_cache: BTreeMap<String, CachedSourceFile>,
+    interactive_index: InteractiveIndexRuntime,
+    index_tx: Sender<IndexCommand>,
     shutting_down: bool,
 }
 
@@ -169,12 +225,333 @@ impl SequenceObserver for TaskSequenceObserver {
 
 const DEFAULT_CONTEXT_MANAGE_BUDGET_TOKENS: u64 = 5_000;
 const DEFAULT_CONTEXT_MANAGE_BUDGET_BYTES: usize = 32_000;
+const INTERACTIVE_INDEX_SCHEMA_VERSION: u32 = 1;
+const INDEX_BATCH_DEBOUNCE_MS: u64 = 150;
 
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
         std::process::exit(2);
     }
+}
+
+fn default_index_manifest(root: &Path) -> DaemonIndexManifest {
+    DaemonIndexManifest {
+        schema_version: INTERACTIVE_INDEX_SCHEMA_VERSION,
+        root: root.to_string_lossy().to_string(),
+        generation: 0,
+        include_tests: true,
+        status: "missing".to_string(),
+        dirty_paths: Vec::new(),
+        queued_paths: Vec::new(),
+        total_files: 0,
+        indexed_files: 0,
+        last_build_started_at_unix: None,
+        last_build_completed_at_unix: None,
+        last_error: None,
+    }
+}
+
+fn load_index_manifest_file(root: &Path) -> DaemonIndexManifest {
+    let path = index_manifest_path(root);
+    let Ok(raw) = fs::read(&path) else {
+        return default_index_manifest(root);
+    };
+    let Ok(mut manifest) = serde_json::from_slice::<DaemonIndexManifest>(&raw) else {
+        return default_index_manifest(root);
+    };
+    if manifest.schema_version != INTERACTIVE_INDEX_SCHEMA_VERSION {
+        return default_index_manifest(root);
+    }
+    manifest.root = root.to_string_lossy().to_string();
+    manifest
+}
+
+fn save_index_manifest_file(root: &Path, manifest: &DaemonIndexManifest) -> Result<()> {
+    fs::create_dir_all(index_dir(root))
+        .with_context(|| format!("failed to create index dir '{}'", index_dir(root).display()))?;
+    fs::write(
+        index_manifest_path(root),
+        serde_json::to_vec_pretty(manifest)?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write index manifest '{}'",
+            index_manifest_path(root).display()
+        )
+    })?;
+    Ok(())
+}
+
+fn load_index_snapshot_file(
+    root: &Path,
+    manifest: &DaemonIndexManifest,
+) -> Option<Arc<mapy_core::RepoIndexSnapshot>> {
+    if manifest.status == "missing" || manifest.generation == 0 {
+        return None;
+    }
+    let raw = fs::read(index_snapshot_path(root)).ok()?;
+    let snapshot = bincode::deserialize::<mapy_core::RepoIndexSnapshot>(&raw).ok()?;
+    if snapshot.version == 0 {
+        return None;
+    }
+    Some(Arc::new(snapshot))
+}
+
+fn save_index_snapshot_file(root: &Path, snapshot: &mapy_core::RepoIndexSnapshot) -> Result<()> {
+    fs::create_dir_all(index_dir(root))
+        .with_context(|| format!("failed to create index dir '{}'", index_dir(root).display()))?;
+    let encoded = bincode::serialize(snapshot)?;
+    fs::write(index_snapshot_path(root), encoded).with_context(|| {
+        format!(
+            "failed to write index snapshot '{}'",
+            index_snapshot_path(root).display()
+        )
+    })?;
+    Ok(())
+}
+
+fn clear_index_files(root: &Path) -> Result<()> {
+    for path in [index_manifest_path(root), index_snapshot_path(root)] {
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove '{}'", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn build_index_status(runtime: &InteractiveIndexRuntime) -> DaemonIndexStatusResponse {
+    let dirty_file_count = runtime.manifest.dirty_paths.len();
+    let queued_file_count = runtime.manifest.queued_paths.len();
+    let ready = runtime.snapshot.is_some()
+        && runtime.manifest.status == "ready"
+        && runtime.manifest.dirty_paths.is_empty();
+    DaemonIndexStatusResponse {
+        manifest: runtime.manifest.clone(),
+        ready,
+        fallback_mode: !ready,
+        loaded_generation: runtime
+            .snapshot
+            .as_ref()
+            .map(|_| runtime.manifest.generation),
+        dirty_file_count,
+        queued_file_count,
+    }
+}
+
+fn enqueue_index_command(state: &Arc<Mutex<DaemonState>>, command: IndexCommand) -> Result<()> {
+    let tx = state.lock().map_err(lock_err)?.index_tx.clone();
+    tx.send(command)
+        .map_err(|err| anyhow!("failed to queue index work: {err}"))
+}
+
+fn enqueue_full_index_rebuild(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
+    {
+        let mut guard = state.lock().map_err(lock_err)?;
+        guard.interactive_index.manifest.status = "queued".to_string();
+        guard.interactive_index.manifest.last_error = None;
+        guard.interactive_index.manifest.queued_paths.clear();
+        save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
+    }
+    enqueue_index_command(state, IndexCommand::RebuildFull)
+}
+
+fn enqueue_incremental_index_paths(
+    state: &Arc<Mutex<DaemonState>>,
+    paths: &[String],
+) -> Result<Vec<String>> {
+    let normalized = paths
+        .iter()
+        .map(|path| path.replace('\\', "/"))
+        .filter(|path| !path.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+    {
+        let mut guard = state.lock().map_err(lock_err)?;
+        for path in &normalized {
+            insert_sorted_unique(
+                &mut guard.interactive_index.manifest.dirty_paths,
+                path.clone(),
+            );
+            insert_sorted_unique(
+                &mut guard.interactive_index.manifest.queued_paths,
+                path.clone(),
+            );
+        }
+        if guard.interactive_index.manifest.status == "missing" {
+            guard.interactive_index.manifest.status = "queued".to_string();
+        }
+        save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
+    }
+    enqueue_index_command(state, IndexCommand::ReindexPaths(normalized.clone()))?;
+    Ok(normalized)
+}
+
+fn spawn_index_worker(state: Arc<Mutex<DaemonState>>, index_rx: Receiver<IndexCommand>) {
+    thread::spawn(move || {
+        let mut pending_paths = BTreeSet::<String>::new();
+        let mut full_rebuild = false;
+        loop {
+            let message = if full_rebuild || !pending_paths.is_empty() {
+                index_rx.recv_timeout(Duration::from_millis(INDEX_BATCH_DEBOUNCE_MS))
+            } else {
+                match index_rx.recv() {
+                    Ok(message) => Ok(message),
+                    Err(_) => return,
+                }
+            };
+            match message {
+                Ok(IndexCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
+                Ok(IndexCommand::Clear) => {
+                    if let Err(err) = perform_index_clear(&state) {
+                        daemon_log(&format!("index clear failed: {err}"));
+                    }
+                    full_rebuild = false;
+                    pending_paths.clear();
+                }
+                Ok(IndexCommand::RebuildFull) => {
+                    full_rebuild = true;
+                    pending_paths.clear();
+                }
+                Ok(IndexCommand::ReindexPaths(paths)) => {
+                    for path in paths {
+                        pending_paths.insert(path);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            if full_rebuild {
+                if let Err(err) = perform_full_index_rebuild(&state) {
+                    daemon_log(&format!("full index rebuild failed: {err}"));
+                }
+                full_rebuild = false;
+                pending_paths.clear();
+                continue;
+            }
+            if !pending_paths.is_empty() {
+                let paths = pending_paths.iter().cloned().collect::<Vec<_>>();
+                pending_paths.clear();
+                if let Err(err) = perform_incremental_index_update(&state, &paths) {
+                    daemon_log(&format!("incremental index update failed: {err}"));
+                }
+            }
+        }
+    });
+}
+
+fn perform_full_index_rebuild(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
+    let root = {
+        let mut guard = state.lock().map_err(lock_err)?;
+        guard.interactive_index.manifest.status = "building".to_string();
+        guard.interactive_index.manifest.last_build_started_at_unix = Some(now_unix());
+        guard.interactive_index.manifest.last_error = None;
+        guard.interactive_index.manifest.queued_paths.clear();
+        save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
+        guard.root.clone()
+    };
+    let snapshot = mapy_core::build_repo_index(&root, true)
+        .map_err(|err| anyhow!("failed to build repo index: {err}"))?;
+    save_index_snapshot_file(&root, &snapshot)?;
+    let mut guard = state.lock().map_err(lock_err)?;
+    guard.interactive_index.snapshot = Some(Arc::new(snapshot.clone()));
+    guard.interactive_index.manifest.generation = guard
+        .interactive_index
+        .manifest
+        .generation
+        .saturating_add(1);
+    guard.interactive_index.manifest.status = "ready".to_string();
+    guard.interactive_index.manifest.dirty_paths.clear();
+    guard.interactive_index.manifest.queued_paths.clear();
+    guard.interactive_index.manifest.total_files = snapshot.files.len();
+    guard.interactive_index.manifest.indexed_files = snapshot.files.len();
+    guard
+        .interactive_index
+        .manifest
+        .last_build_completed_at_unix = Some(now_unix());
+    guard.interactive_index.manifest.last_error = None;
+    guard.repo_map_cache.clear();
+    save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
+    Ok(())
+}
+
+fn perform_incremental_index_update(
+    state: &Arc<Mutex<DaemonState>>,
+    paths: &[String],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let (root, snapshot_opt) = {
+        let mut guard = state.lock().map_err(lock_err)?;
+        if guard.interactive_index.snapshot.is_none() {
+            drop(guard);
+            return perform_full_index_rebuild(state);
+        }
+        guard.interactive_index.manifest.status = "building".to_string();
+        guard.interactive_index.manifest.last_build_started_at_unix = Some(now_unix());
+        for path in paths {
+            insert_sorted_unique(
+                &mut guard.interactive_index.manifest.dirty_paths,
+                path.clone(),
+            );
+        }
+        save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
+        (guard.root.clone(), guard.interactive_index.snapshot.clone())
+    };
+    let Some(snapshot_arc) = snapshot_opt else {
+        return perform_full_index_rebuild(state);
+    };
+    let mut snapshot = (*snapshot_arc).clone();
+    let summary = mapy_core::update_repo_index(&root, &mut snapshot, paths, true)
+        .map_err(|err| anyhow!("failed to update repo index: {err}"))?;
+    save_index_snapshot_file(&root, &snapshot)?;
+    let mut guard = state.lock().map_err(lock_err)?;
+    guard.interactive_index.snapshot = Some(Arc::new(snapshot.clone()));
+    guard.interactive_index.manifest.generation = guard
+        .interactive_index
+        .manifest
+        .generation
+        .saturating_add(1);
+    guard.interactive_index.manifest.status = "ready".to_string();
+    for path in &summary.changed_paths {
+        guard
+            .interactive_index
+            .manifest
+            .dirty_paths
+            .retain(|candidate| candidate != path);
+        guard
+            .interactive_index
+            .manifest
+            .queued_paths
+            .retain(|candidate| candidate != path);
+    }
+    guard.interactive_index.manifest.total_files = snapshot.files.len();
+    guard.interactive_index.manifest.indexed_files = snapshot.files.len();
+    guard
+        .interactive_index
+        .manifest
+        .last_build_completed_at_unix = Some(now_unix());
+    guard.interactive_index.manifest.last_error = None;
+    guard.repo_map_cache.clear();
+    save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
+    Ok(())
+}
+
+fn perform_index_clear(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    clear_index_files(&guard.root)?;
+    guard.interactive_index = InteractiveIndexRuntime {
+        manifest: default_index_manifest(&guard.root),
+        snapshot: None,
+    };
+    guard.repo_map_cache.clear();
+    save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
+    Ok(())
 }
 
 fn run() -> Result<()> {
@@ -213,20 +590,39 @@ fn serve(root: PathBuf) -> Result<()> {
     ));
     let tasks = load_task_registry(&root)?;
     let watches = load_watch_registry(&root)?;
+    let manifest = load_index_manifest_file(&root);
+    let snapshot = load_index_snapshot_file(&root, &manifest);
+    let (index_tx, index_rx) = mpsc::channel();
     let state = Arc::new(Mutex::new(DaemonState {
         root: root.clone(),
         kernel,
         runtime,
         tasks,
+        agent_snapshots: BTreeMap::new(),
         watches,
         watcher_handles: HashMap::new(),
         subscribers: HashMap::new(),
+        repo_map_cache: BTreeMap::new(),
+        source_file_cache: BTreeMap::new(),
+        interactive_index: InteractiveIndexRuntime { manifest, snapshot },
+        index_tx,
         shutting_down: false,
     }));
 
     let (watch_tx, watch_rx) = mpsc::channel();
     restore_watchers(&state, &watch_tx)?;
     spawn_watch_processor(state.clone(), watch_rx);
+    spawn_index_worker(state.clone(), index_rx);
+    {
+        let should_queue = {
+            let guard = state.lock().map_err(lock_err)?;
+            guard.interactive_index.snapshot.is_none()
+                || guard.interactive_index.manifest.status != "ready"
+        };
+        if should_queue {
+            let _ = enqueue_full_index_rebuild(&state);
+        }
+    }
     mark_ready(&state)?;
 
     loop {
@@ -262,34 +658,36 @@ fn handle_connection(
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
-    let request = match read_socket_message(&mut reader) {
-        Ok(value) => value,
-        Err(err) => {
-            let response = DaemonResponse::Error {
-                message: err.to_string(),
-            };
-            write_socket_response(&mut writer, &response)?;
-            return Ok(());
-        }
-    };
-    if let DaemonRequest::TaskSubscribe {
-        task_id,
-        replay_last,
-    } = request
-    {
-        return handle_task_subscribe(state, &mut writer, task_id, replay_last);
-    }
-    let response = match handle_request(state, watch_tx, request) {
-        Ok(value) => value,
-        Err(err) => {
-            daemon_log(&format!("daemon request failed: {err}"));
-            DaemonResponse::Error {
-                message: err.to_string(),
+    loop {
+        let request = match read_socket_message(&mut reader) {
+            Ok(value) => value,
+            Err(err) if is_benign_disconnect_error(&err) => return Ok(()),
+            Err(err) => {
+                let response = DaemonResponse::Error {
+                    message: err.to_string(),
+                };
+                write_socket_response(&mut writer, &response)?;
+                return Ok(());
             }
+        };
+        if let DaemonRequest::TaskSubscribe {
+            task_id,
+            replay_last,
+        } = request
+        {
+            return handle_task_subscribe(state, &mut writer, task_id, replay_last);
         }
-    };
-    write_socket_response(&mut writer, &response)?;
-    Ok(())
+        let response = match handle_request(state.clone(), watch_tx.clone(), request) {
+            Ok(value) => value,
+            Err(err) => {
+                daemon_log(&format!("daemon request failed: {err}"));
+                DaemonResponse::Error {
+                    message: err.to_string(),
+                }
+            }
+        };
+        write_socket_response(&mut writer, &response)?;
+    }
 }
 
 fn handle_task_subscribe(
@@ -424,6 +822,7 @@ fn handle_request(
             let root = {
                 let mut guard = state.lock().map_err(lock_err)?;
                 guard.shutting_down = true;
+                let _ = guard.index_tx.send(IndexCommand::Shutdown);
                 guard.root.clone()
             };
             wake_listener(&root);
@@ -533,9 +932,25 @@ fn handle_request(
             let response = broker_write_state(state, request)?;
             Ok(DaemonResponse::BrokerWriteState { response })
         }
+        DaemonRequest::BrokerWriteStateBatch { request } => {
+            let response = broker_write_state_batch(state, request)?;
+            Ok(DaemonResponse::BrokerWriteStateBatch { response })
+        }
         DaemonRequest::BrokerTaskStatus { request } => {
             let response = broker_task_status(state, request)?;
             Ok(DaemonResponse::BrokerTaskStatus { response })
+        }
+        DaemonRequest::DaemonIndexStatus { request: _ } => {
+            let response = daemon_index_status(state)?;
+            Ok(DaemonResponse::DaemonIndexStatus { response })
+        }
+        DaemonRequest::DaemonIndexRebuild { request } => {
+            let response = daemon_index_rebuild(state, request)?;
+            Ok(DaemonResponse::DaemonIndexRebuild { response })
+        }
+        DaemonRequest::DaemonIndexClear { request: _ } => {
+            let response = daemon_index_clear(state)?;
+            Ok(DaemonResponse::DaemonIndexClear { response })
         }
     }
 }
@@ -576,6 +991,7 @@ fn build_status(state: &DaemonState) -> Result<DaemonStatus> {
         uptime_secs: now_unix().saturating_sub(state.runtime.started_at_unix),
         tasks: state.tasks.tasks.values().cloned().collect(),
         watches: state.watches.watches.clone(),
+        index: Some(build_index_status(&state.interactive_index)),
     })
 }
 
@@ -742,12 +1158,14 @@ fn update_broker_link_state(
 ) -> Result<()> {
     let mut guard = state.lock().map_err(lock_err)?;
     let task = ensure_task_record_mut(&mut guard.tasks, &request.task_id);
+    let mut changed = false;
     match request.op.unwrap_or(BrokerWriteOp::FileRead) {
         BrokerWriteOp::QuestionOpen => {
             if let (Some(question_id), Some(text)) = (&request.question_id, &request.text) {
                 task.question_texts
                     .insert(question_id.clone(), text.clone());
                 task.resolved_questions.remove(question_id);
+                changed = true;
             }
         }
         BrokerWriteOp::QuestionResolve => {
@@ -765,6 +1183,7 @@ fn update_broker_link_state(
                         .entry(question_id.clone())
                         .or_insert_with(String::new);
                 }
+                changed = true;
             }
         }
         BrokerWriteOp::DecisionAdd => {
@@ -775,6 +1194,7 @@ fn update_broker_link_state(
                     .insert(decision_id.clone(), question_id.clone());
                 task.resolved_questions
                     .insert(question_id.clone(), decision_id.clone());
+                changed = true;
             }
         }
         BrokerWriteOp::DecisionSupersede => {
@@ -782,11 +1202,14 @@ fn update_broker_link_state(
                 task.linked_decisions.remove(decision_id);
                 task.resolved_questions
                     .retain(|_, linked_decision_id| linked_decision_id != decision_id);
+                changed = true;
             }
         }
         _ => {}
     }
-    persist_state(&guard)?;
+    if changed {
+        persist_state(&guard)?;
+    }
     Ok(())
 }
 
@@ -794,6 +1217,15 @@ fn load_agent_snapshot_for_task(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
 ) -> Result<suite_packet_core::AgentSnapshotPayload> {
+    if let Some(snapshot) = state
+        .lock()
+        .map_err(lock_err)?
+        .agent_snapshots
+        .get(task_id)
+        .cloned()
+    {
+        return Ok(snapshot);
+    }
     let kernel = state.lock().map_err(lock_err)?.kernel.clone();
     let response = kernel.execute(KernelRequest {
         target: "agenty.state.snapshot".to_string(),
@@ -807,7 +1239,13 @@ fn load_agent_snapshot_for_task(
     let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentSnapshotPayload> =
         serde_json::from_value(packet.body.clone())
             .map_err(|source| anyhow!("invalid agent snapshot packet: {source}"))?;
-    Ok(envelope.payload)
+    let snapshot = envelope.payload;
+    state
+        .lock()
+        .map_err(lock_err)?
+        .agent_snapshots
+        .insert(task_id.to_string(), snapshot.clone());
+    Ok(snapshot)
 }
 
 fn load_context_manage_for_task(
@@ -843,6 +1281,7 @@ fn load_context_manage_for_task(
 }
 
 fn load_repo_map_for_task(
+    state: &Arc<Mutex<DaemonState>>,
     request: &BrokerGetContextRequest,
     focus_paths: &[String],
     focus_symbols: &[String],
@@ -856,13 +1295,289 @@ fn load_repo_map_for_task(
         return Ok(None);
     }
 
-    Ok(Some(build_repo_map_envelope(
+    if let Some(snapshot) = current_interactive_index_snapshot(state) {
+        return Ok(Some(load_cached_repo_map_envelope_from_index(
+            state,
+            root,
+            focus_paths,
+            focus_symbols,
+            snapshot.as_ref(),
+            12,
+            24,
+        )?));
+    }
+
+    Ok(Some(load_cached_repo_map_envelope(
+        state,
         root,
         focus_paths,
         focus_symbols,
         12,
         24,
     )?))
+}
+
+fn current_interactive_index_snapshot(
+    state: &Arc<Mutex<DaemonState>>,
+) -> Option<Arc<mapy_core::RepoIndexSnapshot>> {
+    let guard = state.lock().ok()?;
+    let status = &guard.interactive_index.manifest.status;
+    if status != "ready" || !guard.interactive_index.manifest.dirty_paths.is_empty() {
+        return None;
+    }
+    guard.interactive_index.snapshot.clone()
+}
+
+fn load_cached_repo_map_envelope_from_index(
+    state: &Arc<Mutex<DaemonState>>,
+    root: &Path,
+    focus_paths: &[String],
+    focus_symbols: &[String],
+    snapshot: &mapy_core::RepoIndexSnapshot,
+    max_files: usize,
+    max_symbols: usize,
+) -> Result<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>> {
+    let key = RepoMapCacheKey {
+        include_tests: true,
+        focus_paths: focus_paths
+            .iter()
+            .map(|value| value.replace('\\', "/"))
+            .collect(),
+        focus_symbols: focus_symbols
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        max_files,
+        max_symbols,
+    };
+    if let Some(entry) = state
+        .lock()
+        .map_err(lock_err)?
+        .repo_map_cache
+        .get(&key)
+        .cloned()
+    {
+        return Ok(entry.envelope);
+    }
+    let envelope = mapy_core::build_repo_map_from_index(
+        mapy_core::RepoMapRequest {
+            repo_root: root.to_string_lossy().to_string(),
+            focus_paths: focus_paths.to_vec(),
+            focus_symbols: focus_symbols.to_vec(),
+            max_files,
+            max_symbols,
+            include_tests: true,
+        },
+        snapshot,
+    )
+    .map_err(|err| anyhow!("failed to build indexed repo map: {err}"))?;
+    state.lock().map_err(lock_err)?.repo_map_cache.insert(
+        key,
+        RepoMapCacheEntry {
+            manifest: RepoSourceManifest::default(),
+            envelope: envelope.clone(),
+        },
+    );
+    Ok(envelope)
+}
+
+fn load_cached_repo_map_envelope(
+    state: &Arc<Mutex<DaemonState>>,
+    root: &Path,
+    focus_paths: &[String],
+    focus_symbols: &[String],
+    max_files: usize,
+    max_symbols: usize,
+) -> Result<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>> {
+    let key = RepoMapCacheKey {
+        include_tests: true,
+        focus_paths: focus_paths
+            .iter()
+            .map(|value| value.replace('\\', "/"))
+            .collect(),
+        focus_symbols: focus_symbols
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        max_files,
+        max_symbols,
+    };
+    let cached = state
+        .lock()
+        .map_err(lock_err)?
+        .repo_map_cache
+        .get(&key)
+        .cloned();
+    if let Some(entry) = cached {
+        if repo_source_manifest_is_current(root, &entry.manifest) {
+            return Ok(entry.envelope);
+        }
+        state.lock().map_err(lock_err)?.repo_map_cache.remove(&key);
+    }
+    let envelope =
+        build_repo_map_envelope(root, focus_paths, focus_symbols, max_files, max_symbols)?;
+    let manifest = collect_repo_source_manifest(root, true)?;
+    state.lock().map_err(lock_err)?.repo_map_cache.insert(
+        key,
+        RepoMapCacheEntry {
+            manifest,
+            envelope: envelope.clone(),
+        },
+    );
+    Ok(envelope)
+}
+
+fn collect_repo_source_manifest(root: &Path, include_tests: bool) -> Result<RepoSourceManifest> {
+    let mut manifest = RepoSourceManifest::default();
+    manifest.dirs.insert(String::new(), dir_mtime_secs(root));
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true);
+    let root_owned = root.to_path_buf();
+    builder.filter_entry(move |entry: &ignore::DirEntry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(&root_owned)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        !looks_like_generated_or_vendor_path(&rel)
+    });
+    for entry in builder.build() {
+        let entry: ignore::DirEntry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() || !looks_like_source_file(path) {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !include_tests && looks_like_test_path(&rel) {
+            continue;
+        }
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        manifest.files.insert(
+            rel.clone(),
+            SourceMetadataEntry {
+                size: metadata.len(),
+                mtime_secs: metadata_mtime_secs(&metadata),
+            },
+        );
+        let mut current = Path::new(&rel).parent();
+        while let Some(parent) = current {
+            let parent_rel = parent.to_string_lossy().replace('\\', "/");
+            if manifest.dirs.contains_key(&parent_rel) {
+                current = parent.parent();
+                continue;
+            }
+            manifest
+                .dirs
+                .insert(parent_rel.clone(), dir_mtime_secs(&root.join(parent)));
+            current = parent.parent();
+        }
+    }
+    Ok(manifest)
+}
+
+fn repo_source_manifest_is_current(root: &Path, manifest: &RepoSourceManifest) -> bool {
+    for (path, entry) in &manifest.files {
+        let Ok(metadata) = fs::metadata(root.join(path)) else {
+            return false;
+        };
+        if metadata.len() != entry.size || metadata_mtime_secs(&metadata) != entry.mtime_secs {
+            return false;
+        }
+    }
+    for (path, expected_mtime) in &manifest.dirs {
+        let dir_path = if path.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        if dir_mtime_secs(&dir_path) != *expected_mtime {
+            return false;
+        }
+    }
+    true
+}
+
+fn dir_mtime_secs(path: &Path) -> u64 {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata_mtime_secs(&metadata))
+        .unwrap_or(0)
+}
+
+fn metadata_mtime_secs(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn looks_like_source_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|value| value.to_str()),
+        Some("rs")
+            | Some("py")
+            | Some("js")
+            | Some("jsx")
+            | Some("ts")
+            | Some("tsx")
+            | Some("java")
+            | Some("go")
+            | Some("c")
+            | Some("cc")
+            | Some("cpp")
+            | Some("h")
+            | Some("hpp")
+    )
+}
+
+fn looks_like_generated_or_vendor_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with(".git/")
+        || lower.contains("/.git/")
+        || lower.starts_with("target/")
+        || lower.contains("/target/")
+        || lower.starts_with("build/")
+        || lower.contains("/build/")
+        || lower.starts_with("dist/")
+        || lower.contains("/dist/")
+        || lower.starts_with("out/")
+        || lower.contains("/out/")
+        || lower.starts_with("coverage/")
+        || lower.contains("/coverage/")
+        || lower.starts_with("node_modules/")
+        || lower.contains("/node_modules/")
+        || lower.contains("/jacoco-resources/")
+}
+
+fn looks_like_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/tests/")
+        || lower.contains("/test/")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("test.rs")
 }
 
 fn build_repo_map_envelope(
@@ -1318,6 +2033,7 @@ fn derive_broker_focus_symbols(
 }
 
 fn derive_broker_focus_paths(
+    state: &Arc<Mutex<DaemonState>>,
     root: &Path,
     objective: Option<&str>,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
@@ -1334,7 +2050,8 @@ fn derive_broker_focus_paths(
         return Ok(Vec::new());
     }
 
-    let wide_map = mapy_core::expand_repo_map_payload(&build_repo_map_envelope(
+    let wide_map = mapy_core::expand_repo_map_payload(&build_repo_map_envelope_best_source(
+        state,
         root,
         &explicit_paths,
         &explicit_symbols,
@@ -1355,6 +2072,31 @@ fn derive_broker_focus_paths(
         max_paths,
     );
     Ok(merged_unique(&explicit_paths, &expanded))
+}
+
+fn build_repo_map_envelope_best_source(
+    state: &Arc<Mutex<DaemonState>>,
+    root: &Path,
+    focus_paths: &[String],
+    focus_symbols: &[String],
+    max_files: usize,
+    max_symbols: usize,
+) -> Result<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>> {
+    if let Some(snapshot) = current_interactive_index_snapshot(state) {
+        return mapy_core::build_repo_map_from_index(
+            mapy_core::RepoMapRequest {
+                repo_root: root.to_string_lossy().to_string(),
+                focus_paths: focus_paths.to_vec(),
+                focus_symbols: focus_symbols.to_vec(),
+                max_files,
+                max_symbols,
+                include_tests: true,
+            },
+            snapshot.as_ref(),
+        )
+        .map_err(|err| anyhow!("failed to build indexed repo map: {err}"));
+    }
+    build_repo_map_envelope(root, focus_paths, focus_symbols, max_files, max_symbols)
 }
 
 fn infer_scope_paths(
@@ -1734,6 +2476,49 @@ fn collect_tool_result_provenance(
         .collect()
 }
 
+fn collect_index_provenance(
+    state: &Arc<Mutex<DaemonState>>,
+    path: &str,
+    query_focus: &QueryFocus,
+) -> Vec<ToolResultProvenance> {
+    let Some(snapshot) = current_interactive_index_snapshot(state) else {
+        return Vec::new();
+    };
+    let Some(file) = snapshot.files.get(path) else {
+        return Vec::new();
+    };
+    let mut matched_symbols = Vec::<String>::new();
+    let mut regions = Vec::<String>::new();
+    let mut seen_lines = BTreeSet::<usize>::new();
+    for symbol in query_focus
+        .full_symbol_terms
+        .iter()
+        .chain(query_focus.symbol_terms.iter())
+    {
+        let token = symbol.trim().to_ascii_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(lines) = file.token_lines.get(&token) {
+            matched_symbols.push(symbol.clone());
+            for line in lines.iter().copied().take(6) {
+                if seen_lines.insert(line) {
+                    regions.push(format!("{path}:{line}-{line}"));
+                }
+            }
+        }
+    }
+    if regions.is_empty() {
+        return Vec::new();
+    }
+    vec![ToolResultProvenance {
+        operation_kind: suite_packet_core::ToolOperationKind::Search,
+        symbols: matched_symbols,
+        regions,
+        result_summary_present: false,
+    }]
+}
+
 fn collect_region_hint_lines(
     provenance: &[ToolResultProvenance],
     path: &str,
@@ -1792,6 +2577,7 @@ fn collect_evidence_matches(
     matches
 }
 
+#[cfg(test)]
 fn extract_code_evidence(
     root: &Path,
     relative_path: &str,
@@ -1800,10 +2586,30 @@ fn extract_code_evidence(
     max_windows: usize,
     max_lines: usize,
 ) -> CodeEvidenceSummary {
-    let Ok(contents) = fs::read_to_string(root.join(relative_path)) else {
+    extract_code_evidence_cached(
+        None,
+        root,
+        relative_path,
+        query_focus,
+        provenance,
+        max_windows,
+        max_lines,
+    )
+}
+
+fn extract_code_evidence_cached(
+    state: Option<&Arc<Mutex<DaemonState>>>,
+    root: &Path,
+    relative_path: &str,
+    query_focus: &QueryFocus,
+    provenance: &[ToolResultProvenance],
+    max_windows: usize,
+    max_lines: usize,
+) -> CodeEvidenceSummary {
+    let Ok(lines) = load_source_file_lines(state, root, relative_path) else {
         return CodeEvidenceSummary::default();
     };
-    let lines = contents.lines().collect::<Vec<_>>();
+    let lines = lines.iter().map(String::as_str).collect::<Vec<_>>();
     let hint_lines = collect_region_hint_lines(provenance, relative_path, lines.len());
     let mut matches = if !hint_lines.is_empty() {
         collect_evidence_matches(lines.as_slice(), query_focus, Some(&hint_lines), true)
@@ -1914,6 +2720,50 @@ fn extract_code_evidence(
         from_region_hint: primary_from_region_hint,
         from_tool_result_path: !provenance.is_empty(),
     }
+}
+
+fn load_source_file_lines(
+    state: Option<&Arc<Mutex<DaemonState>>>,
+    root: &Path,
+    relative_path: &str,
+) -> Result<Vec<String>> {
+    let full_path = root.join(relative_path);
+    let metadata = fs::metadata(&full_path)
+        .with_context(|| format!("failed to read metadata for '{}'", full_path.display()))?;
+    let size = metadata.len();
+    let mtime_secs = metadata_mtime_secs(&metadata);
+    if let Some(state) = state {
+        if let Some(cached) = state
+            .lock()
+            .map_err(lock_err)?
+            .source_file_cache
+            .get(relative_path)
+            .cloned()
+        {
+            if cached.size == size && cached.mtime_secs == mtime_secs {
+                return Ok(cached.lines);
+            }
+        }
+        let lines = fs::read_to_string(&full_path)
+            .with_context(|| format!("failed to read '{}'", full_path.display()))?
+            .lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        state.lock().map_err(lock_err)?.source_file_cache.insert(
+            relative_path.to_string(),
+            CachedSourceFile {
+                size,
+                mtime_secs,
+                lines: lines.clone(),
+            },
+        );
+        return Ok(lines);
+    }
+    Ok(fs::read_to_string(&full_path)
+        .with_context(|| format!("failed to read '{}'", full_path.display()))?
+        .lines()
+        .map(|line| line.to_string())
+        .collect())
 }
 
 fn find_candidate_test_paths(
@@ -2470,6 +3320,328 @@ fn load_task_record(state: &Arc<Mutex<DaemonState>>, task_id: &str) -> Option<Ta
     state.lock().ok()?.tasks.tasks.get(task_id).cloned()
 }
 
+fn apply_agent_snapshot_event_to_cache(
+    state: &Arc<Mutex<DaemonState>>,
+    event: &suite_packet_core::AgentStateEventPayload,
+) -> Result<()> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    let snapshot = guard
+        .agent_snapshots
+        .entry(event.task_id.clone())
+        .or_insert_with(|| suite_packet_core::AgentSnapshotPayload {
+            task_id: event.task_id.clone(),
+            ..suite_packet_core::AgentSnapshotPayload::default()
+        });
+    apply_agent_snapshot_event(snapshot, event);
+    Ok(())
+}
+
+fn apply_agent_snapshot_event(
+    snapshot: &mut suite_packet_core::AgentSnapshotPayload,
+    event: &suite_packet_core::AgentStateEventPayload,
+) {
+    snapshot.task_id = event.task_id.clone();
+    snapshot.event_count = snapshot.event_count.saturating_add(1);
+    snapshot.last_event_at_unix = Some(event.occurred_at_unix);
+
+    match &event.data {
+        suite_packet_core::AgentStateEventData::FocusSet { .. }
+        | suite_packet_core::AgentStateEventData::FocusInferred { .. } => {
+            extend_sorted_unique(&mut snapshot.focus_paths, &event.paths);
+            extend_sorted_unique(&mut snapshot.focus_symbols, &event.symbols);
+        }
+        suite_packet_core::AgentStateEventData::FocusCleared { clear_all } => {
+            if *clear_all {
+                snapshot.focus_paths.clear();
+                snapshot.focus_symbols.clear();
+            } else {
+                remove_many(&mut snapshot.focus_paths, &event.paths);
+                remove_many(&mut snapshot.focus_symbols, &event.symbols);
+            }
+        }
+        suite_packet_core::AgentStateEventData::FileRead {} => {
+            extend_sorted_unique(&mut snapshot.files_read, &event.paths);
+        }
+        suite_packet_core::AgentStateEventData::FileEdited { .. } => {
+            extend_sorted_unique(&mut snapshot.files_edited, &event.paths);
+            extend_sorted_unique(&mut snapshot.changed_paths_since_checkpoint, &event.paths);
+            extend_sorted_unique(
+                &mut snapshot.changed_symbols_since_checkpoint,
+                &event.symbols,
+            );
+        }
+        suite_packet_core::AgentStateEventData::CheckpointSaved { checkpoint_id, .. } => {
+            snapshot.latest_checkpoint_id = Some(checkpoint_id.clone());
+            snapshot.latest_checkpoint_at_unix = Some(event.occurred_at_unix);
+            snapshot.changed_paths_since_checkpoint.clear();
+            snapshot.changed_symbols_since_checkpoint.clear();
+        }
+        suite_packet_core::AgentStateEventData::DecisionAdded {
+            decision_id,
+            text,
+            supersedes,
+        } => {
+            if let Some(previous) = supersedes {
+                snapshot
+                    .active_decisions
+                    .retain(|decision| decision.id != *previous);
+            }
+            snapshot
+                .active_decisions
+                .retain(|decision| decision.id != *decision_id);
+            snapshot
+                .active_decisions
+                .push(suite_packet_core::AgentDecision {
+                    id: decision_id.clone(),
+                    text: text.clone(),
+                });
+            snapshot
+                .active_decisions
+                .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.text.cmp(&b.text)));
+        }
+        suite_packet_core::AgentStateEventData::DecisionSuperseded { decision_id, .. } => {
+            snapshot
+                .active_decisions
+                .retain(|decision| decision.id != *decision_id);
+        }
+        suite_packet_core::AgentStateEventData::StepCompleted { step_id } => {
+            insert_sorted_unique(&mut snapshot.completed_steps, step_id.clone());
+        }
+        suite_packet_core::AgentStateEventData::QuestionOpened { question_id, text } => {
+            snapshot
+                .open_questions
+                .retain(|question| question.id != *question_id);
+            snapshot
+                .open_questions
+                .push(suite_packet_core::AgentQuestion {
+                    id: question_id.clone(),
+                    text: text.clone(),
+                });
+            snapshot
+                .open_questions
+                .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.text.cmp(&b.text)));
+        }
+        suite_packet_core::AgentStateEventData::QuestionResolved { question_id } => {
+            snapshot
+                .open_questions
+                .retain(|question| question.id != *question_id);
+        }
+        suite_packet_core::AgentStateEventData::ToolInvocationStarted { .. } => {}
+        suite_packet_core::AgentStateEventData::ToolInvocationCompleted {
+            invocation_id,
+            sequence,
+            tool_name,
+            server_name,
+            operation_kind,
+            request_summary,
+            result_summary,
+            request_fingerprint,
+            search_query,
+            command,
+            artifact_id,
+            regions,
+            duration_ms,
+        } => {
+            extend_sorted_unique(&mut snapshot.focus_paths, &event.paths);
+            extend_sorted_unique(&mut snapshot.focus_symbols, &event.symbols);
+            match operation_kind {
+                suite_packet_core::ToolOperationKind::Read => {
+                    extend_sorted_unique(&mut snapshot.files_read, &event.paths);
+                    merge_tool_path_summary(
+                        &mut snapshot.read_paths_by_tool,
+                        tool_name,
+                        *operation_kind,
+                        &event.paths,
+                    );
+                }
+                suite_packet_core::ToolOperationKind::Edit => {
+                    extend_sorted_unique(&mut snapshot.files_edited, &event.paths);
+                    extend_sorted_unique(
+                        &mut snapshot.changed_paths_since_checkpoint,
+                        &event.paths,
+                    );
+                    extend_sorted_unique(
+                        &mut snapshot.changed_symbols_since_checkpoint,
+                        &event.symbols,
+                    );
+                    merge_tool_path_summary(
+                        &mut snapshot.edited_paths_by_tool,
+                        tool_name,
+                        *operation_kind,
+                        &event.paths,
+                    );
+                }
+                _ => {}
+            }
+            if let Some(query) = search_query
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                snapshot
+                    .search_queries
+                    .retain(|item| !(item.tool_name == *tool_name && item.query == *query));
+                snapshot
+                    .search_queries
+                    .push(suite_packet_core::SearchQuerySummary {
+                        tool_name: tool_name.clone(),
+                        query: query.clone(),
+                    });
+                snapshot.search_queries.sort_by(|a, b| {
+                    a.tool_name
+                        .cmp(&b.tool_name)
+                        .then_with(|| a.query.cmp(&b.query))
+                });
+            }
+            if let Some(artifact_id) = artifact_id
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                insert_sorted_unique(&mut snapshot.evidence_artifact_ids, artifact_id.clone());
+            }
+            snapshot
+                .recent_tool_invocations
+                .retain(|item| item.invocation_id != *invocation_id);
+            snapshot
+                .recent_tool_invocations
+                .push(suite_packet_core::ToolInvocationSummary {
+                    invocation_id: invocation_id.clone(),
+                    sequence: *sequence,
+                    tool_name: tool_name.clone(),
+                    server_name: server_name.clone(),
+                    operation_kind: *operation_kind,
+                    request_summary: request_summary.clone(),
+                    result_summary: result_summary.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    search_query: search_query.clone(),
+                    command: command.clone(),
+                    artifact_id: artifact_id.clone(),
+                    paths: event.paths.clone(),
+                    regions: regions.clone(),
+                    symbols: event.symbols.clone(),
+                    duration_ms: *duration_ms,
+                    occurred_at_unix: event.occurred_at_unix,
+                });
+            snapshot.recent_tool_invocations.sort_by(|a, b| {
+                a.sequence
+                    .cmp(&b.sequence)
+                    .then_with(|| a.occurred_at_unix.cmp(&b.occurred_at_unix))
+                    .then_with(|| a.invocation_id.cmp(&b.invocation_id))
+            });
+            trim_front(&mut snapshot.recent_tool_invocations, 12);
+            snapshot
+                .last_successful_tool_by_kind
+                .retain(|item| item.operation_kind != *operation_kind);
+            snapshot
+                .last_successful_tool_by_kind
+                .push(suite_packet_core::ToolKindSuccess {
+                    operation_kind: *operation_kind,
+                    tool_name: tool_name.clone(),
+                    invocation_id: invocation_id.clone(),
+                });
+            snapshot
+                .last_successful_tool_by_kind
+                .sort_by(|a, b| a.operation_kind.cmp(&b.operation_kind));
+        }
+        suite_packet_core::AgentStateEventData::ToolInvocationFailed {
+            invocation_id,
+            sequence,
+            tool_name,
+            server_name,
+            operation_kind,
+            request_summary,
+            error_class,
+            error_message,
+            request_fingerprint,
+            retryable,
+            duration_ms,
+        } => {
+            snapshot
+                .tool_failures
+                .retain(|item| item.invocation_id != *invocation_id);
+            snapshot
+                .tool_failures
+                .push(suite_packet_core::ToolFailureSummary {
+                    invocation_id: invocation_id.clone(),
+                    sequence: *sequence,
+                    tool_name: tool_name.clone(),
+                    server_name: server_name.clone(),
+                    operation_kind: *operation_kind,
+                    request_summary: request_summary.clone(),
+                    error_class: error_class.clone(),
+                    error_message: error_message.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    retryable: *retryable,
+                    duration_ms: *duration_ms,
+                    occurred_at_unix: event.occurred_at_unix,
+                });
+            snapshot.tool_failures.sort_by(|a, b| {
+                a.sequence
+                    .cmp(&b.sequence)
+                    .then_with(|| a.occurred_at_unix.cmp(&b.occurred_at_unix))
+                    .then_with(|| a.invocation_id.cmp(&b.invocation_id))
+            });
+            trim_front(&mut snapshot.tool_failures, 8);
+        }
+        suite_packet_core::AgentStateEventData::EvidenceCaptured { artifact_id, .. } => {
+            insert_sorted_unique(&mut snapshot.evidence_artifact_ids, artifact_id.clone());
+        }
+    }
+}
+
+fn insert_sorted_unique(values: &mut Vec<String>, value: String) {
+    if values.binary_search(&value).is_err() {
+        values.push(value);
+        values.sort();
+    }
+}
+
+fn extend_sorted_unique(values: &mut Vec<String>, incoming: &[String]) {
+    for value in incoming {
+        insert_sorted_unique(values, value.clone());
+    }
+}
+
+fn remove_many(values: &mut Vec<String>, incoming: &[String]) {
+    values.retain(|value| !incoming.iter().any(|candidate| candidate == value));
+}
+
+fn merge_tool_path_summary(
+    entries: &mut Vec<suite_packet_core::ToolPathSummary>,
+    tool_name: &str,
+    operation_kind: suite_packet_core::ToolOperationKind,
+    paths: &[String],
+) {
+    let mut found = false;
+    for entry in entries.iter_mut() {
+        if entry.tool_name == tool_name && entry.operation_kind == operation_kind {
+            extend_sorted_unique(&mut entry.paths, paths);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        let mut summary = suite_packet_core::ToolPathSummary {
+            tool_name: tool_name.to_string(),
+            operation_kind,
+            paths: Vec::new(),
+        };
+        extend_sorted_unique(&mut summary.paths, paths);
+        entries.push(summary);
+        entries.sort_by(|a, b| {
+            a.tool_name
+                .cmp(&b.tool_name)
+                .then_with(|| a.operation_kind.cmp(&b.operation_kind))
+        });
+    }
+}
+
+fn trim_front<T>(values: &mut Vec<T>, keep: usize) {
+    if values.len() > keep {
+        let drop_count = values.len() - keep;
+        values.drain(0..drop_count);
+    }
+}
+
 fn build_resolved_questions(
     task: Option<&TaskRecord>,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
@@ -3005,7 +4177,7 @@ fn build_broker_sections(
     state: &Arc<Mutex<DaemonState>>,
     request: &BrokerGetContextRequest,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
-    manage: &suite_packet_core::ContextManagePayload,
+    manage: Option<&suite_packet_core::ContextManagePayload>,
     repo_map: Option<&suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>>,
 ) -> Vec<BrokerSection> {
     let action = request.action.unwrap_or(BrokerAction::Plan);
@@ -3316,14 +4488,19 @@ fn build_broker_sections(
             .collect::<BTreeSet<_>>();
         let provenance_by_file = candidate_paths
             .iter()
-            .map(|path| (path.clone(), collect_tool_result_provenance(snapshot, path)))
+            .map(|path| {
+                let mut provenance = collect_tool_result_provenance(snapshot, path);
+                provenance.extend(collect_index_provenance(state, path, &query_focus));
+                (path.clone(), provenance)
+            })
             .collect::<BTreeMap<_, _>>();
         let evidence_by_file = candidate_paths
             .iter()
             .map(|path| {
                 (
                     path.clone(),
-                    extract_code_evidence(
+                    extract_code_evidence_cached(
+                        Some(state),
                         root,
                         path,
                         &query_focus,
@@ -3403,7 +4580,10 @@ fn build_broker_sections(
         }
     }
 
-    if !manage.working_set.is_empty() || !manage.recommended_packets.is_empty() {
+    if manage.is_some_and(|manage| {
+        !manage.working_set.is_empty() || !manage.recommended_packets.is_empty()
+    }) {
+        let manage = manage.expect("manage checked above");
         let packets = if !manage.working_set.is_empty() {
             &manage.working_set
         } else {
@@ -3441,7 +4621,8 @@ fn build_broker_sections(
         }
     }
 
-    if !manage.recommended_actions.is_empty() {
+    if manage.is_some_and(|manage| !manage.recommended_actions.is_empty()) {
+        let manage = manage.expect("manage checked above");
         let title = match request
             .tool_result_kind
             .unwrap_or(BrokerToolResultKind::Generic)
@@ -3691,18 +4872,62 @@ fn compute_broker_response(
     state: &Arc<Mutex<DaemonState>>,
     request: &BrokerGetContextRequest,
 ) -> Result<BrokerGetContextResponse> {
+    let started_at = Instant::now();
+    let mut diagnostics_ms = BTreeMap::new();
+    let snapshot_started = Instant::now();
     let snapshot = load_agent_snapshot_for_task(state, &request.task_id)?;
+    diagnostics_ms.insert(
+        "snapshot_load".to_string(),
+        snapshot_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
     let task = load_task_record(state, &request.task_id);
     let root = state.lock().map_err(lock_err)?.root.clone();
     let kernel = state.lock().map_err(lock_err)?.kernel.clone();
     let objective = broker_objective(state, request);
     let focus_symbols = derive_broker_focus_symbols(&snapshot, request);
     let focus_paths =
-        derive_broker_focus_paths(&root, objective.as_deref(), &snapshot, request, 8)?;
-    let manage = load_context_manage_for_task(&kernel, request, &focus_paths, &focus_symbols)?;
-    let repo_map = load_repo_map_for_task(request, &focus_paths, &focus_symbols, &root)?;
+        derive_broker_focus_paths(state, &root, objective.as_deref(), &snapshot, request, 8)?;
     let version = current_context_version(state, &request.task_id)?;
     let action = request.action.unwrap_or(BrokerAction::Plan);
+    let allowed_sections =
+        filter_requested_section_ids(action, &request.include_sections, &request.exclude_sections);
+    let needs_manage = allowed_sections.contains("relevant_context")
+        || allowed_sections.contains("recommended_actions");
+    let needs_repo_map =
+        allowed_sections.contains("repo_map") || allowed_sections.contains("code_evidence");
+    let manage = if needs_manage {
+        let manage_started = Instant::now();
+        let payload = load_context_manage_for_task(&kernel, request, &focus_paths, &focus_symbols)?;
+        diagnostics_ms.insert(
+            "context_manage".to_string(),
+            manage_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        Some(payload)
+    } else {
+        diagnostics_ms.insert("context_manage".to_string(), 0);
+        None
+    };
+    let repo_map = if needs_repo_map {
+        let repo_map_started = Instant::now();
+        let payload = load_repo_map_for_task(state, request, &focus_paths, &focus_symbols, &root)?;
+        diagnostics_ms.insert(
+            "repo_map".to_string(),
+            repo_map_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        payload
+    } else {
+        diagnostics_ms.insert("repo_map".to_string(), 0);
+        None
+    };
     let effective_limits = resolve_effective_limits(
         action,
         request.verbosity,
@@ -3710,8 +4935,22 @@ fn compute_broker_response(
         request.default_max_items_per_section,
         &request.section_item_limits,
     );
-    let full_sections =
-        build_broker_sections(&root, state, request, &snapshot, &manage, repo_map.as_ref());
+    let section_build_started = Instant::now();
+    let full_sections = build_broker_sections(
+        &root,
+        state,
+        request,
+        &snapshot,
+        manage.as_ref(),
+        repo_map.as_ref(),
+    );
+    diagnostics_ms.insert(
+        "section_build".to_string(),
+        section_build_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
     let budget_tokens = request
         .budget_tokens
         .unwrap_or_else(broker_default_budget_tokens);
@@ -3798,28 +5037,38 @@ fn compute_broker_response(
         eviction_candidates,
         delta,
         working_set: manage
-            .working_set
-            .iter()
-            .map(|packet| BrokerPacketRef {
-                cache_key: packet.cache_key.clone(),
-                target: packet.target.clone(),
-                score: packet.score,
-                summary: packet.summary.clone(),
-                packet_types: packet.packet_types.clone(),
-                est_tokens: packet.est_tokens,
-                est_bytes: packet.est_bytes,
+            .as_ref()
+            .map(|manage| {
+                manage
+                    .working_set
+                    .iter()
+                    .map(|packet| BrokerPacketRef {
+                        cache_key: packet.cache_key.clone(),
+                        target: packet.target.clone(),
+                        score: packet.score,
+                        summary: packet.summary.clone(),
+                        packet_types: packet.packet_types.clone(),
+                        est_tokens: packet.est_tokens,
+                        est_bytes: packet.est_bytes,
+                    })
+                    .collect()
             })
-            .collect(),
+            .unwrap_or_default(),
         recommended_actions: manage
-            .recommended_actions
-            .iter()
-            .map(|action| BrokerRecommendedAction {
-                kind: action.kind.clone(),
-                summary: action.summary.clone(),
-                related_paths: action.related_paths.clone(),
-                related_symbols: action.related_symbols.clone(),
+            .as_ref()
+            .map(|manage| {
+                manage
+                    .recommended_actions
+                    .iter()
+                    .map(|action| BrokerRecommendedAction {
+                        kind: action.kind.clone(),
+                        summary: action.summary.clone(),
+                        related_paths: action.related_paths.clone(),
+                        related_symbols: action.related_symbols.clone(),
+                    })
+                    .collect()
             })
-            .collect(),
+            .unwrap_or_default(),
         active_decisions: snapshot
             .active_decisions
             .iter()
@@ -3851,6 +5100,13 @@ fn compute_broker_response(
         effective_max_sections: effective_limits.max_sections,
         effective_default_max_items_per_section: effective_limits.default_max_items_per_section,
         effective_section_item_limits: effective_limits.section_item_limits,
+        diagnostics_ms: {
+            diagnostics_ms.insert(
+                "total".to_string(),
+                started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            );
+            diagnostics_ms
+        },
     })
 }
 
@@ -3876,6 +5132,7 @@ fn estimate_request_to_get_request(
         max_sections: request.max_sections,
         default_max_items_per_section: request.default_max_items_per_section,
         section_item_limits: request.section_item_limits.clone(),
+        persist_artifacts: request.persist_artifacts,
     }
 }
 
@@ -3929,12 +5186,19 @@ fn broker_get_context(
         let mut session_request = request.clone();
         session_request.since_version = None;
         session_request.response_mode = Some(BrokerResponseMode::Full);
+        session_request.persist_artifacts = Some(true);
         task.latest_broker_request = Some(session_request);
         persist_state(&guard)?;
     }
     let _ = set_context_reason(&state, &request.task_id, "get_context");
     let response = compute_broker_response(&state, &request)?;
-    write_broker_artifacts(&state, &request.task_id, &response)?;
+    daemon_log(&format!(
+        "broker get_context task={} diagnostics_ms={:?}",
+        request.task_id, response.diagnostics_ms
+    ));
+    if request.persist_artifacts.unwrap_or(true) {
+        write_broker_artifacts(&state, &request.task_id, &response)?;
+    }
     Ok(response)
 }
 
@@ -3978,6 +5242,7 @@ fn broker_estimate_context(
         effective_max_sections: response.effective_max_sections,
         effective_default_max_items_per_section: response.effective_default_max_items_per_section,
         effective_section_item_limits: response.effective_section_item_limits,
+        diagnostics_ms: response.diagnostics_ms,
     })
 }
 
@@ -4779,6 +6044,7 @@ fn broker_write_state(
         }),
         ..KernelRequest::default()
     })?;
+    apply_agent_snapshot_event_to_cache(&state, &event)?;
     if matches!(request.op, Some(BrokerWriteOp::ToolResult)) {
         if !request.paths.is_empty() || !request.symbols.is_empty() {
             let focus_event = suite_packet_core::AgentStateEventPayload {
@@ -4807,6 +6073,7 @@ fn broker_write_state(
                 }),
                 ..KernelRequest::default()
             })?;
+            apply_agent_snapshot_event_to_cache(&state, &focus_event)?;
         }
         if let Some(artifact_id) = request
             .artifact_id
@@ -4840,7 +6107,12 @@ fn broker_write_state(
                 }),
                 ..KernelRequest::default()
             })?;
+            apply_agent_snapshot_event_to_cache(&state, &evidence_event)?;
         }
+    }
+    invalidate_broker_caches(&state, &request)?;
+    if matches!(request.op, Some(BrokerWriteOp::FileEdit)) && !request.paths.is_empty() {
+        let _ = enqueue_incremental_index_paths(&state, &request.paths);
     }
     if let Some(question_id) = &request.resolves_question_id {
         let question_resolved_event = suite_packet_core::AgentStateEventPayload {
@@ -4863,6 +6135,7 @@ fn broker_write_state(
             }),
             ..KernelRequest::default()
         })?;
+        apply_agent_snapshot_event_to_cache(&state, &question_resolved_event)?;
     }
     update_broker_link_state(&state, &request)?;
     let reason = format!(
@@ -4872,37 +6145,79 @@ fn broker_write_state(
     let _ = set_context_reason(&state, &request.task_id, reason);
 
     let version = bump_context_version(&state, &request.task_id)?;
-    if let Some(response) = refresh_broker_context_for_task(&state, &request.task_id)? {
-        let changed_section_ids = response
-            .delta
-            .changed_sections
-            .iter()
-            .map(|section| section.id.clone())
-            .collect::<Vec<_>>();
-        let _ = emit_task_event(
-            state.clone(),
-            &request.task_id,
-            "context_updated",
-            json!({
-                "context_version": response.context_version,
-                "changed_section_ids": changed_section_ids,
-                "removed_section_ids": response.delta.removed_section_ids,
-                "reason": state.lock().ok()
-                    .and_then(|guard| guard.tasks.tasks.get(&request.task_id).and_then(|task| task.latest_context_reason.clone()))
-                    .unwrap_or_else(|| "state_write".to_string()),
-                "summary": response
-                    .sections
-                    .first()
-                    .map(|section| section.title.clone())
-                    .unwrap_or_else(|| "broker refresh".to_string()),
-            }),
-        );
+    if request.refresh_context.unwrap_or(true) {
+        if let Some(response) = refresh_broker_context_for_task(&state, &request.task_id)? {
+            let changed_section_ids = response
+                .delta
+                .changed_sections
+                .iter()
+                .map(|section| section.id.clone())
+                .collect::<Vec<_>>();
+            let _ = emit_task_event(
+                state.clone(),
+                &request.task_id,
+                "context_updated",
+                json!({
+                    "context_version": response.context_version,
+                    "changed_section_ids": changed_section_ids,
+                    "removed_section_ids": response.delta.removed_section_ids,
+                    "reason": state.lock().ok()
+                        .and_then(|guard| guard.tasks.tasks.get(&request.task_id).and_then(|task| task.latest_context_reason.clone()))
+                        .unwrap_or_else(|| "state_write".to_string()),
+                    "summary": response
+                        .sections
+                        .first()
+                        .map(|section| section.title.clone())
+                        .unwrap_or_else(|| "broker refresh".to_string()),
+                }),
+            );
+        }
     }
 
     Ok(BrokerWriteStateResponse {
         event_id: event.event_id,
         context_version: version,
         accepted: true,
+    })
+}
+
+fn invalidate_broker_caches(
+    state: &Arc<Mutex<DaemonState>>,
+    request: &BrokerWriteStateRequest,
+) -> Result<()> {
+    let mut invalidate_repo_map = matches!(request.op, Some(BrokerWriteOp::FileEdit));
+    if matches!(
+        request.op,
+        Some(BrokerWriteOp::ToolResult | BrokerWriteOp::ToolInvocationCompleted)
+    ) && request.operation_kind == Some(suite_packet_core::ToolOperationKind::Edit)
+    {
+        invalidate_repo_map = true;
+    }
+    if !invalidate_repo_map && request.paths.is_empty() {
+        return Ok(());
+    }
+    let mut guard = state.lock().map_err(lock_err)?;
+    if invalidate_repo_map {
+        guard.repo_map_cache.clear();
+    }
+    for path in &request.paths {
+        guard.source_file_cache.remove(path);
+    }
+    Ok(())
+}
+
+fn broker_write_state_batch(
+    state: Arc<Mutex<DaemonState>>,
+    request: BrokerWriteStateBatchRequest,
+) -> Result<BrokerWriteStateBatchResponse> {
+    let responses = request
+        .requests
+        .into_iter()
+        .map(|item| broker_write_state(state.clone(), item))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BrokerWriteStateBatchResponse {
+        accepted: responses.iter().all(|response| response.accepted),
+        responses,
     })
 }
 
@@ -4952,6 +6267,40 @@ fn broker_task_status(
                     .to_string()
             }),
     })
+}
+
+fn daemon_index_status(state: Arc<Mutex<DaemonState>>) -> Result<DaemonIndexStatusResponse> {
+    let guard = state.lock().map_err(lock_err)?;
+    Ok(build_index_status(&guard.interactive_index))
+}
+
+fn daemon_index_rebuild(
+    state: Arc<Mutex<DaemonState>>,
+    request: DaemonIndexRebuildRequest,
+) -> Result<DaemonIndexRebuildResponse> {
+    let queued_paths = if request.full || request.paths.is_empty() {
+        enqueue_full_index_rebuild(&state)?;
+        Vec::new()
+    } else {
+        enqueue_incremental_index_paths(&state, &request.paths)?
+    };
+    let generation = state
+        .lock()
+        .map_err(lock_err)?
+        .interactive_index
+        .manifest
+        .generation;
+    Ok(DaemonIndexRebuildResponse {
+        accepted: true,
+        full: request.full || request.paths.is_empty(),
+        generation: Some(generation),
+        queued_paths,
+    })
+}
+
+fn daemon_index_clear(state: Arc<Mutex<DaemonState>>) -> Result<DaemonIndexClearResponse> {
+    enqueue_index_command(&state, IndexCommand::Clear)?;
+    Ok(DaemonIndexClearResponse { cleared: true })
 }
 
 fn register_task_and_watches(
@@ -5415,40 +6764,40 @@ fn process_watch_event(state: Arc<Mutex<DaemonState>>, message: WatchEventMsg) -
     if paths.is_empty() {
         return Ok(());
     }
+    let _ = enqueue_incremental_index_paths(&state, &paths);
 
     let event = match watch.spec.kind {
-        WatchKind::Git => json!({
-            "task_id": task_id,
-            "event_id": format!("{}-{}", watch.watch_id, now_unix()),
-            "occurred_at_unix": now_unix(),
-            "actor": "packet28d.watch",
-            "kind": "focus_set",
-            "paths": paths,
-            "symbols": [],
-            "data": {
-                "type": "focus_set",
-                "note": "git_watch",
-            }
-        }),
-        WatchKind::File | WatchKind::TestReport => json!({
-            "task_id": task_id,
-            "event_id": format!("{}-{}", watch.watch_id, now_unix()),
-            "occurred_at_unix": now_unix(),
-            "actor": "packet28d.watch",
-            "kind": "file_edited",
-            "paths": paths,
-            "symbols": [],
-            "data": {
-                "type": "file_edited",
-                "regions": [],
-            }
-        }),
+        WatchKind::Git => suite_packet_core::AgentStateEventPayload {
+            task_id: task_id.clone(),
+            event_id: format!("{}-{}", watch.watch_id, now_unix()),
+            occurred_at_unix: now_unix_millis(),
+            actor: "packet28d.watch".to_string(),
+            kind: suite_packet_core::AgentStateEventKind::FocusSet,
+            paths: paths.clone(),
+            symbols: Vec::new(),
+            data: suite_packet_core::AgentStateEventData::FocusSet {
+                note: Some("git_watch".to_string()),
+            },
+        },
+        WatchKind::File | WatchKind::TestReport => suite_packet_core::AgentStateEventPayload {
+            task_id: task_id.clone(),
+            event_id: format!("{}-{}", watch.watch_id, now_unix()),
+            occurred_at_unix: now_unix_millis(),
+            actor: "packet28d.watch".to_string(),
+            kind: suite_packet_core::AgentStateEventKind::FileEdited,
+            paths: paths.clone(),
+            symbols: Vec::new(),
+            data: suite_packet_core::AgentStateEventData::FileEdited {
+                regions: Vec::new(),
+            },
+        },
     };
     kernel.execute(KernelRequest {
         target: "agenty.state.write".to_string(),
-        reducer_input: event,
+        reducer_input: serde_json::to_value(&event)?,
         ..KernelRequest::default()
     })?;
+    apply_agent_snapshot_event_to_cache(&state, &event)?;
     daemon_log(&format!(
         "watch event watch_id={} task_id={} paths={}",
         watch.watch_id,

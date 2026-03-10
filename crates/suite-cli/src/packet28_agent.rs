@@ -95,6 +95,7 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
             max_sections: None,
             default_max_items_per_section: None,
             section_item_limits: std::collections::BTreeMap::new(),
+            persist_artifacts: None,
         },
     )?;
     fs::write(&preflight_path, serde_json::to_vec(&broker_response)?).with_context(|| {
