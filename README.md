@@ -288,10 +288,12 @@ Packet28 guard check          Evaluate packet against policy
 Packet28 packet fetch         Retrieve persisted artifact by handle
 Packet28 preflight            Bounded agent context for a task
 Packet28 agent-prompt         Generate agent instruction fragments
+Packet28 mcp serve|proxy      Expose Packet28 as an MCP server or proxy upstream MCP servers
 Packet28 daemon               Daemon lifecycle and task management
+Packet28 setup                Configure Claude/Cursor/Codex integration files
 ```
 
-All machine-mode commands emit `suite.packet.v1` JSON wrappers. Three output profiles:
+Reducer, packet, preflight, and context commands emit `suite.packet.v1` JSON wrappers. Three output profiles:
 
 - `--json` or `--json=compact`: Bounded compact payload
 - `--json=full`: Complete payload with all fields
@@ -351,7 +353,15 @@ The `--via-daemon` flag on any Packet28 command routes execution through the dae
 
 #### Agent Surface
 
-Two entry points for agent integration:
+Three entry points for agent integration:
+
+**`Packet28 setup`** is the fastest way to wire Packet28 into a local agent runtime:
+
+```bash
+Packet28 setup --runtime all --yes
+```
+
+It updates project-local MCP config where supported (`.mcp.json`, `.cursor/mcp.json`), writes fallback prompt fragments for Claude/Cursor/Codex, and prepares the daemon index.
 
 **`Packet28 agent-prompt`** generates instruction fragments for agent config files:
 
@@ -361,9 +371,9 @@ Packet28 agent-prompt --format agents    # AGENTS.md fragment
 Packet28 agent-prompt --format cursor    # .cursorrules fragment
 ```
 
-Output tells the agent: use preflight before broad file reads for non-trivial tasks, prefer bounded packets over raw file scans, fall back to direct reads if preflight fails, skip for trivial edits.
+Output tells the agent how to use Packet28's broker and bounded context flow before broad file reads, while still falling back to direct reads for trivial edits or broker failures.
 
-**`packet28-agent`** is a wrapper binary that runs preflight automatically before delegating to an agent runtime:
+**`packet28-agent`** is a wrapper binary that fetches broker context automatically before delegating to an agent runtime:
 
 ```bash
 packet28-agent \
@@ -372,9 +382,9 @@ packet28-agent \
 ```
 
 The wrapper:
-1. Runs `Packet28 preflight` with the task description
-2. Persists the result to `.packet28/agent/latest-preflight.json`
-3. Exports `PACKET28_PREFLIGHT_PATH` and `PACKET28_ROOT` as environment variables
+1. Resolves a stable task ID from `--task`
+2. Fetches bounded broker context and persists it to `.packet28/agent/latest-preflight.json`
+3. Exports `PACKET28_*` environment variables for the brief, state snapshot, broker tools, MCP command, and repo root
 4. Executes the delegated command, propagating its exit code
 
 #### Preflight
@@ -530,12 +540,39 @@ All persistent state lives under `.packet28/` at the workspace root:
 
 Coverage state from the legacy `covy` CLI lives under `.covy/state/`.
 
-## Quick Start
+## Installation
 
-Build:
+Build from source:
 
 ```bash
 cargo build --release -p suite-cli -p packet28d
+```
+
+Or install the npm wrapper binaries:
+
+```bash
+npm install -g packet28
+```
+
+The npm package installs:
+
+- `packet28` for the main CLI
+- `packet28-mcp` for `Packet28 mcp serve`
+
+## Quick Start
+
+Auto-configure local agent files and MCP config:
+
+```bash
+./target/release/Packet28 setup --runtime all --yes
+```
+
+Run Packet28 as an MCP server:
+
+```bash
+./target/release/Packet28 mcp serve --root .
+# or, if installed via npm:
+packet28-mcp --root .
 ```
 
 Run preflight for a task:
@@ -546,13 +583,13 @@ Run preflight for a task:
   --json
 ```
 
-Generate agent instructions:
+Generate agent instructions directly:
 
 ```bash
 ./target/release/Packet28 agent-prompt --format claude >> CLAUDE.md
 ```
 
-Use the wrapper to launch an agent with preflight context:
+Use the wrapper to launch an agent with broker context:
 
 ```bash
 ./target/release/packet28-agent \
@@ -641,24 +678,24 @@ max_new_errors = 0
 max_new_warnings = 5
 ```
 
-Optional governance via `context.yaml` for policy-constrained execution. See `docs/` for protocol specifications.
+Optional governance via `context.yaml` for policy-constrained execution. The current machine-readable reference material lives in `schemas/` and `scripts/ci/`.
 
-## Protocol Documentation
+## Reference Artifacts
 
-| Document | Path |
+| Artifact | Path |
 | --- | --- |
-| Machine output contract | `docs/machine-output-contract.md` |
-| Wire profiles (compact/full/handle) | `docs/wire-profiles.md` |
-| Packet envelope v1 spec | `docs/packet-envelope-v1.md` |
-| Schema registry | `docs/schema-registry.md` |
-| Context store v1 | `docs/context-store-v1.md` |
-| CI/agent integration examples | `docs/ci-agent-examples.md` |
+| Packet wrapper schema | `schemas/packet-wrapper/suite.packet.v1.schema.json` |
+| Packet type schemas | `schemas/packet-types/` |
+| Snapshot fixtures for compact/full/handle profiles | `schemas/snapshots/` |
+| GitHub Actions example | `scripts/ci/github-actions.yml` |
+| GitLab CI example | `scripts/ci/gitlab-ci.yml` |
+| Benchmark notes | `scripts/benchmark_packet28.md` |
 
-Schema artifacts: `schemas/packet-wrapper/`, `schemas/packet-types/`, `schemas/snapshots/`.
+Repository-local MCP config example: `.mcp.json`.
 
 ## Project Stats
 
-- ~52K lines of Rust across 126 source files
+- ~58K lines of Rust across 119 source files
+- ~8K lines of Rust tests across 12 test files
 - 24 crates in the workspace
-- 69 end-to-end tests
 - 6 binaries (Packet28, packet28-agent, packet28d, covy, diffy, testy)
