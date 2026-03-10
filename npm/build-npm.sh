@@ -62,8 +62,14 @@ for platform_key in "${!PLATFORMS[@]}"; do
   sed -e "s/PLATFORM/$platform_key/g" \
       -e "s/\"OS\"/\"$os\"/g" \
       -e "s/\"CPU\"/\"$cpu\"/g" \
-      -e "s/0\.2\.0/$VERSION/g" \
       "$NPM_DIR/platform-template/package.json" > "$pkg_dir/package.json"
+  node -e '
+    const fs = require("node:fs");
+    const [path, version] = process.argv.slice(1);
+    const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+    pkg.version = version;
+    fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
+  ' "$pkg_dir/package.json" "$VERSION"
 
   echo "  Created @packet28/$platform_key with $(ls "$pkg_dir/bin/" | wc -l | tr -d ' ') binaries"
 done
@@ -73,7 +79,16 @@ echo ""
 echo "=== Staging root packet28 package ==="
 root_dir="$DIST_DIR/packet28"
 cp -r "$NPM_DIR/packet28/" "$root_dir/"
-sed -i.bak "s/0\.2\.0/$VERSION/g" "$root_dir/package.json" && rm -f "$root_dir/package.json.bak"
+node -e '
+  const fs = require("node:fs");
+  const [path, version] = process.argv.slice(1);
+  const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+  pkg.version = version;
+  for (const dep of Object.keys(pkg.optionalDependencies ?? {})) {
+    pkg.optionalDependencies[dep] = version;
+  }
+  fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
+' "$root_dir/package.json" "$VERSION"
 chmod +x "$root_dir/bin/packet28.js" "$root_dir/bin/packet28-mcp.js"
 
 # Also stage vendor/ with native platform binary as fallback

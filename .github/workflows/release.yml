@@ -148,8 +148,8 @@ jobs:
           const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
           pkg.version = version;
           for (const name of ['@packet28/darwin-arm64', '@packet28/darwin-x64', '@packet28/linux-x64', '@packet28/linux-arm64']) {
-            if (pkg.dependencies && pkg.dependencies[name]) {
-              pkg.dependencies[name] = version;
+            if (pkg.optionalDependencies && pkg.optionalDependencies[name]) {
+              pkg.optionalDependencies[name] = version;
             }
           }
           fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
