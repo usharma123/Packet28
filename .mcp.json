@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "packet28": {
+      "args": [
+        "--root",
+        "/Users/utsavsharma/Documents/GitHub/Coverage"
+      ],
+      "command": "/usr/local/bin/packet28-mcp"
+    }
+  }
+}

@@ -42,15 +42,9 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     let root_display = root.display().to_string();
 
     println!();
-    println!(
-        "{}",
-        "  Packet28 Setup  ".bold().white().on_bright_blue()
-    );
+    println!("{}", "  Packet28 Setup  ".bold().white().on_bright_blue());
     println!();
-    println!(
-        "  Workspace: {}",
-        root_display.cyan()
-    );
+    println!("  Workspace: {}", root_display.cyan());
     println!();
 
     // Detect runtimes
@@ -109,11 +103,7 @@ pub fn run(args: SetupArgs) -> Result<i32> {
                         config_path.display().to_string().dimmed()
                     );
                 } else {
-                    println!(
-                        "    {} {} (already configured)",
-                        "·".dimmed(),
-                        rt.name,
-                    );
+                    println!("    {} {} (already configured)", "·".dimmed(), rt.name,);
                 }
             }
             println!();
@@ -141,11 +131,7 @@ pub fn run(args: SetupArgs) -> Result<i32> {
                 path.display().to_string().dimmed()
             );
         } else {
-            println!(
-                "    {} {} (already up to date)",
-                "·".dimmed(),
-                rt.name,
-            );
+            println!("    {} {} (already up to date)", "·".dimmed(), rt.name,);
         }
     }
 
@@ -172,17 +158,10 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     println!("  {}", "Verifying daemon:".bold());
     match crate::cmd_daemon::ensure_daemon(&root) {
         Ok(_) => {
-            println!(
-                "    {} daemon running",
-                "✓".green().bold()
-            );
+            println!("    {} daemon running", "✓".green().bold());
         }
         Err(e) => {
-            println!(
-                "    {} daemon failed to start: {}",
-                "✗".red().bold(),
-                e
-            );
+            println!("    {} daemon failed to start: {}", "✗".red().bold(), e);
             println!(
                 "    {} run `packet28 daemon start --root {}` manually",
                 "hint:".cyan().bold(),
@@ -202,9 +181,7 @@ pub fn run(args: SetupArgs) -> Result<i32> {
         println!("    Start a new session and Packet28 context tools will be available.");
     } else {
         println!("    Agent instruction files have been written.");
-        println!(
-            "    Include them in your agent's context or system prompt."
-        );
+        println!("    Include them in your agent's context or system prompt.");
     }
 
     println!();
@@ -369,7 +346,11 @@ fn write_agent_file(path: &Path, content: &str) -> Result<bool> {
         }
 
         // Append to existing file
-        let separator = if existing.ends_with('\n') { "\n" } else { "\n\n" };
+        let separator = if existing.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
         fs::write(path, format!("{existing}{separator}{content}\n"))?;
         return Ok(true);
     }

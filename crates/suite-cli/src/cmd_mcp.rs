@@ -260,11 +260,7 @@ fn parse_header(name: &str, value: &str, content_length: &mut Option<usize>) -> 
     Ok(())
 }
 
-fn write_message(
-    writer: &mut impl Write,
-    value: &Value,
-    framing: McpMessageFraming,
-) -> Result<()> {
+fn write_message(writer: &mut impl Write, value: &Value, framing: McpMessageFraming) -> Result<()> {
     let body = serde_json::to_vec(value)?;
     match framing {
         McpMessageFraming::ContentLength => {

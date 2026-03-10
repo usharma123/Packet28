@@ -10,9 +10,15 @@ Cargo.lock
 # IDE
 .idea/
 .vscode/
+.cursor/
+.cursorrules
 *.swp
 *.swo
 *~
+
+# Agent/runtime local instructions
+AGENTS.md
+CLAUDE.md
 
 # OS
 .DS_Store
@@ -29,3 +35,6 @@ crates/suite-cli/.packet28/
 # npm build artifacts
 npm/packet28/vendor/
 dist/
+
+# Apache Commons Lang (test repo)
+apache/
