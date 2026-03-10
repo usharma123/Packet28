@@ -84,8 +84,15 @@ jobs:
           sed -e "s/PLATFORM/${{ matrix.platform }}/g" \
               -e "s/\"OS\"/\"${{ matrix.npm_os }}\"/g" \
               -e "s/\"CPU\"/\"${{ matrix.npm_cpu }}\"/g" \
-              -e "s/0\.2\.0/$VERSION/g" \
               npm/platform-template/package.json > "$PKG_DIR/package.json"
+          VERSION="$VERSION" PACKAGE_JSON="$PKG_DIR/package.json" node <<'NODE'
+          const fs = require('fs');
+          const pkgPath = process.env.PACKAGE_JSON;
+          const version = process.env.VERSION;
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          pkg.version = version;
+          fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+          NODE
 
       - name: Upload platform package
         uses: actions/upload-artifact@v4
@@ -117,6 +124,10 @@ jobs:
 
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             PKG_DIR="dist/platforms/pkg-${platform}"
+            if npm view "@packet28/${platform}@${VERSION}" version >/dev/null 2>&1; then
+              echo "@packet28/${platform}@${VERSION} already published, skipping"
+              continue
+            fi
             echo "Publishing @packet28/${platform}@${VERSION}..."
             (cd "$PKG_DIR" && npm publish --access public --provenance)
           done
@@ -130,9 +141,25 @@ jobs:
           # Stage root package
           ROOT_DIR="dist/packet28"
           cp -r npm/packet28/ "$ROOT_DIR/"
-          sed -i "s/0\.2\.0/$VERSION/g" "$ROOT_DIR/package.json"
+          VERSION="$VERSION" PACKAGE_JSON="$ROOT_DIR/package.json" node <<'NODE'
+          const fs = require('fs');
+          const pkgPath = process.env.PACKAGE_JSON;
+          const version = process.env.VERSION;
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          pkg.version = version;
+          for (const name of ['@packet28/darwin-arm64', '@packet28/darwin-x64', '@packet28/linux-x64', '@packet28/linux-arm64']) {
+            if (pkg.dependencies && pkg.dependencies[name]) {
+              pkg.dependencies[name] = version;
+            }
+          }
+          fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+          NODE
           chmod +x "$ROOT_DIR/bin/packet28.js" "$ROOT_DIR/bin/packet28-mcp.js"
 
+          if npm view "packet28@${VERSION}" version >/dev/null 2>&1; then
+            echo "packet28@${VERSION} already published, skipping"
+            exit 0
+          fi
           echo "Publishing packet28@${VERSION}..."
           (cd "$ROOT_DIR" && npm publish --access public --provenance)
 
@@ -140,6 +167,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists, skipping"
+            exit 0
+          fi
           gh release create "$GITHUB_REF_NAME" \
             --title "Packet28 ${GITHUB_REF_NAME}" \
             --generate-notes
