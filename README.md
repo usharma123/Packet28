@@ -690,6 +690,7 @@ Optional governance via `context.yaml` for policy-constrained execution. The cur
 | GitHub Actions example | `scripts/ci/github-actions.yml` |
 | GitLab CI example | `scripts/ci/gitlab-ci.yml` |
 | Benchmark notes | `scripts/benchmark_packet28.md` |
+| Agent search benchmark harness | `scripts/benchmark_agent_search.md` |
 
 Repository-local MCP config example: `.mcp.json`.
 
