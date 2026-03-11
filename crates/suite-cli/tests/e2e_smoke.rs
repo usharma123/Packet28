@@ -458,6 +458,25 @@ enum Beta {
     .unwrap();
 }
 
+fn write_search_expansion_fixture(root: &Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("alpha.rs"),
+        r#"
+pub struct AlphaService;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        src.join("alpha_update.rs"),
+        r#"
+pub fn update_state_for_alpha_service() {}
+"#,
+    )
+    .unwrap();
+}
+
 fn git(root: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .current_dir(root)
@@ -2822,10 +2841,10 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
                     "action":"plan",
                     "query":"What does Alpha do?",
                     "verbosity":"compact",
-                    "include_sections":["task_objective","repo_map","relevant_context"],
+                    "include_sections":["task_objective","search_evidence","relevant_context"],
                     "max_sections":2,
                     "default_max_items_per_section":2,
-                    "section_item_limits":{"repo_map":1}
+                    "section_item_limits":{"search_evidence":1}
                 }
             }
         }),
@@ -2864,7 +2883,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         2
     );
     assert_eq!(
-        first_context["effective_section_item_limits"]["repo_map"]
+        first_context["effective_section_item_limits"]["search_evidence"]
             .as_u64()
             .unwrap(),
         1
@@ -2877,24 +2896,24 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         .all(|section| {
             matches!(
                 section["id"].as_str().unwrap_or_default(),
-                "task_objective" | "repo_map" | "relevant_context"
+                "task_objective" | "search_evidence" | "relevant_context"
             )
         }));
-    let repo_map_section = first_context["sections"]
+    let search_evidence_section = first_context["sections"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|section| section["id"] == "repo_map")
+        .find(|section| section["id"] == "search_evidence")
         .unwrap();
     assert_eq!(
-        repo_map_section["title"].as_str().unwrap(),
+        search_evidence_section["title"].as_str().unwrap(),
         "Relevant Files"
     );
-    assert!(repo_map_section["body"]
+    assert!(search_evidence_section["body"]
         .as_str()
         .unwrap()
-        .contains("[score="));
-    assert!(repo_map_section["body"]
+        .contains("direct reducer hit"));
+    assert!(search_evidence_section["body"]
         .as_str()
         .unwrap()
         .contains("src/alpha.rs"));
@@ -2910,7 +2929,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
                 "arguments":{
                     "task_id":"task-mcp",
                     "action":"plan",
-                    "include_sections":["task_objective","repo_map"],
+                    "include_sections":["task_objective","search_evidence"],
                     "max_sections":2,
                     "default_max_items_per_section":2
                 }
@@ -3077,7 +3096,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
                     "budget_tokens":90,
                     "budget_bytes":360,
                     "response_mode":"full",
-                    "include_sections":["task_objective","current_focus","discovered_scope","recent_tool_activity","code_evidence","repo_map","relevant_context"]
+                    "include_sections":["task_objective","current_focus","discovered_scope","recent_tool_activity","code_evidence","search_evidence","relevant_context"]
                 }
             }
         }),
@@ -3088,7 +3107,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|section| section["id"] == "repo_map"));
+        .any(|section| section["id"] == "search_evidence"));
     assert!(tight_context["sections"]
         .as_array()
         .unwrap()
@@ -3304,12 +3323,12 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "packet28.grep"));
+        .any(|tool| tool["name"] == "packet28.search"));
     assert!(tools["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "packet28.read"));
+        .any(|tool| tool["name"] == "packet28.read_regions"));
 
     write_mcp_message(
         &mut stdin,
@@ -3318,10 +3337,10 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
             "id":3,
             "method":"tools/call",
             "params":{
-                "name":"packet28.grep",
+                "name":"packet28.search",
                 "arguments":{
                     "task_id":"task-native-grep",
-                    "pattern":"Alpha",
+                    "query":"Alpha",
                     "paths":["src"],
                     "whole_word":true
                 }
@@ -3334,7 +3353,7 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
         "native grep returned MCP error: {grep}"
     );
     let grep_payload = &grep["result"]["structuredContent"];
-    assert_eq!(grep_payload["pattern"].as_str().unwrap(), "Alpha");
+    assert_eq!(grep_payload["query"].as_str().unwrap(), "Alpha");
     assert_eq!(grep_payload["match_count"].as_u64().unwrap(), 1);
     assert_eq!(grep_payload["returned_match_count"].as_u64().unwrap(), 1);
     assert_eq!(grep_payload["truncated"], false);
@@ -3375,7 +3394,7 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
                     "action":"inspect",
                     "query":"Where is Alpha defined?",
                     "response_mode":"full",
-                    "include_sections":["task_objective","discovered_scope","recent_tool_activity","code_evidence","repo_map"]
+                    "include_sections":["task_objective","discovered_scope","recent_tool_activity","code_evidence","search_evidence"]
                 }
             }
         }),
@@ -3387,7 +3406,7 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
         .unwrap()
         .iter()
         .any(|item| {
-            item["tool_name"] == "packet28.grep"
+            item["tool_name"] == "packet28.search"
                 && item["regions"]
                     .as_array()
                     .is_some_and(|regions| !regions.is_empty())
@@ -3413,13 +3432,13 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
         .as_str()
         .unwrap()
         .contains("struct Alpha;"));
-    let repo_map_section = inspect_payload["sections"]
+    let search_evidence_section = inspect_payload["sections"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|section| section["id"] == "repo_map")
+        .find(|section| section["id"] == "search_evidence")
         .unwrap();
-    assert!(repo_map_section["body"]
+    assert!(search_evidence_section["body"]
         .as_str()
         .unwrap()
         .contains("src/alpha.rs"));
@@ -3477,7 +3496,7 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
             "id":2,
             "method":"tools/call",
             "params":{
-                "name":"packet28.read",
+                "name":"packet28.read_regions",
                 "arguments":{
                     "task_id":"task-native-read",
                     "path":"src/alpha.rs",
@@ -3518,7 +3537,7 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
                     "action":"inspect",
                     "query":"Where is Alpha defined?",
                     "response_mode":"full",
-                    "include_sections":["task_objective","discovered_scope","recent_tool_activity","code_evidence","repo_map"]
+                    "include_sections":["task_objective","discovered_scope","recent_tool_activity","code_evidence","search_evidence"]
                 }
             }
         }),
@@ -3530,7 +3549,7 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
         .unwrap()
         .iter()
         .any(|item| {
-            item["tool_name"] == "packet28.read"
+            item["tool_name"] == "packet28.read_regions"
                 && item["regions"].as_array().is_some_and(|regions| {
                     regions.iter().any(|region| region == "src/alpha.rs:4-5")
                 })
@@ -3552,6 +3571,93 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
         .as_str()
         .unwrap()
         .contains("struct Alpha;"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_inspect_expands_vague_update_query() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_search_expansion_fixture(dir.path());
+    git(dir.path(), &["add", "src/alpha.rs", "src/alpha_update.rs"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    write_cached_coverage_state(dir.path());
+    write_cached_testmap_state(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let initialize = read_mcp_message_for_id(&mut stdout, 1);
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-vague-inspect",
+                    "action":"inspect",
+                    "query":"How is AlphaService.updateState updated?",
+                    "response_mode":"full",
+                    "include_sections":["task_objective","discovered_scope","code_evidence","search_evidence"]
+                }
+            }
+        }),
+    );
+    let inspect = read_mcp_message_for_id(&mut stdout, 2);
+    let inspect_payload = &inspect["result"]["structuredContent"];
+    let search_evidence_section = inspect_payload["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["id"] == "search_evidence")
+        .unwrap();
+    assert!(search_evidence_section["body"]
+        .as_str()
+        .unwrap()
+        .contains("src/alpha_update.rs"));
+    let code_evidence_section = inspect_payload["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["id"] == "code_evidence")
+        .unwrap();
+    assert!(code_evidence_section["body"]
+        .as_str()
+        .unwrap()
+        .contains("update_state_for_alpha_service"));
 
     child.kill().unwrap();
     child.wait().unwrap();
@@ -4310,8 +4416,37 @@ fn test_suite_daemon_suppresses_disconnect_log_noise() {
         .assert()
         .success();
 
-    let socket = packet28_daemon_core::socket_path(dir.path());
-    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    let status_output = suite_cmd()
+        .args([
+            "daemon",
+            "status",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status_output).unwrap();
+    let socket = PathBuf::from(status.get("socket_path").and_then(Value::as_str).unwrap());
+    let start = std::time::Instant::now();
+    let mut stream = loop {
+        match std::os::unix::net::UnixStream::connect(&socket) {
+            Ok(stream) => break stream,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && start.elapsed() < std::time::Duration::from_secs(15) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(err) => panic!(
+                "failed to connect to daemon socket {}: {err}",
+                socket.display()
+            ),
+        }
+    };
     packet28_daemon_core::write_socket_message(
         &mut stream,
         &packet28_daemon_core::DaemonRequest::Status,
@@ -4321,7 +4456,12 @@ fn test_suite_daemon_suppresses_disconnect_log_noise() {
 
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let log = fs::read_to_string(dir.path().join(".packet28/daemon/packet28d.log")).unwrap();
+    let log_path = dir.path().join(".packet28/daemon/packet28d.log");
+    let start = std::time::Instant::now();
+    while !log_path.exists() && start.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let log = fs::read_to_string(&log_path).unwrap();
     assert!(!log.contains("request handling failed: Broken pipe"));
     assert!(!log.contains("request handling failed: Connection reset"));
     assert!(!log.contains("request handling failed: unexpected end of file"));

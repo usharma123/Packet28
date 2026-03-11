@@ -635,12 +635,10 @@ fn heuristic_reducers(tags: &[String]) -> BTreeSet<PreflightReducer> {
             "coverage" => {
                 reducers.insert(PreflightReducer::Cover);
                 reducers.insert(PreflightReducer::Diff);
-                reducers.insert(PreflightReducer::Map);
                 reducers.insert(PreflightReducer::Recall);
             }
             "diff" => {
                 reducers.insert(PreflightReducer::Diff);
-                reducers.insert(PreflightReducer::Map);
                 reducers.insert(PreflightReducer::Recall);
             }
             "build" => {
@@ -650,7 +648,6 @@ fn heuristic_reducers(tags: &[String]) -> BTreeSet<PreflightReducer> {
             }
             "stack" => {
                 reducers.insert(PreflightReducer::Stack);
-                reducers.insert(PreflightReducer::Map);
                 reducers.insert(PreflightReducer::Recall);
             }
             "test" => {
@@ -663,7 +660,6 @@ fn heuristic_reducers(tags: &[String]) -> BTreeSet<PreflightReducer> {
     }
     if reducers.is_empty() {
         reducers.insert(PreflightReducer::Diff);
-        reducers.insert(PreflightReducer::Map);
         reducers.insert(PreflightReducer::Recall);
     }
     reducers
@@ -1700,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_task_prefers_cover_diff_map_recall() {
+    fn coverage_task_prefers_cover_diff_recall() {
         let plan = plan_selection(
             &base_args("fix coverage gap in FooService"),
             &Availability {
@@ -1718,7 +1714,6 @@ mod tests {
             vec![
                 PreflightReducer::Cover,
                 PreflightReducer::Diff,
-                PreflightReducer::Map,
                 PreflightReducer::Recall,
             ]
         );
@@ -1730,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_task_defaults_to_diff_map_recall() {
+    fn generic_task_defaults_to_diff_recall() {
         let plan = plan_selection(
             &base_args("understand parser changes"),
             &Availability {
@@ -1745,11 +1740,7 @@ mod tests {
         );
         assert_eq!(
             plan.selected,
-            vec![
-                PreflightReducer::Diff,
-                PreflightReducer::Map,
-                PreflightReducer::Recall,
-            ]
+            vec![PreflightReducer::Diff, PreflightReducer::Recall]
         );
     }
 
@@ -1782,6 +1773,7 @@ mod tests {
     #[test]
     fn exclude_wins_over_selection() {
         let mut args = base_args("fix coverage gap in FooService");
+        args.include = vec![PreflightReducer::Map];
         args.exclude = vec![PreflightReducer::Map];
         let plan = plan_selection(
             &args,
@@ -1822,10 +1814,6 @@ mod tests {
             plan.selected,
             vec![PreflightReducer::Cover, PreflightReducer::Diff]
         );
-        assert!(plan
-            .skipped
-            .iter()
-            .any(|item| item.reducer == "map" && item.reason == "budget_trimmed"));
         assert!(plan
             .skipped
             .iter()

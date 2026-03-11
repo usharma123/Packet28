@@ -22,7 +22,6 @@ use context_memory_core::{
 };
 use diffy_core::model::CoverageFormat;
 use glob::Pattern;
-use ignore::WalkBuilder;
 use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
 use packet28_daemon_core::{
     append_task_event, ensure_daemon_dir, index_dir, index_manifest_path, index_snapshot_path,
@@ -80,33 +79,6 @@ struct PendingWatchEvent {
     due_at: Instant,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RepoMapCacheKey {
-    include_tests: bool,
-    focus_paths: Vec<String>,
-    focus_symbols: Vec<String>,
-    max_files: usize,
-    max_symbols: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-struct SourceMetadataEntry {
-    size: u64,
-    mtime_secs: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RepoSourceManifest {
-    files: BTreeMap<String, SourceMetadataEntry>,
-    dirs: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone)]
-struct RepoMapCacheEntry {
-    manifest: RepoSourceManifest,
-    envelope: suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>,
-}
-
 #[derive(Debug, Clone, Default)]
 struct CachedSourceFile {
     size: u64,
@@ -136,7 +108,6 @@ struct DaemonState {
     watches: WatchRegistry,
     watcher_handles: HashMap<String, PollWatcher>,
     subscribers: HashMap<String, Vec<Sender<DaemonEventFrame>>>,
-    repo_map_cache: BTreeMap<RepoMapCacheKey, RepoMapCacheEntry>,
     source_file_cache: BTreeMap<String, CachedSourceFile>,
     interactive_index: InteractiveIndexRuntime,
     index_tx: Sender<IndexCommand>,
@@ -225,7 +196,7 @@ impl SequenceObserver for TaskSequenceObserver {
 
 const DEFAULT_CONTEXT_MANAGE_BUDGET_TOKENS: u64 = 5_000;
 const DEFAULT_CONTEXT_MANAGE_BUDGET_BYTES: usize = 32_000;
-const INTERACTIVE_INDEX_SCHEMA_VERSION: u32 = 1;
+const INTERACTIVE_INDEX_SCHEMA_VERSION: u32 = 2;
 const INDEX_BATCH_DEBOUNCE_MS: u64 = 150;
 
 fn main() {
@@ -474,7 +445,6 @@ fn perform_full_index_rebuild(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
         .manifest
         .last_build_completed_at_unix = Some(now_unix());
     guard.interactive_index.manifest.last_error = None;
-    guard.repo_map_cache.clear();
     save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
     Ok(())
 }
@@ -537,7 +507,6 @@ fn perform_incremental_index_update(
         .manifest
         .last_build_completed_at_unix = Some(now_unix());
     guard.interactive_index.manifest.last_error = None;
-    guard.repo_map_cache.clear();
     save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
     Ok(())
 }
@@ -549,7 +518,6 @@ fn perform_index_clear(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
         manifest: default_index_manifest(&guard.root),
         snapshot: None,
     };
-    guard.repo_map_cache.clear();
     save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
     Ok(())
 }
@@ -602,7 +570,6 @@ fn serve(root: PathBuf) -> Result<()> {
         watches,
         watcher_handles: HashMap::new(),
         subscribers: HashMap::new(),
-        repo_map_cache: BTreeMap::new(),
         source_file_cache: BTreeMap::new(),
         interactive_index: InteractiveIndexRuntime { manifest, snapshot },
         index_tx,
@@ -1280,250 +1247,6 @@ fn load_context_manage_for_task(
     Ok(envelope.payload)
 }
 
-fn load_repo_map_for_task(
-    state: &Arc<Mutex<DaemonState>>,
-    request: &BrokerGetContextRequest,
-    focus_paths: &[String],
-    focus_symbols: &[String],
-    root: &Path,
-) -> Result<Option<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>>> {
-    let action = request.action.unwrap_or(BrokerAction::Plan);
-    if !matches!(
-        action,
-        BrokerAction::Plan | BrokerAction::Inspect | BrokerAction::Edit | BrokerAction::Summarize
-    ) {
-        return Ok(None);
-    }
-
-    if let Some(snapshot) = current_interactive_index_snapshot(state) {
-        return Ok(Some(load_cached_repo_map_envelope_from_index(
-            state,
-            root,
-            focus_paths,
-            focus_symbols,
-            snapshot.as_ref(),
-            12,
-            24,
-        )?));
-    }
-
-    Ok(Some(load_cached_repo_map_envelope(
-        state,
-        root,
-        focus_paths,
-        focus_symbols,
-        12,
-        24,
-    )?))
-}
-
-fn current_interactive_index_snapshot(
-    state: &Arc<Mutex<DaemonState>>,
-) -> Option<Arc<mapy_core::RepoIndexSnapshot>> {
-    let guard = state.lock().ok()?;
-    let status = &guard.interactive_index.manifest.status;
-    if status != "ready" || !guard.interactive_index.manifest.dirty_paths.is_empty() {
-        return None;
-    }
-    guard.interactive_index.snapshot.clone()
-}
-
-fn load_cached_repo_map_envelope_from_index(
-    state: &Arc<Mutex<DaemonState>>,
-    root: &Path,
-    focus_paths: &[String],
-    focus_symbols: &[String],
-    snapshot: &mapy_core::RepoIndexSnapshot,
-    max_files: usize,
-    max_symbols: usize,
-) -> Result<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>> {
-    let key = RepoMapCacheKey {
-        include_tests: true,
-        focus_paths: focus_paths
-            .iter()
-            .map(|value| value.replace('\\', "/"))
-            .collect(),
-        focus_symbols: focus_symbols
-            .iter()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| !value.is_empty())
-            .collect(),
-        max_files,
-        max_symbols,
-    };
-    if let Some(entry) = state
-        .lock()
-        .map_err(lock_err)?
-        .repo_map_cache
-        .get(&key)
-        .cloned()
-    {
-        return Ok(entry.envelope);
-    }
-    let envelope = mapy_core::build_repo_map_from_index(
-        mapy_core::RepoMapRequest {
-            repo_root: root.to_string_lossy().to_string(),
-            focus_paths: focus_paths.to_vec(),
-            focus_symbols: focus_symbols.to_vec(),
-            max_files,
-            max_symbols,
-            include_tests: true,
-        },
-        snapshot,
-    )
-    .map_err(|err| anyhow!("failed to build indexed repo map: {err}"))?;
-    state.lock().map_err(lock_err)?.repo_map_cache.insert(
-        key,
-        RepoMapCacheEntry {
-            manifest: RepoSourceManifest::default(),
-            envelope: envelope.clone(),
-        },
-    );
-    Ok(envelope)
-}
-
-fn load_cached_repo_map_envelope(
-    state: &Arc<Mutex<DaemonState>>,
-    root: &Path,
-    focus_paths: &[String],
-    focus_symbols: &[String],
-    max_files: usize,
-    max_symbols: usize,
-) -> Result<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>> {
-    let key = RepoMapCacheKey {
-        include_tests: true,
-        focus_paths: focus_paths
-            .iter()
-            .map(|value| value.replace('\\', "/"))
-            .collect(),
-        focus_symbols: focus_symbols
-            .iter()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| !value.is_empty())
-            .collect(),
-        max_files,
-        max_symbols,
-    };
-    let cached = state
-        .lock()
-        .map_err(lock_err)?
-        .repo_map_cache
-        .get(&key)
-        .cloned();
-    if let Some(entry) = cached {
-        if repo_source_manifest_is_current(root, &entry.manifest) {
-            return Ok(entry.envelope);
-        }
-        state.lock().map_err(lock_err)?.repo_map_cache.remove(&key);
-    }
-    let envelope =
-        build_repo_map_envelope(root, focus_paths, focus_symbols, max_files, max_symbols)?;
-    let manifest = collect_repo_source_manifest(root, true)?;
-    state.lock().map_err(lock_err)?.repo_map_cache.insert(
-        key,
-        RepoMapCacheEntry {
-            manifest,
-            envelope: envelope.clone(),
-        },
-    );
-    Ok(envelope)
-}
-
-fn collect_repo_source_manifest(root: &Path, include_tests: bool) -> Result<RepoSourceManifest> {
-    let mut manifest = RepoSourceManifest::default();
-    manifest.dirs.insert(String::new(), dir_mtime_secs(root));
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(false)
-        .parents(true)
-        .ignore(true)
-        .git_ignore(true);
-    let root_owned = root.to_path_buf();
-    builder.filter_entry(move |entry: &ignore::DirEntry| {
-        if entry.depth() == 0 {
-            return true;
-        }
-        let rel = entry
-            .path()
-            .strip_prefix(&root_owned)
-            .unwrap_or(entry.path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        !looks_like_generated_or_vendor_path(&rel)
-    });
-    for entry in builder.build() {
-        let entry: ignore::DirEntry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if !path.is_file() || !looks_like_source_file(path) {
-            continue;
-        }
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if !include_tests && looks_like_test_path(&rel) {
-            continue;
-        }
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        manifest.files.insert(
-            rel.clone(),
-            SourceMetadataEntry {
-                size: metadata.len(),
-                mtime_secs: metadata_mtime_secs(&metadata),
-            },
-        );
-        let mut current = Path::new(&rel).parent();
-        while let Some(parent) = current {
-            let parent_rel = parent.to_string_lossy().replace('\\', "/");
-            if manifest.dirs.contains_key(&parent_rel) {
-                current = parent.parent();
-                continue;
-            }
-            manifest
-                .dirs
-                .insert(parent_rel.clone(), dir_mtime_secs(&root.join(parent)));
-            current = parent.parent();
-        }
-    }
-    Ok(manifest)
-}
-
-fn repo_source_manifest_is_current(root: &Path, manifest: &RepoSourceManifest) -> bool {
-    for (path, entry) in &manifest.files {
-        let Ok(metadata) = fs::metadata(root.join(path)) else {
-            return false;
-        };
-        if metadata.len() != entry.size || metadata_mtime_secs(&metadata) != entry.mtime_secs {
-            return false;
-        }
-    }
-    for (path, expected_mtime) in &manifest.dirs {
-        let dir_path = if path.is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(path)
-        };
-        if dir_mtime_secs(&dir_path) != *expected_mtime {
-            return false;
-        }
-    }
-    true
-}
-
-fn dir_mtime_secs(path: &Path) -> u64 {
-    fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata_mtime_secs(&metadata))
-        .unwrap_or(0)
-}
-
 fn metadata_mtime_secs(metadata: &fs::Metadata) -> u64 {
     metadata
         .modified()
@@ -1531,53 +1254,6 @@ fn metadata_mtime_secs(metadata: &fs::Metadata) -> u64 {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
-}
-
-fn looks_like_source_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|value| value.to_str()),
-        Some("rs")
-            | Some("py")
-            | Some("js")
-            | Some("jsx")
-            | Some("ts")
-            | Some("tsx")
-            | Some("java")
-            | Some("go")
-            | Some("c")
-            | Some("cc")
-            | Some("cpp")
-            | Some("h")
-            | Some("hpp")
-    )
-}
-
-fn looks_like_generated_or_vendor_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.starts_with(".git/")
-        || lower.contains("/.git/")
-        || lower.starts_with("target/")
-        || lower.contains("/target/")
-        || lower.starts_with("build/")
-        || lower.contains("/build/")
-        || lower.starts_with("dist/")
-        || lower.contains("/dist/")
-        || lower.starts_with("out/")
-        || lower.contains("/out/")
-        || lower.starts_with("coverage/")
-        || lower.contains("/coverage/")
-        || lower.starts_with("node_modules/")
-        || lower.contains("/node_modules/")
-        || lower.contains("/jacoco-resources/")
-}
-
-fn looks_like_test_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("/tests/")
-        || lower.contains("/test/")
-        || lower.ends_with("_test.rs")
-        || lower.ends_with("_test.py")
-        || lower.ends_with("test.rs")
 }
 
 fn build_repo_map_envelope(
@@ -1678,6 +1354,12 @@ fn estimate_plan_step_tokens(step: &BrokerPlanStep) -> u64 {
     }
     estimate.max(64)
 }
+
+const SEARCH_PLAN_MAX_CANDIDATES: usize = 8;
+const SEARCH_PLAN_PHASE1_MAX_CANDIDATES: usize = 5;
+const SEARCH_PLAN_TEXT_FALLBACK_LIMIT: usize = 3;
+const SEARCH_BROKER_MAX_MATCHES_PER_FILE: usize = 8;
+const SEARCH_BROKER_MAX_TOTAL_MATCHES: usize = 32;
 
 fn tokenize_task_text(task_text: &str) -> Vec<String> {
     task_text
@@ -2038,8 +1720,8 @@ fn derive_broker_focus_symbols(
 }
 
 fn derive_broker_focus_paths(
-    state: &Arc<Mutex<DaemonState>>,
-    root: &Path,
+    _state: &Arc<Mutex<DaemonState>>,
+    _root: &Path,
     objective: Option<&str>,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
     request: &BrokerGetContextRequest,
@@ -2059,54 +1741,11 @@ fn derive_broker_focus_paths(
     if explicit_paths.is_empty() && explicit_symbols.is_empty() && objective.is_none() {
         return Ok(Vec::new());
     }
-
-    let wide_map = mapy_core::expand_repo_map_payload(&build_repo_map_envelope_best_source(
-        state,
-        root,
-        &explicit_paths,
-        &explicit_symbols,
-        64,
-        128,
-    )?);
-    let primary_paths = infer_scope_paths(
-        objective.unwrap_or_default(),
-        &wide_map,
-        &explicit_paths,
-        &explicit_symbols,
-    );
-    let expanded = expand_scope_paths(
-        objective.unwrap_or_default(),
-        &wide_map,
-        &primary_paths,
-        &explicit_symbols,
-        max_paths,
-    );
-    Ok(merged_unique(&explicit_paths, &expanded))
-}
-
-fn build_repo_map_envelope_best_source(
-    state: &Arc<Mutex<DaemonState>>,
-    root: &Path,
-    focus_paths: &[String],
-    focus_symbols: &[String],
-    max_files: usize,
-    max_symbols: usize,
-) -> Result<suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>> {
-    if let Some(snapshot) = current_interactive_index_snapshot(state) {
-        return mapy_core::build_repo_map_from_index(
-            mapy_core::RepoMapRequest {
-                repo_root: root.to_string_lossy().to_string(),
-                focus_paths: focus_paths.to_vec(),
-                focus_symbols: focus_symbols.to_vec(),
-                max_files,
-                max_symbols,
-                include_tests: true,
-            },
-            snapshot.as_ref(),
-        )
-        .map_err(|err| anyhow!("failed to build indexed repo map: {err}"));
+    let mut merged = explicit_paths;
+    if merged.len() > max_paths {
+        merged.truncate(max_paths);
     }
-    build_repo_map_envelope(root, focus_paths, focus_symbols, max_files, max_symbols)
+    Ok(merged)
 }
 
 fn infer_scope_paths(
@@ -2190,16 +1829,6 @@ impl EvidenceMatchKind {
             EvidenceMatchKind::Fallback => 1,
         }
     }
-
-    fn repo_reason_label(self) -> &'static str {
-        match self {
-            EvidenceMatchKind::DefinesSymbol => "defines",
-            EvidenceMatchKind::CallsSymbol => "calls",
-            EvidenceMatchKind::ReferencesSymbol => "references",
-            EvidenceMatchKind::Signature => "declares",
-            EvidenceMatchKind::Fallback => "shows",
-        }
-    }
 }
 
 impl Default for EvidenceMatchKind {
@@ -2210,10 +1839,65 @@ impl Default for EvidenceMatchKind {
 
 #[derive(Debug, Clone, Default)]
 struct ToolResultProvenance {
-    operation_kind: suite_packet_core::ToolOperationKind,
-    symbols: Vec<String>,
     regions: Vec<String>,
-    result_summary_present: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReducerSearchFile {
+    path: String,
+    match_count: usize,
+    matched_terms: BTreeSet<String>,
+    matched_phase_indexes: BTreeSet<usize>,
+    symbols: BTreeSet<String>,
+    regions: BTreeSet<String>,
+    exact_symbol_regions: BTreeSet<String>,
+    definition_regions: BTreeSet<String>,
+    exact_full_symbol_definition_regions: BTreeSet<String>,
+    exact_full_symbol_definition_hits: usize,
+    exact_full_symbol_hits: usize,
+    exact_symbol_hits: usize,
+    best_exact_full_symbol_definition_len: usize,
+    best_exact_full_symbol_len: usize,
+    definition_hits: usize,
+    call_hits: usize,
+    reference_hits: usize,
+    text_token_only_hits: usize,
+    preview_matches: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchTermKind {
+    FullSymbol,
+    Identifier,
+    ExpandedSymbol,
+    TextToken,
+}
+
+#[derive(Debug, Clone)]
+struct SearchCandidate {
+    term: String,
+    phase_index: usize,
+    kind: SearchTermKind,
+    whole_word: bool,
+    case_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchPhase {
+    candidates: Vec<SearchCandidate>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchPlan {
+    phases: Vec<SearchPhase>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchExecution {
+    files: Vec<ReducerSearchFile>,
+    evidence_by_file: BTreeMap<String, CodeEvidenceSummary>,
+    #[cfg(test)]
+    used_fallback: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2221,6 +1905,7 @@ struct CodeEvidenceMatch {
     line_no: usize,
     priority: u8,
     match_kind: EvidenceMatchKind,
+    #[cfg(test)]
     matched_symbol: Option<String>,
     from_region_hint: bool,
 }
@@ -2228,11 +1913,50 @@ struct CodeEvidenceMatch {
 #[derive(Debug, Clone, Default)]
 struct CodeEvidenceSummary {
     rendered_lines: Vec<String>,
+    #[cfg(test)]
     first_match_line: Option<usize>,
+    #[cfg(test)]
     primary_match_symbol: Option<String>,
     primary_match_kind: Option<EvidenceMatchKind>,
     from_region_hint: bool,
+    #[cfg(test)]
     from_tool_result_path: bool,
+}
+
+impl CodeEvidenceSummary {
+    fn has_quality_match(&self) -> bool {
+        matches!(
+            self.primary_match_kind,
+            Some(
+                EvidenceMatchKind::DefinesSymbol
+                    | EvidenceMatchKind::CallsSymbol
+                    | EvidenceMatchKind::ReferencesSymbol
+            )
+        )
+    }
+}
+
+fn build_code_evidence_summary(
+    rendered_lines: Vec<String>,
+    from_region_hint: bool,
+    matches: &[CodeEvidenceMatch],
+    _provenance: &[ToolResultProvenance],
+) -> CodeEvidenceSummary {
+    let mut summary = CodeEvidenceSummary {
+        rendered_lines,
+        ..CodeEvidenceSummary::default()
+    };
+    summary.from_region_hint = from_region_hint;
+    #[cfg(test)]
+    {
+        summary.first_match_line = matches.first().map(|matched| matched.line_no);
+        summary.primary_match_symbol = matches
+            .iter()
+            .find_map(|matched| matched.matched_symbol.clone());
+        summary.from_tool_result_path = !_provenance.is_empty();
+    }
+    summary.primary_match_kind = matches.first().map(|matched| matched.match_kind);
+    summary
 }
 
 fn looks_like_signature(line: &str) -> bool {
@@ -2369,8 +2093,17 @@ fn looks_like_type_declaration(line: &str) -> bool {
         || trimmed.contains(" trait ")
 }
 
+fn signature_search_slice(line: &str) -> &str {
+    let trimmed = line.trim();
+    if let Some(index) = trimmed.find('{') {
+        &trimmed[..index]
+    } else {
+        trimmed
+    }
+}
+
 fn classify_symbol_match(line: &str, symbol: &str) -> EvidenceMatchKind {
-    if looks_like_signature(line) {
+    if looks_like_signature(line) && contains_identifier_term(signature_search_slice(line), symbol) {
         EvidenceMatchKind::DefinesSymbol
     } else if looks_like_symbol_call(line, symbol) {
         EvidenceMatchKind::CallsSymbol
@@ -2390,8 +2123,9 @@ fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEv
             line_no: 0,
             priority: match_kind.priority(),
             match_kind,
-            matched_symbol: Some(symbol.clone()),
             from_region_hint: false,
+            #[cfg(test)]
+            matched_symbol: Some(symbol.clone()),
         });
     }
     if let Some(symbol) = query_focus
@@ -2404,8 +2138,9 @@ fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEv
             line_no: 0,
             priority: match_kind.priority(),
             match_kind,
-            matched_symbol: Some(symbol.clone()),
             from_region_hint: false,
+            #[cfg(test)]
+            matched_symbol: Some(symbol.clone()),
         });
     }
     if looks_like_signature(line)
@@ -2416,8 +2151,9 @@ fn match_query_focus_line(line: &str, query_focus: &QueryFocus) -> Option<CodeEv
             line_no: 0,
             priority: EvidenceMatchKind::Signature.priority(),
             match_kind: EvidenceMatchKind::Signature,
-            matched_symbol: None,
             from_region_hint: false,
+            #[cfg(test)]
+            matched_symbol: None,
         });
     }
     None
@@ -2500,58 +2236,495 @@ fn collect_tool_result_provenance(
         .rev()
         .filter(|invocation| invocation.paths.iter().any(|candidate| candidate == path))
         .map(|invocation| ToolResultProvenance {
-            operation_kind: invocation.operation_kind,
-            symbols: invocation.symbols.clone(),
             regions: invocation.regions.clone(),
-            result_summary_present: invocation
-                .result_summary
-                .as_ref()
-                .is_some_and(|summary| !summary.trim().is_empty()),
         })
         .collect()
 }
 
-fn collect_index_provenance(
-    state: &Arc<Mutex<DaemonState>>,
-    path: &str,
-    query_focus: &QueryFocus,
-) -> Vec<ToolResultProvenance> {
-    let Some(snapshot) = current_interactive_index_snapshot(state) else {
-        return Vec::new();
-    };
-    let Some(file) = snapshot.files.get(path) else {
-        return Vec::new();
-    };
-    let mut matched_symbols = Vec::<String>::new();
-    let mut regions = Vec::<String>::new();
-    let mut seen_lines = BTreeSet::<usize>::new();
-    for symbol in query_focus
-        .full_symbol_terms
-        .iter()
-        .chain(query_focus.symbol_terms.iter())
-    {
-        let token = symbol.trim().to_ascii_lowercase();
-        if token.is_empty() {
-            continue;
+fn is_identifier_like_query(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':'))
+}
+
+fn split_camel_case_term(value: &str) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let chars = value.chars().collect::<Vec<_>>();
+    for (idx, ch) in chars.iter().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|pos| chars.get(pos)).copied();
+        let next = chars.get(idx + 1).copied();
+        let boundary = !current.is_empty()
+            && ch.is_ascii_uppercase()
+            && prev.is_some_and(|candidate| {
+                candidate.is_ascii_lowercase()
+                    || (candidate.is_ascii_uppercase()
+                        && next.is_some_and(|upcoming| upcoming.is_ascii_lowercase()))
+            });
+        if boundary {
+            pieces.push(current);
+            current = String::new();
         }
-        if let Some(lines) = file.token_lines.get(&token) {
-            matched_symbols.push(symbol.clone());
-            for line in lines.iter().copied().take(6) {
-                if seen_lines.insert(line) {
-                    regions.push(format!("{path}:{line}-{line}"));
-                }
+        current.push(*ch);
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
+}
+
+fn expanded_symbol_terms(value: &str) -> Vec<String> {
+    let mut expanded = Vec::new();
+    let mut seen = HashSet::new();
+    for chunk in trim_query_fragment(value)
+        .replace("::", ".")
+        .split(['.', '/', '\\', '_', '-'])
+    {
+        for piece in split_camel_case_term(chunk) {
+            let trimmed = piece.trim();
+            if trimmed.len() < 3 {
+                continue;
+            }
+            let lowered = trimmed.to_ascii_lowercase();
+            if is_low_signal_query_token(&lowered) || !seen.insert(lowered) {
+                continue;
+            }
+            expanded.push(trimmed.to_string());
+        }
+    }
+    expanded
+}
+
+fn push_search_candidate(
+    candidates: &mut Vec<SearchCandidate>,
+    seen: &mut HashSet<String>,
+    term: &str,
+    phase_index: usize,
+    kind: SearchTermKind,
+    case_sensitive: bool,
+    max_candidates: usize,
+) {
+    let trimmed = term.trim();
+    if trimmed.is_empty() || candidates.len() >= max_candidates {
+        return;
+    }
+    let key = trimmed.to_ascii_lowercase();
+    if !seen.insert(key) {
+        return;
+    }
+    candidates.push(SearchCandidate {
+        term: trimmed.to_string(),
+        phase_index,
+        kind,
+        whole_word: matches!(kind, SearchTermKind::FullSymbol | SearchTermKind::Identifier)
+            && is_identifier_like_query(trimmed),
+        case_sensitive,
+    });
+}
+
+fn build_search_plan(query_focus: &QueryFocus) -> SearchPlan {
+    let mut seen = HashSet::new();
+    let mut precision = Vec::new();
+    for term in &query_focus.full_symbol_terms {
+        push_search_candidate(
+            &mut precision,
+            &mut seen,
+            term,
+            0,
+            SearchTermKind::FullSymbol,
+            true,
+            SEARCH_PLAN_PHASE1_MAX_CANDIDATES,
+        );
+    }
+    for term in &query_focus.symbol_terms {
+        push_search_candidate(
+            &mut precision,
+            &mut seen,
+            term,
+            0,
+            SearchTermKind::Identifier,
+            true,
+            SEARCH_PLAN_PHASE1_MAX_CANDIDATES,
+        );
+    }
+
+    let mut fallback = Vec::new();
+    let fallback_capacity = SEARCH_PLAN_MAX_CANDIDATES.saturating_sub(precision.len());
+    if fallback_capacity > 0 {
+        for term in query_focus
+            .full_symbol_terms
+            .iter()
+            .chain(query_focus.symbol_terms.iter())
+        {
+            for expanded in expanded_symbol_terms(term) {
+                push_search_candidate(
+                    &mut fallback,
+                    &mut seen,
+                    &expanded,
+                    1,
+                    SearchTermKind::ExpandedSymbol,
+                    false,
+                    fallback_capacity,
+                );
             }
         }
     }
-    if regions.is_empty() {
-        return Vec::new();
+    if fallback.len() < fallback_capacity {
+        for token in query_focus
+            .text_tokens
+            .iter()
+            .take(SEARCH_PLAN_TEXT_FALLBACK_LIMIT)
+        {
+            push_search_candidate(
+                &mut fallback,
+                &mut seen,
+                token,
+                1,
+                SearchTermKind::TextToken,
+                false,
+                fallback_capacity,
+            );
+        }
     }
-    vec![ToolResultProvenance {
-        operation_kind: suite_packet_core::ToolOperationKind::Search,
-        symbols: matched_symbols,
-        regions,
-        result_summary_present: false,
-    }]
+
+    let mut phases = Vec::new();
+    if !precision.is_empty() {
+        phases.push(SearchPhase {
+            candidates: precision,
+        });
+    }
+    if !fallback.is_empty() {
+        phases.push(SearchPhase {
+            candidates: fallback,
+        });
+    }
+    SearchPlan { phases }
+}
+
+fn uses_staged_search_planner(action: BrokerAction) -> bool {
+    matches!(action, BrokerAction::Inspect | BrokerAction::ChooseTool)
+}
+
+fn classify_search_candidate_match(
+    candidate: &SearchCandidate,
+    line: &str,
+) -> Option<EvidenceMatchKind> {
+    if matches!(candidate.kind, SearchTermKind::FullSymbol | SearchTermKind::Identifier)
+        && contains_identifier_term(line, &candidate.term)
+    {
+        Some(classify_symbol_match(line, &candidate.term))
+    } else if matches!(
+        candidate.kind,
+        SearchTermKind::ExpandedSymbol | SearchTermKind::TextToken
+    )
+        && line
+            .to_ascii_lowercase()
+            .contains(&candidate.term.to_ascii_lowercase())
+    {
+        Some(if looks_like_signature(line) {
+            EvidenceMatchKind::DefinesSymbol
+        } else {
+            EvidenceMatchKind::ReferencesSymbol
+        })
+    } else {
+        None
+    }
+}
+
+fn requested_search_paths(
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    request: &BrokerGetContextRequest,
+    query_focus: &QueryFocus,
+) -> Vec<String> {
+    merged_unique(
+        &merged_unique(
+            &merged_unique(&snapshot.focus_paths, &snapshot.checkpoint_focus_paths),
+            &request.focus_paths,
+        ),
+        &query_focus.path_terms,
+    )
+}
+
+fn apply_search_candidate_results(
+    root: &Path,
+    requested_paths: &[String],
+    candidate: &SearchCandidate,
+    files: &mut BTreeMap<String, ReducerSearchFile>,
+) {
+    let search = packet28_reducer_core::search(
+        root,
+        &packet28_reducer_core::SearchRequest {
+            query: candidate.term.clone(),
+            requested_paths: requested_paths.to_vec(),
+            fixed_string: true,
+            case_sensitive: Some(candidate.case_sensitive),
+            whole_word: candidate.whole_word,
+            context_lines: None,
+            max_matches_per_file: Some(SEARCH_BROKER_MAX_MATCHES_PER_FILE),
+            max_total_matches: Some(SEARCH_BROKER_MAX_TOTAL_MATCHES),
+        },
+    );
+    let Ok(search) = search else {
+        return;
+    };
+    for group in search.groups {
+        let entry = files
+            .entry(group.path.clone())
+            .or_insert_with(|| ReducerSearchFile {
+                path: group.path.clone(),
+                ..ReducerSearchFile::default()
+            });
+        entry.match_count = entry.match_count.saturating_add(group.match_count);
+        entry.matched_terms.insert(candidate.term.clone());
+        entry.matched_phase_indexes.insert(candidate.phase_index);
+        for symbol in &search.symbols {
+            entry.symbols.insert(symbol.clone());
+        }
+        if matches!(
+            candidate.kind,
+            SearchTermKind::FullSymbol | SearchTermKind::Identifier
+        ) {
+            entry.symbols.insert(candidate.term.clone());
+        }
+        for item in group.matches {
+            let region = packet28_reducer_core::format_region(&item.path, item.line, item.line);
+            entry.regions.insert(region.clone());
+            if let Some(match_kind) = classify_search_candidate_match(candidate, &item.text) {
+                match candidate.kind {
+                    SearchTermKind::FullSymbol => {
+                        entry.exact_full_symbol_hits =
+                            entry.exact_full_symbol_hits.saturating_add(1);
+                        entry.exact_symbol_hits = entry.exact_symbol_hits.saturating_add(1);
+                        entry.best_exact_full_symbol_len =
+                            entry.best_exact_full_symbol_len.max(candidate.term.len());
+                        entry.exact_symbol_regions.insert(region.clone());
+                        if matches!(match_kind, EvidenceMatchKind::DefinesSymbol) {
+                            entry.exact_full_symbol_definition_hits =
+                                entry.exact_full_symbol_definition_hits.saturating_add(1);
+                            entry.best_exact_full_symbol_definition_len = entry
+                                .best_exact_full_symbol_definition_len
+                                .max(candidate.term.len());
+                            entry
+                                .exact_full_symbol_definition_regions
+                                .insert(region.clone());
+                        }
+                    }
+                    SearchTermKind::Identifier => {
+                        entry.exact_symbol_hits = entry.exact_symbol_hits.saturating_add(1);
+                        entry.exact_symbol_regions.insert(region.clone());
+                    }
+                    SearchTermKind::ExpandedSymbol | SearchTermKind::TextToken => {
+                        entry.text_token_only_hits = entry.text_token_only_hits.saturating_add(1);
+                    }
+                }
+                match match_kind {
+                    EvidenceMatchKind::DefinesSymbol => {
+                        entry.definition_hits = entry.definition_hits.saturating_add(1);
+                        entry.definition_regions.insert(region.clone());
+                    }
+                    EvidenceMatchKind::CallsSymbol => {
+                        entry.call_hits = entry.call_hits.saturating_add(1);
+                    }
+                    EvidenceMatchKind::ReferencesSymbol => {
+                        entry.reference_hits = entry.reference_hits.saturating_add(1);
+                    }
+                    EvidenceMatchKind::Signature | EvidenceMatchKind::Fallback => {}
+                }
+            }
+            if entry
+                .preview_matches
+                .iter()
+                .all(|(line, _)| *line != item.line)
+                && entry.preview_matches.len() < 6
+            {
+                entry.preview_matches.push((item.line, item.text));
+            }
+        }
+    }
+}
+
+fn rank_reducer_search_files(
+    mut files: Vec<ReducerSearchFile>,
+    max_files: usize,
+) -> Vec<ReducerSearchFile> {
+    files.sort_by(|a, b| {
+        b.best_exact_full_symbol_definition_len
+            .cmp(&a.best_exact_full_symbol_definition_len)
+            .then_with(|| {
+                b.exact_full_symbol_definition_hits
+                    .cmp(&a.exact_full_symbol_definition_hits)
+            })
+            .then_with(|| b.best_exact_full_symbol_len.cmp(&a.best_exact_full_symbol_len))
+            .then_with(|| b.exact_full_symbol_hits.cmp(&a.exact_full_symbol_hits))
+            .then_with(|| {
+                b.matched_phase_indexes
+                    .len()
+                    .cmp(&a.matched_phase_indexes.len())
+            })
+            .then_with(|| b.definition_hits.cmp(&a.definition_hits))
+            .then_with(|| b.match_count.cmp(&a.match_count))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    files.truncate(max_files.max(1));
+    files
+}
+
+fn preferred_search_regions(file: &ReducerSearchFile) -> Vec<String> {
+    if !file.exact_full_symbol_definition_regions.is_empty() {
+        return file
+            .exact_full_symbol_definition_regions
+            .iter()
+            .cloned()
+            .collect();
+    }
+    if !file.exact_symbol_regions.is_empty() {
+        return file.exact_symbol_regions.iter().cloned().collect();
+    }
+    if !file.definition_regions.is_empty() {
+        return file.definition_regions.iter().cloned().collect();
+    }
+    file.regions.iter().cloned().collect()
+}
+
+fn build_reducer_search_evidence(
+    state: Option<&Arc<Mutex<DaemonState>>>,
+    root: &Path,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    request: &BrokerGetContextRequest,
+    query_focus: &QueryFocus,
+    reducer_files: &[ReducerSearchFile],
+    max_lines: usize,
+) -> BTreeMap<String, CodeEvidenceSummary> {
+    let candidate_paths = reducer_files
+        .iter()
+        .map(|file| file.path.clone())
+        .chain(
+            snapshot
+                .recent_tool_invocations
+                .iter()
+                .flat_map(|invocation| invocation.paths.iter().cloned()),
+        )
+        .chain(snapshot.focus_paths.iter().cloned())
+        .chain(snapshot.checkpoint_focus_paths.iter().cloned())
+        .chain(request.focus_paths.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let search_file_map = reducer_files
+        .iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<BTreeMap<_, _>>();
+    candidate_paths
+        .iter()
+        .map(|path| {
+            let mut provenance = collect_tool_result_provenance(snapshot, path);
+            if let Some(file) = search_file_map.get(path) {
+                let preferred_regions = preferred_search_regions(file);
+                if !preferred_regions.is_empty() {
+                    provenance.push(ToolResultProvenance {
+                        regions: preferred_regions,
+                    });
+                }
+            }
+            (
+                path.clone(),
+                extract_code_evidence_cached(
+                    state,
+                    root,
+                    path,
+                    query_focus,
+                    provenance.as_slice(),
+                    3,
+                    max_lines,
+                ),
+            )
+        })
+        .collect()
+}
+
+fn phase_results_are_weak(
+    reducer_files: &[ReducerSearchFile],
+    evidence_by_file: &BTreeMap<String, CodeEvidenceSummary>,
+) -> bool {
+    if reducer_files
+        .iter()
+        .any(|file| file.exact_full_symbol_definition_hits > 0)
+    {
+        return false;
+    }
+    let no_definition_biased_hits = reducer_files.iter().all(|file| file.definition_hits == 0);
+    let exact_hit_files = reducer_files
+        .iter()
+        .filter(|file| file.exact_symbol_hits > 0)
+        .count();
+    let has_quality_evidence = reducer_files.iter().any(|file| {
+        evidence_by_file
+            .get(&file.path)
+            .is_some_and(CodeEvidenceSummary::has_quality_match)
+    });
+    no_definition_biased_hits || exact_hit_files < 2 || !has_quality_evidence
+}
+
+fn build_reducer_search_execution(
+    state: Option<&Arc<Mutex<DaemonState>>>,
+    root: &Path,
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+    request: &BrokerGetContextRequest,
+    query_focus: &QueryFocus,
+    action: BrokerAction,
+    max_files: usize,
+    max_evidence_lines: usize,
+) -> SearchExecution {
+    let requested_paths = requested_search_paths(snapshot, request, query_focus);
+    let plan = build_search_plan(query_focus);
+    let mut files_by_path = BTreeMap::<String, ReducerSearchFile>::new();
+    let mut used_fallback = false;
+    if let Some(phase) = plan.phases.first() {
+        for candidate in &phase.candidates {
+            apply_search_candidate_results(root, &requested_paths, candidate, &mut files_by_path);
+        }
+    }
+    let mut reducer_files =
+        rank_reducer_search_files(files_by_path.into_values().collect(), max_files);
+    let mut evidence_by_file = build_reducer_search_evidence(
+        state,
+        root,
+        snapshot,
+        request,
+        query_focus,
+        &reducer_files,
+        max_evidence_lines,
+    );
+    if uses_staged_search_planner(action)
+        && plan.phases.len() > 1
+        && phase_results_are_weak(&reducer_files, &evidence_by_file)
+    {
+        let mut files_by_path = reducer_files
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect::<BTreeMap<_, _>>();
+        for candidate in &plan.phases[1].candidates {
+            apply_search_candidate_results(root, &requested_paths, candidate, &mut files_by_path);
+        }
+        reducer_files = rank_reducer_search_files(files_by_path.into_values().collect(), max_files);
+        evidence_by_file = build_reducer_search_evidence(
+            state,
+            root,
+            snapshot,
+            request,
+            query_focus,
+            &reducer_files,
+            max_evidence_lines,
+        );
+        used_fallback = true;
+    }
+    #[cfg(not(test))]
+    let _ = used_fallback;
+    SearchExecution {
+        files: reducer_files,
+        evidence_by_file,
+        #[cfg(test)]
+        used_fallback,
+    }
 }
 
 fn collect_region_hint_lines(
@@ -2683,6 +2856,29 @@ fn extract_code_evidence_cached(
     if matches.is_empty() {
         matches = collect_evidence_matches(lines.as_slice(), query_focus, None, false);
     }
+    if matches.is_empty() && !hint_lines.is_empty() {
+        for line_no in &hint_lines {
+            let Some(line) = lines.get(line_no.saturating_sub(1)) else {
+                continue;
+            };
+            if looks_like_low_signal_line(line) {
+                continue;
+            }
+            matches.push(CodeEvidenceMatch {
+                line_no: *line_no,
+                priority: EvidenceMatchKind::Signature.priority(),
+                match_kind: if looks_like_signature(line) {
+                    EvidenceMatchKind::Signature
+                } else {
+                    EvidenceMatchKind::Fallback
+                },
+                from_region_hint: true,
+                #[cfg(test)]
+                matched_symbol: None,
+            });
+            break;
+        }
+    }
 
     if matches.is_empty()
         && (query_focus.symbol_terms.is_empty() && query_focus.full_symbol_terms.is_empty())
@@ -2704,8 +2900,9 @@ fn extract_code_evidence_cached(
                 line_no,
                 priority: EvidenceMatchKind::Fallback.priority(),
                 match_kind: EvidenceMatchKind::Fallback,
-                matched_symbol: None,
                 from_region_hint: fallback_candidates.is_some(),
+                #[cfg(test)]
+                matched_symbol: None,
             });
             break;
         }
@@ -2718,8 +2915,9 @@ fn extract_code_evidence_cached(
                     line_no: idx + 1,
                     priority: EvidenceMatchKind::Fallback.priority(),
                     match_kind: EvidenceMatchKind::Fallback,
-                    matched_symbol: None,
                     from_region_hint: false,
+                    #[cfg(test)]
+                    matched_symbol: None,
                 });
                 break;
             }
@@ -2736,10 +2934,6 @@ fn extract_code_evidence_cached(
             .then_with(|| b.from_region_hint.cmp(&a.from_region_hint))
             .then_with(|| a.line_no.cmp(&b.line_no))
     });
-    let primary_match_symbol = matches
-        .iter()
-        .find_map(|matched| matched.matched_symbol.clone());
-    let primary_match_kind = matches.first().map(|matched| matched.match_kind);
     let primary_from_region_hint = matches
         .first()
         .is_some_and(|matched| matched.from_region_hint);
@@ -2764,26 +2958,22 @@ fn extract_code_evidence_cached(
                 truncate_evidence_line(line, 120)
             ));
             if rendered_lines.len() >= max_lines {
-                return CodeEvidenceSummary {
-                    first_match_line: matches.first().map(|matched| matched.line_no),
-                    primary_match_symbol,
-                    primary_match_kind,
-                    from_region_hint: primary_from_region_hint,
-                    from_tool_result_path: !provenance.is_empty(),
+                return build_code_evidence_summary(
                     rendered_lines,
-                };
+                    primary_from_region_hint,
+                    &matches,
+                    provenance,
+                );
             }
         }
     }
 
-    CodeEvidenceSummary {
+    build_code_evidence_summary(
         rendered_lines,
-        first_match_line: matches.first().map(|matched| matched.line_no),
-        primary_match_symbol,
-        primary_match_kind,
-        from_region_hint: primary_from_region_hint,
-        from_tool_result_path: !provenance.is_empty(),
-    }
+        primary_from_region_hint,
+        &matches,
+        provenance,
+    )
 }
 
 fn load_source_file_lines(
@@ -3059,7 +3249,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
             "current_focus",
             "discovered_scope",
             "recent_tool_activity",
-            "repo_map",
+            "search_evidence",
             "code_evidence",
             "relevant_context",
             "recommended_actions",
@@ -3073,7 +3263,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
             "discovered_scope",
             "recent_tool_activity",
             "tool_failures",
-            "repo_map",
+            "search_evidence",
             "code_evidence",
             "relevant_context",
             "checkpoint_deltas",
@@ -3088,6 +3278,8 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
             "recent_tool_activity",
             "tool_failures",
             "discovered_scope",
+            "search_evidence",
+            "code_evidence",
             "recommended_actions",
             "relevant_context",
             "open_questions",
@@ -3119,7 +3311,7 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
             "evidence_cache",
             "checkpoint_deltas",
             "active_decisions",
-            "repo_map",
+            "search_evidence",
             "code_evidence",
             "relevant_context",
             "resolved_questions",
@@ -3152,7 +3344,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             section_item_limits.insert("current_focus".to_string(), 8);
             section_item_limits.insert("discovered_scope".to_string(), 8);
             section_item_limits.insert("recent_tool_activity".to_string(), 6);
-            section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("search_evidence".to_string(), 8);
             section_item_limits.insert("code_evidence".to_string(), 6);
             section_item_limits.insert("relevant_context".to_string(), 6);
             section_item_limits.insert("recommended_actions".to_string(), 6);
@@ -3170,7 +3362,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             section_item_limits.insert("discovered_scope".to_string(), 8);
             section_item_limits.insert("recent_tool_activity".to_string(), 6);
             section_item_limits.insert("tool_failures".to_string(), 4);
-            section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("search_evidence".to_string(), 8);
             section_item_limits.insert("code_evidence".to_string(), 6);
             section_item_limits.insert("relevant_context".to_string(), 6);
             section_item_limits.insert("checkpoint_deltas".to_string(), 8);
@@ -3187,6 +3379,8 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             section_item_limits.insert("recent_tool_activity".to_string(), 4);
             section_item_limits.insert("tool_failures".to_string(), 4);
             section_item_limits.insert("discovered_scope".to_string(), 6);
+            section_item_limits.insert("search_evidence".to_string(), 6);
+            section_item_limits.insert("code_evidence".to_string(), 4);
             section_item_limits.insert("recommended_actions".to_string(), 4);
             section_item_limits.insert("relevant_context".to_string(), 4);
             section_item_limits.insert("open_questions".to_string(), 4);
@@ -3222,7 +3416,7 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
             section_item_limits.insert("tool_failures".to_string(), 4);
             section_item_limits.insert("evidence_cache".to_string(), 4);
             section_item_limits.insert("checkpoint_deltas".to_string(), 8);
-            section_item_limits.insert("repo_map".to_string(), 8);
+            section_item_limits.insert("search_evidence".to_string(), 8);
             section_item_limits.insert("code_evidence".to_string(), 6);
             section_item_limits.insert("relevant_context".to_string(), 5);
             BrokerEffectiveLimits {
@@ -3926,309 +4120,6 @@ fn build_resolved_questions(
         .collect()
 }
 
-fn score_to_string(score: f64) -> String {
-    format!("{score:.2}")
-}
-
-fn render_repo_map_reason(
-    path: &str,
-    query_focus: &QueryFocus,
-    snapshot: &suite_packet_core::AgentSnapshotPayload,
-    edges: &[mapy_core::RepoEdgeRich],
-    evidence: Option<&CodeEvidenceSummary>,
-    has_tool_result_path: bool,
-) -> String {
-    let lower_path = path.to_ascii_lowercase();
-    if let Some(summary) = evidence {
-        if let Some(symbol) = summary
-            .primary_match_symbol
-            .as_ref()
-            .filter(|symbol| !symbol.trim().is_empty())
-        {
-            match summary.primary_match_kind {
-                Some(EvidenceMatchKind::DefinesSymbol)
-                | Some(EvidenceMatchKind::CallsSymbol)
-                | Some(EvidenceMatchKind::ReferencesSymbol) => {
-                    let base = format!(
-                        "{} {}",
-                        summary.primary_match_kind.unwrap().repo_reason_label(),
-                        symbol
-                    );
-                    if has_tool_result_path && summary.from_region_hint {
-                        return format!("{base} (from tool_result)");
-                    }
-                    return base;
-                }
-                _ => {}
-            }
-        }
-        if has_tool_result_path || summary.from_tool_result_path {
-            return "explicit path from tool_result".to_string();
-        }
-    }
-    if let Some(token) = query_focus
-        .path_terms
-        .iter()
-        .find(|token| lower_path.contains(&token.to_ascii_lowercase()))
-        .or_else(|| {
-            query_focus
-                .text_tokens
-                .iter()
-                .find(|token| lower_path.contains(token.as_str()))
-        })
-    {
-        if lower_path.contains("test") || lower_path.contains("/spec") {
-            return format!("likely test for {token}");
-        }
-        return format!("matches query token {token}");
-    }
-    if snapshot.focus_paths.iter().any(|focus| focus == path) {
-        return "explicit focus path".to_string();
-    }
-    if snapshot
-        .read_paths_by_tool
-        .iter()
-        .any(|summary| summary.paths.iter().any(|candidate| candidate == path))
-    {
-        return "read via tool".to_string();
-    }
-    if snapshot
-        .edited_paths_by_tool
-        .iter()
-        .any(|summary| summary.paths.iter().any(|candidate| candidate == path))
-    {
-        return "edited via tool".to_string();
-    }
-    if edges.iter().any(|edge| {
-        (edge.from == path && snapshot.focus_paths.iter().any(|focus| focus == &edge.to))
-            || (edge.to == path && snapshot.focus_paths.iter().any(|focus| focus == &edge.from))
-    }) {
-        return "structural fallback via import edge".to_string();
-    }
-    "high repo-map relevance".to_string()
-}
-
-#[derive(Debug, Clone)]
-struct RepoMapDisplayEntry {
-    path: String,
-    raw_score: f64,
-    display_score: f64,
-    reason: String,
-    line_hint: Option<usize>,
-    structural_only: bool,
-    direct_signal: bool,
-}
-
-fn has_focus_import_edge(
-    path: &str,
-    snapshot: &suite_packet_core::AgentSnapshotPayload,
-    edges: &[mapy_core::RepoEdgeRich],
-) -> bool {
-    edges.iter().any(|edge| {
-        (edge.from == path && snapshot.focus_paths.iter().any(|focus| focus == &edge.to))
-            || (edge.to == path && snapshot.focus_paths.iter().any(|focus| focus == &edge.from))
-    })
-}
-
-fn repo_map_query_path_token<'a>(path: &str, query_focus: &'a QueryFocus) -> Option<&'a str> {
-    let lower_path = path.to_ascii_lowercase();
-    query_focus
-        .path_terms
-        .iter()
-        .find(|token| lower_path.contains(&token.to_ascii_lowercase()))
-        .map(String::as_str)
-        .or_else(|| {
-            query_focus
-                .text_tokens
-                .iter()
-                .find(|token| lower_path.contains(token.as_str()))
-                .map(String::as_str)
-        })
-}
-
-fn is_test_like_path(path: &str) -> bool {
-    let lower_path = path.to_ascii_lowercase();
-    lower_path.contains("test") || lower_path.contains("/spec")
-}
-
-fn build_repo_map_display_entries(
-    rich_repo_map: &mapy_core::RepoMapPayloadRich,
-    query_focus: &QueryFocus,
-    snapshot: &suite_packet_core::AgentSnapshotPayload,
-    evidence_by_file: &BTreeMap<String, CodeEvidenceSummary>,
-    provenance_by_file: &BTreeMap<String, Vec<ToolResultProvenance>>,
-    max_entries: usize,
-) -> Vec<RepoMapDisplayEntry> {
-    let has_symbol_focus =
-        !query_focus.symbol_terms.is_empty() || !query_focus.full_symbol_terms.is_empty();
-    let mut entries = rich_repo_map
-        .files_ranked
-        .iter()
-        .map(|file| {
-            let evidence = evidence_by_file.get(&file.path);
-            let provenance = provenance_by_file.get(&file.path);
-            let query_path_token = repo_map_query_path_token(&file.path, query_focus);
-            let explicit_focus = snapshot.focus_paths.iter().any(|focus| focus == &file.path);
-            let read_via_tool = snapshot.read_paths_by_tool.iter().any(|summary| {
-                summary
-                    .paths
-                    .iter()
-                    .any(|candidate| candidate == &file.path)
-            });
-            let edited_via_tool = snapshot.edited_paths_by_tool.iter().any(|summary| {
-                summary
-                    .paths
-                    .iter()
-                    .any(|candidate| candidate == &file.path)
-            });
-            let import_edge = has_focus_import_edge(&file.path, snapshot, &rich_repo_map.edges);
-            let evidence_lines = evidence.map_or(0, |summary| summary.rendered_lines.len());
-            let has_symbol_evidence = evidence.and_then(|summary| summary.primary_match_kind);
-            let has_tool_result_path = provenance.is_some_and(|items| !items.is_empty());
-            let has_search_or_read_provenance = provenance.is_some_and(|items| {
-                items.iter().any(|item| {
-                    matches!(
-                        item.operation_kind,
-                        suite_packet_core::ToolOperationKind::Search
-                            | suite_packet_core::ToolOperationKind::Read
-                    )
-                })
-            });
-            let has_matching_tool_symbol = provenance.is_some_and(|items| {
-                items
-                    .iter()
-                    .flat_map(|item| item.symbols.iter())
-                    .any(|symbol| {
-                        query_focus
-                            .symbol_terms
-                            .iter()
-                            .chain(query_focus.full_symbol_terms.iter())
-                            .any(|needle| symbol.eq_ignore_ascii_case(needle))
-                    })
-            });
-            let has_result_summary = provenance
-                .is_some_and(|items| items.iter().any(|item| item.result_summary_present));
-            let has_direct_signal = has_symbol_evidence.is_some()
-                || evidence_lines > 0
-                || has_tool_result_path
-                || query_path_token.is_some()
-                || explicit_focus
-                || read_via_tool
-                || edited_via_tool;
-            let structural_only = import_edge && !has_direct_signal;
-
-            let mut display_score = file.score;
-            match has_symbol_evidence {
-                Some(EvidenceMatchKind::DefinesSymbol) => display_score += 0.40,
-                Some(EvidenceMatchKind::CallsSymbol) => display_score += 0.32,
-                Some(EvidenceMatchKind::ReferencesSymbol) => display_score += 0.16,
-                Some(EvidenceMatchKind::Signature) => display_score += 0.12,
-                Some(EvidenceMatchKind::Fallback) | None => {}
-            }
-            if has_tool_result_path {
-                display_score += 0.16;
-            }
-            if has_search_or_read_provenance {
-                display_score += 0.04;
-            }
-            if has_matching_tool_symbol {
-                display_score += 0.08;
-            }
-            if evidence.is_some_and(|summary| summary.from_region_hint) {
-                display_score += 0.10;
-            } else if evidence_lines > 0 {
-                display_score += 0.18;
-            }
-            if query_path_token.is_some() {
-                display_score += if is_test_like_path(&file.path) {
-                    0.08
-                } else {
-                    0.14
-                };
-            }
-            if explicit_focus {
-                display_score += 0.10;
-            }
-            if read_via_tool || edited_via_tool {
-                display_score += 0.04;
-            }
-            if import_edge {
-                display_score += if structural_only { -0.30 } else { 0.02 };
-            }
-            if has_symbol_focus && has_symbol_evidence.is_none() && evidence_lines == 0 {
-                display_score -= if structural_only { 0.18 } else { 0.08 };
-            }
-            if has_symbol_focus && is_test_like_path(&file.path) && has_symbol_evidence.is_none() {
-                display_score -= 0.06;
-            }
-            if has_tool_result_path && has_result_summary {
-                display_score += 0.03;
-            }
-
-            RepoMapDisplayEntry {
-                path: file.path.clone(),
-                raw_score: file.score,
-                display_score: display_score.clamp(0.0, 1.5),
-                reason: if structural_only {
-                    "structural fallback via import edge".to_string()
-                } else {
-                    render_repo_map_reason(
-                        &file.path,
-                        query_focus,
-                        snapshot,
-                        &rich_repo_map.edges,
-                        evidence,
-                        has_tool_result_path,
-                    )
-                },
-                line_hint: evidence
-                    .and_then(|summary| summary.primary_match_kind.and(summary.first_match_line)),
-                structural_only,
-                direct_signal: has_direct_signal,
-            }
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|a, b| {
-        a.structural_only
-            .cmp(&b.structural_only)
-            .then_with(|| {
-                b.display_score
-                    .partial_cmp(&a.display_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                b.raw_score
-                    .partial_cmp(&a.raw_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.path.cmp(&b.path))
-    });
-
-    let strong_matches = entries
-        .iter()
-        .filter(|entry| !entry.structural_only)
-        .count();
-    let direct_signal_matches = entries
-        .iter()
-        .filter(|entry| !entry.structural_only && entry.direct_signal)
-        .count();
-    let filtered = if has_symbol_focus && direct_signal_matches > 0 {
-        entries
-            .into_iter()
-            .filter(|entry| entry.direct_signal)
-            .collect::<Vec<_>>()
-    } else if strong_matches >= max_entries {
-        entries
-            .into_iter()
-            .filter(|entry| !entry.structural_only)
-            .collect::<Vec<_>>()
-    } else {
-        entries
-    };
-
-    filtered.into_iter().take(max_entries).collect()
-}
-
 fn shrink_section_to_budget(
     section: &BrokerSection,
     remaining_tokens: u64,
@@ -4270,7 +4161,7 @@ fn action_critical_section_ids(action: BrokerAction) -> &'static [&'static str] 
             "budget_notes",
             "task_memory",
             "checkpoint_context",
-            "repo_map",
+            "search_evidence",
             "relevant_context",
             "recommended_actions",
         ],
@@ -4279,7 +4170,7 @@ fn action_critical_section_ids(action: BrokerAction) -> &'static [&'static str] 
             "task_memory",
             "checkpoint_context",
             "code_evidence",
-            "repo_map",
+            "search_evidence",
             "relevant_context",
         ],
         BrokerAction::ChooseTool => &[
@@ -4452,7 +4343,7 @@ fn build_broker_sections(
     request: &BrokerGetContextRequest,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
     manage: Option<&suite_packet_core::ContextManagePayload>,
-    repo_map: Option<&suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>>,
+    _repo_map: Option<&suite_packet_core::EnvelopeV1<mapy_core::RepoMapPayload>>,
 ) -> Vec<BrokerSection> {
     let action = request.action.unwrap_or(BrokerAction::Plan);
     let effective_limits = resolve_effective_limits(
@@ -4789,80 +4680,51 @@ fn build_broker_sections(
         });
     }
 
-    if let Some(repo_map) = repo_map {
-        let rich_repo_map = mapy_core::expand_repo_map_payload(repo_map);
-        let candidate_paths = rich_repo_map
-            .files_ranked
+    let search_execution = build_reducer_search_execution(
+        Some(state),
+        root,
+        snapshot,
+        request,
+        &query_focus,
+        action,
+        section_item_limit(&effective_limits, "search_evidence").max(8),
+        section_item_limit(&effective_limits, "code_evidence").min(15),
+    );
+    let reducer_files = search_execution.files;
+    if !reducer_files.is_empty() {
+        let evidence_by_file = search_execution.evidence_by_file;
+        let lines = reducer_files
             .iter()
-            .take(8)
-            .map(|file| file.path.clone())
-            .chain(
-                snapshot
-                    .recent_tool_invocations
-                    .iter()
-                    .flat_map(|invocation| invocation.paths.iter().cloned()),
-            )
-            .chain(snapshot.focus_paths.iter().cloned())
-            .chain(snapshot.checkpoint_focus_paths.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        let provenance_by_file = candidate_paths
-            .iter()
-            .map(|path| {
-                let mut provenance = collect_tool_result_provenance(snapshot, path);
-                provenance.extend(collect_index_provenance(state, path, &query_focus));
-                (path.clone(), provenance)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let evidence_by_file = candidate_paths
-            .iter()
-            .map(|path| {
-                (
-                    path.clone(),
-                    extract_code_evidence_cached(
-                        Some(state),
-                        root,
-                        path,
-                        &query_focus,
-                        provenance_by_file
-                            .get(path)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
-                        3,
-                        section_item_limit(&effective_limits, "code_evidence").min(15),
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let repo_map_entries = build_repo_map_display_entries(
-            &rich_repo_map,
-            &query_focus,
-            snapshot,
-            &evidence_by_file,
-            &provenance_by_file,
-            section_item_limit(&effective_limits, "repo_map"),
-        );
-        let lines = repo_map_entries
-            .iter()
-            .map(|entry| {
-                let line_hint = entry
-                    .line_hint
-                    .map(|line| format!(":{line}"))
+            .map(|file| {
+                let line_hint = file
+                    .preview_matches
+                    .first()
+                    .map(|(line, _)| format!(":{line}"))
                     .unwrap_or_default();
+                let terms = file
+                    .matched_terms
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!(
-                    "- {}{} [score={}] — {}",
-                    entry.path,
-                    line_hint,
-                    score_to_string(entry.display_score),
-                    entry.reason
+                    "- {}{} [matches={}] — direct reducer hit for {}",
+                    file.path, line_hint, file.match_count, terms
                 )
             })
             .collect::<Vec<_>>();
         if !lines.is_empty() {
             sections.push(BrokerSection {
-                id: "repo_map".to_string(),
+                id: "search_evidence".to_string(),
                 title: "Relevant Files".to_string(),
-                body: truncate_lines(lines, section_item_limit(&effective_limits, "repo_map")),
-                priority: if matches!(action, BrokerAction::Plan | BrokerAction::Inspect) {
+                body: truncate_lines(
+                    lines,
+                    section_item_limit(&effective_limits, "search_evidence"),
+                ),
+                priority: if matches!(
+                    action,
+                    BrokerAction::Plan | BrokerAction::Inspect | BrokerAction::ChooseTool
+                ) {
                     1
                 } else {
                     2
@@ -4871,11 +4733,11 @@ fn build_broker_sections(
             });
         }
 
-        let evidence_lines = repo_map_entries
+        let evidence_lines = reducer_files
             .iter()
-            .flat_map(|entry| {
+            .flat_map(|file| {
                 evidence_by_file
-                    .get(&entry.path)
+                    .get(&file.path)
                     .map(|summary| summary.rendered_lines.clone())
                     .unwrap_or_default()
             })
@@ -4888,7 +4750,10 @@ fn build_broker_sections(
                 body: evidence_lines.join("\n"),
                 priority: if matches!(
                     action,
-                    BrokerAction::Inspect | BrokerAction::Interpret | BrokerAction::Edit
+                    BrokerAction::Inspect
+                        | BrokerAction::Interpret
+                        | BrokerAction::Edit
+                        | BrokerAction::ChooseTool
                 ) {
                     1
                 } else {
@@ -5090,14 +4955,17 @@ fn build_eviction_candidates(sections: &[BrokerSection]) -> Vec<BrokerEvictionCa
         .filter(|section| {
             matches!(
                 section.id.as_str(),
-                "relevant_context" | "repo_map" | "checkpoint_deltas" | "recommended_actions"
+                "relevant_context"
+                    | "search_evidence"
+                    | "checkpoint_deltas"
+                    | "recommended_actions"
             )
         })
         .map(|section| {
             let (est_tokens, _) = estimate_text_cost(&section.body);
             let reason = match section.id.as_str() {
                 "relevant_context" => "refreshable evidence".to_string(),
-                "repo_map" => "stable repo anchors".to_string(),
+                "search_evidence" => "search evidence can be regenerated".to_string(),
                 "checkpoint_deltas" => "checkpoint state can be recomputed".to_string(),
                 "recommended_actions" => "guidance can be regenerated".to_string(),
                 _ => "refreshable section".to_string(),
@@ -5215,8 +5083,6 @@ fn compute_broker_response(
         filter_requested_section_ids(action, &request.include_sections, &request.exclude_sections);
     let needs_manage = allowed_sections.contains("relevant_context")
         || allowed_sections.contains("recommended_actions");
-    let needs_repo_map =
-        allowed_sections.contains("repo_map") || allowed_sections.contains("code_evidence");
     let manage = if needs_manage {
         let manage_started = Instant::now();
         let payload = load_context_manage_for_task(&kernel, request, &focus_paths, &focus_symbols)?;
@@ -5232,21 +5098,7 @@ fn compute_broker_response(
         diagnostics_ms.insert("context_manage".to_string(), 0);
         None
     };
-    let repo_map = if needs_repo_map {
-        let repo_map_started = Instant::now();
-        let payload = load_repo_map_for_task(state, request, &focus_paths, &focus_symbols, &root)?;
-        diagnostics_ms.insert(
-            "repo_map".to_string(),
-            repo_map_started
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-        );
-        payload
-    } else {
-        diagnostics_ms.insert("repo_map".to_string(), 0);
-        None
-    };
+    diagnostics_ms.insert("search_evidence".to_string(), 0);
     let effective_limits = resolve_effective_limits(
         action,
         request.verbosity,
@@ -5255,14 +5107,8 @@ fn compute_broker_response(
         &request.section_item_limits,
     );
     let section_build_started = Instant::now();
-    let full_sections = build_broker_sections(
-        &root,
-        state,
-        request,
-        &snapshot,
-        manage.as_ref(),
-        repo_map.as_ref(),
-    );
+    let full_sections =
+        build_broker_sections(&root, state, request, &snapshot, manage.as_ref(), None);
     diagnostics_ms.insert(
         "section_build".to_string(),
         section_build_started
@@ -6532,9 +6378,7 @@ fn invalidate_broker_caches(
         return Ok(());
     }
     let mut guard = state.lock().map_err(lock_err)?;
-    if invalidate_repo_map {
-        guard.repo_map_cache.clear();
-    }
+    let _ = invalidate_repo_map;
     for path in &request.paths {
         guard.source_file_cache.remove(path);
     }
@@ -7990,6 +7834,192 @@ mod tests {
         assert!(expanded.contains(&"crates/diffy-cli/src/cmd_analyze.rs".to_string()));
     }
 
+    fn write_search_fixture(root: &std::path::Path, files: &[(&str, &str)]) {
+        let _ = std::fs::remove_dir_all(root);
+        for (relative_path, contents) in files {
+            let path = root.join(relative_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+    }
+
+    fn run_search_execution_for_query(
+        root: &std::path::Path,
+        query: &str,
+        action: BrokerAction,
+    ) -> SearchExecution {
+        let snapshot = suite_packet_core::AgentSnapshotPayload::default();
+        let request = BrokerGetContextRequest {
+            task_id: "task-search".to_string(),
+            action: Some(action),
+            query: Some(query.to_string()),
+            ..BrokerGetContextRequest::default()
+        };
+        let query_focus = derive_query_focus(Some(query));
+        build_reducer_search_execution(None, root, &snapshot, &request, &query_focus, action, 8, 8)
+    }
+
+    #[test]
+    fn exact_symbol_query_returns_definition_first_without_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("packet28d-search-exact-{}", std::process::id()));
+        write_search_fixture(
+            &root,
+            &[
+                (
+                    "src/alpha.rs",
+                    "pub struct Alpha;\nimpl Alpha { pub fn build() {} }\n",
+                ),
+                (
+                    "src/mentions.rs",
+                    "fn helper() { let _ = Alpha::build(); }\n",
+                ),
+            ],
+        );
+
+        let execution =
+            run_search_execution_for_query(&root, "Where is Alpha defined?", BrokerAction::Inspect);
+        assert!(!execution.used_fallback);
+        assert_eq!(
+            execution.files.first().map(|file| file.path.as_str()),
+            Some("src/alpha.rs")
+        );
+        assert!(execution.files[0].definition_hits > 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vague_query_triggers_fallback_only_after_weak_first_pass() {
+        let root =
+            std::env::temp_dir().join(format!("packet28d-search-fallback-{}", std::process::id()));
+        write_search_fixture(
+            &root,
+            &[
+                ("src/alpha.rs", "pub struct AlphaService;\n"),
+                (
+                    "src/alpha_update.rs",
+                    "pub fn update_state_for_alpha_service() {}\n",
+                ),
+            ],
+        );
+
+        let execution = run_search_execution_for_query(
+            &root,
+            "How is AlphaService.updateState updated?",
+            BrokerAction::Inspect,
+        );
+        assert!(execution.used_fallback);
+        assert!(execution
+            .files
+            .iter()
+            .any(|file| file.path == "src/alpha_update.rs"));
+        assert!(execution
+            .evidence_by_file
+            .get("src/alpha_update.rs")
+            .is_some_and(|summary| summary
+                .rendered_lines
+                .iter()
+                .any(|line| line.contains("update_state_for_alpha_service"))));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn definition_hits_outrank_bulk_references() {
+        let root = std::env::temp_dir().join(format!(
+            "packet28d-search-definition-rank-{}",
+            std::process::id()
+        ));
+        write_search_fixture(
+            &root,
+            &[
+                (
+                    "src/alpha.rs",
+                    "pub struct Alpha;\n",
+                ),
+                (
+                    "src/references.rs",
+                    "fn one() { let _ = Alpha; }\nfn two() { let _ = Alpha; }\nfn three() { let _ = Alpha; }\nfn four() { let _ = Alpha; }\n",
+                ),
+            ],
+        );
+
+        let execution = run_search_execution_for_query(&root, "Alpha", BrokerAction::Inspect);
+        assert_eq!(
+            execution.files.first().map(|file| file.path.as_str()),
+            Some("src/alpha.rs")
+        );
+        assert!(execution.files[0].definition_hits >= execution.files[1].definition_hits);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn broad_generic_tokens_do_not_outrank_exact_symbol_hits() {
+        let root = std::env::temp_dir().join(format!(
+            "packet28d-search-generic-rank-{}",
+            std::process::id()
+        ));
+        write_search_fixture(
+            &root,
+            &[
+                (
+                    "src/request.rs",
+                    "pub struct BrokerWriteStateRequest {\n    pub task_id: String,\n}\n",
+                ),
+                (
+                    "src/noise.rs",
+                    "pub fn a(task_id: &str) {}\npub fn b(task_id: &str) {}\npub fn c(task_id: &str) {}\npub fn d(task_id: &str) {}\n",
+                ),
+            ],
+        );
+
+        let execution = run_search_execution_for_query(
+            &root,
+            "How does BrokerWriteStateRequest use task_id?",
+            BrokerAction::Inspect,
+        );
+        assert_eq!(
+            execution.files.first().map(|file| file.path.as_str()),
+            Some("src/request.rs")
+        );
+        assert!(execution.files[0].exact_symbol_hits > 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn choose_tool_uses_the_same_staged_search_planner() {
+        let root = std::env::temp_dir().join(format!(
+            "packet28d-search-choose-tool-{}",
+            std::process::id()
+        ));
+        write_search_fixture(
+            &root,
+            &[
+                ("src/alpha.rs", "pub struct AlphaService;\n"),
+                (
+                    "src/alpha_update.rs",
+                    "pub fn update_state_for_alpha_service() {}\n",
+                ),
+            ],
+        );
+
+        let execution = run_search_execution_for_query(
+            &root,
+            "How is AlphaService.updateState updated?",
+            BrokerAction::ChooseTool,
+        );
+        assert!(execution.used_fallback);
+        assert!(execution
+            .files
+            .iter()
+            .any(|file| file.path == "src/alpha_update.rs"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn extract_code_evidence_prefers_query_hits_and_context() {
         let root =
@@ -8114,10 +8144,7 @@ mod tests {
         focus.symbol_terms.clear();
         let focus = merge_query_focus_with_symbols(focus, &["isBlank".to_string()]);
         let provenance = vec![ToolResultProvenance {
-            operation_kind: suite_packet_core::ToolOperationKind::Search,
-            symbols: vec!["isBlank".to_string()],
             regions: vec!["src/StringUtils.java:7-8".to_string()],
-            result_summary_present: true,
         }];
         let evidence =
             extract_code_evidence(&root, "src/StringUtils.java", &focus, &provenance, 1, 3);
@@ -8197,145 +8224,14 @@ mod tests {
     }
 
     #[test]
-    fn repo_map_display_drops_structural_only_files_when_direct_matches_exist() {
-        let rich_repo_map = mapy_core::RepoMapPayloadRich {
-            files_ranked: vec![
-                mapy_core::RankedFileRich {
-                    path: "src/test/java/org/apache/commons/lang3/AbstractLangTest.java"
-                        .to_string(),
-                    score: 0.90,
-                    symbol_count: 0,
-                    import_count: 1,
-                },
-                mapy_core::RankedFileRich {
-                    path: "src/main/java/org/apache/commons/lang3/math/NumberUtils.java"
-                        .to_string(),
-                    score: 0.88,
-                    symbol_count: 3,
-                    import_count: 0,
-                },
-                mapy_core::RankedFileRich {
-                    path: "src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java"
-                        .to_string(),
-                    score: 0.84,
-                    symbol_count: 2,
-                    import_count: 0,
-                },
-            ],
-            edges: vec![mapy_core::RepoEdgeRich {
-                from: "src/test/java/org/apache/commons/lang3/AbstractLangTest.java".to_string(),
-                to: "src/main/java/org/apache/commons/lang3/math/NumberUtils.java".to_string(),
-                kind: "import".to_string(),
-            }],
-            ..Default::default()
-        };
-        let mut query_focus =
-            derive_query_focus(Some("Where is NumberUtils.createNumber defined and used?"));
-        query_focus.full_symbol_terms.clear();
-        query_focus.symbol_terms.clear();
-        let query_focus =
-            merge_query_focus_with_symbols(query_focus, &["createNumber".to_string()]);
-        let snapshot = suite_packet_core::AgentSnapshotPayload {
-            focus_paths: vec![
-                "src/main/java/org/apache/commons/lang3/math/NumberUtils.java".to_string(),
-            ],
-            ..Default::default()
-        };
-        let evidence_by_file = BTreeMap::from([
-            (
-                "src/main/java/org/apache/commons/lang3/math/NumberUtils.java".to_string(),
-                CodeEvidenceSummary {
-                    rendered_lines: vec![
-                        "- src/main/java/org/apache/commons/lang3/math/NumberUtils.java:189 public static Number createNumber(final String str) {".to_string(),
-                    ],
-                    first_match_line: Some(189),
-                    primary_match_symbol: Some("createNumber".to_string()),
-                    primary_match_kind: Some(EvidenceMatchKind::DefinesSymbol),
-                    from_region_hint: true,
-                    from_tool_result_path: true,
-                },
-            ),
-            (
-                "src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java".to_string(),
-                CodeEvidenceSummary {
-                    rendered_lines: vec![
-                        "- src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java:42 assertEquals(... createNumber(\"1\"));".to_string(),
-                    ],
-                    first_match_line: Some(42),
-                    primary_match_symbol: Some("createNumber".to_string()),
-                    primary_match_kind: Some(EvidenceMatchKind::CallsSymbol),
-                    from_region_hint: true,
-                    from_tool_result_path: true,
-                },
-            ),
-            (
-                "src/test/java/org/apache/commons/lang3/AbstractLangTest.java".to_string(),
-                CodeEvidenceSummary::default(),
-            ),
-        ]);
-
-        let provenance_by_file = BTreeMap::from([
-            (
-                "src/main/java/org/apache/commons/lang3/math/NumberUtils.java".to_string(),
-                vec![ToolResultProvenance {
-                    operation_kind: suite_packet_core::ToolOperationKind::Search,
-                    symbols: vec!["createNumber".to_string()],
-                    regions: vec![
-                        "src/main/java/org/apache/commons/lang3/math/NumberUtils.java:189-191"
-                            .to_string(),
-                    ],
-                    result_summary_present: true,
-                }],
-            ),
-            (
-                "src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java".to_string(),
-                vec![ToolResultProvenance {
-                    operation_kind: suite_packet_core::ToolOperationKind::Search,
-                    symbols: vec!["createNumber".to_string()],
-                    regions: vec![
-                        "src/test/java/org/apache/commons/lang3/math/NumberUtilsTest.java:42-42"
-                            .to_string(),
-                    ],
-                    result_summary_present: true,
-                }],
-            ),
-            (
-                "src/test/java/org/apache/commons/lang3/AbstractLangTest.java".to_string(),
-                Vec::new(),
-            ),
-        ]);
-
-        let entries = build_repo_map_display_entries(
-            &rich_repo_map,
-            &query_focus,
-            &snapshot,
-            &evidence_by_file,
-            &provenance_by_file,
-            2,
-        );
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| !entry.structural_only));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.path.ends_with("NumberUtils.java")));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.path.ends_with("NumberUtilsTest.java")));
-        assert!(entries
-            .iter()
-            .all(|entry| !entry.path.ends_with("AbstractLangTest.java")));
-    }
-
-    #[test]
     fn build_budget_notes_section_is_empty_without_budget_pruning() {
         let limits =
             resolve_effective_limits(BrokerAction::Inspect, None, None, None, &BTreeMap::new());
         assert!(build_budget_notes_section(&[], &limits).is_none());
         assert!(build_budget_notes_section(
             &[BrokerEvictionCandidate {
-                section_id: "repo_map".to_string(),
-                reason: "stable repo anchors".to_string(),
+                section_id: "search_evidence".to_string(),
+                reason: "search evidence can be regenerated".to_string(),
                 est_tokens: 12,
             }],
             &limits
@@ -8388,7 +8284,7 @@ mod tests {
             },
         ];
         let pruned = vec![BrokerEvictionCandidate {
-            section_id: "repo_map".to_string(),
+            section_id: "search_evidence".to_string(),
             reason: "budget_pruned".to_string(),
             est_tokens: 491,
         }];
@@ -8398,7 +8294,9 @@ mod tests {
             .iter()
             .find(|section| section.id == "budget_notes")
             .expect("budget notes should be inserted");
-        assert!(budget_notes.body.contains("repo_map omitted due to budget"));
+        assert!(budget_notes
+            .body
+            .contains("search_evidence omitted due to budget"));
         assert!(budget_notes.body.contains("491"));
         let tool_activity = processed
             .iter()
@@ -8432,9 +8330,9 @@ mod tests {
                 source_kind: BrokerSourceKind::Derived,
             },
             BrokerSection {
-                id: "repo_map".to_string(),
+                id: "search_evidence".to_string(),
                 title: "Relevant Files".to_string(),
-                body: "- src/alpha.rs [score=0.95] — contains Alpha".to_string(),
+                body: "- src/alpha.rs:1 [matches=2] — direct reducer hit for Alpha".to_string(),
                 priority: 1,
                 source_kind: BrokerSourceKind::Derived,
             },
@@ -8466,7 +8364,9 @@ mod tests {
             8,
         );
         assert!(selected.iter().any(|section| section.id == "code_evidence"));
-        assert!(selected.iter().any(|section| section.id == "repo_map"));
+        assert!(selected
+            .iter()
+            .any(|section| section.id == "search_evidence"));
         assert!(!selected
             .iter()
             .any(|section| section.id == "recent_tool_activity"));
@@ -8497,9 +8397,9 @@ mod tests {
                 source_kind: BrokerSourceKind::Derived,
             },
             BrokerSection {
-                id: "repo_map".to_string(),
+                id: "search_evidence".to_string(),
                 title: "Relevant Files".to_string(),
-                body: "- src/alpha.rs [score=0.95] — contains Alpha".to_string(),
+                body: "- src/alpha.rs:1 [matches=2] — direct reducer hit for Alpha".to_string(),
                 priority: 1,
                 source_kind: BrokerSourceKind::Derived,
             },
