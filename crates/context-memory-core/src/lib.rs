@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -1419,12 +1419,65 @@ fn persist_cache_path_v2(root: &Path) -> PathBuf {
     root.join(PERSIST_CACHE_DIR).join(PERSIST_CACHE_FILE_V2)
 }
 
+fn push_token_term(tokens: &mut Vec<String>, seen: &mut HashSet<String>, raw: &str) {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.len() >= 2 && seen.insert(normalized.clone()) {
+        tokens.push(normalized);
+    }
+}
+
+fn split_identifier_fragments(raw: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let chars = raw.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return fragments;
+    }
+
+    let mut current = String::new();
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|prev| chars.get(prev)).copied();
+        let next = chars.get(idx + 1).copied();
+        let boundary = !current.is_empty()
+            && prev.is_some_and(|prev| {
+                (ch.is_ascii_uppercase() && prev.is_ascii_lowercase())
+                    || (ch.is_ascii_digit() && !prev.is_ascii_digit())
+                    || (!ch.is_ascii_digit() && prev.is_ascii_digit())
+                    || (prev.is_ascii_uppercase()
+                        && ch.is_ascii_uppercase()
+                        && next.is_some_and(|next| next.is_ascii_lowercase()))
+            });
+        if boundary {
+            fragments.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        fragments.push(current);
+    }
+    fragments
+}
+
 fn tokenize(input: &str) -> Vec<String> {
-    input
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != ':' && c != '/')
-        .map(|part| part.trim().to_ascii_lowercase())
-        .filter(|part| part.len() >= 2)
-        .collect()
+    let mut tokens = Vec::new();
+    let mut seen = HashSet::new();
+    for part in input.split(|c: char| !c.is_alphanumeric() && c != '_' && c != ':' && c != '/') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        push_token_term(&mut tokens, &mut seen, part);
+        for segment in part.split(['/', ':', '.', '_', '-']) {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            push_token_term(&mut tokens, &mut seen, segment);
+            for fragment in split_identifier_fragments(segment) {
+                push_token_term(&mut tokens, &mut seen, &fragment);
+            }
+        }
+    }
+    tokens
 }
 
 pub fn normalize_context_path(
@@ -2498,5 +2551,22 @@ mod tests {
             .iter()
             .any(|reason| reason == "task_scope"));
         assert_eq!(hits[0].budget_estimate.est_tokens, 32);
+    }
+
+    #[test]
+    fn tokenize_expands_identifier_fragments() {
+        let tokens =
+            tokenize("StringUtils.seededRandom src/main/java/org/apache/FastDateParser.java");
+
+        assert!(tokens.iter().any(|token| token == "stringutils"));
+        assert!(tokens.iter().any(|token| token == "string"));
+        assert!(tokens.iter().any(|token| token == "utils"));
+        assert!(tokens.iter().any(|token| token == "seededrandom"));
+        assert!(tokens.iter().any(|token| token == "seeded"));
+        assert!(tokens.iter().any(|token| token == "random"));
+        assert!(tokens.iter().any(|token| token == "fastdateparser"));
+        assert!(tokens.iter().any(|token| token == "fast"));
+        assert!(tokens.iter().any(|token| token == "date"));
+        assert!(tokens.iter().any(|token| token == "parser"));
     }
 }
