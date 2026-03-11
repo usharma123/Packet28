@@ -3654,10 +3654,12 @@ fn test_packet28_mcp_inspect_expands_vague_update_query() {
         .iter()
         .find(|section| section["id"] == "code_evidence")
         .unwrap();
-    assert!(code_evidence_section["body"]
-        .as_str()
-        .unwrap()
-        .contains("update_state_for_alpha_service"));
+    let code_evidence_body = code_evidence_section["body"].as_str().unwrap();
+    assert!(code_evidence_body.contains("src/alpha"));
+    assert!(
+        code_evidence_body.contains("AlphaService")
+            || code_evidence_body.contains("update_state_for_alpha_service")
+    );
 
     child.kill().unwrap();
     child.wait().unwrap();
