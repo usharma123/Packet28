@@ -3055,15 +3055,12 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
     assert!(inspect_context["brief"]
         .as_str()
         .unwrap()
-        .contains("Recent Tool Activity"));
-    assert!(inspect_context["brief"]
-        .as_str()
+        .contains("Task Memory"));
+    assert!(inspect_context["sections"]
+        .as_array()
         .unwrap()
-        .contains("Discovered Scope"));
-    assert!(inspect_context["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Code Evidence"));
+        .iter()
+        .any(|section| section["id"] == "task_memory"));
 
     write_mcp_message(
         &mut stdin,

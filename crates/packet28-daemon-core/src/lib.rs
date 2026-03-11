@@ -31,6 +31,7 @@ pub const INDEX_DIR_NAME: &str = ".packet28/index";
 pub const INDEX_MANIFEST_FILE_NAME: &str = "manifest.json";
 pub const INDEX_SNAPSHOT_FILE_NAME: &str = "semantic-index-v1.bin";
 pub const MAX_SOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const SOCKET_DIR_NAME: &str = "packet28d-sockets";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1026,6 +1027,15 @@ pub fn daemon_dir(root: &Path) -> PathBuf {
     root.join(DAEMON_DIR_NAME)
 }
 
+fn socket_dir() -> PathBuf {
+    std::env::temp_dir().join(SOCKET_DIR_NAME)
+}
+
+fn socket_file_name(root: &Path) -> String {
+    let digest = blake3::hash(root.to_string_lossy().as_bytes()).to_hex();
+    format!("p28-{}.sock", &digest[..16])
+}
+
 pub fn index_dir(root: &Path) -> PathBuf {
     root.join(INDEX_DIR_NAME)
 }
@@ -1039,7 +1049,7 @@ pub fn index_snapshot_path(root: &Path) -> PathBuf {
 }
 
 pub fn socket_path(root: &Path) -> PathBuf {
-    daemon_dir(root).join(SOCKET_FILE_NAME)
+    socket_dir().join(socket_file_name(root))
 }
 
 pub fn pid_path(root: &Path) -> PathBuf {
@@ -1125,6 +1135,13 @@ pub fn ensure_daemon_dir(root: &Path) -> Result<PathBuf> {
     let dir = daemon_dir(root);
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create daemon directory '{}'", dir.display()))?;
+    let socket_dir = socket_dir();
+    fs::create_dir_all(&socket_dir).with_context(|| {
+        format!(
+            "failed to create daemon socket directory '{}'",
+            socket_dir.display()
+        )
+    })?;
     Ok(dir)
 }
 
@@ -1307,5 +1324,26 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].seq, 1);
         assert_eq!(loaded[1].event.kind, "task_completed");
+    }
+
+    #[test]
+    fn socket_path_uses_short_hashed_temp_location() {
+        let dir = tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("very")
+            .join("long")
+            .join("nested")
+            .join("workspace")
+            .join("path");
+        let socket = socket_path(&root);
+
+        assert!(socket.starts_with(std::env::temp_dir()));
+        assert_eq!(
+            socket.extension().and_then(|ext| ext.to_str()),
+            Some("sock")
+        );
+        assert!(socket.to_string_lossy().len() < 104);
+        assert_ne!(socket, daemon_dir(&root).join(SOCKET_FILE_NAME));
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -146,6 +146,8 @@ struct UpstreamClient {
 const BROKER_SECTION_IDS: &[&str] = &[
     "task_objective",
     "budget_notes",
+    "task_memory",
+    "checkpoint_context",
     "active_decisions",
     "open_questions",
     "resolved_questions",
@@ -1230,7 +1232,114 @@ fn normalize_capture_path(root: &Path, text: &str) -> String {
             return stripped.to_string_lossy().to_string();
         }
     }
-    trimmed.to_string()
+    trimmed
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .replace('\\', "/")
+}
+
+fn path_exists_under_root(root: &Path, path: &str) -> bool {
+    !path.is_empty() && root.join(path).exists()
+}
+
+fn resolve_capture_path_suffix(root: &Path, path: &str) -> Option<String> {
+    let needle = normalize_capture_path(root, path);
+    if needle.is_empty() {
+        return None;
+    }
+    let mut matches = BTreeSet::new();
+    collect_suffix_matches(root, root, &needle, &mut matches);
+    if matches.len() > 1 {
+        return None;
+    }
+    matches.into_iter().next()
+}
+
+fn collect_suffix_matches(
+    root: &Path,
+    current: &Path,
+    needle: &str,
+    matches: &mut BTreeSet<String>,
+) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_suffix_matches(root, &path, needle, matches);
+            if matches.len() > 1 {
+                return;
+            }
+            continue;
+        }
+        let Ok(stripped) = path.strip_prefix(root) else {
+            continue;
+        };
+        let normalized = stripped.to_string_lossy().replace('\\', "/");
+        if normalized == needle || normalized.ends_with(&format!("/{needle}")) {
+            matches.insert(normalized);
+            if matches.len() > 1 {
+                return;
+            }
+        }
+    }
+}
+
+fn resolve_grep_paths(root: &Path, requested_paths: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut seen = BTreeSet::new();
+    for original in requested_paths {
+        let normalized = normalize_capture_path(root, original);
+        if normalized.is_empty() {
+            diagnostics.push(format!("ignored invalid path input: {}", original.trim()));
+            continue;
+        }
+        let final_path = if path_exists_under_root(root, &normalized) {
+            normalized
+        } else if let Some(candidate) = resolve_capture_path_suffix(root, &normalized) {
+            diagnostics.push(format!(
+                "resolved missing path '{}' to '{}'",
+                original.trim(),
+                candidate
+            ));
+            candidate
+        } else {
+            diagnostics.push(format!(
+                "path '{}' does not exist under daemon root {}",
+                original.trim(),
+                root.display()
+            ));
+            continue;
+        };
+        if seen.insert(final_path.clone()) {
+            resolved.push(final_path);
+        }
+    }
+    (resolved, diagnostics)
+}
+
+fn parse_grep_output_line(
+    root: &Path,
+    line: &str,
+    single_resolved_path: Option<&str>,
+) -> Option<(String, usize, String)> {
+    if let Some(only_path) = single_resolved_path {
+        let mut parts = line.splitn(2, ':');
+        let line_no = parts.next()?.parse::<usize>().ok()?;
+        let text = parts.next().unwrap_or_default().to_string();
+        return Some((only_path.to_string(), line_no, text));
+    }
+    let mut parts = line.splitn(3, ':');
+    let path = parts.next()?;
+    let line_no = parts.next()?.parse::<usize>().ok()?;
+    let text = parts.next().unwrap_or_default().to_string();
+    let normalized_path = normalize_capture_path(root, path);
+    if normalized_path.is_empty() {
+        return None;
+    }
+    Some((normalized_path, line_no, text))
 }
 
 fn extract_symbols(value: &Value) -> Vec<String> {
@@ -2220,59 +2329,84 @@ fn handle_packet28_grep(
             .arg(max_matches_per_file.to_string());
     }
     command.arg(pattern);
-    let normalized_paths = args
-        .paths
-        .iter()
-        .map(|path| normalize_capture_path(root, path))
-        .filter(|path| !path.is_empty())
-        .collect::<Vec<_>>();
-    for path in &normalized_paths {
+    let (resolved_paths, mut diagnostics) = resolve_grep_paths(root, &args.paths);
+    for path in &resolved_paths {
         command.arg(path);
     }
     let mut command_summary = format!("rg {}", pattern);
     let started_at = Instant::now();
-    let output = match command.output() {
-        Ok(output) => Ok(output),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut fallback = Command::new("grep");
-            fallback
-                .current_dir(root)
-                .arg("-R")
-                .arg("-n")
-                .arg("-H")
-                .arg("--binary-files=without-match");
-            if args.fixed_string {
-                fallback.arg("-F");
-            }
-            if matches!(args.case_sensitive, Some(false)) {
-                fallback.arg("-i");
-            }
-            if args.whole_word {
-                fallback.arg("-w");
-            }
-            if let Some(context_lines) = args.context_lines {
-                fallback.arg("-C").arg(context_lines.to_string());
-            }
-            if let Some(max_matches_per_file) = args.max_matches_per_file {
-                fallback.arg("-m").arg(max_matches_per_file.to_string());
-            }
-            fallback.arg(pattern);
-            if normalized_paths.is_empty() {
-                fallback.arg(".");
-            } else {
-                for path in &normalized_paths {
-                    fallback.arg(path);
+    let output = if !args.paths.is_empty() && resolved_paths.is_empty() {
+        None
+    } else {
+        let output = match command.output() {
+            Ok(output) => Ok(output),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut fallback = Command::new("grep");
+                fallback
+                    .current_dir(root)
+                    .arg("-R")
+                    .arg("-n")
+                    .arg("-H")
+                    .arg("--binary-files=without-match");
+                if args.fixed_string {
+                    fallback.arg("-F");
                 }
+                if matches!(args.case_sensitive, Some(false)) {
+                    fallback.arg("-i");
+                }
+                if args.whole_word {
+                    fallback.arg("-w");
+                }
+                if let Some(context_lines) = args.context_lines {
+                    fallback.arg("-C").arg(context_lines.to_string());
+                }
+                if let Some(max_matches_per_file) = args.max_matches_per_file {
+                    fallback.arg("-m").arg(max_matches_per_file.to_string());
+                }
+                fallback.arg(pattern);
+                if resolved_paths.is_empty() {
+                    fallback.arg(".");
+                } else {
+                    for path in &resolved_paths {
+                        fallback.arg(path);
+                    }
+                }
+                command_summary = format!("grep -R {}", pattern);
+                fallback.output()
             }
-            command_summary = format!("grep -R {}", pattern);
-            fallback.output()
+            Err(error) => Err(error),
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                write_native_tool_failure(
+                    root,
+                    session,
+                    task_id,
+                    &invocation_id,
+                    sequence,
+                    "packet28.grep",
+                    suite_packet_core::ToolOperationKind::Search,
+                    request_summary,
+                    error.to_string(),
+                    Some(command_summary),
+                    duration_ms,
+                )?;
+                return Err(error.into());
+            }
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            diagnostics.push(stderr.clone());
         }
-        Err(error) => Err(error),
-    };
-    let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let error_message = if stderr.is_empty() {
+                format!("rg exited with status {}", output.status)
+            } else {
+                stderr
+            };
             write_native_tool_failure(
                 root,
                 session,
@@ -2282,67 +2416,45 @@ fn handle_packet28_grep(
                 "packet28.grep",
                 suite_packet_core::ToolOperationKind::Search,
                 request_summary,
-                error.to_string(),
+                error_message.clone(),
                 Some(command_summary),
                 duration_ms,
             )?;
-            return Err(error.into());
+            return Err(anyhow!(error_message));
         }
+        Some(output)
     };
-    if !matches!(output.status.code(), Some(0 | 1)) {
-        let error_message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let error_message = if error_message.is_empty() {
-            format!("rg exited with status {}", output.status)
-        } else {
-            error_message
-        };
-        write_native_tool_failure(
-            root,
-            session,
-            task_id,
-            &invocation_id,
-            sequence,
-            "packet28.grep",
-            suite_packet_core::ToolOperationKind::Search,
-            request_summary,
-            error_message.clone(),
-            Some(command_summary),
-            duration_ms,
-        )?;
-        return Err(anyhow!(error_message));
-    }
+    let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
     let max_total_matches = args.max_total_matches.unwrap_or(24).clamp(1, 200);
     let mut matches = Vec::new();
     let mut matched_paths = BTreeMap::<String, ()>::new();
     let mut regions = BTreeMap::<String, ()>::new();
     let mut total_match_count = 0_usize;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.trim().is_empty() || line == "--" {
-            continue;
-        }
-        let mut parts = line.splitn(3, ':');
-        let Some(path) = parts.next() else {
-            continue;
-        };
-        let Some(line_no) = parts.next().and_then(|value| value.parse::<usize>().ok()) else {
-            continue;
-        };
-        let text = parts.next().unwrap_or_default();
-        let normalized_path = normalize_capture_path(root, path);
-        if normalized_path.is_empty() {
-            continue;
-        }
-        total_match_count = total_match_count.saturating_add(1);
-        matched_paths.insert(normalized_path.clone(), ());
-        regions.insert(format_region(&normalized_path, line_no, line_no), ());
-        if matches.len() < max_total_matches {
-            matches.push(json!({
-                "path": normalized_path,
-                "line": line_no,
-                "text": text,
-            }));
+    let single_resolved_path = (resolved_paths.len() == 1
+        && root.join(&resolved_paths[0]).is_file())
+    .then(|| resolved_paths[0].clone());
+    if let Some(output) = output.as_ref() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.trim().is_empty() || line == "--" {
+                continue;
+            }
+            let Some((normalized_path, line_no, text)) =
+                parse_grep_output_line(root, line, single_resolved_path.as_deref())
+            else {
+                continue;
+            };
+            total_match_count = total_match_count.saturating_add(1);
+            matched_paths.insert(normalized_path.clone(), ());
+            regions.insert(format_region(&normalized_path, line_no, line_no), ());
+            if matches.len() < max_total_matches {
+                matches.push(json!({
+                    "path": normalized_path,
+                    "line": line_no,
+                    "text": text,
+                }));
+            }
         }
     }
     let paths = matched_paths.into_keys().collect::<Vec<_>>();
@@ -2359,14 +2471,24 @@ fn handle_packet28_grep(
             ))
         })
         .collect::<Vec<_>>();
+    let stderr = output
+        .as_ref()
+        .map(|value| String::from_utf8_lossy(&value.stderr).trim().to_string())
+        .unwrap_or_default();
     let result_summary = if matches.is_empty() {
-        if normalized_paths.is_empty() {
+        if !args.paths.is_empty() && resolved_paths.is_empty() {
+            format!(
+                "No search paths resolved for '{}' ({} requested path(s) missing)",
+                pattern,
+                args.paths.len()
+            )
+        } else if resolved_paths.is_empty() {
             format!("No matches for '{}' across repo", pattern)
         } else {
             format!(
                 "No matches for '{}' in {} path(s)",
                 pattern,
-                normalized_paths.len()
+                resolved_paths.len()
             )
         }
     } else {
@@ -2391,10 +2513,14 @@ fn handle_packet28_grep(
         "match_count": total_match_count,
         "returned_match_count": matches.len(),
         "truncated": total_match_count > matches.len(),
+        "requested_paths": args.paths,
+        "resolved_paths": resolved_paths,
         "paths": paths,
         "regions": regions,
         "symbols": symbols,
         "matches": matches,
+        "stderr": stderr,
+        "diagnostics": diagnostics,
     });
     let artifact_id = maybe_store_result_artifact(
         root,
@@ -2422,6 +2548,52 @@ fn handle_packet28_grep(
         duration_ms,
     )?;
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_grep_output_line, resolve_grep_paths};
+    use std::fs;
+
+    #[test]
+    fn parse_grep_output_line_supports_single_file_rg_output() {
+        let root = tempfile::tempdir().unwrap();
+        let parsed = parse_grep_output_line(
+            root.path(),
+            "2:    public static void shuffle() {}",
+            Some("apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.0,
+            "apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java"
+        );
+        assert_eq!(parsed.1, 2);
+        assert!(parsed.2.contains("shuffle"));
+    }
+
+    #[test]
+    fn resolve_grep_paths_recovers_unique_suffixes() {
+        let root = tempfile::tempdir().unwrap();
+        let full_path = root
+            .path()
+            .join("apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java");
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        fs::write(&full_path, "class ArrayUtils {}\n").unwrap();
+
+        let (resolved, diagnostics) = resolve_grep_paths(
+            root.path(),
+            &["src/main/java/org/apache/commons/lang3/ArrayUtils.java".to_string()],
+        );
+
+        assert_eq!(
+            resolved,
+            vec!["apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java".to_string()]
+        );
+        assert!(diagnostics
+            .iter()
+            .any(|item| item.contains("resolved missing path")));
+    }
 }
 
 fn handle_packet28_read(
