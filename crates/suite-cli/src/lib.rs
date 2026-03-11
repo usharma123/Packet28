@@ -9,6 +9,7 @@ pub mod cmd_context;
 pub mod cmd_cover;
 pub mod cmd_daemon;
 pub mod cmd_diff;
+pub mod cmd_doctor;
 pub mod cmd_guard;
 pub mod cmd_impact;
 pub mod cmd_map;
@@ -33,7 +34,7 @@ use serde_json::{json, Value};
     name = "Packet28",
     version,
     about = "Umbrella platform CLI for suite domains",
-    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 preflight --task \"investigate flaky parser test\" --json=compact\n  Packet28 agent-prompt --format claude\n  Packet28 daemon status --root . --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
+    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 preflight --task \"investigate flaky parser test\" --json=compact\n  Packet28 agent-prompt --format claude\n  Packet28 daemon status --root . --json\n  Packet28 doctor --root . --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
 )]
 pub struct Cli {
     /// Path to config file
@@ -86,6 +87,8 @@ pub enum Commands {
     Mcp(cmd_mcp::McpArgs),
     /// Daemon lifecycle and task commands
     Daemon(cmd_daemon::DaemonArgs),
+    /// Verify Packet28 daemon, index, MCP, notifications, and broker round-trip health
+    Doctor(cmd_doctor::DoctorArgs),
     /// Configure Packet28 for your agent runtimes (Claude Code, Cursor, Codex)
     Setup(cmd_setup::SetupArgs),
 }
@@ -292,6 +295,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         Commands::AgentPrompt(args) => cmd_agent_prompt::run(args),
         Commands::Mcp(args) => cmd_mcp::run(args),
         Commands::Daemon(daemon) => cmd_daemon::run(daemon),
+        Commands::Doctor(args) => cmd_doctor::run(args),
         Commands::Setup(args) => cmd_setup::run(args),
     }
 }
@@ -537,7 +541,8 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
         | Commands::Guard(_)
         | Commands::AgentPrompt(_)
         | Commands::Mcp(_)
-        | Commands::Setup(_) => None,
+        | Commands::Setup(_)
+        | Commands::Doctor(_) => None,
     }
 }
 

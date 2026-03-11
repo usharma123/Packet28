@@ -145,6 +145,7 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
         .env("PACKET28_BROKER_BRIEF_JSON_PATH", &brief_json_path)
         .env("PACKET28_BROKER_STATE_PATH", &state_json_path)
         .env("PACKET28_BROKER_SUPPORTS_PUSH", "1")
+        .env("PACKET28_BROKER_SYNC_TOOL", "packet28.sync")
         .env("PACKET28_BROKER_ESTIMATE_TOOL", "packet28.estimate_context")
         .env("PACKET28_BROKER_GET_CONTEXT_TOOL", "packet28.get_context")
         .env(

@@ -2760,7 +2760,7 @@ fn test_packet28_agent_bootstraps_broker_session() {
             "--",
             "sh",
             "-c",
-            "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PACKET28_TASK_ID\" \"$PACKET28_BROKER_BRIEF_PATH\" \"$PACKET28_BROKER_STATE_PATH\" \"$PACKET28_MCP_COMMAND\" \"$PACKET28_BROKER_ESTIMATE_TOOL\" \"$PACKET28_BROKER_POLL_FIELD\" \"$PACKET28_BROKER_WINDOW_MODE\" \"$PACKET28_BROKER_SUPERSESSION\" \"$PACKET28_BROKER_VALIDATE_PLAN_TOOL\" \"$PACKET28_BROKER_DECOMPOSE_TOOL\"",
+            "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PACKET28_TASK_ID\" \"$PACKET28_BROKER_BRIEF_PATH\" \"$PACKET28_BROKER_STATE_PATH\" \"$PACKET28_MCP_COMMAND\" \"$PACKET28_BROKER_SYNC_TOOL\" \"$PACKET28_BROKER_ESTIMATE_TOOL\" \"$PACKET28_BROKER_POLL_FIELD\" \"$PACKET28_BROKER_WINDOW_MODE\" \"$PACKET28_BROKER_SUPERSESSION\" \"$PACKET28_BROKER_VALIDATE_PLAN_TOOL\" \"$PACKET28_BROKER_DECOMPOSE_TOOL\"",
         ])
         .assert()
         .success()
@@ -2772,17 +2772,81 @@ fn test_packet28_agent_bootstraps_broker_session() {
         .lines()
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
-    assert_eq!(lines.len(), 10);
+    assert_eq!(lines.len(), 11);
     assert!(lines[0].starts_with("task-"));
     assert!(Path::new(&lines[1]).exists(), "brief path should exist");
     assert!(Path::new(&lines[2]).exists(), "state path should exist");
     assert!(lines[3].contains("Packet28 mcp serve --root"));
-    assert_eq!(lines[4], "packet28.estimate_context");
-    assert_eq!(lines[5], "since_version");
-    assert_eq!(lines[6], "replace");
-    assert_eq!(lines[7], "1");
-    assert_eq!(lines[8], "packet28.validate_plan");
-    assert_eq!(lines[9], "packet28.decompose");
+    assert_eq!(lines[4], "packet28.sync");
+    assert_eq!(lines[5], "packet28.estimate_context");
+    assert_eq!(lines[6], "since_version");
+    assert_eq!(lines[7], "replace");
+    assert_eq!(lines[8], "1");
+    assert_eq!(lines[9], "packet28.validate_plan");
+    assert_eq!(lines[10], "packet28.decompose");
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_doctor_reports_healthy_stack() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    git(dir.path(), &["add", "src/alpha.rs", "src/beta.rs"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    write_cached_coverage_state(dir.path());
+    write_cached_testmap_state(dir.path());
+    fs::write(
+        dir.path().join(".mcp.json"),
+        json!({
+            "mcpServers": {
+                "packet28": {
+                    "command": "packet28-mcp",
+                    "args": ["--root", dir.path().to_str().unwrap()]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = suite_cmd()
+        .current_dir(dir.path())
+        .args(["doctor", "--root", dir.path().to_str().unwrap(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["daemon"]["ok"], true);
+    assert_eq!(payload["index"]["ok"], true);
+    assert!(payload["mcp_config"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["packet28_configured"] == true));
+    assert_eq!(payload["handshake"]["ok"], true);
+    assert_eq!(payload["get_context_round_trip"]["ok"], true);
+    assert_eq!(payload["push_notifications"]["ok"], true);
+    assert_eq!(payload["sync_round_trip"]["ok"], true);
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
@@ -2827,6 +2891,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
     );
     let initialize = read_mcp_message_for_id(&mut stdout, 1);
     assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+    assert!(initialize["result"]["capabilities"]["prompts"].is_object());
 
     write_mcp_message(
         &mut stdin,
@@ -3164,6 +3229,11 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         .unwrap()
         .iter()
         .any(|item| item == "resolved_questions"));
+    assert!(capabilities["result"]["structuredContent"]["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "packet28.start_task"));
 
     let notification = read_mcp_notification(&mut stdout, "notifications/packet28.context_updated");
     assert_eq!(
@@ -3264,6 +3334,131 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
         .unwrap()
         .contains("\"supports_push\": true"));
 
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":14,
+            "method":"resources/list"
+        }),
+    );
+    let resources = read_mcp_message_for_id(&mut stdout, 14);
+    assert!(resources["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["uri"] == "packet28://current/task"));
+    assert!(resources["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["uri"] == "packet28://current/brief"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":15,
+            "method":"resources/read",
+            "params":{"uri":"packet28://current/task"}
+        }),
+    );
+    let current_task = read_mcp_message_for_id(&mut stdout, 15);
+    assert!(current_task["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("\"task_id\": \"task-mcp\""));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":16,
+            "method":"resources/read",
+            "params":{"uri":"packet28://current/brief"}
+        }),
+    );
+    let current_brief = read_mcp_message_for_id(&mut stdout, 16);
+    assert!(current_brief["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Relevant Files"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":17,
+            "method":"prompts/list"
+        }),
+    );
+    let prompts = read_mcp_message_for_id(&mut stdout, 17);
+    assert!(prompts["result"]["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["name"] == "packet28.start_task"));
+    assert!(prompts["result"]["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["name"] == "packet28.continue_task"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":18,
+            "method":"prompts/get",
+            "params":{
+                "name":"packet28.start_task",
+                "arguments":{"task":"inspect alpha behavior"}
+            }
+        }),
+    );
+    let start_prompt = read_mcp_message_for_id(&mut stdout, 18);
+    assert!(start_prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("packet28.get_context"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":19,
+            "method":"prompts/get",
+            "params":{
+                "name":"packet28.continue_task",
+                "arguments":{"task_id":"task-mcp"}
+            }
+        }),
+    );
+    let continue_prompt = read_mcp_message_for_id(&mut stdout, 19);
+    let continue_text = continue_prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(continue_text.contains("packet28://current/brief"));
+    assert!(continue_text.contains("task-mcp"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":20,
+            "method":"prompts/get",
+            "params":{
+                "name":"packet28.summarize_current_context",
+                "arguments":{"task_id":"task-mcp"}
+            }
+        }),
+    );
+    let summarize_prompt = read_mcp_message_for_id(&mut stdout, 20);
+    assert!(summarize_prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Current brief"));
+
     child.kill().unwrap();
     child.wait().unwrap();
 
@@ -3328,6 +3523,11 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
         .as_array()
         .unwrap()
         .iter()
+        .any(|tool| tool["name"] == "packet28.fetch_tool_result"));
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
         .any(|tool| tool["name"] == "packet28.read_regions"));
 
     write_mcp_message(
@@ -3370,16 +3570,44 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
             .as_str()
             .unwrap_or_default()
             .starts_with("src/alpha.rs:")));
-    assert!(grep_payload["symbols"]
+    assert_eq!(grep_payload["response_mode"], "slim");
+    assert!(grep_payload.get("groups").is_none());
+    assert!(grep_payload.get("symbols").is_none());
+    let artifact_id = grep_payload["artifact_id"].as_str().unwrap().to_string();
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":35,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.fetch_tool_result",
+                "arguments":{
+                    "task_id":"task-native-grep",
+                    "artifact_id": artifact_id
+                }
+            }
+        }),
+    );
+    let grep_full = read_mcp_message_for_id(&mut stdout, 35);
+    let grep_full_payload = &grep_full["result"]["structuredContent"];
+    assert_eq!(grep_full_payload["response_mode"], "full");
+    assert!(grep_full_payload["symbols"]
         .as_array()
         .unwrap()
         .iter()
         .any(|item| item == "Alpha"));
-    assert!(grep_payload["matches"]
+    assert!(grep_full_payload["groups"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["text"].as_str().unwrap_or_default().contains("Alpha")));
+        .any(
+            |group| group["matches"].as_array().is_some_and(|matches| matches
+                .iter()
+                .any(|item| item["text"].as_str().unwrap_or_default().contains("Alpha")))
+        ));
+    assert!(grep_full_payload.get("matches").is_none());
 
     write_mcp_message(
         &mut stdin,
@@ -3571,6 +3799,155 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
         .as_str()
         .unwrap()
         .contains("struct Alpha;"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_sync_uses_current_task_and_optional_task_ids() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    git(dir.path(), &["add", "src/alpha.rs", "src/beta.rs"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    write_cached_coverage_state(dir.path());
+    write_cached_testmap_state(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let initialize = read_mcp_message_for_id(&mut stdout, 1);
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.get_context",
+                "arguments":{
+                    "task_id":"task-sync",
+                    "action":"plan",
+                    "query":"How does Alpha work?",
+                    "response_mode":"full"
+                }
+            }
+        }),
+    );
+    let first = read_mcp_message_for_id(&mut stdout, 2);
+    let first_payload = &first["result"]["structuredContent"];
+    let first_version = first_payload["context_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "op":"decision_add",
+                    "decision_id":"sync-decision",
+                    "text":"Use sync with current task"
+                }
+            }
+        }),
+    );
+    let write_response = read_mcp_message_for_id(&mut stdout, 3);
+    assert_eq!(
+        write_response["result"]["structuredContent"]["accepted"],
+        true
+    );
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.sync",
+                "arguments":{
+                    "action":"inspect",
+                    "query":"Summarize Alpha",
+                    "include_estimate":true,
+                    "writes":[
+                        {
+                            "op":"checkpoint_save",
+                            "checkpoint_id":"sync-checkpoint",
+                            "note":"sync verification"
+                        }
+                    ]
+                }
+            }
+        }),
+    );
+    let sync = read_mcp_message_for_id(&mut stdout, 4);
+    let sync_payload = &sync["result"]["structuredContent"];
+    assert_eq!(sync_payload["task_id"], "task-sync");
+    assert_eq!(sync_payload["used_current_task"], true);
+    assert_eq!(sync_payload["used_since_version"], first_version);
+    assert_eq!(sync_payload["writes_applied"], 1);
+    assert_eq!(sync_payload["context"]["task_id"], "task-sync");
+    assert!(sync_payload["estimate"]["selected_section_ids"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
+    assert!(sync_payload["context"]["active_decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "sync-decision"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":5,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.task_status",
+                "arguments":{}
+            }
+        }),
+    );
+    let status = read_mcp_message_for_id(&mut stdout, 5);
+    assert_eq!(
+        status["result"]["structuredContent"]["task"]["task_id"],
+        "task-sync"
+    );
 
     child.kill().unwrap();
     child.wait().unwrap();
@@ -3852,6 +4229,342 @@ fn test_packet28_mcp_proxy_auto_captures_tool_activity() {
         .as_str()
         .unwrap()
         .contains("Discovered Scope"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_proxy_namespaces_colliding_tools() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let script_alpha = dir.path().join("alpha_mcp.py");
+    fs::write(
+        &script_alpha,
+        r#"import json, sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("utf-8").split(":", 1)
+        headers[name.lower().strip()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def write_message(value):
+    body = json.dumps(value).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    msg_id = message.get("id")
+    if msg_id is None:
+        continue
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "initialize":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "alpha", "version": "1"}}})
+    elif method == "tools/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "shared.read", "description": "alpha shared tool", "inputSchema": {"type": "object", "properties": {}}}]}})
+    elif method == "resources/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resources": []}})
+    elif method == "resources/templates/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": []}})
+    elif method == "tools/call":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": "alpha ok"}], "structuredContent": {"owner": "alpha"}}})
+    else:
+        write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown method"}})
+"#,
+    )
+    .unwrap();
+
+    let script_beta = dir.path().join("beta_mcp.py");
+    fs::write(
+        &script_beta,
+        r#"import json, sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("utf-8").split(":", 1)
+        headers[name.lower().strip()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def write_message(value):
+    body = json.dumps(value).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    msg_id = message.get("id")
+    if msg_id is None:
+        continue
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "initialize":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "beta", "version": "1"}}})
+    elif method == "tools/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "shared.read", "description": "beta shared tool", "inputSchema": {"type": "object", "properties": {}}}]}})
+    elif method == "resources/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resources": []}})
+    elif method == "resources/templates/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": []}})
+    elif method == "tools/call":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": "beta ok"}], "structuredContent": {"owner": "beta"}}})
+    else:
+        write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown method"}})
+"#,
+    )
+    .unwrap();
+
+    let config_path = dir.path().join(".mcp.proxy.json");
+    fs::write(
+        &config_path,
+        json!({
+            "mcpServers": {
+                "alpha": {
+                    "command": "python3",
+                    "args": ["-u", script_alpha.to_str().unwrap()]
+                },
+                "beta": {
+                    "command": "python3",
+                    "args": ["-u", script_beta.to_str().unwrap()]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (mut child, mut stdin, mut stdout) =
+        start_mcp_proxy_server(dir.path(), &config_path, "task-proxy-collision");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/list"
+        }),
+    );
+    let tools = read_mcp_message_for_id(&mut stdout, 2);
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "alpha.shared.read"));
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "beta.shared.read"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"beta.shared.read",
+                "arguments":{}
+            }
+        }),
+    );
+    let response = read_mcp_message_for_id(&mut stdout, 3);
+    assert_eq!(
+        response["result"]["structuredContent"]["owner"]
+            .as_str()
+            .unwrap(),
+        "beta"
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_proxy_caches_tool_catalog_and_respects_timeout_ms() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let counter_path = dir.path().join("tools-list-count.txt");
+    let script_path = dir.path().join("slow_mcp.py");
+    fs::write(
+        &script_path,
+        format!(
+            r#"import json, pathlib, sys, time
+
+COUNTER = pathlib.Path({counter:?})
+
+def read_message():
+    headers = {{}}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("utf-8").split(":", 1)
+        headers[name.lower().strip()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def write_message(value):
+    body = json.dumps(value).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {{len(body)}}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    msg_id = message.get("id")
+    if msg_id is None:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        write_message({{"jsonrpc": "2.0", "id": msg_id, "result": {{"protocolVersion": "2024-11-05", "capabilities": {{"tools": {{}}, "resources": {{}}}}, "serverInfo": {{"name": "slow", "version": "1"}}}}}})
+    elif method == "tools/list":
+        count = 0
+        if COUNTER.exists():
+            count = int(COUNTER.read_text() or "0")
+        COUNTER.write_text(str(count + 1))
+        write_message({{"jsonrpc": "2.0", "id": msg_id, "result": {{"tools": [{{"name": "slow.read", "description": "slow tool", "inputSchema": {{"type": "object", "properties": {{}}}}}}]}}}})
+    elif method == "resources/list":
+        write_message({{"jsonrpc": "2.0", "id": msg_id, "result": {{"resources": []}}}})
+    elif method == "resources/templates/list":
+        write_message({{"jsonrpc": "2.0", "id": msg_id, "result": {{"resourceTemplates": []}}}})
+    elif method == "tools/call":
+        time.sleep(0.2)
+        write_message({{"jsonrpc": "2.0", "id": msg_id, "result": {{"content": [{{"type": "text", "text": "slow ok"}}]}}}})
+    else:
+        write_message({{"jsonrpc": "2.0", "id": msg_id, "error": {{"code": -32601, "message": "unknown method"}}}})
+"#,
+            counter = counter_path,
+        ),
+    )
+    .unwrap();
+
+    let config_path = dir.path().join(".mcp.proxy.json");
+    fs::write(
+        &config_path,
+        json!({
+            "mcpServers": {
+                "slow": {
+                    "command": "python3",
+                    "args": ["-u", script_path.to_str().unwrap()],
+                    "timeout_ms": 50
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (mut child, mut stdin, mut stdout) =
+        start_mcp_proxy_server(dir.path(), &config_path, "task-proxy-timeout");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/list"
+        }),
+    );
+    let tools = read_mcp_message_for_id(&mut stdout, 2);
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "slow.read"));
+    assert_eq!(fs::read_to_string(&counter_path).unwrap().trim(), "1");
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"slow.read",
+                "arguments":{}
+            }
+        }),
+    );
+    let timeout = read_mcp_message_for_id(&mut stdout, 3);
+    assert!(timeout["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("50ms"));
+    assert!(timeout["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("python3 -u"));
+    assert_eq!(fs::read_to_string(&counter_path).unwrap().trim(), "1");
 
     child.kill().unwrap();
     child.wait().unwrap();
@@ -4261,6 +4974,7 @@ fn test_suite_agent_prompt_outputs_all_supported_fragments() {
         let rendered = String::from_utf8(output).unwrap();
         assert!(!rendered.trim().is_empty());
         assert!(rendered.contains("Packet28 mcp serve"));
+        assert!(rendered.contains("packet28.sync"));
         assert!(rendered.contains("packet28.get_context"));
         assert!(rendered.contains("packet28.validate_plan"));
         assert!(rendered

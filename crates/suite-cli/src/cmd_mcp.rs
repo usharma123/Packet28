@@ -12,10 +12,11 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use packet28_daemon_core::{
     load_task_events, task_artifact_dir, task_brief_markdown_path, task_state_json_path,
-    BrokerDecomposeRequest, BrokerEstimateContextRequest, BrokerGetContextRequest,
-    BrokerTaskStatusRequest, BrokerTaskStatusResponse, BrokerValidatePlanRequest, BrokerWriteOp,
-    BrokerWriteStateBatchRequest, BrokerWriteStateBatchResponse, BrokerWriteStateRequest,
-    BrokerWriteStateResponse, DaemonRequest, DaemonResponse,
+    BrokerAction, BrokerDecomposeRequest, BrokerEstimateContextRequest, BrokerGetContextRequest,
+    BrokerResponseMode, BrokerTaskStatusRequest, BrokerTaskStatusResponse, BrokerToolResultKind,
+    BrokerValidatePlanRequest, BrokerVerbosity, BrokerWriteOp, BrokerWriteStateBatchRequest,
+    BrokerWriteStateBatchResponse, BrokerWriteStateRequest, BrokerWriteStateResponse,
+    DaemonRequest, DaemonResponse, TaskRecord,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -56,9 +57,18 @@ struct McpSessionState {
     initialized: bool,
     shutdown: bool,
     tracked_tasks: BTreeMap<String, u64>,
+    current_task_id: Option<String>,
+    latest_context_versions: BTreeMap<String, String>,
     framing: Option<McpMessageFraming>,
     tool_owners: BTreeMap<String, String>,
+    tool_forward_names: BTreeMap<String, String>,
+    upstream_tools_cache: Vec<Value>,
+    upstream_tools_loaded: bool,
     resource_owners: BTreeMap<String, String>,
+    upstream_resources_cache: Vec<Value>,
+    upstream_resources_loaded: bool,
+    upstream_resource_templates_cache: Vec<Value>,
+    upstream_resource_templates_loaded: bool,
     proxy_task_id: Option<String>,
     next_invocation_seq: u64,
     #[cfg(unix)]
@@ -71,9 +81,18 @@ impl Default for McpSessionState {
             initialized: false,
             shutdown: false,
             tracked_tasks: BTreeMap::new(),
+            current_task_id: None,
+            latest_context_versions: BTreeMap::new(),
             framing: None,
             tool_owners: BTreeMap::new(),
+            tool_forward_names: BTreeMap::new(),
+            upstream_tools_cache: Vec::new(),
+            upstream_tools_loaded: false,
             resource_owners: BTreeMap::new(),
+            upstream_resources_cache: Vec::new(),
+            upstream_resources_loaded: false,
+            upstream_resource_templates_cache: Vec::new(),
+            upstream_resource_templates_loaded: false,
             proxy_task_id: None,
             next_invocation_seq: 0,
             #[cfg(unix)]
@@ -96,6 +115,14 @@ struct McpProxyConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum Packet28SearchResponseMode {
+    #[default]
+    Slim,
+    Full,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct Packet28SearchArgs {
     task_id: String,
@@ -107,6 +134,7 @@ struct Packet28SearchArgs {
     context_lines: Option<usize>,
     max_matches_per_file: Option<usize>,
     max_total_matches: Option<usize>,
+    response_mode: Packet28SearchResponseMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -117,6 +145,40 @@ struct Packet28ReadRegionsArgs {
     regions: Vec<String>,
     line_start: Option<usize>,
     line_end: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct Packet28FetchToolResultArgs {
+    task_id: String,
+    artifact_id: Option<String>,
+    invocation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct Packet28SyncArgs {
+    task_id: String,
+    task_text: Option<String>,
+    action: Option<BrokerAction>,
+    budget_tokens: Option<u64>,
+    budget_bytes: Option<usize>,
+    query: Option<String>,
+    focus_paths: Vec<String>,
+    focus_symbols: Vec<String>,
+    tool_name: Option<String>,
+    tool_result_kind: Option<BrokerToolResultKind>,
+    include_sections: Vec<String>,
+    exclude_sections: Vec<String>,
+    verbosity: Option<BrokerVerbosity>,
+    response_mode: Option<BrokerResponseMode>,
+    include_self_context: bool,
+    max_sections: Option<usize>,
+    default_max_items_per_section: Option<usize>,
+    section_item_limits: BTreeMap<String, usize>,
+    persist_artifacts: Option<bool>,
+    include_estimate: bool,
+    writes: Vec<BrokerWriteStateRequest>,
 }
 
 impl Default for McpProxyConfig {
@@ -134,6 +196,7 @@ struct McpProxyServerConfig {
     args: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: Option<String>,
+    timeout_ms: Option<u64>,
 }
 
 struct UpstreamClient {
@@ -141,6 +204,8 @@ struct UpstreamClient {
     _child: Child,
     stdin: ChildStdin,
     responses: Receiver<Value>,
+    request_timeout: Duration,
+    command_preview: String,
 }
 
 const BROKER_SECTION_IDS: &[&str] = &[
@@ -163,6 +228,7 @@ const BROKER_SECTION_IDS: &[&str] = &[
     "recommended_actions",
     "progress",
 ];
+const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 30_000;
 
 pub fn run(args: McpArgs) -> Result<i32> {
     match args.command {
@@ -339,6 +405,13 @@ fn spawn_upstream_clients(
             command.current_dir(root);
         }
         command.envs(server.env.clone());
+        let command_preview = render_command_preview(&server.command, &server.args);
+        let timeout = Duration::from_millis(
+            server
+                .timeout_ms
+                .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_MS)
+                .max(1),
+        );
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to start upstream MCP server '{name}'"))?;
@@ -359,10 +432,25 @@ fn spawn_upstream_clients(
                 _child: child,
                 stdin,
                 responses: rx,
+                request_timeout: timeout,
+                command_preview,
             },
         );
     }
     Ok(upstreams)
+}
+
+fn render_command_preview(command: &str, args: &[String]) -> String {
+    std::iter::once(command.to_string())
+        .chain(args.iter().map(|arg| {
+            if arg.contains(' ') {
+                format!("{arg:?}")
+            } else {
+                arg.clone()
+            }
+        }))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn start_upstream_reader_thread(
@@ -607,6 +695,9 @@ fn handle_proxy_method(
         "initialize" => {
             if let Ok(mut guard) = session.lock() {
                 guard.initialized = true;
+                guard.upstream_tools_loaded = false;
+                guard.upstream_resources_loaded = false;
+                guard.upstream_resource_templates_loaded = false;
             }
             for upstream in upstreams.values_mut() {
                 let request = json!({
@@ -632,49 +723,15 @@ fn handle_proxy_method(
         }
         "tools/list" => {
             let mut result = handle_method(root, session, method, Value::Null)?;
-            refresh_upstream_tools(session, upstreams)?;
             if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
-                for upstream in upstreams.values_mut() {
-                    let response = send_request_to_upstream(
-                        upstream,
-                        &json!({
-                            "jsonrpc":"2.0",
-                            "id": format!("packet28-tools-list-{}", upstream.name),
-                            "method":"tools/list"
-                        }),
-                    )?;
-                    if let Some(items) = response
-                        .get("result")
-                        .and_then(|value| value.get("tools"))
-                        .and_then(Value::as_array)
-                    {
-                        tools.extend(items.iter().cloned());
-                    }
-                }
+                tools.extend(ensure_upstream_tools_loaded(session, upstreams)?);
             }
             Ok(json!({"jsonrpc":"2.0","id":id,"result":result}))
         }
         "resources/list" => {
             let mut result = handle_method(root, session, method, Value::Null)?;
-            refresh_upstream_resources(session, upstreams)?;
             if let Some(resources) = result.get_mut("resources").and_then(Value::as_array_mut) {
-                for upstream in upstreams.values_mut() {
-                    let response = send_request_to_upstream(
-                        upstream,
-                        &json!({
-                            "jsonrpc":"2.0",
-                            "id": format!("packet28-resources-list-{}", upstream.name),
-                            "method":"resources/list"
-                        }),
-                    )?;
-                    if let Some(items) = response
-                        .get("result")
-                        .and_then(|value| value.get("resources"))
-                        .and_then(Value::as_array)
-                    {
-                        resources.extend(items.iter().cloned());
-                    }
-                }
+                resources.extend(ensure_upstream_resources_loaded(session, upstreams)?);
             }
             Ok(json!({"jsonrpc":"2.0","id":id,"result":result}))
         }
@@ -684,25 +741,42 @@ fn handle_proxy_method(
                 .get_mut("resourceTemplates")
                 .and_then(Value::as_array_mut)
             {
-                for upstream in upstreams.values_mut() {
-                    let response = send_request_to_upstream(
-                        upstream,
-                        &json!({
-                            "jsonrpc":"2.0",
-                            "id": format!("packet28-templates-list-{}", upstream.name),
-                            "method":"resources/templates/list"
-                        }),
-                    )?;
-                    if let Some(items) = response
-                        .get("result")
-                        .and_then(|value| value.get("resourceTemplates"))
-                        .and_then(Value::as_array)
-                    {
-                        templates.extend(items.iter().cloned());
-                    }
-                }
+                templates.extend(ensure_upstream_resource_templates_loaded(
+                    session, upstreams,
+                )?);
             }
             Ok(json!({"jsonrpc":"2.0","id":id,"result":result}))
+        }
+        "prompts/list" => Ok(json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "result": handle_method(root, session, method, Value::Null)?,
+        })),
+        "prompts/get" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing prompt name"))?;
+            if name.starts_with("packet28.") {
+                return Ok(json!({
+                    "jsonrpc":"2.0",
+                    "id": id,
+                    "result": handle_method(root, session, method, params)?,
+                }));
+            }
+            let upstream = upstreams
+                .values_mut()
+                .next()
+                .ok_or_else(|| anyhow!("no upstream MCP servers configured"))?;
+            send_request_to_upstream(
+                upstream,
+                &json!({
+                    "jsonrpc":"2.0",
+                    "id": id,
+                    "method":"prompts/get",
+                    "params": params,
+                }),
+            )
         }
         "resources/read" => {
             let uri = params
@@ -717,7 +791,7 @@ fn handle_proxy_method(
                 }));
             }
             if owner_for_resource(session, uri).is_none() {
-                refresh_upstream_resources(session, upstreams)?;
+                let _ = ensure_upstream_resources_loaded(session, upstreams)?;
             }
             let owner = owner_for_resource(session, uri)
                 .ok_or_else(|| anyhow!("no upstream owns resource '{uri}'"))?;
@@ -757,7 +831,9 @@ fn handle_proxy_method(
 fn refresh_upstream_tools(
     session: &Arc<Mutex<McpSessionState>>,
     upstreams: &mut BTreeMap<String, UpstreamClient>,
-) -> Result<()> {
+) -> Result<Vec<Value>> {
+    let native_tool_names = native_tool_names();
+    let mut discovered = BTreeMap::<String, Vec<(String, Value)>>::new();
     let mut tool_owners = BTreeMap::new();
     for upstream in upstreams.values_mut() {
         let response = send_request_to_upstream(
@@ -775,22 +851,51 @@ fn refresh_upstream_tools(
         {
             for item in items {
                 if let Some(name) = item.get("name").and_then(Value::as_str) {
-                    tool_owners.insert(name.to_string(), upstream.name.clone());
+                    discovered
+                        .entry(name.to_string())
+                        .or_default()
+                        .push((upstream.name.clone(), item.clone()));
                 }
             }
         }
     }
+
+    let mut tool_forward_names = BTreeMap::new();
+    let mut rendered_tools = Vec::new();
+    for (name, entries) in discovered {
+        let needs_namespace = entries.len() > 1 || native_tool_names.contains_key(&name);
+        for (owner, item) in entries {
+            let alias = if needs_namespace {
+                namespaced_tool_name(&owner, &name)
+            } else {
+                name.clone()
+            };
+            tool_owners.insert(alias.clone(), owner.clone());
+            tool_forward_names.insert(alias.clone(), name.clone());
+            rendered_tools.push(annotated_tool_item(item, &alias, &owner, needs_namespace));
+        }
+    }
+    rendered_tools.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .cmp(&right.get("name").and_then(Value::as_str))
+    });
+
     if let Ok(mut guard) = session.lock() {
         guard.tool_owners = tool_owners;
+        guard.tool_forward_names = tool_forward_names;
+        guard.upstream_tools_cache = rendered_tools.clone();
+        guard.upstream_tools_loaded = true;
     }
-    Ok(())
+    Ok(rendered_tools)
 }
 
 fn refresh_upstream_resources(
     session: &Arc<Mutex<McpSessionState>>,
     upstreams: &mut BTreeMap<String, UpstreamClient>,
-) -> Result<()> {
+) -> Result<Vec<Value>> {
     let mut resource_owners = BTreeMap::new();
+    let mut rendered_resources = Vec::new();
     for upstream in upstreams.values_mut() {
         let response = send_request_to_upstream(
             upstream,
@@ -808,14 +913,22 @@ fn refresh_upstream_resources(
             for item in items {
                 if let Some(uri) = item.get("uri").and_then(Value::as_str) {
                     resource_owners.insert(uri.to_string(), upstream.name.clone());
+                    rendered_resources.push(item.clone());
                 }
             }
         }
     }
+    rendered_resources.sort_by(|left, right| {
+        left.get("uri")
+            .and_then(Value::as_str)
+            .cmp(&right.get("uri").and_then(Value::as_str))
+    });
     if let Ok(mut guard) = session.lock() {
         guard.resource_owners = resource_owners;
+        guard.upstream_resources_cache = rendered_resources.clone();
+        guard.upstream_resources_loaded = true;
     }
-    Ok(())
+    Ok(rendered_resources)
 }
 
 fn owner_for_tool(session: &Arc<Mutex<McpSessionState>>, tool_name: &str) -> Option<String> {
@@ -825,11 +938,121 @@ fn owner_for_tool(session: &Arc<Mutex<McpSessionState>>, tool_name: &str) -> Opt
         .and_then(|guard| guard.tool_owners.get(tool_name).cloned())
 }
 
+fn forward_name_for_tool(session: &Arc<Mutex<McpSessionState>>, tool_name: &str) -> Option<String> {
+    session
+        .lock()
+        .ok()
+        .and_then(|guard| guard.tool_forward_names.get(tool_name).cloned())
+}
+
 fn owner_for_resource(session: &Arc<Mutex<McpSessionState>>, uri: &str) -> Option<String> {
     session
         .lock()
         .ok()
         .and_then(|guard| guard.resource_owners.get(uri).cloned())
+}
+
+fn ensure_upstream_tools_loaded(
+    session: &Arc<Mutex<McpSessionState>>,
+    upstreams: &mut BTreeMap<String, UpstreamClient>,
+) -> Result<Vec<Value>> {
+    if let Ok(guard) = session.lock() {
+        if guard.upstream_tools_loaded {
+            return Ok(guard.upstream_tools_cache.clone());
+        }
+    }
+    refresh_upstream_tools(session, upstreams)
+}
+
+fn ensure_upstream_resources_loaded(
+    session: &Arc<Mutex<McpSessionState>>,
+    upstreams: &mut BTreeMap<String, UpstreamClient>,
+) -> Result<Vec<Value>> {
+    if let Ok(guard) = session.lock() {
+        if guard.upstream_resources_loaded {
+            return Ok(guard.upstream_resources_cache.clone());
+        }
+    }
+    refresh_upstream_resources(session, upstreams)
+}
+
+fn ensure_upstream_resource_templates_loaded(
+    session: &Arc<Mutex<McpSessionState>>,
+    upstreams: &mut BTreeMap<String, UpstreamClient>,
+) -> Result<Vec<Value>> {
+    if let Ok(guard) = session.lock() {
+        if guard.upstream_resource_templates_loaded {
+            return Ok(guard.upstream_resource_templates_cache.clone());
+        }
+    }
+    let mut templates = Vec::new();
+    for upstream in upstreams.values_mut() {
+        let response = send_request_to_upstream(
+            upstream,
+            &json!({
+                "jsonrpc":"2.0",
+                "id": format!("packet28-templates-list-{}", upstream.name),
+                "method":"resources/templates/list"
+            }),
+        )?;
+        if let Some(items) = response
+            .get("result")
+            .and_then(|value| value.get("resourceTemplates"))
+            .and_then(Value::as_array)
+        {
+            templates.extend(items.iter().cloned());
+        }
+    }
+    if let Ok(mut guard) = session.lock() {
+        guard.upstream_resource_templates_cache = templates.clone();
+        guard.upstream_resource_templates_loaded = true;
+    }
+    Ok(templates)
+}
+
+fn namespaced_tool_name(owner: &str, name: &str) -> String {
+    let prefix = format!("{owner}.");
+    if name.starts_with(&prefix) {
+        name.to_string()
+    } else {
+        format!("{owner}.{name}")
+    }
+}
+
+fn annotated_tool_item(mut item: Value, alias: &str, owner: &str, namespaced: bool) -> Value {
+    if let Some(obj) = item.as_object_mut() {
+        obj.insert("name".to_string(), Value::String(alias.to_string()));
+        if namespaced {
+            let description = obj
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Upstream MCP tool");
+            obj.insert(
+                "description".to_string(),
+                Value::String(format!("{description} [via {owner}]")),
+            );
+        }
+    }
+    item
+}
+
+fn native_tool_names() -> BTreeMap<String, ()> {
+    [
+        "packet28.get_context",
+        "packet28.estimate_context",
+        "packet28.sync",
+        "packet28.search",
+        "packet28.fetch_tool_result",
+        "packet28.read_regions",
+        "packet28.write_state",
+        "packet28.validate_plan",
+        "packet28.decompose",
+        "packet28.task_status",
+        "packet28.capabilities",
+    ]
+    .into_iter()
+    .map(|name| (name.to_string(), ()))
+    .collect()
 }
 
 fn next_proxy_invocation(session: &Arc<Mutex<McpSessionState>>) -> Result<(String, u64, String)> {
@@ -857,8 +1080,15 @@ fn send_request_to_upstream(upstream: &mut UpstreamClient, request: &Value) -> R
     send_message_to_upstream(upstream, request)?;
     upstream
         .responses
-        .recv_timeout(Duration::from_secs(30))
-        .map_err(|_| anyhow!("timed out waiting for upstream '{}'", upstream.name))
+        .recv_timeout(upstream.request_timeout)
+        .map_err(|_| {
+            anyhow!(
+                "timed out waiting for upstream '{}' after {}ms while running `{}`",
+                upstream.name,
+                upstream.request_timeout.as_millis(),
+                upstream.command_preview
+            )
+        })
 }
 
 fn handle_proxy_tool_call(
@@ -879,10 +1109,12 @@ fn handle_proxy_tool_call(
     }
 
     if owner_for_tool(session, name).is_none() {
-        refresh_upstream_tools(session, upstreams)?;
+        let _ = ensure_upstream_tools_loaded(session, upstreams)?;
     }
     let owner =
         owner_for_tool(session, name).ok_or_else(|| anyhow!("no upstream owns tool '{name}'"))?;
+    let upstream_tool_name = forward_name_for_tool(session, name)
+        .ok_or_else(|| anyhow!("no upstream mapping found for tool '{name}'"))?;
     let upstream = upstreams
         .get_mut(&owner)
         .ok_or_else(|| anyhow!("missing upstream '{owner}'"))?;
@@ -925,7 +1157,7 @@ fn handle_proxy_tool_call(
             "id": id,
             "method":"tools/call",
             "params": {
-                "name": name,
+                "name": upstream_tool_name,
                 "arguments": arguments.clone(),
             }
         }),
@@ -1311,6 +1543,15 @@ fn maybe_store_result_artifact(
     )?))
 }
 
+fn store_result_artifact(
+    root: &Path,
+    task_id: &str,
+    invocation_id: &str,
+    result: &Value,
+) -> Result<String> {
+    store_tool_artifact(root, task_id, invocation_id, "result", result)
+}
+
 fn store_tool_artifact(
     root: &Path,
     task_id: &str,
@@ -1328,6 +1569,254 @@ fn store_tool_artifact(
     Ok(artifact_id)
 }
 
+fn load_tool_result_artifact(
+    root: &Path,
+    task_id: &str,
+    artifact_id: Option<&str>,
+    invocation_id: Option<&str>,
+) -> Result<(String, Value)> {
+    let selected_artifact_id = match (artifact_id, invocation_id) {
+        (Some(artifact_id), _) if !artifact_id.trim().is_empty() => artifact_id.trim().to_string(),
+        (None, Some(invocation_id)) if !invocation_id.trim().is_empty() => {
+            format!("{}-result.json", invocation_id.trim())
+        }
+        _ => {
+            return Err(anyhow!(
+                "packet28.fetch_tool_result requires artifact_id or invocation_id"
+            ));
+        }
+    };
+    let path = task_artifact_dir(root, task_id)
+        .join("tool-evidence")
+        .join(&selected_artifact_id);
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read tool evidence '{}'", path.display()))?;
+    let value = serde_json::from_str(&text)
+        .with_context(|| format!("invalid tool evidence JSON '{}'", path.display()))?;
+    Ok((selected_artifact_id, value))
+}
+
+fn prompt_descriptors() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "packet28.start_task",
+            "description": "Start a new Packet28-scoped task with the recommended broker flow.",
+            "arguments": [
+                {
+                    "name": "task",
+                    "description": "Natural-language task description to start.",
+                    "required": true
+                },
+                {
+                    "name": "task_id",
+                    "description": "Optional explicit Packet28 task identifier.",
+                    "required": false
+                }
+            ]
+        }),
+        json!({
+            "name": "packet28.continue_task",
+            "description": "Continue the current or a specific Packet28 task with the latest known context.",
+            "arguments": [
+                {
+                    "name": "task_id",
+                    "description": "Optional Packet28 task identifier. Defaults to the current task.",
+                    "required": false
+                }
+            ]
+        }),
+        json!({
+            "name": "packet28.summarize_current_context",
+            "description": "Summarize the latest persisted Packet28 brief for the current or specified task.",
+            "arguments": [
+                {
+                    "name": "task_id",
+                    "description": "Optional Packet28 task identifier. Defaults to the current task.",
+                    "required": false
+                }
+            ]
+        }),
+    ]
+}
+
+fn handle_prompt_get(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    params: Value,
+) -> Result<Value> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing prompt name"))?;
+    let arguments = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    match name {
+        "packet28.start_task" => {
+            let task = prompt_argument(&arguments, "task")
+                .ok_or_else(|| anyhow!("packet28.start_task requires task"))?;
+            let task_id = prompt_argument(&arguments, "task_id")
+                .unwrap_or_else(|| crate::broker_client::derive_task_id(&task));
+            let prompt = format!(
+                "Start Packet28 task `{task_id}` for: {task}\n\n\
+Use Packet28 as the primary context broker for this task.\n\
+- If the next step is cheap or you are budget-constrained, call `packet28.estimate_context` first.\n\
+- Then call `packet28.get_context` with `task_id=\"{task_id}\"`, `action=\"plan\"`, `query={task:?}`, and `response_mode=\"auto\"`.\n\
+- Keep one mutable Packet28 context block and replace older briefs when a newer brief supersedes them.\n\
+- If Packet28 is fronting upstream MCP tools via proxy, prefer those proxied tools so activity is auto-captured into the next brief.\n\
+- After important reads, edits, decisions, or checkpoints, call `packet28.write_state`.\n\
+- If Packet28 is unavailable, fall back to direct reads and commands."
+            );
+            Ok(prompt_response("Start a new Packet28 task.", prompt))
+        }
+        "packet28.continue_task" => {
+            let task_id = resolve_requested_or_current_task_id(
+                root,
+                session,
+                prompt_argument(&arguments, "task_id").as_deref(),
+            )?;
+            let status = broker_task_status_via_session(root, session, &task_id)?;
+            let brief_excerpt = read_brief_excerpt(root, &task_id)
+                .unwrap_or_else(|| "No persisted brief is available yet.".to_string());
+            let prompt = format!(
+                "Continue Packet28 task `{task_id}`.\n\n\
+Latest known status:\n\
+- context version: {}\n\
+- reason: {}\n\
+- supports push notifications: {}\n\n\
+Recommended flow:\n\
+- Read `packet28://current/brief` or `packet28://task/{task_id}/brief` to review the latest rendered brief.\n\
+- Call `packet28.get_context` with `task_id=\"{task_id}\"`, the action that matches your next step, `since_version` set to the latest context version when available, and `response_mode=\"auto\"`.\n\
+- If you use Packet28 proxy mode, prefer proxied upstream tools so tool activity is captured automatically.\n\n\
+Latest brief excerpt:\n{}",
+                status
+                    .latest_context_version
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                status
+                    .latest_context_reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                status.supports_push,
+                brief_excerpt,
+            );
+            Ok(prompt_response(
+                "Continue the current Packet28 task.",
+                prompt,
+            ))
+        }
+        "packet28.summarize_current_context" => {
+            let task_id = resolve_requested_or_current_task_id(
+                root,
+                session,
+                prompt_argument(&arguments, "task_id").as_deref(),
+            )?;
+            let brief = read_brief_excerpt(root, &task_id).unwrap_or_else(|| {
+                "No persisted brief is available yet. Call `packet28.get_context` first."
+                    .to_string()
+            });
+            let prompt = format!(
+                "Summarize the current Packet28 context for task `{task_id}`. Focus on active decisions, discovered scope, recent tool activity, and the next recommended actions.\n\n\
+Current brief:\n{brief}"
+            );
+            Ok(prompt_response(
+                "Summarize the latest Packet28 context.",
+                prompt,
+            ))
+        }
+        _ => Err(anyhow!("unsupported prompt '{name}'")),
+    }
+}
+
+fn prompt_response(description: &str, text: String) -> Value {
+    json!({
+        "description": description,
+        "messages": [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": text
+                }
+            }
+        ]
+    })
+}
+
+fn prompt_argument(arguments: &Map<String, Value>, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_requested_or_current_task_id(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    requested_task_id: Option<&str>,
+) -> Result<String> {
+    if let Some(task_id) = requested_task_id.filter(|value| !value.trim().is_empty()) {
+        track_task(session, root, task_id)?;
+        return Ok(task_id.trim().to_string());
+    }
+    resolve_current_task_id(root, session)
+}
+
+fn resolve_current_task_id(root: &Path, session: &Arc<Mutex<McpSessionState>>) -> Result<String> {
+    if let Ok(guard) = session.lock() {
+        if let Some(task_id) = guard.current_task_id.clone() {
+            return Ok(task_id);
+        }
+    }
+    let status = daemon_status(root)?;
+    let current = select_current_task(&status.tasks)
+        .map(|task| task.task_id.clone())
+        .ok_or_else(|| anyhow!("no Packet28 task is available for current-task resources"))?;
+    track_task(session, root, &current)?;
+    Ok(current)
+}
+
+fn daemon_status(root: &Path) -> Result<packet28_daemon_core::DaemonStatus> {
+    match crate::cmd_daemon::send_request(root, &DaemonRequest::Status)? {
+        DaemonResponse::Status { status } => Ok(status),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn select_current_task(tasks: &[TaskRecord]) -> Option<&TaskRecord> {
+    tasks.iter().max_by_key(|task| task_recency_key(task))
+}
+
+fn task_recency_key(task: &TaskRecord) -> (u8, u64, u64, u64, u64, u64) {
+    (
+        u8::from(task.running),
+        task.last_context_refresh_at_unix.unwrap_or(0),
+        task.latest_brief_generated_at_unix.unwrap_or(0),
+        task.last_completed_at_unix.unwrap_or(0),
+        task.last_started_at_unix.unwrap_or(0),
+        task.last_event_seq,
+    )
+}
+
+fn read_brief_excerpt(root: &Path, task_id: &str) -> Option<String> {
+    let path = task_brief_markdown_path(root, task_id);
+    let text = fs::read_to_string(path).ok()?;
+    Some(truncate_for_prompt(&text, 4_000))
+}
+
+fn truncate_for_prompt(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        text.to_string()
+    } else {
+        format!("{}...", &text[..limit])
+    }
+}
+
 fn handle_method(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
@@ -1343,7 +1832,8 @@ fn handle_method(
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {},
-                    "resources": {}
+                    "resources": {},
+                    "prompts": {}
                 },
                 "serverInfo": {
                     "name": "Packet28",
@@ -1358,7 +1848,7 @@ fn handle_method(
                     "description": "Get action-specific Packet28 context for a task.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id", "action"],
+                        "required": ["action"],
                         "properties": {
                             "task_id": {"type":"string"},
                             "action": {"type":"string","enum":["plan","inspect","choose_tool","interpret","edit","summarize"]},
@@ -1387,7 +1877,7 @@ fn handle_method(
                     "description": "Preview the cost and selected sections for a broker context request without fetching the full brief.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id", "action"],
+                        "required": ["action"],
                         "properties": {
                             "task_id": {"type":"string"},
                             "action": {"type":"string","enum":["plan","inspect","choose_tool","interpret","edit","summarize"]},
@@ -1413,10 +1903,10 @@ fn handle_method(
                 },
                 {
                     "name": "packet28.search",
-                    "description": "Search repository files under the Packet28 root with reducer-backed grouped results and auto-capture the result into broker state.",
+                    "description": "Search repository files under the Packet28 root with reducer-backed grouped results and auto-capture the result into broker state. Returns a slim payload by default and can fetch full details later by artifact or invocation id.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id", "query"],
+                        "required": ["query"],
                         "properties": {
                             "task_id": {"type":"string"},
                             "query": {"type":"string"},
@@ -1426,7 +1916,50 @@ fn handle_method(
                             "whole_word": {"type":"boolean"},
                             "context_lines": {"type":"number"},
                             "max_matches_per_file": {"type":"number"},
-                            "max_total_matches": {"type":"number"}
+                            "max_total_matches": {"type":"number"},
+                            "response_mode": {"type":"string","enum":["slim","full"]}
+                        }
+                    }
+                },
+                {
+                    "name": "packet28.fetch_tool_result",
+                    "description": "Fetch a previously stored full native Packet28 tool result by artifact_id or invocation_id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "artifact_id": {"type":"string"},
+                            "invocation_id": {"type":"string"}
+                        }
+                    }
+                },
+                {
+                    "name": "packet28.sync",
+                    "description": "High-level Packet28 turn sync: resolve the current task, apply optional state writes, auto-use session since_version, optionally estimate, then fetch broker context.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "task_text": {"type":"string"},
+                            "action": {"type":"string","enum":["plan","inspect","choose_tool","interpret","edit","summarize"]},
+                            "budget_tokens": {"type":"number"},
+                            "budget_bytes": {"type":"number"},
+                            "query": {"type":"string"},
+                            "focus_paths": {"type":"array","items":{"type":"string"}},
+                            "focus_symbols": {"type":"array","items":{"type":"string"}},
+                            "tool_name": {"type":"string"},
+                            "tool_result_kind": {"type":"string","enum":["build","stack","test","diff","generic"]},
+                            "include_sections": {"type":"array","items":{"type":"string"}},
+                            "exclude_sections": {"type":"array","items":{"type":"string"}},
+                            "verbosity": {"type":"string","enum":["compact","standard","rich"]},
+                            "response_mode": {"type":"string","enum":["full","delta","auto"]},
+                            "include_self_context": {"type":"boolean"},
+                            "max_sections": {"type":"number"},
+                            "default_max_items_per_section": {"type":"number"},
+                            "section_item_limits": {"type":"object","additionalProperties":{"type":"number"}},
+                            "persist_artifacts": {"type":"boolean"},
+                            "include_estimate": {"type":"boolean"},
+                            "writes": {"type":"array","items":{"type":"object"}}
                         }
                     }
                 },
@@ -1435,7 +1968,7 @@ fn handle_method(
                     "description": "Read file content under the Packet28 root using explicit region hints and auto-capture the result into broker state.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id", "path"],
+                        "required": ["path"],
                         "properties": {
                             "task_id": {"type":"string"},
                             "path": {"type":"string"},
@@ -1450,7 +1983,7 @@ fn handle_method(
                     "description": "Write one structured agent-state update into Packet28.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id", "op"],
+                        "required": ["op"],
                         "properties": {
                             "task_id": {"type":"string"},
                             "op": {"type":"string","enum":["focus_set","focus_clear","file_read","file_edit","checkpoint_save","decision_add","decision_supersede","step_complete","question_open","question_resolve","tool_invocation_started","tool_invocation_completed","tool_invocation_failed","tool_result","focus_inferred","evidence_captured"]},
@@ -1489,7 +2022,7 @@ fn handle_method(
                     "description": "Validate a structured agent plan against current repo, task, and broker state.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id", "steps"],
+                        "required": ["steps"],
                         "properties": {
                             "task_id": {"type":"string"},
                             "steps": {
@@ -1518,7 +2051,7 @@ fn handle_method(
                     "description": "Experimental: deterministically decompose a constrained refactor intent into ordered plan steps.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id", "task_text", "intent"],
+                        "required": ["task_text", "intent"],
                         "properties": {
                             "task_id": {"type":"string"},
                             "task_text": {"type":"string"},
@@ -1534,7 +2067,6 @@ fn handle_method(
                     "description": "Return current Packet28 task status and broker artifact paths.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id"],
                         "properties": {
                             "task_id": {"type":"string"}
                         }
@@ -1550,8 +2082,12 @@ fn handle_method(
                 }
             ]
         })),
+        "prompts/list" => Ok(json!({
+            "prompts": prompt_descriptors(),
+        })),
+        "prompts/get" => handle_prompt_get(root, session, params),
         "tools/call" => handle_tool_call(root, session, params),
-        "resources/list" => handle_resources_list(root),
+        "resources/list" => handle_resources_list(root, session),
         "resources/templates/list" => Ok(json!({
             "resourceTemplates": [
                 {
@@ -1568,6 +2104,11 @@ fn handle_method(
                     "uriTemplate": "packet28://task/{task_id}/state",
                     "name": "Packet28 task state",
                     "description": "Current task state metadata for a task."
+                },
+                {
+                    "uriTemplate": "packet28://current/{artifact}",
+                    "name": "Packet28 current task artifact",
+                    "description": "Current task aliases for task, brief, events, and state."
                 }
             ]
         })),
@@ -1589,49 +2130,118 @@ fn handle_tool_call(
     let payload = match name {
         "packet28.get_context" => {
             let mut request: BrokerGetContextRequest = serde_json::from_value(arguments)?;
-            track_task(session, root, &request.task_id)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                request.query.as_deref(),
+                "packet28.get_context",
+            )?;
             if request.persist_artifacts.is_none() {
                 request.persist_artifacts = Some(false);
             }
-            serde_json::to_value(broker_get_context_via_session(root, session, request)?)?
+            let task_id = request.task_id.clone();
+            let mut payload =
+                serde_json::to_value(broker_get_context_via_session(root, session, request)?)?;
+            if payload.get("task_id").is_none() {
+                payload["task_id"] = json!(task_id);
+            }
+            payload
         }
         "packet28.estimate_context" => {
-            let request: BrokerEstimateContextRequest = serde_json::from_value(arguments)?;
-            track_task(session, root, &request.task_id)?;
-            serde_json::to_value(broker_estimate_context_via_session(root, session, request)?)?
+            let mut request: BrokerEstimateContextRequest = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                request.query.as_deref(),
+                "packet28.estimate_context",
+            )?;
+            let task_id = request.task_id.clone();
+            let mut payload =
+                serde_json::to_value(broker_estimate_context_via_session(root, session, request)?)?;
+            if payload.get("task_id").is_none() {
+                payload["task_id"] = json!(task_id);
+            }
+            payload
         }
         "packet28.search" => {
-            let request: Packet28SearchArgs = serde_json::from_value(arguments)?;
-            track_task(session, root, &request.task_id)?;
+            let mut request: Packet28SearchArgs = serde_json::from_value(arguments)?;
+            request.task_id =
+                resolve_session_task_id(session, root, &request.task_id, None, "packet28.search")?;
             handle_packet28_search(root, session, request)?
         }
+        "packet28.fetch_tool_result" => {
+            let mut request: Packet28FetchToolResultArgs = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                None,
+                "packet28.fetch_tool_result",
+            )?;
+            handle_packet28_fetch_tool_result(root, request)?
+        }
+        "packet28.sync" => {
+            let request: Packet28SyncArgs = serde_json::from_value(arguments)?;
+            handle_packet28_sync(root, session, request)?
+        }
         "packet28.read_regions" => {
-            let request: Packet28ReadRegionsArgs = serde_json::from_value(arguments)?;
-            track_task(session, root, &request.task_id)?;
+            let mut request: Packet28ReadRegionsArgs = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                None,
+                "packet28.read_regions",
+            )?;
             handle_packet28_read_regions(root, session, request)?
         }
         "packet28.write_state" => {
-            let request: BrokerWriteStateRequest = serde_json::from_value(arguments)?;
-            track_task(session, root, &request.task_id)?;
+            let mut request: BrokerWriteStateRequest = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                None,
+                "packet28.write_state",
+            )?;
             serde_json::to_value(broker_write_state_via_session(root, session, request)?)?
         }
         "packet28.validate_plan" => {
-            let request: BrokerValidatePlanRequest = serde_json::from_value(arguments)?;
-            track_task(session, root, &request.task_id)?;
+            let mut request: BrokerValidatePlanRequest = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                None,
+                "packet28.validate_plan",
+            )?;
             serde_json::to_value(broker_validate_plan_via_session(root, session, request)?)?
         }
         "packet28.decompose" => {
-            let request: BrokerDecomposeRequest = serde_json::from_value(arguments)?;
-            track_task(session, root, &request.task_id)?;
+            let mut request: BrokerDecomposeRequest = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                Some(&request.task_text),
+                "packet28.decompose",
+            )?;
             serde_json::to_value(broker_decompose_via_session(root, session, request)?)?
         }
         "packet28.task_status" => {
-            let task_id = arguments
-                .get("task_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("packet28.task_status requires task_id"))?;
-            track_task(session, root, task_id)?;
-            serde_json::to_value(broker_task_status_via_session(root, session, task_id)?)?
+            let task_id = resolve_session_task_id(
+                session,
+                root,
+                arguments
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                None,
+                "packet28.task_status",
+            )?;
+            serde_json::to_value(broker_task_status_via_session(root, session, &task_id)?)?
         }
         "packet28.capabilities" => capabilities_payload(),
         _ => return Err(anyhow!("unsupported tool '{name}'")),
@@ -1653,16 +2263,36 @@ fn capabilities_payload() -> Value {
         "section_ids": BROKER_SECTION_IDS,
         "verbosity_modes": ["compact", "standard", "rich"],
         "response_modes": ["full", "delta", "auto"],
-        "tools": ["packet28.get_context", "packet28.estimate_context", "packet28.search", "packet28.read_regions", "packet28.validate_plan", "packet28.decompose", "packet28.write_state", "packet28.task_status", "packet28.capabilities"],
+        "tools": ["packet28.get_context", "packet28.estimate_context", "packet28.search", "packet28.fetch_tool_result", "packet28.sync", "packet28.read_regions", "packet28.validate_plan", "packet28.decompose", "packet28.write_state", "packet28.task_status", "packet28.capabilities"],
+        "prompts": ["packet28.start_task", "packet28.continue_task", "packet28.summarize_current_context"],
         "tool_result_kinds": ["build", "stack", "test", "diff", "generic"],
         "push_notifications": {
             "supported": true,
             "method": "notifications/packet28.context_updated"
         },
+        "resources": {
+            "current_aliases": ["packet28://current/task", "packet28://current/brief", "packet28://current/events", "packet28://current/state"]
+        },
         "filters": {
             "include_sections": true,
             "exclude_sections": true,
             "include_self_context_default": false
+        },
+        "session": {
+            "current_task_default": true,
+            "task_id_optional_after_first_task": true
+        },
+        "search": {
+            "response_modes": ["slim", "full"],
+            "default_response_mode": "slim",
+            "detail_fetch_tool": "packet28.fetch_tool_result"
+        },
+        "sync": {
+            "supported": true,
+            "tool": "packet28.sync",
+            "manages_since_version": true,
+            "supports_write_batch": true,
+            "supports_estimate": true
         },
         "section_limits": {
             "explicit_limits_supported": true,
@@ -1725,6 +2355,20 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
                 .unwrap_or(0);
             format!("Packet28 search found {matches} match(es) across {files} file(s).")
         }
+        "packet28.fetch_tool_result" => {
+            let artifact_id = payload
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!("Packet28 fetched tool result artifact {artifact_id}.")
+        }
+        "packet28.sync" => payload
+            .get("context")
+            .and_then(|context| context.get("brief"))
+            .and_then(Value::as_str)
+            .filter(|brief| !brief.trim().is_empty())
+            .map(|brief| brief.to_string())
+            .unwrap_or_else(|| "Packet28 sync completed.".to_string()),
         "packet28.read_regions" => {
             let path = payload
                 .get("path")
@@ -1786,7 +2430,66 @@ fn track_task(session: &Arc<Mutex<McpSessionState>>, root: &Path, task_id: &str)
         .tracked_tasks
         .entry(task_id.to_string())
         .or_insert(latest_seq);
+    guard.current_task_id = Some(task_id.to_string());
     Ok(())
+}
+
+fn session_current_task_id(session: &Arc<Mutex<McpSessionState>>) -> Option<String> {
+    session.lock().ok().and_then(|guard| {
+        guard
+            .current_task_id
+            .clone()
+            .or_else(|| guard.proxy_task_id.clone())
+    })
+}
+
+fn session_context_version(session: &Arc<Mutex<McpSessionState>>, task_id: &str) -> Option<String> {
+    session
+        .lock()
+        .ok()
+        .and_then(|guard| guard.latest_context_versions.get(task_id).cloned())
+}
+
+fn remember_task_context_version(
+    session: &Arc<Mutex<McpSessionState>>,
+    task_id: &str,
+    context_version: &str,
+) -> Result<()> {
+    if context_version.trim().is_empty() {
+        return Ok(());
+    }
+    let mut guard = session
+        .lock()
+        .map_err(|_| anyhow!("failed to lock MCP session"))?;
+    guard.current_task_id = Some(task_id.to_string());
+    guard
+        .latest_context_versions
+        .insert(task_id.to_string(), context_version.to_string());
+    Ok(())
+}
+
+fn resolve_session_task_id(
+    session: &Arc<Mutex<McpSessionState>>,
+    root: &Path,
+    explicit_task_id: &str,
+    derive_hint: Option<&str>,
+    tool_name: &str,
+) -> Result<String> {
+    let task_id = if !explicit_task_id.trim().is_empty() {
+        explicit_task_id.trim().to_string()
+    } else if let Some(task_id) = session_current_task_id(session) {
+        task_id
+    } else if let Ok(task_id) = resolve_current_task_id(root, session) {
+        task_id
+    } else if let Some(hint) = derive_hint.filter(|hint| !hint.trim().is_empty()) {
+        crate::broker_client::derive_task_id(hint)
+    } else {
+        return Err(anyhow!(
+            "{tool_name} requires task_id or an active Packet28 session task"
+        ));
+    };
+    track_task(session, root, &task_id)?;
+    Ok(task_id)
 }
 
 #[cfg(unix)]
@@ -1835,7 +2538,13 @@ fn broker_get_context_via_session(
     mut request: BrokerGetContextRequest,
 ) -> Result<packet28_daemon_core::BrokerGetContextResponse> {
     if request.task_id.trim().is_empty() {
-        return Err(anyhow!("broker get_context requires task_id"));
+        request.task_id = resolve_session_task_id(
+            session,
+            root,
+            "",
+            request.query.as_deref(),
+            "packet28.get_context",
+        )?;
     }
     if request.action.is_none() {
         request.action = Some(packet28_daemon_core::BrokerAction::Plan);
@@ -1849,9 +2558,14 @@ fn broker_get_context_via_session(
     match send_daemon_request_via_session(
         root,
         session,
-        &DaemonRequest::BrokerGetContext { request },
+        &DaemonRequest::BrokerGetContext {
+            request: request.clone(),
+        },
     )? {
-        DaemonResponse::BrokerGetContext { response } => Ok(response),
+        DaemonResponse::BrokerGetContext { response } => {
+            remember_task_context_version(session, &request.task_id, &response.context_version)?;
+            Ok(response)
+        }
         DaemonResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
     }
@@ -1863,7 +2577,13 @@ fn broker_estimate_context_via_session(
     mut request: BrokerEstimateContextRequest,
 ) -> Result<packet28_daemon_core::BrokerEstimateContextResponse> {
     if request.task_id.trim().is_empty() {
-        return Err(anyhow!("broker estimate_context requires task_id"));
+        request.task_id = resolve_session_task_id(
+            session,
+            root,
+            "",
+            request.query.as_deref(),
+            "packet28.estimate_context",
+        )?;
     }
     if request.action.is_none() {
         request.action = Some(packet28_daemon_core::BrokerAction::Plan);
@@ -1877,7 +2597,9 @@ fn broker_estimate_context_via_session(
     match send_daemon_request_via_session(
         root,
         session,
-        &DaemonRequest::BrokerEstimateContext { request },
+        &DaemonRequest::BrokerEstimateContext {
+            request: request.clone(),
+        },
     )? {
         DaemonResponse::BrokerEstimateContext { response } => Ok(response),
         DaemonResponse::Error { message } => Err(anyhow!(message)),
@@ -1956,13 +2678,12 @@ fn broker_task_status_via_session(
     session: &Arc<Mutex<McpSessionState>>,
     task_id: &str,
 ) -> Result<BrokerTaskStatusResponse> {
+    let task_id = resolve_session_task_id(session, root, task_id, None, "packet28.task_status")?;
     match send_daemon_request_via_session(
         root,
         session,
         &DaemonRequest::BrokerTaskStatus {
-            request: BrokerTaskStatusRequest {
-                task_id: task_id.to_string(),
-            },
+            request: BrokerTaskStatusRequest { task_id },
         },
     )? {
         DaemonResponse::BrokerTaskStatus { response } => Ok(response),
@@ -1996,9 +2717,17 @@ fn json_array_strings(value: &Value, key: &str) -> Vec<String> {
 
 fn search_request_summary(args: &Packet28SearchArgs) -> String {
     if args.paths.is_empty() {
-        format!("search '{}' across repo", args.query)
+        format!(
+            "search '{}' across repo ({:?})",
+            args.query, args.response_mode
+        )
     } else {
-        format!("search '{}' in {} path(s)", args.query, args.paths.len())
+        format!(
+            "search '{}' in {} path(s) ({:?})",
+            args.query,
+            args.paths.len(),
+            args.response_mode
+        )
     }
 }
 
@@ -2147,19 +2876,6 @@ fn handle_packet28_search(
         }
     };
     let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let matches = search_result
-        .groups
-        .iter()
-        .flat_map(|group| group.matches.iter())
-        .take(search_result.returned_match_count)
-        .map(|item| {
-            json!({
-                "path": item.path,
-                "line": item.line,
-                "text": item.text,
-            })
-        })
-        .collect::<Vec<_>>();
     let groups = search_result
         .groups
         .iter()
@@ -2197,7 +2913,14 @@ fn handle_packet28_search(
             .unwrap_or("Search completed")
             .to_string()
     };
-    let payload = json!({
+    let requested_paths = search_result.requested_paths.clone();
+    let resolved_paths = search_result.resolved_paths.clone();
+    let paths = search_result.paths.clone();
+    let regions = search_result.regions.clone();
+    let symbols = search_result.symbols.clone();
+    let compact_preview = search_result.compact_preview.clone();
+    let diagnostics = search_result.diagnostics.clone();
+    let full_payload = json!({
         "task_id": task_id,
         "invocation_id": invocation_id,
         "sequence": sequence,
@@ -2205,23 +2928,44 @@ fn handle_packet28_search(
         "match_count": search_result.match_count,
         "returned_match_count": search_result.returned_match_count,
         "truncated": search_result.truncated,
-        "requested_paths": search_result.requested_paths,
-        "resolved_paths": search_result.resolved_paths,
-        "paths": search_result.paths,
-        "regions": search_result.regions,
-        "symbols": search_result.symbols,
+        "requested_paths": requested_paths,
+        "resolved_paths": resolved_paths,
+        "paths": paths.clone(),
+        "regions": regions.clone(),
+        "symbols": symbols.clone(),
         "groups": groups,
-        "compact_preview": search_result.compact_preview,
-        "matches": matches,
-        "diagnostics": search_result.diagnostics,
+        "compact_preview": compact_preview,
+        "diagnostics": diagnostics,
+        "response_mode": "full",
     });
-    let artifact_id = maybe_store_result_artifact(
+    let artifact_id = Some(store_result_artifact(
         root,
         task_id,
-        payload["invocation_id"].as_str().unwrap_or_default(),
-        &payload,
-        false,
-    )?;
+        full_payload["invocation_id"].as_str().unwrap_or_default(),
+        &full_payload,
+    )?);
+    let payload = match args.response_mode {
+        Packet28SearchResponseMode::Full => {
+            let mut payload = full_payload;
+            payload["artifact_id"] = json!(artifact_id.clone());
+            payload
+        }
+        Packet28SearchResponseMode::Slim => json!({
+            "task_id": task_id,
+            "invocation_id": invocation_id,
+            "sequence": sequence,
+            "query": query,
+            "match_count": search_result.match_count,
+            "returned_match_count": search_result.returned_match_count,
+            "truncated": search_result.truncated,
+            "paths": full_payload["paths"].clone(),
+            "regions": full_payload["regions"].clone(),
+            "compact_preview": full_payload["compact_preview"].clone(),
+            "diagnostics": full_payload["diagnostics"].clone(),
+            "artifact_id": artifact_id.clone(),
+            "response_mode": "slim",
+        }),
+    };
     write_native_tool_result(
         root,
         session,
@@ -2234,13 +2978,139 @@ fn handle_packet28_search(
         result_summary,
         Some(query.to_string()),
         None,
-        json_array_strings(&payload, "paths"),
-        json_array_strings(&payload, "regions"),
-        json_array_strings(&payload, "symbols"),
+        search_result.paths.clone(),
+        search_result.regions.clone(),
+        search_result.symbols.clone(),
         artifact_id,
         duration_ms,
     )?;
     Ok(payload)
+}
+
+fn handle_packet28_fetch_tool_result(
+    root: &Path,
+    args: Packet28FetchToolResultArgs,
+) -> Result<Value> {
+    let task_id = args.task_id.trim();
+    if task_id.is_empty() {
+        return Err(anyhow!("packet28.fetch_tool_result requires task_id"));
+    }
+    let (artifact_id, mut payload) = load_tool_result_artifact(
+        root,
+        task_id,
+        args.artifact_id.as_deref(),
+        args.invocation_id.as_deref(),
+    )?;
+    if payload.get("artifact_id").is_none() {
+        payload["artifact_id"] = json!(artifact_id.clone());
+    }
+    if payload.get("response_mode").is_none() {
+        payload["response_mode"] = json!("full");
+    }
+    Ok(payload)
+}
+
+fn handle_packet28_sync(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    args: Packet28SyncArgs,
+) -> Result<Value> {
+    let task_id = resolve_session_task_id(
+        session,
+        root,
+        &args.task_id,
+        args.task_text.as_deref().or(args.query.as_deref()),
+        "packet28.sync",
+    )?;
+    let used_current_task = args.task_id.trim().is_empty();
+    let used_since_version = session_context_version(session, &task_id);
+
+    let write_responses = if args.writes.is_empty() {
+        None
+    } else {
+        let requests = args
+            .writes
+            .into_iter()
+            .map(|mut request| {
+                request.task_id = task_id.clone();
+                request
+            })
+            .collect::<Vec<_>>();
+        Some(broker_write_state_batch_via_session(
+            root, session, requests,
+        )?)
+    };
+
+    let estimate = if args.include_estimate {
+        Some(broker_estimate_context_via_session(
+            root,
+            session,
+            packet28_daemon_core::BrokerEstimateContextRequest {
+                task_id: task_id.clone(),
+                action: args.action,
+                budget_tokens: args.budget_tokens,
+                budget_bytes: args.budget_bytes,
+                since_version: used_since_version.clone(),
+                focus_paths: args.focus_paths.clone(),
+                focus_symbols: args.focus_symbols.clone(),
+                tool_name: args.tool_name.clone(),
+                tool_result_kind: args.tool_result_kind,
+                query: args.query.clone(),
+                include_sections: args.include_sections.clone(),
+                exclude_sections: args.exclude_sections.clone(),
+                verbosity: args.verbosity,
+                response_mode: args.response_mode,
+                include_self_context: args.include_self_context,
+                max_sections: args.max_sections,
+                default_max_items_per_section: args.default_max_items_per_section,
+                section_item_limits: args.section_item_limits.clone(),
+                persist_artifacts: args.persist_artifacts,
+            },
+        )?)
+    } else {
+        None
+    };
+
+    let context = broker_get_context_via_session(
+        root,
+        session,
+        BrokerGetContextRequest {
+            task_id: task_id.clone(),
+            action: args.action,
+            budget_tokens: args.budget_tokens,
+            budget_bytes: args.budget_bytes,
+            since_version: used_since_version.clone(),
+            focus_paths: args.focus_paths,
+            focus_symbols: args.focus_symbols,
+            tool_name: args.tool_name,
+            tool_result_kind: args.tool_result_kind,
+            query: args.query,
+            include_sections: args.include_sections,
+            exclude_sections: args.exclude_sections,
+            verbosity: args.verbosity,
+            response_mode: Some(args.response_mode.unwrap_or(BrokerResponseMode::Auto)),
+            include_self_context: args.include_self_context,
+            max_sections: args.max_sections,
+            default_max_items_per_section: args.default_max_items_per_section,
+            section_item_limits: args.section_item_limits,
+            persist_artifacts: args.persist_artifacts.or(Some(false)),
+        },
+    )?;
+    let mut context_payload = serde_json::to_value(context)?;
+    if context_payload.get("task_id").is_none() {
+        context_payload["task_id"] = json!(task_id.clone());
+    }
+
+    Ok(json!({
+        "task_id": task_id,
+        "current_task_id": session_current_task_id(session),
+        "used_current_task": used_current_task,
+        "used_since_version": used_since_version,
+        "writes_applied": write_responses.as_ref().map(|batch| batch.responses.len()).unwrap_or(0),
+        "write_responses": write_responses,
+        "estimate": estimate,
+        "context": context_payload,
+    }))
 }
 
 fn handle_packet28_read_regions(
@@ -2329,13 +3199,43 @@ fn handle_packet28_read_regions(
     Ok(payload)
 }
 
-fn handle_resources_list(root: &Path) -> Result<Value> {
-    let status = match crate::cmd_daemon::send_request(root, &DaemonRequest::Status)? {
-        DaemonResponse::Status { status } => status,
-        DaemonResponse::Error { message } => return Err(anyhow!(message)),
-        other => return Err(anyhow!("unexpected daemon response: {other:?}")),
-    };
+fn handle_resources_list(root: &Path, session: &Arc<Mutex<McpSessionState>>) -> Result<Value> {
+    let status = daemon_status(root)?;
     let mut resources = Vec::new();
+    let current_task_id = session
+        .lock()
+        .ok()
+        .and_then(|guard| guard.current_task_id.clone())
+        .or_else(|| select_current_task(&status.tasks).map(|task| task.task_id.clone()));
+    if let Some(current_task_id) = current_task_id {
+        if let Ok(mut guard) = session.lock() {
+            guard.current_task_id = Some(current_task_id.clone());
+        }
+        resources.push(json!({
+            "uri": "packet28://current/task",
+            "name": "Packet28 current task",
+            "description": format!("Current task metadata for {}", current_task_id),
+            "mimeType": "application/json"
+        }));
+        resources.push(json!({
+            "uri": "packet28://current/brief",
+            "name": "Packet28 current brief",
+            "description": format!("Latest broker brief for {}", current_task_id),
+            "mimeType": "text/markdown"
+        }));
+        resources.push(json!({
+            "uri": "packet28://current/events",
+            "name": "Packet28 current events",
+            "description": format!("Task event replay for {}", current_task_id),
+            "mimeType": "application/json"
+        }));
+        resources.push(json!({
+            "uri": "packet28://current/state",
+            "name": "Packet28 current state",
+            "description": format!("Task broker metadata for {}", current_task_id),
+            "mimeType": "application/json"
+        }));
+    }
     for task in status.tasks {
         resources.push(json!({
             "uri": format!("packet28://task/{}/brief", task.task_id),
@@ -2368,15 +3268,39 @@ fn handle_resource_read(
         .get("uri")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing resource uri"))?;
-    let task_id = uri
-        .strip_prefix("packet28://task/")
-        .and_then(|rest| rest.split('/').next())
-        .filter(|task_id| !task_id.is_empty())
-        .ok_or_else(|| anyhow!("invalid Packet28 resource URI"))?;
-    track_task(session, root, task_id)?;
-    if uri.ends_with("/brief") {
-        let path = task_brief_markdown_path(root, task_id);
-        materialize_task_artifacts(root, session, task_id)?;
+    let (task_id, current_alias, kind) = if let Some(kind) = uri.strip_prefix("packet28://current/")
+    {
+        (resolve_current_task_id(root, session)?, true, kind)
+    } else {
+        let task_id = uri
+            .strip_prefix("packet28://task/")
+            .and_then(|rest| rest.split('/').next())
+            .filter(|task_id| !task_id.is_empty())
+            .ok_or_else(|| anyhow!("invalid Packet28 resource URI"))?;
+        let kind = uri
+            .strip_prefix(&format!("packet28://task/{task_id}/"))
+            .ok_or_else(|| anyhow!("invalid Packet28 resource URI"))?;
+        (task_id.to_string(), false, kind)
+    };
+    track_task(session, root, &task_id)?;
+    if current_alias && kind == "task" {
+        let status = broker_task_status_via_session(root, session, &task_id)?;
+        return Ok(json!({
+            "contents": [
+                {
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&json!({
+                        "task_id": task_id,
+                        "status": status,
+                    }))?
+                }
+            ]
+        }));
+    }
+    if kind == "brief" {
+        let path = task_brief_markdown_path(root, &task_id);
+        materialize_task_artifacts(root, session, &task_id)?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
         return Ok(json!({
@@ -2389,8 +3313,8 @@ fn handle_resource_read(
             ]
         }));
     }
-    if uri.ends_with("/events") {
-        let frames = load_task_events(root, task_id)?;
+    if kind == "events" {
+        let frames = load_task_events(root, &task_id)?;
         return Ok(json!({
             "contents": [
                 {
@@ -2401,9 +3325,9 @@ fn handle_resource_read(
             ]
         }));
     }
-    if uri.ends_with("/state") {
-        let path = task_state_json_path(root, task_id);
-        materialize_task_artifacts(root, session, task_id)?;
+    if kind == "state" {
+        let path = task_state_json_path(root, &task_id);
+        materialize_task_artifacts(root, session, &task_id)?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
         return Ok(json!({

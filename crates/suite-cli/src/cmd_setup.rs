@@ -279,6 +279,7 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     println!("  {}", "Verify with:".dimmed());
     println!("    packet28 --version");
     println!("    packet28 daemon status --root {root_display}");
+    println!("    packet28 doctor --root {root_display}");
     println!();
 
     Ok(0)
@@ -391,7 +392,12 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<McpConfi
     let mut config: BTreeMap<String, Value> = if path.exists() {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
-        serde_json::from_str(&content).unwrap_or_default()
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "refusing to overwrite invalid JSON in '{}'; fix the file and rerun setup",
+                path.display()
+            )
+        })?
     } else {
         BTreeMap::new()
     };
