@@ -25,6 +25,7 @@ glob.workspace = true
 ignore.workspace = true
 notify.workspace = true
 packet28-daemon-core = { version = "0.2.0", path = "../packet28-daemon-core" }
+packet28-reducer-core = { version = "0.2.0", path = "../packet28-reducer-core" }
 serde.workspace = true
 serde_json.workspace = true
 suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }

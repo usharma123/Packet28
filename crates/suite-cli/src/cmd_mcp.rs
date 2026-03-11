@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -97,9 +97,9 @@ struct McpProxyConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-struct Packet28GrepArgs {
+struct Packet28SearchArgs {
     task_id: String,
-    pattern: String,
+    query: String,
     paths: Vec<String>,
     fixed_string: bool,
     case_sensitive: Option<bool>,
@@ -111,7 +111,7 @@ struct Packet28GrepArgs {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-struct Packet28ReadArgs {
+struct Packet28ReadRegionsArgs {
     task_id: String,
     path: String,
     regions: Vec<String>,
@@ -157,7 +157,8 @@ const BROKER_SECTION_IDS: &[&str] = &[
     "tool_failures",
     "evidence_cache",
     "checkpoint_deltas",
-    "repo_map",
+    "search_evidence",
+    "code_evidence",
     "relevant_context",
     "recommended_actions",
     "progress",
@@ -1238,110 +1239,6 @@ fn normalize_capture_path(root: &Path, text: &str) -> String {
         .replace('\\', "/")
 }
 
-fn path_exists_under_root(root: &Path, path: &str) -> bool {
-    !path.is_empty() && root.join(path).exists()
-}
-
-fn resolve_capture_path_suffix(root: &Path, path: &str) -> Option<String> {
-    let needle = normalize_capture_path(root, path);
-    if needle.is_empty() {
-        return None;
-    }
-    let mut matches = BTreeSet::new();
-    collect_suffix_matches(root, root, &needle, &mut matches);
-    if matches.len() > 1 {
-        return None;
-    }
-    matches.into_iter().next()
-}
-
-fn collect_suffix_matches(
-    root: &Path,
-    current: &Path,
-    needle: &str,
-    matches: &mut BTreeSet<String>,
-) {
-    let Ok(entries) = fs::read_dir(current) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_suffix_matches(root, &path, needle, matches);
-            if matches.len() > 1 {
-                return;
-            }
-            continue;
-        }
-        let Ok(stripped) = path.strip_prefix(root) else {
-            continue;
-        };
-        let normalized = stripped.to_string_lossy().replace('\\', "/");
-        if normalized == needle || normalized.ends_with(&format!("/{needle}")) {
-            matches.insert(normalized);
-            if matches.len() > 1 {
-                return;
-            }
-        }
-    }
-}
-
-fn resolve_grep_paths(root: &Path, requested_paths: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut resolved = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut seen = BTreeSet::new();
-    for original in requested_paths {
-        let normalized = normalize_capture_path(root, original);
-        if normalized.is_empty() {
-            diagnostics.push(format!("ignored invalid path input: {}", original.trim()));
-            continue;
-        }
-        let final_path = if path_exists_under_root(root, &normalized) {
-            normalized
-        } else if let Some(candidate) = resolve_capture_path_suffix(root, &normalized) {
-            diagnostics.push(format!(
-                "resolved missing path '{}' to '{}'",
-                original.trim(),
-                candidate
-            ));
-            candidate
-        } else {
-            diagnostics.push(format!(
-                "path '{}' does not exist under daemon root {}",
-                original.trim(),
-                root.display()
-            ));
-            continue;
-        };
-        if seen.insert(final_path.clone()) {
-            resolved.push(final_path);
-        }
-    }
-    (resolved, diagnostics)
-}
-
-fn parse_grep_output_line(
-    root: &Path,
-    line: &str,
-    single_resolved_path: Option<&str>,
-) -> Option<(String, usize, String)> {
-    if let Some(only_path) = single_resolved_path {
-        let mut parts = line.splitn(2, ':');
-        let line_no = parts.next()?.parse::<usize>().ok()?;
-        let text = parts.next().unwrap_or_default().to_string();
-        return Some((only_path.to_string(), line_no, text));
-    }
-    let mut parts = line.splitn(3, ':');
-    let path = parts.next()?;
-    let line_no = parts.next()?.parse::<usize>().ok()?;
-    let text = parts.next().unwrap_or_default().to_string();
-    let normalized_path = normalize_capture_path(root, path);
-    if normalized_path.is_empty() {
-        return None;
-    }
-    Some((normalized_path, line_no, text))
-}
-
 fn extract_symbols(value: &Value) -> Vec<String> {
     let mut symbols = BTreeMap::<String, ()>::new();
     collect_symbols(None, value, &mut symbols);
@@ -1515,14 +1412,14 @@ fn handle_method(
                     }
                 },
                 {
-                    "name": "packet28.grep",
-                    "description": "Search repository files under the Packet28 root and auto-capture the result into broker state.",
+                    "name": "packet28.search",
+                    "description": "Search repository files under the Packet28 root with reducer-backed grouped results and auto-capture the result into broker state.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["task_id", "pattern"],
+                        "required": ["task_id", "query"],
                         "properties": {
                             "task_id": {"type":"string"},
-                            "pattern": {"type":"string"},
+                            "query": {"type":"string"},
                             "paths": {"type":"array","items":{"type":"string"}},
                             "fixed_string": {"type":"boolean"},
                             "case_sensitive": {"type":"boolean"},
@@ -1534,8 +1431,8 @@ fn handle_method(
                     }
                 },
                 {
-                    "name": "packet28.read",
-                    "description": "Read file content under the Packet28 root and auto-capture the result into broker state.",
+                    "name": "packet28.read_regions",
+                    "description": "Read file content under the Packet28 root using explicit region hints and auto-capture the result into broker state.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["task_id", "path"],
@@ -1703,15 +1600,15 @@ fn handle_tool_call(
             track_task(session, root, &request.task_id)?;
             serde_json::to_value(broker_estimate_context_via_session(root, session, request)?)?
         }
-        "packet28.grep" => {
-            let request: Packet28GrepArgs = serde_json::from_value(arguments)?;
+        "packet28.search" => {
+            let request: Packet28SearchArgs = serde_json::from_value(arguments)?;
             track_task(session, root, &request.task_id)?;
-            handle_packet28_grep(root, session, request)?
+            handle_packet28_search(root, session, request)?
         }
-        "packet28.read" => {
-            let request: Packet28ReadArgs = serde_json::from_value(arguments)?;
+        "packet28.read_regions" => {
+            let request: Packet28ReadRegionsArgs = serde_json::from_value(arguments)?;
             track_task(session, root, &request.task_id)?;
-            handle_packet28_read(root, session, request)?
+            handle_packet28_read_regions(root, session, request)?
         }
         "packet28.write_state" => {
             let request: BrokerWriteStateRequest = serde_json::from_value(arguments)?;
@@ -1756,7 +1653,7 @@ fn capabilities_payload() -> Value {
         "section_ids": BROKER_SECTION_IDS,
         "verbosity_modes": ["compact", "standard", "rich"],
         "response_modes": ["full", "delta", "auto"],
-        "tools": ["packet28.get_context", "packet28.estimate_context", "packet28.grep", "packet28.read", "packet28.validate_plan", "packet28.decompose", "packet28.write_state", "packet28.task_status", "packet28.capabilities"],
+        "tools": ["packet28.get_context", "packet28.estimate_context", "packet28.search", "packet28.read_regions", "packet28.validate_plan", "packet28.decompose", "packet28.write_state", "packet28.task_status", "packet28.capabilities"],
         "tool_result_kinds": ["build", "stack", "test", "diff", "generic"],
         "push_notifications": {
             "supported": true,
@@ -1816,7 +1713,7 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
                 .unwrap_or(0);
             format!("Packet28 context estimate with {sections} section(s), ~{est_tokens} tokens.")
         }
-        "packet28.grep" => {
+        "packet28.search" => {
             let matches = payload
                 .get("match_count")
                 .and_then(Value::as_u64)
@@ -1826,9 +1723,9 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
                 .and_then(Value::as_array)
                 .map(|items| items.len())
                 .unwrap_or(0);
-            format!("Packet28 grep found {matches} match(es) across {files} file(s).")
+            format!("Packet28 search found {matches} match(es) across {files} file(s).")
         }
-        "packet28.read" => {
+        "packet28.read_regions" => {
             let path = payload
                 .get("path")
                 .and_then(Value::as_str)
@@ -1838,7 +1735,7 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
                 .and_then(Value::as_array)
                 .map(|items| items.len())
                 .unwrap_or(0);
-            format!("Packet28 read returned {lines} line(s) from {path}.")
+            format!("Packet28 read_regions returned {lines} line(s) from {path}.")
         }
         "packet28.write_state" => {
             let accepted = payload
@@ -2087,58 +1984,6 @@ fn next_task_invocation(
     Ok((sequence, format!("tool-invocation-{sequence}")))
 }
 
-fn infer_symbols_from_pattern(pattern: &str) -> Vec<String> {
-    let candidate = pattern
-        .trim()
-        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | ':' | '.'));
-    if candidate.len() < 3 || !candidate.chars().any(|ch| ch.is_ascii_alphabetic()) {
-        return Vec::new();
-    }
-    vec![candidate.to_string()]
-}
-
-fn infer_symbols_from_lines(lines: &[String]) -> Vec<String> {
-    let mut symbols = BTreeMap::<String, ()>::new();
-    for line in lines {
-        let trimmed = line.trim();
-        let token = if let Some(rest) = trimmed.strip_prefix("pub struct ") {
-            rest.split_whitespace().next()
-        } else if let Some(rest) = trimmed.strip_prefix("struct ") {
-            rest.split_whitespace().next()
-        } else if let Some(rest) = trimmed.strip_prefix("pub enum ") {
-            rest.split_whitespace().next()
-        } else if let Some(rest) = trimmed.strip_prefix("enum ") {
-            rest.split_whitespace().next()
-        } else if let Some(rest) = trimmed.strip_prefix("pub trait ") {
-            rest.split_whitespace().next()
-        } else if let Some(rest) = trimmed.strip_prefix("trait ") {
-            rest.split_whitespace().next()
-        } else if let Some(rest) = trimmed.strip_prefix("pub fn ") {
-            rest.split('(').next()
-        } else if let Some(rest) = trimmed.strip_prefix("fn ") {
-            rest.split('(').next()
-        } else if let Some(rest) = trimmed.strip_prefix("class ") {
-            rest.split_whitespace().next()
-        } else if let Some(rest) = trimmed.strip_prefix("interface ") {
-            rest.split_whitespace().next()
-        } else if trimmed.contains('(') && trimmed.ends_with('{') {
-            trimmed
-                .split('(')
-                .next()
-                .and_then(|prefix| prefix.split_whitespace().last())
-        } else {
-            None
-        };
-        if let Some(token) = token {
-            let cleaned = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
-            if cleaned.len() >= 3 && cleaned.chars().any(|ch| ch.is_ascii_alphabetic()) {
-                symbols.insert(cleaned.to_string(), ());
-            }
-        }
-    }
-    symbols.into_keys().take(8).collect()
-}
-
 fn json_array_strings(value: &Value, key: &str) -> Vec<String> {
     value
         .get(key)
@@ -2149,64 +1994,28 @@ fn json_array_strings(value: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_line_range_spec(value: &str) -> Option<(usize, usize)> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let (start, end) = if let Some((start, end)) = trimmed.split_once('-') {
-        (
-            start.trim().parse::<usize>().ok()?,
-            end.trim().parse::<usize>().ok()?,
-        )
-    } else {
-        let line = trimmed.parse::<usize>().ok()?;
-        (line, line)
-    };
-    if start == 0 || end == 0 {
-        return None;
-    }
-    Some((start.min(end), start.max(end)))
-}
-
-fn parse_region_for_path(region: &str, path: &str) -> Option<(usize, usize)> {
-    let trimmed = region.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some((start, end)) = parse_line_range_spec(trimmed) {
-        return Some((start, end));
-    }
-    let (region_path, range) = trimmed.rsplit_once(':')?;
-    if normalize_capture_path(Path::new(""), region_path) != path {
-        return None;
-    }
-    parse_line_range_spec(range)
-}
-
-fn format_region(path: &str, start: usize, end: usize) -> String {
-    format!("{path}:{start}-{end}")
-}
-
-fn grep_request_summary(args: &Packet28GrepArgs) -> String {
+fn search_request_summary(args: &Packet28SearchArgs) -> String {
     if args.paths.is_empty() {
-        format!("grep '{}' across repo", args.pattern)
+        format!("search '{}' across repo", args.query)
     } else {
-        format!("grep '{}' in {} path(s)", args.pattern, args.paths.len())
+        format!("search '{}' in {} path(s)", args.query, args.paths.len())
     }
 }
 
-fn read_request_summary(args: &Packet28ReadArgs, path: &str) -> String {
+fn read_regions_request_summary(args: &Packet28ReadRegionsArgs, path: &str) -> String {
     if !args.regions.is_empty() {
-        format!("read {path} using {} region hint(s)", args.regions.len())
+        format!(
+            "read_regions {path} using {} region hint(s)",
+            args.regions.len()
+        )
     } else if args.line_start.is_some() || args.line_end.is_some() {
         format!(
-            "read {path} lines {}-{}",
+            "read_regions {path} lines {}-{}",
             args.line_start.unwrap_or(1),
             args.line_end.unwrap_or(args.line_start.unwrap_or(1))
         )
     } else {
-        format!("read {path}")
+        format!("read_regions {path}")
     }
 }
 
@@ -2288,239 +2097,123 @@ fn write_native_tool_failure(
     )
 }
 
-fn handle_packet28_grep(
+fn handle_packet28_search(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
-    args: Packet28GrepArgs,
+    args: Packet28SearchArgs,
 ) -> Result<Value> {
     let task_id = args.task_id.trim();
     if task_id.is_empty() {
-        return Err(anyhow!("packet28.grep requires task_id"));
+        return Err(anyhow!("packet28.search requires task_id"));
     }
-    let pattern = args.pattern.trim();
-    if pattern.is_empty() {
-        return Err(anyhow!("packet28.grep requires pattern"));
+    let query = args.query.trim();
+    if query.is_empty() {
+        return Err(anyhow!("packet28.search requires query"));
     }
     let (sequence, invocation_id) = next_task_invocation(session, task_id)?;
-    let request_summary = grep_request_summary(&args);
+    let request_summary = search_request_summary(&args);
 
-    let mut command = Command::new("rg");
-    command
-        .current_dir(root)
-        .arg("--line-number")
-        .arg("--no-heading")
-        .arg("--color")
-        .arg("never");
-    if args.fixed_string {
-        command.arg("-F");
-    }
-    if matches!(args.case_sensitive, Some(false)) {
-        command.arg("-i");
-    }
-    if args.whole_word {
-        command.arg("-w");
-    }
-    if let Some(context_lines) = args.context_lines {
-        command.arg("-C").arg(context_lines.to_string());
-    }
-    if let Some(max_matches_per_file) = args.max_matches_per_file {
-        command
-            .arg("--max-count")
-            .arg(max_matches_per_file.to_string());
-    }
-    command.arg(pattern);
-    let (resolved_paths, mut diagnostics) = resolve_grep_paths(root, &args.paths);
-    for path in &resolved_paths {
-        command.arg(path);
-    }
-    let mut command_summary = format!("rg {}", pattern);
     let started_at = Instant::now();
-    let output = if !args.paths.is_empty() && resolved_paths.is_empty() {
-        None
-    } else {
-        let output = match command.output() {
-            Ok(output) => Ok(output),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut fallback = Command::new("grep");
-                fallback
-                    .current_dir(root)
-                    .arg("-R")
-                    .arg("-n")
-                    .arg("-H")
-                    .arg("--binary-files=without-match");
-                if args.fixed_string {
-                    fallback.arg("-F");
-                }
-                if matches!(args.case_sensitive, Some(false)) {
-                    fallback.arg("-i");
-                }
-                if args.whole_word {
-                    fallback.arg("-w");
-                }
-                if let Some(context_lines) = args.context_lines {
-                    fallback.arg("-C").arg(context_lines.to_string());
-                }
-                if let Some(max_matches_per_file) = args.max_matches_per_file {
-                    fallback.arg("-m").arg(max_matches_per_file.to_string());
-                }
-                fallback.arg(pattern);
-                if resolved_paths.is_empty() {
-                    fallback.arg(".");
-                } else {
-                    for path in &resolved_paths {
-                        fallback.arg(path);
-                    }
-                }
-                command_summary = format!("grep -R {}", pattern);
-                fallback.output()
-            }
-            Err(error) => Err(error),
-        };
-        let output = match output {
-            Ok(output) => output,
-            Err(error) => {
-                let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                write_native_tool_failure(
-                    root,
-                    session,
-                    task_id,
-                    &invocation_id,
-                    sequence,
-                    "packet28.grep",
-                    suite_packet_core::ToolOperationKind::Search,
-                    request_summary,
-                    error.to_string(),
-                    Some(command_summary),
-                    duration_ms,
-                )?;
-                return Err(error.into());
-            }
-        };
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if !stderr.is_empty() {
-            diagnostics.push(stderr.clone());
-        }
-        if !matches!(output.status.code(), Some(0 | 1)) {
+    let search_result = match packet28_reducer_core::search(
+        root,
+        &packet28_reducer_core::SearchRequest {
+            query: query.to_string(),
+            requested_paths: args.paths.clone(),
+            fixed_string: args.fixed_string,
+            case_sensitive: args.case_sensitive,
+            whole_word: args.whole_word,
+            context_lines: args.context_lines,
+            max_matches_per_file: args.max_matches_per_file,
+            max_total_matches: args.max_total_matches,
+        },
+    ) {
+        Ok(result) => result,
+        Err(error) => {
             let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let error_message = if stderr.is_empty() {
-                format!("rg exited with status {}", output.status)
-            } else {
-                stderr
-            };
             write_native_tool_failure(
                 root,
                 session,
                 task_id,
                 &invocation_id,
                 sequence,
-                "packet28.grep",
+                "packet28.search",
                 suite_packet_core::ToolOperationKind::Search,
                 request_summary,
-                error_message.clone(),
-                Some(command_summary),
+                error.to_string(),
+                None,
                 duration_ms,
             )?;
-            return Err(anyhow!(error_message));
+            return Err(error);
         }
-        Some(output)
     };
     let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-
-    let max_total_matches = args.max_total_matches.unwrap_or(24).clamp(1, 200);
-    let mut matches = Vec::new();
-    let mut matched_paths = BTreeMap::<String, ()>::new();
-    let mut regions = BTreeMap::<String, ()>::new();
-    let mut total_match_count = 0_usize;
-    let single_resolved_path = (resolved_paths.len() == 1
-        && root.join(&resolved_paths[0]).is_file())
-    .then(|| resolved_paths[0].clone());
-    if let Some(output) = output.as_ref() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if line.trim().is_empty() || line == "--" {
-                continue;
-            }
-            let Some((normalized_path, line_no, text)) =
-                parse_grep_output_line(root, line, single_resolved_path.as_deref())
-            else {
-                continue;
-            };
-            total_match_count = total_match_count.saturating_add(1);
-            matched_paths.insert(normalized_path.clone(), ());
-            regions.insert(format_region(&normalized_path, line_no, line_no), ());
-            if matches.len() < max_total_matches {
-                matches.push(json!({
-                    "path": normalized_path,
-                    "line": line_no,
-                    "text": text,
-                }));
-            }
-        }
-    }
-    let paths = matched_paths.into_keys().collect::<Vec<_>>();
-    let regions = regions.into_keys().collect::<Vec<_>>();
-    let symbols = infer_symbols_from_pattern(pattern);
-    let preview = matches
+    let matches = search_result
+        .groups
         .iter()
-        .take(3)
-        .filter_map(|item| {
-            Some(format!(
-                "{}:{}",
-                item.get("path")?.as_str()?,
-                item.get("line")?.as_u64()?
-            ))
+        .flat_map(|group| group.matches.iter())
+        .take(search_result.returned_match_count)
+        .map(|item| {
+            json!({
+                "path": item.path,
+                "line": item.line,
+                "text": item.text,
+            })
         })
         .collect::<Vec<_>>();
-    let stderr = output
-        .as_ref()
-        .map(|value| String::from_utf8_lossy(&value.stderr).trim().to_string())
-        .unwrap_or_default();
-    let result_summary = if matches.is_empty() {
-        if !args.paths.is_empty() && resolved_paths.is_empty() {
+    let groups = search_result
+        .groups
+        .iter()
+        .map(|group| {
+            json!({
+                "path": group.path,
+                "match_count": group.match_count,
+                "displayed_match_count": group.displayed_match_count,
+                "truncated": group.truncated,
+                "matches": group.matches,
+            })
+        })
+        .collect::<Vec<_>>();
+    let result_summary = if search_result.match_count == 0 {
+        if !args.paths.is_empty() && search_result.resolved_paths.is_empty() {
             format!(
                 "No search paths resolved for '{}' ({} requested path(s) missing)",
-                pattern,
+                query,
                 args.paths.len()
             )
-        } else if resolved_paths.is_empty() {
-            format!("No matches for '{}' across repo", pattern)
+        } else if search_result.resolved_paths.is_empty() {
+            format!("No matches for '{}' across repo", query)
         } else {
             format!(
                 "No matches for '{}' in {} path(s)",
-                pattern,
-                resolved_paths.len()
+                query,
+                search_result.resolved_paths.len()
             )
         }
     } else {
-        let base = format!(
-            "Found {} matches across {} files for '{}': {}",
-            total_match_count,
-            paths.len(),
-            pattern,
-            preview.join(", ")
-        );
-        if total_match_count > matches.len() {
-            format!("{base} (showing first {} matches)", matches.len())
-        } else {
-            base
-        }
+        search_result
+            .compact_preview
+            .lines()
+            .next()
+            .unwrap_or("Search completed")
+            .to_string()
     };
     let payload = json!({
         "task_id": task_id,
         "invocation_id": invocation_id,
         "sequence": sequence,
-        "pattern": pattern,
-        "match_count": total_match_count,
-        "returned_match_count": matches.len(),
-        "truncated": total_match_count > matches.len(),
-        "requested_paths": args.paths,
-        "resolved_paths": resolved_paths,
-        "paths": paths,
-        "regions": regions,
-        "symbols": symbols,
+        "query": query,
+        "match_count": search_result.match_count,
+        "returned_match_count": search_result.returned_match_count,
+        "truncated": search_result.truncated,
+        "requested_paths": search_result.requested_paths,
+        "resolved_paths": search_result.resolved_paths,
+        "paths": search_result.paths,
+        "regions": search_result.regions,
+        "symbols": search_result.symbols,
+        "groups": groups,
+        "compact_preview": search_result.compact_preview,
         "matches": matches,
-        "stderr": stderr,
-        "diagnostics": diagnostics,
+        "diagnostics": search_result.diagnostics,
     });
     let artifact_id = maybe_store_result_artifact(
         root,
@@ -2535,12 +2228,12 @@ fn handle_packet28_grep(
         task_id,
         payload["invocation_id"].as_str().unwrap_or_default(),
         sequence,
-        "packet28.grep",
+        "packet28.search",
         suite_packet_core::ToolOperationKind::Search,
         request_summary,
         result_summary,
-        Some(pattern.to_string()),
-        Some(command_summary),
+        Some(query.to_string()),
+        None,
         json_array_strings(&payload, "paths"),
         json_array_strings(&payload, "regions"),
         json_array_strings(&payload, "symbols"),
@@ -2550,141 +2243,63 @@ fn handle_packet28_grep(
     Ok(payload)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{parse_grep_output_line, resolve_grep_paths};
-    use std::fs;
-
-    #[test]
-    fn parse_grep_output_line_supports_single_file_rg_output() {
-        let root = tempfile::tempdir().unwrap();
-        let parsed = parse_grep_output_line(
-            root.path(),
-            "2:    public static void shuffle() {}",
-            Some("apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java"),
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.0,
-            "apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java"
-        );
-        assert_eq!(parsed.1, 2);
-        assert!(parsed.2.contains("shuffle"));
-    }
-
-    #[test]
-    fn resolve_grep_paths_recovers_unique_suffixes() {
-        let root = tempfile::tempdir().unwrap();
-        let full_path = root
-            .path()
-            .join("apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java");
-        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
-        fs::write(&full_path, "class ArrayUtils {}\n").unwrap();
-
-        let (resolved, diagnostics) = resolve_grep_paths(
-            root.path(),
-            &["src/main/java/org/apache/commons/lang3/ArrayUtils.java".to_string()],
-        );
-
-        assert_eq!(
-            resolved,
-            vec!["apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java".to_string()]
-        );
-        assert!(diagnostics
-            .iter()
-            .any(|item| item.contains("resolved missing path")));
-    }
-}
-
-fn handle_packet28_read(
+fn handle_packet28_read_regions(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
-    args: Packet28ReadArgs,
+    args: Packet28ReadRegionsArgs,
 ) -> Result<Value> {
     let task_id = args.task_id.trim();
     if task_id.is_empty() {
-        return Err(anyhow!("packet28.read requires task_id"));
-    }
-    let path = normalize_capture_path(root, &args.path);
-    if path.is_empty() {
-        return Err(anyhow!("packet28.read requires a valid path"));
+        return Err(anyhow!("packet28.read_regions requires task_id"));
     }
     let (sequence, invocation_id) = next_task_invocation(session, task_id)?;
-    let request_summary = read_request_summary(&args, &path);
+    let request_summary = read_regions_request_summary(&args, &args.path);
 
     let started_at = Instant::now();
-    let contents = fs::read_to_string(root.join(&path));
-    let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let contents = match contents {
-        Ok(contents) => contents,
+    let read_result = match packet28_reducer_core::read_regions(
+        root,
+        &packet28_reducer_core::ReadRegionsRequest {
+            path: args.path.clone(),
+            regions: args.regions.clone(),
+            line_start: args.line_start,
+            line_end: args.line_end,
+        },
+    ) {
+        Ok(result) => result,
         Err(error) => {
+            let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             write_native_tool_failure(
                 root,
                 session,
                 task_id,
                 &invocation_id,
                 sequence,
-                "packet28.read",
+                "packet28.read_regions",
                 suite_packet_core::ToolOperationKind::Read,
                 request_summary,
                 error.to_string(),
                 None,
                 duration_ms,
             )?;
-            return Err(error.into());
+            return Err(error);
         }
     };
-    let all_lines = contents
-        .lines()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    let mut ranges = args
-        .regions
-        .iter()
-        .filter_map(|region| parse_region_for_path(region, &path))
-        .collect::<Vec<_>>();
-    if ranges.is_empty() {
-        match (args.line_start, args.line_end) {
-            (Some(start), Some(end)) if start > 0 && end > 0 => {
-                ranges.push((start.min(end), start.max(end)));
-            }
-            (Some(start), None) if start > 0 => ranges.push((start, start)),
-            (None, Some(end)) if end > 0 => ranges.push((end, end)),
-            _ => ranges.push((1, all_lines.len().min(120).max(1))),
-        }
-    }
-    let mut rendered = Vec::new();
-    let mut selected_text = Vec::new();
-    let mut normalized_regions = Vec::new();
-    for (start, end) in ranges {
-        let start = start.min(all_lines.len().max(1));
-        let end = end.min(all_lines.len().max(1)).max(start);
-        normalized_regions.push(format_region(&path, start, end));
-        for line_no in start..=end {
-            if let Some(line) = all_lines.get(line_no - 1) {
-                rendered.push(json!({
-                    "line": line_no,
-                    "text": line,
-                }));
-                selected_text.push(line.clone());
-            }
-        }
-    }
-    let symbols = infer_symbols_from_lines(&selected_text);
+    let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let result_summary = format!(
         "Read {} line(s) from {} across {} region(s)",
-        rendered.len(),
-        path,
-        normalized_regions.len()
+        read_result.lines.len(),
+        read_result.path,
+        read_result.regions.len()
     );
     let payload = json!({
         "task_id": task_id,
         "invocation_id": invocation_id,
         "sequence": sequence,
-        "path": path,
-        "regions": normalized_regions,
-        "symbols": symbols,
-        "lines": rendered,
+        "path": read_result.path,
+        "regions": read_result.regions,
+        "symbols": read_result.symbols,
+        "lines": read_result.lines,
+        "compact_preview": read_result.compact_preview,
     });
     let artifact_id = maybe_store_result_artifact(
         root,
@@ -2699,7 +2314,7 @@ fn handle_packet28_read(
         task_id,
         payload["invocation_id"].as_str().unwrap_or_default(),
         sequence,
-        "packet28.read",
+        "packet28.read_regions",
         suite_packet_core::ToolOperationKind::Read,
         request_summary,
         result_summary,

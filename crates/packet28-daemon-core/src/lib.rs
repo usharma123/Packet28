@@ -29,7 +29,7 @@ pub const TASK_BRIEF_JSON_FILE_NAME: &str = "brief.json";
 pub const TASK_STATE_JSON_FILE_NAME: &str = "state.json";
 pub const INDEX_DIR_NAME: &str = ".packet28/index";
 pub const INDEX_MANIFEST_FILE_NAME: &str = "manifest.json";
-pub const INDEX_SNAPSHOT_FILE_NAME: &str = "semantic-index-v1.bin";
+pub const INDEX_SNAPSHOT_FILE_NAME: &str = "repo-index-v1.bin";
 pub const MAX_SOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const SOCKET_DIR_NAME: &str = "packet28d-sockets";
 
