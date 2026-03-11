@@ -1,6 +1,6 @@
 {
   "name": "packet28",
-  "version": "0.2.14",
+  "version": "0.2.16",
   "description": "Context broker for AI coding agents — manages your agent's context window so it conserves tokens",
   "license": "MIT",
   "repository": {
@@ -21,10 +21,10 @@
     "vendor"
   ],
   "optionalDependencies": {
-    "@packet28/darwin-arm64": "0.2.14",
-    "@packet28/darwin-x64": "0.2.14",
-    "@packet28/linux-x64": "0.2.14",
-    "@packet28/linux-arm64": "0.2.14"
+    "@packet28/darwin-arm64": "0.2.16",
+    "@packet28/darwin-x64": "0.2.16",
+    "@packet28/linux-x64": "0.2.16",
+    "@packet28/linux-arm64": "0.2.16"
   },
   "keywords": [
     "ai",
