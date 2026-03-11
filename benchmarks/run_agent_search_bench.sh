@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKET28_BIN="${BENCH_PACKET28_BIN:-$ROOT_DIR/target/debug/Packet28}"
 
 if [[ "${BENCH_SKIP_BUILD:-0}" != "1" ]]; then
-  cargo build -q -p suite-cli --bin Packet28
+  cargo build -q -p suite-cli --bin Packet28 -p packet28d --bin packet28d
 fi
 
 python3 - "$ROOT_DIR" "$PACKET28_BIN" <<'PY'
