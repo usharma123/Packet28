@@ -384,12 +384,18 @@ fn test_check_accepts_packed_issues_input() {
 
 #[test]
 fn test_check_loads_coverage_from_state_by_default() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+    setup_git_repo(dir.path());
+
     covy_cmd()
+        .current_dir(dir.path())
         .args(["ingest", &fixture("lcov/basic.info")])
         .assert()
         .success();
 
     covy_cmd()
+        .current_dir(dir.path())
         .args([
             "check", "--base", "HEAD", "--head", "HEAD", "--report", "json",
         ])
