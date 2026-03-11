@@ -579,6 +579,16 @@ fn parse_grep_output_line(
     line: &str,
     single_resolved_path: Option<&str>,
 ) -> Option<(String, usize, String)> {
+    let mut path_parts = line.splitn(3, ':');
+    let first = path_parts.next()?;
+    let second = path_parts.next()?;
+    if let Ok(line_no) = second.parse::<usize>() {
+        let text = path_parts.next().unwrap_or_default().to_string();
+        let normalized_path = normalize_capture_path(root, first);
+        if !normalized_path.is_empty() {
+            return Some((normalized_path, line_no, text));
+        }
+    }
     if let Some(only_path) = single_resolved_path {
         let mut parts = line.splitn(2, ':');
         let line_no = parts.next()?.parse::<usize>().ok()?;
@@ -633,5 +643,26 @@ mod tests {
         );
         assert!(preview.contains("src/lib.rs"));
         assert!(preview.contains("+1 more in file"));
+    }
+
+    #[test]
+    fn parse_grep_output_line_accepts_grep_h_output_for_single_file() {
+        let root = Path::new("/tmp/example");
+        let parsed =
+            parse_grep_output_line(root, "src/lib.rs:41:pub struct Alpha;", Some("src/lib.rs"))
+                .expect("single-file grep -H output should parse");
+        assert_eq!(parsed.0, "src/lib.rs");
+        assert_eq!(parsed.1, 41);
+        assert_eq!(parsed.2, "pub struct Alpha;");
+    }
+
+    #[test]
+    fn parse_grep_output_line_accepts_rg_single_file_output() {
+        let root = Path::new("/tmp/example");
+        let parsed = parse_grep_output_line(root, "41:pub struct Alpha;", Some("src/lib.rs"))
+            .expect("single-file rg output should parse");
+        assert_eq!(parsed.0, "src/lib.rs");
+        assert_eq!(parsed.1, 41);
+        assert_eq!(parsed.2, "pub struct Alpha;");
     }
 }

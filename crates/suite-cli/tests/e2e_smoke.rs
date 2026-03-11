@@ -4094,8 +4094,8 @@ fn test_suite_preflight_json_selects_expected_reducers() {
         .unwrap();
     assert!(selected.iter().any(|item| item.as_str() == Some("cover")));
     assert!(selected.iter().any(|item| item.as_str() == Some("diff")));
-    assert!(selected.iter().any(|item| item.as_str() == Some("map")));
     assert!(selected.iter().any(|item| item.as_str() == Some("recall")));
+    assert!(!selected.iter().any(|item| item.as_str() == Some("map")));
     assert!(value
         .get("selection")
         .and_then(|selection| selection.get("anchors"))

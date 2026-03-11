@@ -2103,7 +2103,8 @@ fn signature_search_slice(line: &str) -> &str {
 }
 
 fn classify_symbol_match(line: &str, symbol: &str) -> EvidenceMatchKind {
-    if looks_like_signature(line) && contains_identifier_term(signature_search_slice(line), symbol) {
+    if looks_like_signature(line) && contains_identifier_term(signature_search_slice(line), symbol)
+    {
         EvidenceMatchKind::DefinesSymbol
     } else if looks_like_symbol_call(line, symbol) {
         EvidenceMatchKind::CallsSymbol
@@ -2317,8 +2318,10 @@ fn push_search_candidate(
         term: trimmed.to_string(),
         phase_index,
         kind,
-        whole_word: matches!(kind, SearchTermKind::FullSymbol | SearchTermKind::Identifier)
-            && is_identifier_like_query(trimmed),
+        whole_word: matches!(
+            kind,
+            SearchTermKind::FullSymbol | SearchTermKind::Identifier
+        ) && is_identifier_like_query(trimmed),
         case_sensitive,
     });
 }
@@ -2410,17 +2413,18 @@ fn classify_search_candidate_match(
     candidate: &SearchCandidate,
     line: &str,
 ) -> Option<EvidenceMatchKind> {
-    if matches!(candidate.kind, SearchTermKind::FullSymbol | SearchTermKind::Identifier)
-        && contains_identifier_term(line, &candidate.term)
+    if matches!(
+        candidate.kind,
+        SearchTermKind::FullSymbol | SearchTermKind::Identifier
+    ) && contains_identifier_term(line, &candidate.term)
     {
         Some(classify_symbol_match(line, &candidate.term))
     } else if matches!(
         candidate.kind,
         SearchTermKind::ExpandedSymbol | SearchTermKind::TextToken
-    )
-        && line
-            .to_ascii_lowercase()
-            .contains(&candidate.term.to_ascii_lowercase())
+    ) && line
+        .to_ascii_lowercase()
+        .contains(&candidate.term.to_ascii_lowercase())
     {
         Some(if looks_like_signature(line) {
             EvidenceMatchKind::DefinesSymbol
@@ -2555,7 +2559,10 @@ fn rank_reducer_search_files(
                 b.exact_full_symbol_definition_hits
                     .cmp(&a.exact_full_symbol_definition_hits)
             })
-            .then_with(|| b.best_exact_full_symbol_len.cmp(&a.best_exact_full_symbol_len))
+            .then_with(|| {
+                b.best_exact_full_symbol_len
+                    .cmp(&a.best_exact_full_symbol_len)
+            })
             .then_with(|| b.exact_full_symbol_hits.cmp(&a.exact_full_symbol_hits))
             .then_with(|| {
                 b.matched_phase_indexes
@@ -3755,6 +3762,10 @@ fn filter_requested_section_ids(
     allowed
 }
 
+fn should_run_reducer_search(allowed_sections: &HashSet<String>) -> bool {
+    allowed_sections.contains("search_evidence") || allowed_sections.contains("code_evidence")
+}
+
 fn load_task_record(state: &Arc<Mutex<DaemonState>>, task_id: &str) -> Option<TaskRecord> {
     state.lock().ok()?.tasks.tasks.get(task_id).cloned()
 }
@@ -4680,87 +4691,89 @@ fn build_broker_sections(
         });
     }
 
-    let search_execution = build_reducer_search_execution(
-        Some(state),
-        root,
-        snapshot,
-        request,
-        &query_focus,
-        action,
-        section_item_limit(&effective_limits, "search_evidence").max(8),
-        section_item_limit(&effective_limits, "code_evidence").min(15),
-    );
-    let reducer_files = search_execution.files;
-    if !reducer_files.is_empty() {
-        let evidence_by_file = search_execution.evidence_by_file;
-        let lines = reducer_files
-            .iter()
-            .map(|file| {
-                let line_hint = file
-                    .preview_matches
-                    .first()
-                    .map(|(line, _)| format!(":{line}"))
-                    .unwrap_or_default();
-                let terms = file
-                    .matched_terms
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "- {}{} [matches={}] — direct reducer hit for {}",
-                    file.path, line_hint, file.match_count, terms
-                )
-            })
-            .collect::<Vec<_>>();
-        if !lines.is_empty() {
-            sections.push(BrokerSection {
-                id: "search_evidence".to_string(),
-                title: "Relevant Files".to_string(),
-                body: truncate_lines(
-                    lines,
-                    section_item_limit(&effective_limits, "search_evidence"),
-                ),
-                priority: if matches!(
-                    action,
-                    BrokerAction::Plan | BrokerAction::Inspect | BrokerAction::ChooseTool
-                ) {
-                    1
-                } else {
-                    2
-                },
-                source_kind: BrokerSourceKind::Derived,
-            });
-        }
+    if should_run_reducer_search(&allowed_sections) {
+        let search_execution = build_reducer_search_execution(
+            Some(state),
+            root,
+            snapshot,
+            request,
+            &query_focus,
+            action,
+            section_item_limit(&effective_limits, "search_evidence").max(8),
+            section_item_limit(&effective_limits, "code_evidence").min(15),
+        );
+        let reducer_files = search_execution.files;
+        if !reducer_files.is_empty() {
+            let evidence_by_file = search_execution.evidence_by_file;
+            let lines = reducer_files
+                .iter()
+                .map(|file| {
+                    let line_hint = file
+                        .preview_matches
+                        .first()
+                        .map(|(line, _)| format!(":{line}"))
+                        .unwrap_or_default();
+                    let terms = file
+                        .matched_terms
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "- {}{} [matches={}] — direct reducer hit for {}",
+                        file.path, line_hint, file.match_count, terms
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                sections.push(BrokerSection {
+                    id: "search_evidence".to_string(),
+                    title: "Relevant Files".to_string(),
+                    body: truncate_lines(
+                        lines,
+                        section_item_limit(&effective_limits, "search_evidence"),
+                    ),
+                    priority: if matches!(
+                        action,
+                        BrokerAction::Plan | BrokerAction::Inspect | BrokerAction::ChooseTool
+                    ) {
+                        1
+                    } else {
+                        2
+                    },
+                    source_kind: BrokerSourceKind::Derived,
+                });
+            }
 
-        let evidence_lines = reducer_files
-            .iter()
-            .flat_map(|file| {
-                evidence_by_file
-                    .get(&file.path)
-                    .map(|summary| summary.rendered_lines.clone())
-                    .unwrap_or_default()
-            })
-            .take(15)
-            .collect::<Vec<_>>();
-        if !evidence_lines.is_empty() {
-            sections.push(BrokerSection {
-                id: "code_evidence".to_string(),
-                title: "Code Evidence".to_string(),
-                body: evidence_lines.join("\n"),
-                priority: if matches!(
-                    action,
-                    BrokerAction::Inspect
-                        | BrokerAction::Interpret
-                        | BrokerAction::Edit
-                        | BrokerAction::ChooseTool
-                ) {
-                    1
-                } else {
-                    2
-                },
-                source_kind: BrokerSourceKind::Derived,
-            });
+            let evidence_lines = reducer_files
+                .iter()
+                .flat_map(|file| {
+                    evidence_by_file
+                        .get(&file.path)
+                        .map(|summary| summary.rendered_lines.clone())
+                        .unwrap_or_default()
+                })
+                .take(15)
+                .collect::<Vec<_>>();
+            if !evidence_lines.is_empty() {
+                sections.push(BrokerSection {
+                    id: "code_evidence".to_string(),
+                    title: "Code Evidence".to_string(),
+                    body: evidence_lines.join("\n"),
+                    priority: if matches!(
+                        action,
+                        BrokerAction::Inspect
+                            | BrokerAction::Interpret
+                            | BrokerAction::Edit
+                            | BrokerAction::ChooseTool
+                    ) {
+                        1
+                    } else {
+                        2
+                    },
+                    source_kind: BrokerSourceKind::Derived,
+                });
+            }
         }
     }
 
@@ -8463,6 +8476,18 @@ mod tests {
         );
         assert_eq!(current.response_mode, Some(BrokerResponseMode::Delta));
         assert_eq!(current.section_item_limits["code_evidence"], 2);
+    }
+
+    #[test]
+    fn reducer_search_only_runs_when_evidence_sections_are_allowed() {
+        let only_summary = HashSet::from(["task_objective".to_string(), "progress".to_string()]);
+        assert!(!should_run_reducer_search(&only_summary));
+
+        let with_search = HashSet::from(["search_evidence".to_string()]);
+        assert!(should_run_reducer_search(&with_search));
+
+        let with_code = HashSet::from(["code_evidence".to_string()]);
+        assert!(should_run_reducer_search(&with_code));
     }
 
     #[test]
