@@ -1,6 +1,6 @@
 # Agent Search Benchmark
 
-`scripts/bench_agent_search.py` benchmarks Packet28's brokered `packet28.get_context` search flow against plain `rg` on real code-search tasks.
+`scripts/bench_agent_search.py` benchmarks Packet28's slim-first `packet28.search` flow against plain `rg` on real code-search tasks.
 
 It uses two real workspaces:
 
@@ -20,8 +20,11 @@ What it measures:
 
 - surfaced file quality against explicit expected paths
 - median latency across repeated runs
-- broker token estimate from `est_tokens`
+- compact payload size in bytes and estimated tokens
+- search match counts from the slim response
 - naive `rg` candidate-file and line counts
+
+The Packet28 side measures the first-pass `response_mode="slim"` response only. Full grouped matches stay behind `packet28.fetch_tool_result` and are not counted unless a follow-up expansion is requested.
 
 Quick run:
 

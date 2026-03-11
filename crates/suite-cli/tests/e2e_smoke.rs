@@ -3553,24 +3553,21 @@ fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
         "native grep returned MCP error: {grep}"
     );
     let grep_payload = &grep["result"]["structuredContent"];
-    assert_eq!(grep_payload["query"].as_str().unwrap(), "Alpha");
     assert_eq!(grep_payload["match_count"].as_u64().unwrap(), 1);
-    assert_eq!(grep_payload["returned_match_count"].as_u64().unwrap(), 1);
-    assert_eq!(grep_payload["truncated"], false);
-    assert!(grep_payload["paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "src/alpha.rs"));
-    assert!(grep_payload["regions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("src/alpha.rs:")));
     assert_eq!(grep_payload["response_mode"], "slim");
+    assert!(grep_payload["compact_preview"]
+        .as_str()
+        .unwrap()
+        .contains("src/alpha.rs"));
+    assert!(grep_payload.get("task_id").is_none());
+    assert!(grep_payload.get("invocation_id").is_none());
+    assert!(grep_payload.get("sequence").is_none());
+    assert!(grep_payload.get("query").is_none());
+    assert!(grep_payload.get("returned_match_count").is_none());
+    assert!(grep_payload.get("truncated").is_none());
+    assert!(grep_payload.get("paths").is_none());
+    assert!(grep_payload.get("regions").is_none());
+    assert!(grep_payload.get("diagnostics").is_none());
     assert!(grep_payload.get("groups").is_none());
     assert!(grep_payload.get("symbols").is_none());
     let artifact_id = grep_payload["artifact_id"].as_str().unwrap().to_string();

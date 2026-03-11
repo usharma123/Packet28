@@ -48,3 +48,35 @@ fn test_setup_only_writes_artifacts_for_detected_runtimes() {
     assert!(!root.path().join("CLAUDE.md").exists());
     assert!(!root.path().join(".cursorrules").exists());
 }
+
+#[test]
+#[cfg(unix)]
+fn test_setup_refuses_to_overwrite_invalid_mcp_json() {
+    let root = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let claude_config = root.path().join(".mcp.json");
+    fs::write(&claude_config, "{ invalid json").unwrap();
+
+    suite_cmd()
+        .current_dir(root.path())
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "setup",
+            "--root",
+            root.path().to_str().unwrap(),
+            "--runtime",
+            "claude",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refusing to overwrite invalid JSON",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(&claude_config).unwrap(),
+        "{ invalid json"
+    );
+}

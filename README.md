@@ -361,7 +361,13 @@ Three entry points for agent integration:
 Packet28 setup --runtime all --yes
 ```
 
-It updates project-local MCP config where supported (`.mcp.json`, `.cursor/mcp.json`), writes fallback prompt fragments for Claude/Cursor/Codex, and prepares the daemon index.
+It updates project-local MCP config where supported (`.mcp.json`, `.cursor/mcp.json`), writes fallback prompt fragments for Claude/Cursor/Codex, and prepares the daemon index. Existing MCP config is preserved: setup refuses to overwrite invalid JSON so users can fix the file explicitly instead of silently losing configuration.
+
+Packet28's MCP surface includes:
+
+- Tools for broker context, search, region reads, planning, and state writes
+- Prompt entry points such as `packet28.start_task`, `packet28.continue_task`, and `packet28.summarize_current_context`
+- Task resources plus ergonomic current-task aliases like `packet28://current/task` and `packet28://current/brief`
 
 **`Packet28 agent-prompt`** generates instruction fragments for agent config files:
 
@@ -574,6 +580,19 @@ Run Packet28 as an MCP server:
 # or, if installed via npm:
 packet28-mcp --root .
 ```
+
+Prefer Packet28 as an MCP proxy when you want upstream tool usage to become part of the next Packet28 brief:
+
+```bash
+./target/release/Packet28 mcp proxy --root . --upstream-config .mcp.proxy.json
+```
+
+Example auto-capture loop:
+
+1. Call `packet28.get_context` for a task and inspect the brief.
+2. Call an upstream MCP tool through `Packet28 mcp proxy`, for example a repo search or file reader.
+3. Call `packet28.get_context` again for the same task.
+4. The next brief now includes the proxied tool activity under sections like `Recent Tool Activity`, `Tool Failures`, and `Discovered Scope`.
 
 Run preflight for a task:
 

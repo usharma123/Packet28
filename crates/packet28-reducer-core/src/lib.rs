@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_MAX_TOTAL_MATCHES: usize = 50;
 const MAX_TOTAL_MATCHES_LIMIT: usize = 200;
 const DEFAULT_DISPLAYED_MATCHES_PER_FILE: usize = 12;
+const DEFAULT_DISPLAYED_GROUPS_IN_PREVIEW: usize = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
@@ -404,7 +405,7 @@ pub fn read_regions(root: &Path, request: &ReadRegionsRequest) -> Result<ReadReg
 fn render_search_compact_preview(
     total_match_count: usize,
     groups: &[SearchGroup],
-    max_total_matches: usize,
+    _max_total_matches: usize,
 ) -> String {
     if total_match_count == 0 {
         return "Search found 0 matches.".to_string();
@@ -414,38 +415,14 @@ fn render_search_compact_preview(
         total_match_count,
         groups.len()
     )];
-    let mut shown = 0_usize;
-    for group in groups {
-        if shown >= max_total_matches {
-            break;
-        }
+    for group in groups.iter().take(DEFAULT_DISPLAYED_GROUPS_IN_PREVIEW) {
         lines.push(format!("- {} ({})", group.path, group.match_count));
-        for item in group
-            .matches
-            .iter()
-            .take(DEFAULT_DISPLAYED_MATCHES_PER_FILE)
-        {
-            if shown >= max_total_matches {
-                break;
-            }
-            lines.push(format!(
-                "  {}: {}",
-                item.line,
-                compact_line(&item.text, 100)
-            ));
-            shown = shown.saturating_add(1);
-        }
-        if group.truncated {
-            lines.push(format!(
-                "  +{} more in file",
-                group
-                    .match_count
-                    .saturating_sub(group.displayed_match_count)
-            ));
-        }
     }
-    if total_match_count > shown {
-        lines.push(format!("+{} more overall", total_match_count - shown));
+    if groups.len() > DEFAULT_DISPLAYED_GROUPS_IN_PREVIEW {
+        lines.push(format!(
+            "+{} more files",
+            groups.len() - DEFAULT_DISPLAYED_GROUPS_IN_PREVIEW
+        ));
     }
     lines.join("\n")
 }
@@ -641,8 +618,9 @@ mod tests {
             }],
             DEFAULT_MAX_TOTAL_MATCHES,
         );
+        assert!(preview.contains("Search found 3 matches in 1 files."));
         assert!(preview.contains("src/lib.rs"));
-        assert!(preview.contains("+1 more in file"));
+        assert!(!preview.contains("alpha"));
     }
 
     #[test]

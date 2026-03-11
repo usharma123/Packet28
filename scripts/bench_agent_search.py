@@ -16,7 +16,7 @@ import re
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PACKET28_BIN = REPO_ROOT / "target" / "release" / "Packet28"
 PATH_CAPTURE_RE = re.compile(
-    r"^- (?P<path>.+?\.[A-Za-z0-9]+?)(?::\d+|\s+\[|$)"
+    r"^- (?P<path>.+?\.[A-Za-z0-9]+?)(?::\d+|\s+\(|\s+\[|$)"
 )
 
 
@@ -213,28 +213,28 @@ def run_broker_case(
         task_id = f"bench-agent-search-{case.repo}-{case.case_id}-{iteration + 1}-{int(time.time() * 1000)}"
         started = time.perf_counter()
         payload = session.call(
-            "packet28.get_context",
+            "packet28.search",
             {
                 "task_id": task_id,
-                "action": "inspect",
-                "query": case.query,
-                "response_mode": "full",
-                "include_sections": ["task_objective", "search_evidence", "code_evidence"],
-                "max_sections": 3,
-                "persist_artifacts": False,
+                "query": case.needle,
+                "paths": list(case.rg_paths),
+                "fixed_string": case.literal,
+                "whole_word": case.whole_word,
+                "response_mode": "slim",
             },
             request_id=iteration + 2,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        surfaced_paths = extract_paths_from_context(payload)
+        surfaced_paths = extract_paths_from_preview(payload.get("compact_preview", ""))
+        payload_bytes = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         score = score_paths(surfaced_paths, case.expected_paths)
         samples.append(
             {
                 "elapsed_ms": elapsed_ms,
-                "est_tokens": payload.get("est_tokens", 0),
-                "context_version": payload.get("context_version"),
+                "payload_bytes": payload_bytes,
+                "payload_token_est": estimate_json_tokens(payload),
+                "match_count": payload.get("match_count", 0),
                 "surfaced_paths": surfaced_paths,
-                "sections": [section["id"] for section in payload.get("sections", [])],
                 "score": score,
             }
         )
@@ -303,24 +303,23 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
             for sample in samples
         ],
         **(
-            {"est_tokens": representative["est_tokens"], "sections": representative["sections"]}
-            if "est_tokens" in representative
+            {
+                "payload_bytes": representative["payload_bytes"],
+                "payload_token_est": representative["payload_token_est"],
+                "match_count": representative["match_count"],
+            }
+            if "payload_token_est" in representative
             else {"line_count": representative["line_count"]}
         ),
     }
 
 
-def extract_paths_from_context(payload: dict[str, Any]) -> list[str]:
-    sections = payload.get("sections", [])
+def extract_paths_from_preview(preview: str) -> list[str]:
     paths: list[str] = []
-    for section in sections:
-        if section.get("id") not in {"code_evidence", "search_evidence"}:
-            continue
-        body = section.get("body", "")
-        for line in body.splitlines():
-            match = PATH_CAPTURE_RE.match(line.strip())
-            if match:
-                paths.append(match.group("path"))
+    for line in preview.splitlines():
+        match = PATH_CAPTURE_RE.match(line.strip())
+        if match:
+            paths.append(match.group("path"))
     return unique_in_order(paths)
 
 
@@ -355,36 +354,46 @@ def unique_in_order(items: Any) -> list[str]:
     return ordered
 
 
+def estimate_json_tokens(payload: dict[str, Any]) -> int:
+    serialized = json.dumps(payload, separators=(",", ":"))
+    return max(1, round(len(serialized) / 4))
+
+
 def render_markdown(results: list[CaseResult]) -> str:
     broker_median = statistics.median(result.broker["elapsed_ms"] for result in results)
     rg_median = statistics.median(result.rg["elapsed_ms"] for result in results)
     broker_recall = statistics.mean(result.broker["score"]["recall"] for result in results)
     rg_recall = statistics.mean(result.rg["score"]["recall"] for result in results)
+    broker_token_est = statistics.median(
+        result.broker["payload_token_est"] for result in results
+    )
 
     lines = [
         "# Agent Search Benchmark",
         "",
         f"- Cases: {len(results)}",
-        f"- Broker median latency: {broker_median:.3f} ms",
+        f"- Packet28 slim-search median latency: {broker_median:.3f} ms",
+        f"- Packet28 slim-search median payload estimate: {broker_token_est:.0f} tokens",
         f"- rg median latency: {rg_median:.3f} ms",
-        f"- Broker mean recall: {broker_recall:.3f}",
+        f"- Packet28 mean recall: {broker_recall:.3f}",
         f"- rg mean recall: {rg_recall:.3f}",
         "",
-        "| Case | Repo | Broker recall | Broker top rank | Broker files | Broker ms | Broker tokens | rg recall | rg top rank | rg files | rg lines | rg ms |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Case | Repo | Packet28 recall | Packet28 top rank | Packet28 files | Packet28 ms | Packet28 tok est | Packet28 bytes | rg recall | rg top rank | rg files | rg lines | rg ms |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in results:
         broker_score = result.broker["score"]
         rg_score = result.rg["score"]
         lines.append(
-            "| {case} | {repo} | {b_recall:.3f} | {b_rank} | {b_files} | {b_ms:.3f} | {b_tokens} | {r_recall:.3f} | {r_rank} | {r_files} | {r_lines} | {r_ms:.3f} |".format(
+            "| {case} | {repo} | {b_recall:.3f} | {b_rank} | {b_files} | {b_ms:.3f} | {b_tokens} | {b_bytes} | {r_recall:.3f} | {r_rank} | {r_files} | {r_lines} | {r_ms:.3f} |".format(
                 case=result.case_id,
                 repo=result.repo,
                 b_recall=broker_score["recall"],
                 b_rank=broker_score["top_hit_rank"] or "-",
                 b_files=len(result.broker["surfaced_paths"]),
                 b_ms=result.broker["elapsed_ms"],
-                b_tokens=result.broker.get("est_tokens", "-"),
+                b_tokens=result.broker.get("payload_token_est", "-"),
+                b_bytes=result.broker.get("payload_bytes", "-"),
                 r_recall=rg_score["recall"],
                 r_rank=rg_score["top_hit_rank"] or "-",
                 r_files=len(result.rg["surfaced_paths"]),
@@ -401,7 +410,8 @@ def render_markdown(results: list[CaseResult]) -> str:
                 f"- Repo: `{result.repo}`",
                 f"- Query: `{result.query}`",
                 f"- Expected paths: {', '.join(f'`{path}`' for path in result.expected_paths)}",
-                f"- Broker surfaced: {', '.join(f'`{path}`' for path in result.broker['surfaced_paths']) or '(none)'}",
+                f"- Packet28 surfaced: {', '.join(f'`{path}`' for path in result.broker['surfaced_paths']) or '(none)'}",
+                f"- Packet28 match count: `{result.broker.get('match_count', 0)}`",
                 f"- rg surfaced: {', '.join(f'`{path}`' for path in result.rg['surfaced_paths']) or '(none)'}",
                 "",
             ]

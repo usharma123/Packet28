@@ -51,6 +51,35 @@ Ask Packet28 whether a full fetch is worth it before spending tokens:
 
 The estimate response includes `selected_section_ids`, `est_tokens`, `budget_remaining_tokens`, `section_estimates`, and `eviction_candidates`.
 
+### Slim Search First
+
+Use `packet28.search` when you want cheap steering before asking for full grouped matches:
+
+```json
+{
+  "name": "packet28.search",
+  "arguments": {
+    "task_id": "task-auth-broker",
+    "query": "BrokerWriteStateRequest",
+    "paths": ["crates"],
+    "whole_word": true,
+    "response_mode": "slim"
+  }
+}
+```
+
+The slim response returns only `compact_preview`, `match_count`, and `artifact_id`. If the preview looks promising, expand the stored full result on demand:
+
+```json
+{
+  "name": "packet28.fetch_tool_result",
+  "arguments": {
+    "task_id": "task-auth-broker",
+    "artifact_id": "artifact-123"
+  }
+}
+```
+
 ### Deterministic Planning
 
 Use Packet28 to generate and validate constrained refactor plans before execution. `packet28.decompose` is experimental and intentionally narrow in this milestone:

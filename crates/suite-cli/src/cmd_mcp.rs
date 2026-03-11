@@ -1903,7 +1903,7 @@ fn handle_method(
                 },
                 {
                     "name": "packet28.search",
-                    "description": "Search repository files under the Packet28 root with reducer-backed grouped results and auto-capture the result into broker state. Returns a slim payload by default and can fetch full details later by artifact or invocation id.",
+                    "description": "Search repository files under the Packet28 root with reducer-backed grouped results and auto-capture the result into broker state. Returns only compact_preview, match_count, and artifact_id by default; fetch full details later by artifact or invocation id.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["query"],
@@ -2285,7 +2285,8 @@ fn capabilities_payload() -> Value {
         "search": {
             "response_modes": ["slim", "full"],
             "default_response_mode": "slim",
-            "detail_fetch_tool": "packet28.fetch_tool_result"
+            "detail_fetch_tool": "packet28.fetch_tool_result",
+            "slim_fields": ["compact_preview", "match_count", "artifact_id"]
         },
         "sync": {
             "supported": true,
@@ -2348,12 +2349,15 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
                 .get("match_count")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            let files = payload
+            if let Some(files) = payload
                 .get("paths")
                 .and_then(Value::as_array)
                 .map(|items| items.len())
-                .unwrap_or(0);
-            format!("Packet28 search found {matches} match(es) across {files} file(s).")
+            {
+                format!("Packet28 search found {matches} match(es) across {files} file(s).")
+            } else {
+                format!("Packet28 search found {matches} match(es).")
+            }
         }
         "packet28.fetch_tool_result" => {
             let artifact_id = payload
@@ -2951,17 +2955,8 @@ fn handle_packet28_search(
             payload
         }
         Packet28SearchResponseMode::Slim => json!({
-            "task_id": task_id,
-            "invocation_id": invocation_id,
-            "sequence": sequence,
-            "query": query,
             "match_count": search_result.match_count,
-            "returned_match_count": search_result.returned_match_count,
-            "truncated": search_result.truncated,
-            "paths": full_payload["paths"].clone(),
-            "regions": full_payload["regions"].clone(),
             "compact_preview": full_payload["compact_preview"].clone(),
-            "diagnostics": full_payload["diagnostics"].clone(),
             "artifact_id": artifact_id.clone(),
             "response_mode": "slim",
         }),
@@ -2970,7 +2965,7 @@ fn handle_packet28_search(
         root,
         session,
         task_id,
-        payload["invocation_id"].as_str().unwrap_or_default(),
+        &invocation_id,
         sequence,
         "packet28.search",
         suite_packet_core::ToolOperationKind::Search,
