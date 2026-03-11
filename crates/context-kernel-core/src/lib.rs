@@ -4551,6 +4551,9 @@ fn derive_agent_snapshot(
     let mut last_event_at_unix = None;
     let mut latest_checkpoint_id = None;
     let mut latest_checkpoint_at_unix = None;
+    let mut checkpoint_note = None;
+    let mut checkpoint_focus_paths = std::collections::BTreeSet::new();
+    let mut checkpoint_focus_symbols = std::collections::BTreeSet::new();
     let mut changed_paths_since_checkpoint = std::collections::BTreeSet::new();
     let mut changed_symbols_since_checkpoint = std::collections::BTreeSet::new();
     let mut recent_tool_invocations = Vec::new();
@@ -4608,9 +4611,15 @@ fn derive_agent_snapshot(
                     changed_symbols_since_checkpoint.insert(symbol.clone());
                 }
             }
-            suite_packet_core::AgentStateEventData::CheckpointSaved { checkpoint_id, .. } => {
+            suite_packet_core::AgentStateEventData::CheckpointSaved {
+                checkpoint_id,
+                note,
+            } => {
                 latest_checkpoint_id = Some(checkpoint_id.clone());
                 latest_checkpoint_at_unix = Some(event.occurred_at_unix);
+                checkpoint_note = note.clone();
+                checkpoint_focus_paths = event.paths.iter().cloned().collect();
+                checkpoint_focus_symbols = event.symbols.iter().cloned().collect();
                 changed_paths_since_checkpoint.clear();
                 changed_symbols_since_checkpoint.clear();
             }
@@ -4810,6 +4819,9 @@ fn derive_agent_snapshot(
         last_event_at_unix,
         latest_checkpoint_id,
         latest_checkpoint_at_unix,
+        checkpoint_note,
+        checkpoint_focus_paths: checkpoint_focus_paths.into_iter().collect(),
+        checkpoint_focus_symbols: checkpoint_focus_symbols.into_iter().collect(),
         changed_paths_since_checkpoint: changed_paths_since_checkpoint.into_iter().collect(),
         changed_symbols_since_checkpoint: changed_symbols_since_checkpoint.into_iter().collect(),
         recent_tool_invocations,

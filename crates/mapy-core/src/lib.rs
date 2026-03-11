@@ -351,9 +351,14 @@ fn build_repo_map_from_scans(
         let dependency_centrality = degree as f64 / max_degree as f64;
         let recency_hint = (scan.mtime_secs.saturating_sub(oldest)) as f64 / recency_span as f64;
 
-        let score = 0.45 * focus_match
+        let (focus_weight, dependency_weight) = if focus_symbols.is_empty() {
+            (0.45, 0.20)
+        } else {
+            (0.55, 0.10)
+        };
+        let score = focus_weight * focus_match
             + 0.25 * change_proximity
-            + 0.20 * dependency_centrality
+            + dependency_weight * dependency_centrality
             + 0.10 * recency_hint;
 
         ranked_files_tmp.push(RankedFileTmp {
@@ -364,14 +369,10 @@ fn build_repo_map_from_scans(
         });
 
         for (kind, name) in &scan.symbols {
-            let symbol_focus = if focus_symbols
+            let symbol_focus = focus_symbols
                 .iter()
-                .any(|candidate| focus_term_matches(name, candidate))
-            {
-                1.0
-            } else {
-                0.0
-            };
+                .map(|candidate| focus_term_match_score(name, candidate))
+                .fold(0.0, f64::max);
             let symbol_score = (0.7 * score + 0.3 * symbol_focus).min(1.0);
             ranked_symbols_tmp.push(RankedSymbolTmp {
                 name: name.clone(),
@@ -1159,29 +1160,35 @@ fn file_focus_match(
     focus_symbols: &BTreeSet<String>,
 ) -> f64 {
     let normalized_path = normalize_path(path).to_ascii_lowercase();
-    let path_match: f64 = if focus_paths.iter().any(|p| {
+    let explicit_path_match = focus_paths.iter().any(|p| {
         let candidate = normalize_path(p).to_ascii_lowercase();
         normalized_path == candidate
             || normalized_path.starts_with(&candidate)
             || candidate.starts_with(&normalized_path)
-    }) || focus_symbols
-        .iter()
-        .any(|candidate| focus_term_matches(&normalized_path, candidate))
-    {
+    });
+    let path_match = if explicit_path_match {
         1.0
     } else {
-        0.0
-    };
-
-    let symbol_match: f64 = if symbols.iter().any(|(_, name)| {
         focus_symbols
             .iter()
-            .any(|candidate| focus_term_matches(name, candidate))
-    }) {
-        1.0
-    } else {
-        0.0
+            .map(|candidate| {
+                if normalized_path.contains(candidate) {
+                    0.3
+                } else {
+                    0.0
+                }
+            })
+            .fold(0.0, f64::max)
     };
+
+    let symbol_match = symbols
+        .iter()
+        .flat_map(|(_, name)| {
+            focus_symbols
+                .iter()
+                .map(move |candidate| focus_term_match_score(name, candidate))
+        })
+        .fold(0.0, f64::max);
 
     path_match.max(symbol_match)
 }
@@ -1203,14 +1210,19 @@ fn proximity_score(path: &str, focus_paths: &[String]) -> f64 {
     best
 }
 
-fn focus_term_matches(candidate: &str, focus_term: &str) -> bool {
+fn focus_term_match_score(candidate: &str, focus_term: &str) -> f64 {
     let candidate = candidate.trim().to_ascii_lowercase();
     let focus_term = focus_term.trim().to_ascii_lowercase();
-    !candidate.is_empty()
-        && !focus_term.is_empty()
-        && (candidate == focus_term
-            || candidate.contains(&focus_term)
-            || focus_term.contains(&candidate))
+    if candidate.is_empty() || focus_term.is_empty() {
+        return 0.0;
+    }
+    if candidate == focus_term {
+        return 1.0;
+    }
+    if candidate.contains(&focus_term) || focus_term.contains(&candidate) {
+        return 0.6;
+    }
+    0.0
 }
 
 fn common_prefix_segments(a: &str, b: &str) -> usize {
@@ -2002,5 +2014,36 @@ public class Calculator {
             .files
             .get("src/a.rs")
             .is_some_and(|file| file.symbols.iter().any(|symbol| symbol.name == "gamma")));
+    }
+
+    #[test]
+    fn focus_term_match_score_graduates_exact_and_partial_matches() {
+        assert_eq!(focus_term_match_score("shuffle", "shuffle"), 1.0);
+        assert_eq!(focus_term_match_score("shuffleConfig", "shuffle"), 0.6);
+        assert_eq!(focus_term_match_score("ArrayUtils", "shuffle"), 0.0);
+    }
+
+    #[test]
+    fn file_focus_match_prefers_exact_symbol_matches_over_path_only_matches() {
+        let symbols = vec![("method".to_string(), "shuffle".to_string())];
+        let focus_paths = Vec::new();
+        let focus_symbols = BTreeSet::from(["shuffle".to_string()]);
+
+        let direct = file_focus_match(
+            "src/main/java/org/apache/commons/lang3/ArrayUtils.java",
+            &symbols,
+            &focus_paths,
+            &focus_symbols,
+        );
+        let indirect = file_focus_match(
+            "src/main/java/org/apache/commons/lang3/StringUtils.java",
+            &[],
+            &focus_paths,
+            &focus_symbols,
+        );
+
+        assert!(direct > indirect);
+        assert_eq!(direct, 1.0);
+        assert_eq!(indirect, 0.0);
     }
 }

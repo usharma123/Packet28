@@ -2028,7 +2028,12 @@ fn derive_broker_focus_symbols(
     request: &BrokerGetContextRequest,
 ) -> Vec<String> {
     let query_focus = derive_query_focus(request.query.as_deref());
-    let explicit = merged_unique(&snapshot.focus_symbols, &request.focus_symbols);
+    let snapshot_symbols = if request.focus_symbols.is_empty() {
+        merged_unique(&snapshot.focus_symbols, &snapshot.checkpoint_focus_symbols)
+    } else {
+        snapshot.focus_symbols.clone()
+    };
+    let explicit = merged_unique(&snapshot_symbols, &request.focus_symbols);
     merged_unique(&explicit, &query_focus.symbol_terms)
 }
 
@@ -2041,8 +2046,13 @@ fn derive_broker_focus_paths(
     max_paths: usize,
 ) -> Result<Vec<String>> {
     let query_focus = derive_query_focus(objective.or(request.query.as_deref()));
+    let snapshot_paths = if request.focus_paths.is_empty() {
+        merged_unique(&snapshot.focus_paths, &snapshot.checkpoint_focus_paths)
+    } else {
+        snapshot.focus_paths.clone()
+    };
     let explicit_paths = merged_unique(
-        &merged_unique(&snapshot.focus_paths, &request.focus_paths),
+        &merged_unique(&snapshot_paths, &request.focus_paths),
         &query_focus.path_terms,
     );
     let explicit_symbols = derive_broker_focus_symbols(snapshot, request);
@@ -2334,6 +2344,31 @@ fn looks_like_symbol_call(line: &str, symbol: &str) -> bool {
     false
 }
 
+fn looks_like_type_declaration(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    [
+        "class ",
+        "interface ",
+        "enum ",
+        "struct ",
+        "trait ",
+        "public class ",
+        "public interface ",
+        "public enum ",
+        "public record ",
+        "final class ",
+        "abstract class ",
+        "record ",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+        || trimmed.contains(" class ")
+        || trimmed.contains(" interface ")
+        || trimmed.contains(" enum ")
+        || trimmed.contains(" struct ")
+        || trimmed.contains(" trait ")
+}
+
 fn classify_symbol_match(line: &str, symbol: &str) -> EvidenceMatchKind {
     if looks_like_signature(line) {
         EvidenceMatchKind::DefinesSymbol
@@ -2573,6 +2608,35 @@ fn collect_evidence_matches(
         if let Some(matched) = matched {
             matches.push(matched);
         }
+    }
+    let has_symbol_focus =
+        !query_focus.symbol_terms.is_empty() || !query_focus.full_symbol_terms.is_empty();
+    let has_non_type_symbol_match = has_symbol_focus
+        && matches.iter().any(|matched| {
+            !looks_like_type_declaration(
+                lines
+                    .get(matched.line_no.saturating_sub(1))
+                    .copied()
+                    .unwrap_or_default(),
+            ) && matches!(
+                matched.match_kind,
+                EvidenceMatchKind::DefinesSymbol
+                    | EvidenceMatchKind::CallsSymbol
+                    | EvidenceMatchKind::ReferencesSymbol
+            )
+        });
+    if has_non_type_symbol_match {
+        matches.retain(|matched| {
+            !looks_like_type_declaration(
+                lines
+                    .get(matched.line_no.saturating_sub(1))
+                    .copied()
+                    .unwrap_or_default(),
+            ) || !matches!(
+                matched.match_kind,
+                EvidenceMatchKind::DefinesSymbol | EvidenceMatchKind::ReferencesSymbol
+            )
+        });
     }
     matches
 }
@@ -2882,6 +2946,77 @@ fn broker_objective(
         .filter(|value| !value.is_empty())
 }
 
+fn request_query_missing(request: &BrokerGetContextRequest) -> bool {
+    request
+        .query
+        .as_ref()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn inherit_broker_request_defaults(
+    request: &mut BrokerGetContextRequest,
+    previous: Option<&BrokerGetContextRequest>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    let action_was_explicit = request.action.is_some();
+
+    if request.action.is_none() {
+        request.action = previous.action;
+    }
+    if request.budget_tokens.is_none() {
+        request.budget_tokens = previous.budget_tokens;
+    }
+    if request.budget_bytes.is_none() {
+        request.budget_bytes = previous.budget_bytes;
+    }
+    if request.focus_paths.is_empty() {
+        request.focus_paths = previous.focus_paths.clone();
+    }
+    if request.focus_symbols.is_empty() {
+        request.focus_symbols = previous.focus_symbols.clone();
+    }
+    if request.tool_name.is_none() {
+        request.tool_name = previous.tool_name.clone();
+    }
+    if request.tool_result_kind.is_none() {
+        request.tool_result_kind = previous.tool_result_kind;
+    }
+    if request_query_missing(request) {
+        request.query = previous
+            .query
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+    if !action_was_explicit && request.include_sections.is_empty() {
+        request.include_sections = previous.include_sections.clone();
+    }
+    if !action_was_explicit && request.exclude_sections.is_empty() {
+        request.exclude_sections = previous.exclude_sections.clone();
+    }
+    if request.verbosity.is_none() {
+        request.verbosity = previous.verbosity;
+    }
+    if request.response_mode.is_none() {
+        request.response_mode = previous.response_mode;
+    }
+    if !action_was_explicit && request.max_sections.is_none() {
+        request.max_sections = previous.max_sections;
+    }
+    if !action_was_explicit && request.default_max_items_per_section.is_none() {
+        request.default_max_items_per_section = previous.default_max_items_per_section;
+    }
+    if !action_was_explicit && request.section_item_limits.is_empty() {
+        request.section_item_limits = previous.section_item_limits.clone();
+    }
+    if request.persist_artifacts.is_none() {
+        request.persist_artifacts = previous.persist_artifacts;
+    }
+}
+
 fn broker_request_response_mode(request: &BrokerGetContextRequest) -> BrokerResponseMode {
     request.response_mode.unwrap_or(BrokerResponseMode::Full)
 }
@@ -2917,6 +3052,8 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         BrokerAction::Plan => &[
             "task_objective",
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "active_decisions",
             "open_questions",
             "current_focus",
@@ -2930,6 +3067,8 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         BrokerAction::Inspect => &[
             "task_objective",
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "current_focus",
             "discovered_scope",
             "recent_tool_activity",
@@ -2944,6 +3083,8 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         BrokerAction::ChooseTool => &[
             "task_objective",
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "recent_tool_activity",
             "tool_failures",
             "discovered_scope",
@@ -2955,6 +3096,8 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         BrokerAction::Interpret => &[
             "task_objective",
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "recent_tool_activity",
             "tool_failures",
             "code_evidence",
@@ -2967,6 +3110,8 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         BrokerAction::Edit => &[
             "task_objective",
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "current_focus",
             "discovered_scope",
             "recent_tool_activity",
@@ -2982,6 +3127,8 @@ fn section_ids_for_action(action: BrokerAction) -> &'static [&'static str] {
         BrokerAction::Summarize => &[
             "task_objective",
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "progress",
             "recent_tool_activity",
             "tool_failures",
@@ -2998,6 +3145,8 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
     match action {
         BrokerAction::Plan => {
             section_item_limits.insert("budget_notes".to_string(), 4);
+            section_item_limits.insert("task_memory".to_string(), 8);
+            section_item_limits.insert("checkpoint_context".to_string(), 6);
             section_item_limits.insert("active_decisions".to_string(), 8);
             section_item_limits.insert("open_questions".to_string(), 8);
             section_item_limits.insert("current_focus".to_string(), 8);
@@ -3015,6 +3164,8 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
         }
         BrokerAction::Inspect => {
             section_item_limits.insert("budget_notes".to_string(), 4);
+            section_item_limits.insert("task_memory".to_string(), 8);
+            section_item_limits.insert("checkpoint_context".to_string(), 6);
             section_item_limits.insert("current_focus".to_string(), 8);
             section_item_limits.insert("discovered_scope".to_string(), 8);
             section_item_limits.insert("recent_tool_activity".to_string(), 6);
@@ -3031,6 +3182,8 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
         }
         BrokerAction::ChooseTool => {
             section_item_limits.insert("budget_notes".to_string(), 4);
+            section_item_limits.insert("task_memory".to_string(), 6);
+            section_item_limits.insert("checkpoint_context".to_string(), 4);
             section_item_limits.insert("recent_tool_activity".to_string(), 4);
             section_item_limits.insert("tool_failures".to_string(), 4);
             section_item_limits.insert("discovered_scope".to_string(), 6);
@@ -3045,6 +3198,8 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
         }
         BrokerAction::Interpret => {
             section_item_limits.insert("budget_notes".to_string(), 4);
+            section_item_limits.insert("task_memory".to_string(), 6);
+            section_item_limits.insert("checkpoint_context".to_string(), 5);
             section_item_limits.insert("recent_tool_activity".to_string(), 4);
             section_item_limits.insert("tool_failures".to_string(), 4);
             section_item_limits.insert("code_evidence".to_string(), 6);
@@ -3059,6 +3214,8 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
         }
         BrokerAction::Edit => {
             section_item_limits.insert("budget_notes".to_string(), 4);
+            section_item_limits.insert("task_memory".to_string(), 8);
+            section_item_limits.insert("checkpoint_context".to_string(), 6);
             section_item_limits.insert("current_focus".to_string(), 8);
             section_item_limits.insert("discovered_scope".to_string(), 8);
             section_item_limits.insert("recent_tool_activity".to_string(), 6);
@@ -3076,6 +3233,8 @@ fn default_limits_for_action(action: BrokerAction) -> BrokerEffectiveLimits {
         }
         BrokerAction::Summarize => {
             section_item_limits.insert("budget_notes".to_string(), 4);
+            section_item_limits.insert("task_memory".to_string(), 6);
+            section_item_limits.insert("checkpoint_context".to_string(), 5);
             section_item_limits.insert("progress".to_string(), 3);
             section_item_limits.insert("recent_tool_activity".to_string(), 6);
             section_item_limits.insert("tool_failures".to_string(), 4);
@@ -3212,6 +3371,92 @@ fn render_recent_tool_activity_lines(
             }
         })
         .collect()
+}
+
+fn render_task_memory_lines(snapshot: &suite_packet_core::AgentSnapshotPayload) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(invocation) = snapshot.recent_tool_invocations.last() {
+        let request = invocation
+            .request_summary
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("no request summary");
+        let result = invocation
+            .result_summary
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("no result summary");
+        let operation_kind = serde_json::to_string(&invocation.operation_kind)
+            .unwrap_or_else(|_| "\"generic\"".to_string())
+            .trim_matches('"')
+            .to_string();
+        lines.push(format!(
+            "- latest tool: {} [{}] {} -> {}",
+            invocation.tool_name, operation_kind, request, result
+        ));
+        for path in invocation.paths.iter().take(2) {
+            lines.push(format!("- latest tool path: {path}"));
+        }
+        for symbol in invocation.symbols.iter().take(2) {
+            lines.push(format!("- latest tool symbol: {symbol}"));
+        }
+    }
+    for path in snapshot.files_read.iter().rev().take(3) {
+        lines.push(format!("- recently read: {path}"));
+    }
+    for path in snapshot.files_edited.iter().rev().take(2) {
+        lines.push(format!("- recently edited: {path}"));
+    }
+    if let Some(checkpoint_id) = snapshot.latest_checkpoint_id.as_ref() {
+        lines.push(format!("- latest checkpoint: {checkpoint_id}"));
+    }
+    if let Some(note) = snapshot
+        .checkpoint_note
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("- checkpoint note: {note}"));
+    }
+    for path in snapshot.checkpoint_focus_paths.iter().take(2) {
+        lines.push(format!("- checkpoint focus path: {path}"));
+    }
+    for symbol in snapshot.checkpoint_focus_symbols.iter().take(2) {
+        lines.push(format!("- checkpoint focus symbol: {symbol}"));
+    }
+    for path in snapshot.changed_paths_since_checkpoint.iter().take(3) {
+        lines.push(format!("- changed since checkpoint: {path}"));
+    }
+    for symbol in snapshot.changed_symbols_since_checkpoint.iter().take(3) {
+        lines.push(format!("- changed symbol since checkpoint: {symbol}"));
+    }
+    for artifact_id in snapshot.evidence_artifact_ids.iter().rev().take(2) {
+        lines.push(format!("- evidence artifact: {artifact_id}"));
+    }
+    lines
+}
+
+fn render_checkpoint_context_lines(
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(checkpoint_id) = snapshot.latest_checkpoint_id.as_ref() else {
+        return lines;
+    };
+    lines.push(format!("- checkpoint: {checkpoint_id}"));
+    if let Some(note) = snapshot
+        .checkpoint_note
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("- note: {note}"));
+    }
+    for path in snapshot.checkpoint_focus_paths.iter().take(4) {
+        lines.push(format!("- focus path: {path}"));
+    }
+    for symbol in snapshot.checkpoint_focus_symbols.iter().take(4) {
+        lines.push(format!("- focus symbol: {symbol}"));
+    }
+    lines
 }
 
 fn build_budget_notes_section(
@@ -3370,9 +3615,15 @@ fn apply_agent_snapshot_event(
                 &event.symbols,
             );
         }
-        suite_packet_core::AgentStateEventData::CheckpointSaved { checkpoint_id, .. } => {
+        suite_packet_core::AgentStateEventData::CheckpointSaved {
+            checkpoint_id,
+            note,
+        } => {
             snapshot.latest_checkpoint_id = Some(checkpoint_id.clone());
             snapshot.latest_checkpoint_at_unix = Some(event.occurred_at_unix);
+            snapshot.checkpoint_note = note.clone();
+            snapshot.checkpoint_focus_paths = event.paths.clone();
+            snapshot.checkpoint_focus_symbols = event.symbols.clone();
             snapshot.changed_paths_since_checkpoint.clear();
             snapshot.changed_symbols_since_checkpoint.clear();
         }
@@ -3765,6 +4016,7 @@ struct RepoMapDisplayEntry {
     reason: String,
     line_hint: Option<usize>,
     structural_only: bool,
+    direct_signal: bool,
 }
 
 fn has_focus_import_edge(
@@ -3932,6 +4184,7 @@ fn build_repo_map_display_entries(
                 line_hint: evidence
                     .and_then(|summary| summary.primary_match_kind.and(summary.first_match_line)),
                 structural_only,
+                direct_signal: has_direct_signal,
             }
         })
         .collect::<Vec<_>>();
@@ -3955,7 +4208,16 @@ fn build_repo_map_display_entries(
         .iter()
         .filter(|entry| !entry.structural_only)
         .count();
-    let filtered = if strong_matches >= max_entries {
+    let direct_signal_matches = entries
+        .iter()
+        .filter(|entry| !entry.structural_only && entry.direct_signal)
+        .count();
+    let filtered = if has_symbol_focus && direct_signal_matches > 0 {
+        entries
+            .into_iter()
+            .filter(|entry| entry.direct_signal)
+            .collect::<Vec<_>>()
+    } else if strong_matches >= max_entries {
         entries
             .into_iter()
             .filter(|entry| !entry.structural_only)
@@ -4006,30 +4268,40 @@ fn action_critical_section_ids(action: BrokerAction) -> &'static [&'static str] 
     match action {
         BrokerAction::Plan => &[
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "repo_map",
             "relevant_context",
             "recommended_actions",
         ],
         BrokerAction::Inspect => &[
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "code_evidence",
             "repo_map",
             "relevant_context",
         ],
         BrokerAction::ChooseTool => &[
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "recent_tool_activity",
             "tool_failures",
             "recommended_actions",
         ],
         BrokerAction::Interpret => &[
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "recent_tool_activity",
             "tool_failures",
             "code_evidence",
         ],
         BrokerAction::Edit => &[
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "code_evidence",
             "current_focus",
             "checkpoint_deltas",
@@ -4037,6 +4309,8 @@ fn action_critical_section_ids(action: BrokerAction) -> &'static [&'static str] 
         ],
         BrokerAction::Summarize => &[
             "budget_notes",
+            "task_memory",
+            "checkpoint_context",
             "progress",
             "recent_tool_activity",
             "tool_failures",
@@ -4193,7 +4467,7 @@ fn build_broker_sections(
     let task = load_task_record(state, &request.task_id);
     let resolved_questions = build_resolved_questions(task.as_ref(), snapshot);
     let focus_symbols = if request.focus_symbols.is_empty() {
-        snapshot.focus_symbols.clone()
+        merged_unique(&snapshot.focus_symbols, &snapshot.checkpoint_focus_symbols)
     } else {
         request.focus_symbols.clone()
     };
@@ -4212,6 +4486,45 @@ fn build_broker_sections(
             body: objective,
             priority: 1,
             source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
+    let task_memory_lines = render_task_memory_lines(snapshot);
+    if !task_memory_lines.is_empty() {
+        sections.push(BrokerSection {
+            id: "task_memory".to_string(),
+            title: "Task Memory".to_string(),
+            body: truncate_lines(
+                task_memory_lines,
+                section_item_limit(&effective_limits, "task_memory"),
+            ),
+            priority: if matches!(
+                action,
+                BrokerAction::Plan
+                    | BrokerAction::Inspect
+                    | BrokerAction::ChooseTool
+                    | BrokerAction::Interpret
+                    | BrokerAction::Edit
+            ) {
+                1
+            } else {
+                2
+            },
+            source_kind: BrokerSourceKind::SelfAuthored,
+        });
+    }
+
+    let checkpoint_context_lines = render_checkpoint_context_lines(snapshot);
+    if !checkpoint_context_lines.is_empty() {
+        sections.push(BrokerSection {
+            id: "checkpoint_context".to_string(),
+            title: "Checkpoint Context".to_string(),
+            body: truncate_lines(
+                checkpoint_context_lines,
+                section_item_limit(&effective_limits, "checkpoint_context"),
+            ),
+            priority: 1,
+            source_kind: BrokerSourceKind::SelfAuthored,
         });
     }
 
@@ -4289,15 +4602,21 @@ fn build_broker_sections(
         });
     }
 
-    let focus_lines = merged_unique(&snapshot.focus_paths, &request.focus_paths)
-        .into_iter()
-        .map(|path| format!("- path: {path}"))
-        .chain(
-            merged_unique(&snapshot.focus_symbols, &request.focus_symbols)
-                .into_iter()
-                .map(|symbol| format!("- symbol: {symbol}")),
+    let focus_lines = merged_unique(
+        &merged_unique(&snapshot.focus_paths, &snapshot.checkpoint_focus_paths),
+        &request.focus_paths,
+    )
+    .into_iter()
+    .map(|path| format!("- path: {path}"))
+    .chain(
+        merged_unique(
+            &merged_unique(&snapshot.focus_symbols, &snapshot.checkpoint_focus_symbols),
+            &request.focus_symbols,
         )
-        .collect::<Vec<_>>();
+        .into_iter()
+        .map(|symbol| format!("- symbol: {symbol}")),
+    )
+    .collect::<Vec<_>>();
     if !focus_lines.is_empty() {
         sections.push(BrokerSection {
             id: "current_focus".to_string(),
@@ -4333,9 +4652,8 @@ fn build_broker_sections(
                 .collect::<Vec<_>>()
         }))
         .chain(
-            snapshot
-                .focus_symbols
-                .iter()
+            merged_unique(&snapshot.focus_symbols, &snapshot.checkpoint_focus_symbols)
+                .into_iter()
                 .map(|symbol| format!("- symbol: {symbol}")),
         )
         .collect::<Vec<_>>();
@@ -4485,6 +4803,7 @@ fn build_broker_sections(
                     .flat_map(|invocation| invocation.paths.iter().cloned()),
             )
             .chain(snapshot.focus_paths.iter().cloned())
+            .chain(snapshot.checkpoint_focus_paths.iter().cloned())
             .collect::<BTreeSet<_>>();
         let provenance_by_file = candidate_paths
             .iter()
@@ -5139,6 +5458,7 @@ fn estimate_request_to_get_request(
 fn refresh_broker_context_for_task(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
+    since_version: Option<String>,
 ) -> Result<Option<BrokerGetContextResponse>> {
     let request = state
         .lock()
@@ -5150,7 +5470,7 @@ fn refresh_broker_context_for_task(
     let Some(mut request) = request else {
         return Ok(None);
     };
-    request.since_version = None;
+    request.since_version = since_version;
     request.response_mode = Some(BrokerResponseMode::Full);
     let response = compute_broker_response(state, &request)?;
     write_broker_artifacts(state, task_id, &response)?;
@@ -5164,6 +5484,14 @@ fn broker_get_context(
     if request.task_id.trim().is_empty() {
         anyhow::bail!("broker get_context requires task_id");
     }
+    let previous_request = state
+        .lock()
+        .map_err(lock_err)?
+        .tasks
+        .tasks
+        .get(&request.task_id)
+        .and_then(|task| task.latest_broker_request.clone());
+    inherit_broker_request_defaults(&mut request, previous_request.as_ref());
     if request.action.is_none() {
         request.action = Some(BrokerAction::Plan);
     }
@@ -5185,7 +5513,6 @@ fn broker_get_context(
         ensure_context_version(task);
         let mut session_request = request.clone();
         session_request.since_version = None;
-        session_request.response_mode = Some(BrokerResponseMode::Full);
         session_request.persist_artifacts = Some(true);
         task.latest_broker_request = Some(session_request);
         persist_state(&guard)?;
@@ -5706,7 +6033,12 @@ fn material_write_is_noop(
             .checkpoint_id
             .as_ref()
             .zip(snapshot.latest_checkpoint_id.as_ref())
-            .is_some_and(|(next, current)| next == current),
+            .is_some_and(|(next, current)| {
+                next == current
+                    && request.note == snapshot.checkpoint_note
+                    && request.paths == snapshot.checkpoint_focus_paths
+                    && request.symbols == snapshot.checkpoint_focus_symbols
+            }),
         BrokerWriteOp::DecisionAdd => request
             .decision_id
             .as_ref()
@@ -6144,9 +6476,12 @@ fn broker_write_state(
     );
     let _ = set_context_reason(&state, &request.task_id, reason);
 
+    let previous_version = current_context_version(&state, &request.task_id)?;
     let version = bump_context_version(&state, &request.task_id)?;
     if request.refresh_context.unwrap_or(true) {
-        if let Some(response) = refresh_broker_context_for_task(&state, &request.task_id)? {
+        if let Some(response) =
+            refresh_broker_context_for_task(&state, &request.task_id, Some(previous_version))?
+        {
             let changed_section_ids = response
                 .delta
                 .changed_sections
@@ -6492,7 +6827,7 @@ fn run_sequence_for_task(
             let mut summary =
                 refresh_task_context_summary(state.clone(), task_id)?.unwrap_or_else(|| json!({}));
             let _ = set_context_reason(&state, task_id, "replan_applied");
-            if let Some(response) = refresh_broker_context_for_task(&state, task_id)? {
+            if let Some(response) = refresh_broker_context_for_task(&state, task_id, None)? {
                 if let Some(object) = summary.as_object_mut() {
                     object.insert(
                         "changed_section_ids".to_string(),
@@ -7826,6 +8161,42 @@ mod tests {
     }
 
     #[test]
+    fn extract_code_evidence_prefers_method_match_over_class_declaration() {
+        let root = std::env::temp_dir().join(format!(
+            "packet28d-code-evidence-method-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("src/ArrayUtils.java");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "package org.example;\n\npublic class ArrayUtils {\n    public static void shuffle() {}\n}\n",
+        )
+        .unwrap();
+
+        let mut focus = derive_query_focus(Some(
+            "Add deterministic seeded shuffle overloads to ArrayUtils",
+        ));
+        focus.full_symbol_terms.clear();
+        focus.symbol_terms.clear();
+        let focus = merge_query_focus_with_symbols(
+            focus,
+            &["ArrayUtils".to_string(), "shuffle".to_string()],
+        );
+        let evidence = extract_code_evidence(&root, "src/ArrayUtils.java", &focus, &[], 3, 6);
+        assert!(evidence
+            .rendered_lines
+            .iter()
+            .any(|line| line.contains("public static void shuffle")));
+        assert!(evidence
+            .rendered_lines
+            .iter()
+            .all(|line| !line.contains("public class ArrayUtils")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn repo_map_display_drops_structural_only_files_when_direct_matches_exist() {
         let rich_repo_map = mapy_core::RepoMapPayloadRich {
             files_ranked: vec![
@@ -8154,5 +8525,128 @@ mod tests {
             .expect("code_evidence should be retained");
         assert!(code_evidence.body.len() < code_evidence_body.len());
         assert!(code_evidence.body.contains("src/alpha.rs:1"));
+    }
+
+    #[test]
+    fn inherit_broker_request_defaults_reuses_previous_follow_up_shape() {
+        let previous = BrokerGetContextRequest {
+            task_id: "task-a".to_string(),
+            action: Some(BrokerAction::Inspect),
+            budget_tokens: Some(700),
+            budget_bytes: Some(2800),
+            focus_paths: vec!["src/alpha.rs".to_string()],
+            focus_symbols: vec!["Alpha".to_string()],
+            query: Some("Where is Alpha defined?".to_string()),
+            include_sections: vec!["task_objective".to_string(), "code_evidence".to_string()],
+            verbosity: Some(BrokerVerbosity::Rich),
+            response_mode: Some(BrokerResponseMode::Delta),
+            max_sections: Some(5),
+            default_max_items_per_section: Some(3),
+            section_item_limits: BTreeMap::from([("code_evidence".to_string(), 2)]),
+            persist_artifacts: Some(true),
+            ..BrokerGetContextRequest::default()
+        };
+        let mut current = BrokerGetContextRequest {
+            task_id: "task-a".to_string(),
+            ..BrokerGetContextRequest::default()
+        };
+
+        inherit_broker_request_defaults(&mut current, Some(&previous));
+
+        assert_eq!(current.action, Some(BrokerAction::Inspect));
+        assert_eq!(current.query.as_deref(), Some("Where is Alpha defined?"));
+        assert_eq!(current.focus_paths, vec!["src/alpha.rs"]);
+        assert_eq!(current.focus_symbols, vec!["Alpha"]);
+        assert_eq!(
+            current.include_sections,
+            vec!["task_objective".to_string(), "code_evidence".to_string()]
+        );
+        assert_eq!(current.response_mode, Some(BrokerResponseMode::Delta));
+        assert_eq!(current.section_item_limits["code_evidence"], 2);
+    }
+
+    #[test]
+    fn render_task_memory_lines_surfaces_recent_state() {
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            files_read: vec!["src/alpha.rs".to_string()],
+            latest_checkpoint_id: Some("cp-1".to_string()),
+            checkpoint_note: Some("Validated shuffle scope".to_string()),
+            checkpoint_focus_paths: vec!["src/alpha.rs".to_string()],
+            checkpoint_focus_symbols: vec!["Alpha".to_string()],
+            changed_paths_since_checkpoint: vec!["src/beta.rs".to_string()],
+            changed_symbols_since_checkpoint: vec!["Beta".to_string()],
+            evidence_artifact_ids: vec!["artifact-1".to_string()],
+            recent_tool_invocations: vec![suite_packet_core::ToolInvocationSummary {
+                invocation_id: "tool-1".to_string(),
+                sequence: 7,
+                tool_name: "manual.read".to_string(),
+                operation_kind: suite_packet_core::ToolOperationKind::Read,
+                request_summary: Some("Read alpha".to_string()),
+                result_summary: Some("Found Alpha".to_string()),
+                paths: vec!["src/alpha.rs".to_string()],
+                symbols: vec!["Alpha".to_string()],
+                occurred_at_unix: 1,
+                ..suite_packet_core::ToolInvocationSummary::default()
+            }],
+            ..suite_packet_core::AgentSnapshotPayload::default()
+        };
+
+        let rendered = render_task_memory_lines(&snapshot);
+
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("latest tool: manual.read")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("recently read: src/alpha.rs")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("latest checkpoint: cp-1")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("checkpoint note: Validated shuffle scope")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("checkpoint focus path: src/alpha.rs")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("checkpoint focus symbol: Alpha")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("changed since checkpoint: src/beta.rs")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("changed symbol since checkpoint: Beta")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("evidence artifact: artifact-1")));
+    }
+
+    #[test]
+    fn checkpoint_context_lines_surface_saved_focus() {
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            latest_checkpoint_id: Some("cp-42".to_string()),
+            checkpoint_note: Some("Seeded shuffle plan".to_string()),
+            checkpoint_focus_paths: vec![
+                "apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java".to_string(),
+            ],
+            checkpoint_focus_symbols: vec!["shuffle".to_string()],
+            ..suite_packet_core::AgentSnapshotPayload::default()
+        };
+
+        let rendered = render_checkpoint_context_lines(&snapshot);
+
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("checkpoint: cp-42")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("note: Seeded shuffle plan")));
+        assert!(rendered.iter().any(|line| line.contains(
+            "focus path: apache/src/main/java/org/apache/commons/lang3/ArrayUtils.java"
+        )));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("focus symbol: shuffle")));
     }
 }

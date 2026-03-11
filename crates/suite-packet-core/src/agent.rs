@@ -268,6 +268,10 @@ pub struct AgentSnapshotPayload {
     pub task_id: String,
     pub focus_paths: Vec<String>,
     pub focus_symbols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoint_focus_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoint_focus_symbols: Vec<String>,
     pub files_read: Vec<String>,
     pub files_edited: Vec<String>,
     pub active_decisions: Vec<AgentDecision>,
@@ -280,6 +284,8 @@ pub struct AgentSnapshotPayload {
     pub latest_checkpoint_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_checkpoint_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_note: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_paths_since_checkpoint: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
