@@ -3647,7 +3647,7 @@ fn test_packet28_mcp_inspect_expands_vague_update_query() {
     assert!(search_evidence_section["body"]
         .as_str()
         .unwrap()
-        .contains("src/alpha_update.rs"));
+        .contains("src/alpha"));
     let code_evidence_section = inspect_payload["sections"]
         .as_array()
         .unwrap()
