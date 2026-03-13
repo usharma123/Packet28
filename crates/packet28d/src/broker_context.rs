@@ -114,6 +114,7 @@ fn slim_broker_response(
 fn write_broker_artifacts(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
+    since_version: Option<&str>,
     response: &BrokerGetContextResponse,
 ) -> Result<String> {
     let root = state.lock().map_err(lock_err)?.root.clone();
@@ -121,6 +122,7 @@ fn write_broker_artifacts(
     let brief_json_path = task_brief_json_path(&root, task_id);
     let state_json_path = task_state_json_path(&root, task_id);
     let version_json_path = task_version_json_path(&root, task_id, &response.context_version);
+    let version_snapshot = build_version_snapshot_response(&root, task_id, since_version, response)?;
     if let Some(parent) = brief_md_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!("failed to create task artifact dir '{}'", parent.display())
@@ -138,7 +140,7 @@ fn write_broker_artifacts(
         .with_context(|| format!("failed to write '{}'", brief_md_path.display()))?;
     fs::write(&brief_json_path, serde_json::to_vec_pretty(response)?)
         .with_context(|| format!("failed to write '{}'", brief_json_path.display()))?;
-    fs::write(&version_json_path, serde_json::to_vec_pretty(response)?)
+    fs::write(&version_json_path, serde_json::to_vec_pretty(&version_snapshot)?)
         .with_context(|| format!("failed to write '{}'", version_json_path.display()))?;
 
     let hash = blake3::hash(serde_json::to_string(response)?.as_bytes())
@@ -168,6 +170,75 @@ fn write_broker_artifacts(
             .with_context(|| format!("failed to write '{}'", state_json_path.display()))?;
     }
     Ok(hash)
+}
+
+fn build_version_snapshot_response(
+    root: &Path,
+    task_id: &str,
+    since_version: Option<&str>,
+    response: &BrokerGetContextResponse,
+) -> Result<BrokerGetContextResponse> {
+    if !matches!(response.response_mode, BrokerResponseMode::Delta) {
+        return Ok(response.clone());
+    }
+
+    let previous = match since_version {
+        Some(version) if version != response.context_version => {
+            load_versioned_broker_response(root, task_id, version)?
+        }
+        _ => None,
+    };
+
+    let mut snapshot = response.clone();
+    snapshot.response_mode = BrokerResponseMode::Full;
+    snapshot.sections = merge_version_snapshot_sections(previous.as_ref(), response);
+    snapshot.brief = render_brief(task_id, &snapshot.context_version, &snapshot.sections);
+    let (est_tokens, est_bytes) = estimate_text_cost(&snapshot.brief);
+    snapshot.est_tokens = est_tokens;
+    snapshot.est_bytes = est_bytes;
+    Ok(snapshot)
+}
+
+fn merge_version_snapshot_sections(
+    previous: Option<&BrokerGetContextResponse>,
+    response: &BrokerGetContextResponse,
+) -> Vec<BrokerSection> {
+    let Some(previous) = previous else {
+        return response.delta.changed_sections.clone();
+    };
+
+    let changed_by_id = response
+        .delta
+        .changed_sections
+        .iter()
+        .map(|section| (section.id.as_str(), section))
+        .collect::<BTreeMap<_, _>>();
+    let removed_ids = response
+        .delta
+        .removed_section_ids
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<HashSet<_>>();
+    let mut merged = previous
+        .sections
+        .iter()
+        .filter(|section| !removed_ids.contains(section.id.as_str()))
+        .map(|section| {
+            changed_by_id
+                .get(section.id.as_str())
+                .cloned()
+                .cloned()
+                .unwrap_or_else(|| section.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for section in &response.delta.changed_sections {
+        if !previous.sections.iter().any(|existing| existing.id == section.id) {
+            merged.push(section.clone());
+        }
+    }
+
+    merged
 }
 
 fn compute_broker_response(
@@ -443,11 +514,11 @@ pub(crate) fn refresh_broker_context_for_task(
     let Some(mut request) = request else {
         return Ok(None);
     };
-    request.since_version = since_version;
+    request.since_version = since_version.clone();
     request.response_mode = Some(BrokerResponseMode::Full);
     let mut response = compute_broker_response(state, &request)?;
     response.artifact_id = Some(response.context_version.clone());
-    write_broker_artifacts(state, task_id, &response)?;
+    write_broker_artifacts(state, task_id, since_version.as_deref(), &response)?;
     Ok(Some(response))
 }
 
@@ -500,7 +571,7 @@ pub(crate) fn broker_get_context(
     let persist_artifacts = should_persist_broker_artifacts(&request);
     if persist_artifacts {
         response.artifact_id = Some(response.context_version.clone());
-        write_broker_artifacts(&state, &request.task_id, &response)?;
+        write_broker_artifacts(&state, &request.task_id, request.since_version.as_deref(), &response)?;
     }
     if matches!(
         broker_request_response_mode(&request),
@@ -647,7 +718,7 @@ pub(crate) fn broker_prepare_handoff(
     let _ = set_context_reason(&state, &request.task_id, "prepare_handoff");
     let mut context = compute_broker_response(&state, &get_request)?;
     context.artifact_id = Some(context.context_version.clone());
-    write_broker_artifacts(&state, &request.task_id, &context)?;
+    write_broker_artifacts(&state, &request.task_id, get_request.since_version.as_deref(), &context)?;
     let generated_at = now_unix_millis();
     {
         let mut guard = state.lock().map_err(lock_err)?;
