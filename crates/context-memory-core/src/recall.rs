@@ -434,7 +434,8 @@ impl PacketCache {
                     };
                 }
             }
-            score += (1.0 / (1.0 + (age_secs as f64 / 86_400.0))).min(1.0) * 0.25;
+            score += (1.0_f64 / (1.0_f64 + (age_secs as f64 / 86_400.0_f64))).min(1.0_f64)
+                * 0.25;
 
             if score <= 0.0
                 || (query_tokens.is_empty()
