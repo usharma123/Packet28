@@ -453,7 +453,6 @@ fn dedupe_findings(
 
 pub(crate) fn correlate_packets(
     input_packets: &[KernelPacket],
-    task_id: Option<String>,
     snapshot: Option<&suite_packet_core::AgentSnapshotPayload>,
 ) -> Vec<suite_packet_core::ContextCorrelationFinding> {
     let diffs = input_packets
@@ -883,7 +882,5 @@ pub(crate) fn correlate_packets(
             }
         }
     }
-
-    let _ = task_id;
     dedupe_findings(findings)
 }

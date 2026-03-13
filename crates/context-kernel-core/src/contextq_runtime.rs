@@ -305,7 +305,7 @@ pub(crate) fn run_contextq_correlate(
             });
         }
     }
-    let findings = correlate_packets(&packets, task_id.clone(), snapshot.as_ref());
+    let findings = correlate_packets(&packets, snapshot.as_ref());
     let (envelope, packet) = build_context_correlation_packet(
         &ctx.target,
         task_id.clone(),
