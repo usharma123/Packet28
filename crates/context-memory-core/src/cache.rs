@@ -362,11 +362,13 @@ impl PacketCache {
                 .or_default()
                 .insert(doc.cache_key.clone());
         }
-        for basename in &doc.path_basenames {
-            self.basename_alias_index
-                .entry(basename.clone())
-                .or_default()
-                .extend(doc.paths.iter().cloned());
+        for path in &doc.paths {
+            if let Some(basename) = basename_alias(path) {
+                self.basename_alias_index
+                    .entry(basename)
+                    .or_default()
+                    .insert(path.clone());
+            }
         }
         for symbol in &doc.symbols {
             self.symbol_index
@@ -403,13 +405,19 @@ impl PacketCache {
             }
         }
         remove_key_from_ref_index(&mut self.file_ref_index, &doc.paths, cache_key);
-        for basename in &doc.path_basenames {
-            if let Some(canonicals) = self.basename_alias_index.get_mut(basename) {
-                for path in &doc.paths {
+        let orphaned_paths = doc
+            .paths
+            .iter()
+            .filter(|path| !self.file_ref_index.contains_key(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in &orphaned_paths {
+            if let Some(basename) = basename_alias(path) {
+                if let Some(canonicals) = self.basename_alias_index.get_mut(&basename) {
                     canonicals.remove(path);
-                }
-                if canonicals.is_empty() {
-                    self.basename_alias_index.remove(basename);
+                    if canonicals.is_empty() {
+                        self.basename_alias_index.remove(&basename);
+                    }
                 }
             }
         }
@@ -833,6 +841,77 @@ mod tests {
             .iter()
             .any(|reason| reason == "task_scope"));
         assert_eq!(hits[0].budget_estimate.est_tokens, 32);
+    }
+
+    #[test]
+    fn basename_aliases_index_each_path_independently() {
+        let mut cache = PacketCache::new();
+        let mut hooks = NoopDeltaReuseHooks;
+        let lookup =
+            cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"paths"}), &mut hooks);
+        cache.put_with_hooks(
+            "demo.reducer",
+            &lookup,
+            vec![CachePacket {
+                body: serde_json::json!({
+                    "files": [
+                        {"path": "src/alpha.rs"},
+                        {"path": "src/beta.rs"}
+                    ]
+                }),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        assert_eq!(
+            cache.basename_alias_index.get("alpha.rs"),
+            Some(&BTreeSet::from(["src/alpha.rs".to_string()]))
+        );
+        assert_eq!(
+            cache.basename_alias_index.get("beta.rs"),
+            Some(&BTreeSet::from(["src/beta.rs".to_string()]))
+        );
+    }
+
+    #[test]
+    fn removing_one_entry_keeps_shared_basename_aliases_live() {
+        let mut cache = PacketCache::new();
+        let mut hooks = NoopDeltaReuseHooks;
+
+        let first_lookup =
+            cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"one"}), &mut hooks);
+        let first = cache.put_with_hooks(
+            "demo.reducer",
+            &first_lookup,
+            vec![CachePacket {
+                body: serde_json::json!({"files": [{"path": "src/shared.rs"}]}),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        let second_lookup =
+            cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"two"}), &mut hooks);
+        cache.put_with_hooks(
+            "demo.reducer",
+            &second_lookup,
+            vec![CachePacket {
+                body: serde_json::json!({"files": [{"path": "src/shared.rs"}]}),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        cache.remove_where(|entry, _| entry.cache_key == first.cache_key, EvictionReason::ManualPrune);
+
+        assert_eq!(
+            cache.basename_alias_index.get("shared.rs"),
+            Some(&BTreeSet::from(["src/shared.rs".to_string()]))
+        );
     }
 
     #[test]
