@@ -29,13 +29,10 @@ impl PacketCache {
     }
 
     pub fn evict_expired(&mut self, ttl_secs: u64) {
-        let removed = self.remove_where(
+        self.remove_where(
             |entry, now| is_expired(entry.created_at_unix, ttl_secs, now),
             EvictionReason::ExpiredTtl,
         );
-        if removed > 0 {
-            self.evict_reason(EvictionReason::ExpiredTtl, removed);
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -622,6 +619,7 @@ mod tests {
 
         cache.evict_expired(60);
         assert!(cache.is_empty());
+        assert_eq!(cache.stats().evictions.expired_ttl, 1);
     }
 
     #[test]
