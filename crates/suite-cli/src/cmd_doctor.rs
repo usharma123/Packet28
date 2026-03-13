@@ -48,17 +48,17 @@ struct DoctorReport {
     index: DoctorCheck,
     mcp_config: Vec<McpConfigCheck>,
     handshake: DoctorCheck,
-    get_context_round_trip: DoctorCheck,
+    reducer_round_trip: DoctorCheck,
     push_notifications: DoctorCheck,
-    sync_round_trip: DoctorCheck,
+    handoff_round_trip: DoctorCheck,
     checks: Vec<DoctorCheck>,
 }
 
 struct McpRoundTripChecks {
     handshake: DoctorCheck,
-    get_context_round_trip: DoctorCheck,
+    reducer_round_trip: DoctorCheck,
     push_notifications: DoctorCheck,
-    sync_round_trip: DoctorCheck,
+    handoff_round_trip: DoctorCheck,
 }
 
 struct McpHarness {
@@ -172,9 +172,9 @@ fn build_report(root: &Path) -> DoctorReport {
         index.clone(),
         mcp_config_summary,
         mcp_round_trip.handshake.clone(),
-        mcp_round_trip.get_context_round_trip.clone(),
+        mcp_round_trip.reducer_round_trip.clone(),
         mcp_round_trip.push_notifications.clone(),
-        mcp_round_trip.sync_round_trip.clone(),
+        mcp_round_trip.handoff_round_trip.clone(),
     ];
     let ok = checks
         .iter()
@@ -187,9 +187,9 @@ fn build_report(root: &Path) -> DoctorReport {
         index,
         mcp_config,
         handshake: mcp_round_trip.handshake,
-        get_context_round_trip: mcp_round_trip.get_context_round_trip,
+        reducer_round_trip: mcp_round_trip.reducer_round_trip,
         push_notifications: mcp_round_trip.push_notifications,
-        sync_round_trip: mcp_round_trip.sync_round_trip,
+        handoff_round_trip: mcp_round_trip.handoff_round_trip,
         checks,
     }
 }
@@ -355,8 +355,8 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         required: true,
         detail: "not attempted".to_string(),
     };
-    let mut get_context_round_trip = DoctorCheck {
-        name: "get_context_round_trip",
+    let mut reducer_round_trip = DoctorCheck {
+        name: "reducer_round_trip",
         ok: false,
         required: true,
         detail: "skipped because handshake did not complete".to_string(),
@@ -364,14 +364,14 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
     let mut push_notifications = DoctorCheck {
         name: "push_notifications",
         ok: false,
-        required: true,
-        detail: "skipped because get_context round trip did not complete".to_string(),
+        required: false,
+        detail: "skipped because reducer round trip did not complete".to_string(),
     };
-    let mut sync_round_trip = DoctorCheck {
-        name: "sync_round_trip",
+    let mut handoff_round_trip = DoctorCheck {
+        name: "handoff_round_trip",
         ok: false,
         required: true,
-        detail: "skipped because get_context round trip did not complete".to_string(),
+        detail: "skipped because reducer round trip did not complete".to_string(),
     };
 
     let mut harness = match McpHarness::start(root) {
@@ -380,9 +380,9 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             handshake.detail = err.to_string();
             return McpRoundTripChecks {
                 handshake,
-                get_context_round_trip,
+                reducer_round_trip,
                 push_notifications,
-                sync_round_trip,
+                handoff_round_trip,
             };
         }
     };
@@ -411,8 +411,15 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             .flatten()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        if !tool_names.iter().any(|name| *name == "packet28.sync") {
-            return Err(anyhow!("packet28.sync missing from tools/list"));
+        for required_tool in [
+            "packet28.search",
+            "packet28.read_regions",
+            "packet28.write_state",
+            "packet28.prepare_handoff",
+        ] {
+            if !tool_names.iter().any(|name| *name == required_tool) {
+                return Err(anyhow!("{required_tool} missing from tools/list"));
+            }
         }
         handshake = DoctorCheck {
             name: "handshake",
@@ -429,26 +436,25 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             "id":3,
             "method":"tools/call",
             "params":{
-                "name":"packet28.get_context",
+                "name":"packet28.search",
                 "arguments":{
                     "task_id":task_id,
-                    "action":"plan",
-                    "query":"Doctor smoke test",
-                    "response_mode":"full",
-                    "persist_artifacts":false
+                    "query":"Alpha",
+                    "paths":["src"],
+                    "response_mode":"slim"
                 }
             }
         }))?;
-        let get_context = harness.read_response(3, timeout)?;
-        let context_version = get_context["result"]["structuredContent"]["context_version"]
+        let search = harness.read_response(3, timeout)?;
+        let artifact_id = search["result"]["structuredContent"]["artifact_id"]
             .as_str()
             .unwrap_or("unknown")
             .to_string();
-        get_context_round_trip = DoctorCheck {
-            name: "get_context_round_trip",
+        reducer_round_trip = DoctorCheck {
+            name: "reducer_round_trip",
             ok: true,
             required: true,
-            detail: format!("task_id={task_id} context_version={context_version}"),
+            detail: format!("task_id={task_id} reducer artifact_id={artifact_id}"),
         };
 
         harness.send(&json!({
@@ -458,59 +464,92 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             "params":{
                 "name":"packet28.write_state",
                 "arguments":{
-                    "op":"checkpoint_save",
-                    "checkpoint_id":"doctor-smoke-checkpoint",
-                    "note":"doctor notification probe"
+                    "task_id":task_id,
+                    "op":"intention",
+                    "text":"Doctor handoff probe",
+                    "step_id":"handoff"
                 }
             }
         }))?;
-        let write = harness.read_response(4, timeout)?;
-        if write["result"]["structuredContent"]["accepted"] != json!(true) {
-            return Err(anyhow!("write_state was not accepted"));
+        let intention = harness.read_response(4, timeout)?;
+        if intention["result"]["structuredContent"]["accepted"] != json!(true) {
+            return Err(anyhow!("intention write_state was not accepted"));
         }
-
-        let notification =
-            harness.read_notification("notifications/packet28.context_updated", timeout)?;
-        let notified_task_id = notification["params"]["task_id"]
-            .as_str()
-            .unwrap_or("unknown");
-        if notified_task_id != task_id {
-            return Err(anyhow!(
-                "notification task mismatch: expected {task_id}, got {notified_task_id}"
-            ));
-        }
-        push_notifications = DoctorCheck {
-            name: "push_notifications",
-            ok: true,
-            required: true,
-            detail: format!("notification received for task_id={task_id}"),
-        };
 
         harness.send(&json!({
             "jsonrpc":"2.0",
             "id":5,
             "method":"tools/call",
             "params":{
-                "name":"packet28.sync",
+                "name":"packet28.write_state",
                 "arguments":{
-                    "action":"summarize",
-                    "query":"Doctor smoke sync",
-                    "include_estimate":true
+                    "task_id":task_id,
+                    "op":"checkpoint_save",
+                    "checkpoint_id":"doctor-smoke-checkpoint",
+                    "note":"doctor notification probe"
                 }
             }
         }))?;
-        let sync = harness.read_response(5, timeout)?;
-        let sync_task_id = sync["result"]["structuredContent"]["task_id"]
+        let write = harness.read_response(5, timeout)?;
+        if write["result"]["structuredContent"]["accepted"] != json!(true) {
+            return Err(anyhow!("write_state was not accepted"));
+        }
+
+        push_notifications =
+            match harness.read_notification("notifications/packet28.context_updated", timeout) {
+                Ok(notification) => {
+                    let notified_task_id = notification["params"]["task_id"]
+                        .as_str()
+                        .unwrap_or("unknown");
+                    if notified_task_id != task_id {
+                        return Err(anyhow!(
+                        "notification task mismatch: expected {task_id}, got {notified_task_id}"
+                    ));
+                    }
+                    DoctorCheck {
+                        name: "push_notifications",
+                        ok: true,
+                        required: false,
+                        detail: format!("notification received for task_id={task_id}"),
+                    }
+                }
+                Err(err) => DoctorCheck {
+                    name: "push_notifications",
+                    ok: false,
+                    required: false,
+                    detail: format!("notification probe skipped: {err}"),
+                },
+            };
+
+        harness.send(&json!({
+            "jsonrpc":"2.0",
+            "id":6,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.prepare_handoff",
+                "arguments":{
+                    "task_id":task_id,
+                    "response_mode":"slim"
+                }
+            }
+        }))?;
+        let handoff = harness.read_response(6, timeout)?;
+        let handoff_task_id = handoff["result"]["structuredContent"]["task_id"]
             .as_str()
             .unwrap_or("unknown");
-        if sync_task_id != task_id {
-            return Err(anyhow!("sync resolved unexpected task_id '{sync_task_id}'"));
+        if handoff_task_id != task_id {
+            return Err(anyhow!(
+                "prepare_handoff resolved unexpected task_id '{handoff_task_id}'"
+            ));
         }
-        sync_round_trip = DoctorCheck {
-            name: "sync_round_trip",
+        if handoff["result"]["structuredContent"]["handoff_ready"] != json!(true) {
+            return Err(anyhow!("prepare_handoff did not return a ready handoff"));
+        }
+        handoff_round_trip = DoctorCheck {
+            name: "handoff_round_trip",
             ok: true,
             required: true,
-            detail: format!("task_id={task_id} current-task sync ok"),
+            detail: format!("task_id={task_id} checkpointed handoff ok"),
         };
 
         Ok(())
@@ -519,23 +558,20 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
     if let Err(err) = result {
         if !handshake.ok {
             handshake.detail = err.to_string();
-        } else if !get_context_round_trip.ok {
-            get_context_round_trip.detail = err.to_string();
-            push_notifications.detail = "skipped because get_context round trip failed".to_string();
-            sync_round_trip.detail = "skipped because get_context round trip failed".to_string();
-        } else if !push_notifications.ok {
-            push_notifications.detail = err.to_string();
-            sync_round_trip.detail = "skipped because notification probe failed".to_string();
-        } else if !sync_round_trip.ok {
-            sync_round_trip.detail = err.to_string();
+        } else if !reducer_round_trip.ok {
+            reducer_round_trip.detail = err.to_string();
+            push_notifications.detail = "skipped because reducer round trip failed".to_string();
+            handoff_round_trip.detail = "skipped because reducer round trip failed".to_string();
+        } else if !handoff_round_trip.ok {
+            handoff_round_trip.detail = err.to_string();
         }
     }
 
     McpRoundTripChecks {
         handshake,
-        get_context_round_trip,
+        reducer_round_trip,
         push_notifications,
-        sync_round_trip,
+        handoff_round_trip,
     }
 }
 

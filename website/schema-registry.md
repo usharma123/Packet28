@@ -47,7 +47,6 @@ Schema artifacts:
 | Schema Version | Description |
 | --- | --- |
 | `suite.packet.v1` | Standard packet wrapper |
-| `suite.preflight.v1` | Preflight response with selection + packets + totals |
 | `suite.error.v1` | Structured error output |
 
 ## Registry Contract

@@ -718,8 +718,8 @@ footer {
       <div class="pipe-step">
         <div class="pipe-num">02</div>
         <h3 class="pipe-title">Agent calls MCP</h3>
-        <p class="pipe-desc">Your AI agent calls get_context with an action: plan, inspect, edit.</p>
-        <div class="pipe-code">get_context({ action: "plan" })</div>
+        <p class="pipe-desc">Your AI agent stays on slim reducers during the turn, then assembles handoff context outside the loop.</p>
+        <div class="pipe-code">search() -> write_state() -> prepare_handoff()</div>
       </div>
       <div class="pipe-arrow">&rarr;</div>
       <div class="pipe-step">
