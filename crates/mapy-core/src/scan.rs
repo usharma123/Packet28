@@ -230,7 +230,9 @@ pub(crate) fn is_test_path(path: &str) -> bool {
         || lower.contains("/test/")
         || lower.ends_with("_test.rs")
         || lower.ends_with("_test.py")
-        || lower.ends_with("test.rs")
+        || lower.ends_with("/test.rs")
+        || lower.ends_with("\\test.rs")
+        || lower == "test.rs"
 }
 
 pub(crate) fn extract_imports(content: &str) -> Vec<String> {

@@ -397,19 +397,21 @@ pub(crate) fn invalidate_broker_caches(
     state: &Arc<Mutex<DaemonState>>,
     request: &BrokerWriteStateRequest,
 ) -> Result<()> {
-    let mut invalidate_repo_map = matches!(request.op, Some(BrokerWriteOp::FileEdit));
-    if matches!(
-        request.op,
-        Some(BrokerWriteOp::ToolResult | BrokerWriteOp::ToolInvocationCompleted)
-    ) && request.operation_kind == Some(suite_packet_core::ToolOperationKind::Edit)
-    {
-        invalidate_repo_map = true;
-    }
-    if !invalidate_repo_map && request.paths.is_empty() {
+    let invalidate_repo_map = matches!(request.op, Some(BrokerWriteOp::FileEdit))
+        || (matches!(
+            request.op,
+            Some(BrokerWriteOp::ToolResult | BrokerWriteOp::ToolInvocationCompleted)
+        ) && request.operation_kind == Some(suite_packet_core::ToolOperationKind::Edit));
+    if invalidate_repo_map {
+        if request.paths.is_empty() {
+            enqueue_full_index_rebuild(state)?;
+        } else {
+            let _ = enqueue_incremental_index_paths(state, &request.paths)?;
+        }
+    } else if request.paths.is_empty() {
         return Ok(());
     }
     let mut guard = state.lock().map_err(lock_err)?;
-    let _ = invalidate_repo_map;
     for path in &request.paths {
         guard.source_file_cache.remove(path);
     }

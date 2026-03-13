@@ -879,9 +879,6 @@ pub(crate) fn correlate_packets(
         }
     }
 
-    if task_id.is_some() {
-        dedupe_findings(findings)
-    } else {
-        dedupe_findings(findings)
-    }
+    let _ = task_id;
+    dedupe_findings(findings)
 }

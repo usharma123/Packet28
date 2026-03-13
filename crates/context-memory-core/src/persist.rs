@@ -103,7 +103,14 @@ impl PacketCache {
             workspace_root: Some(config.root_dir.clone()),
             ..Self::new()
         };
-        if cache.try_load_v2(config).is_none() {
+        let mut v2_cache = Self {
+            workspace_root: Some(config.root_dir.clone()),
+            ..Self::new()
+        };
+        if v2_cache.try_load_v2(config).is_some() {
+            cache = v2_cache;
+        } else {
+            cache.eviction_counters = v2_cache.eviction_counters;
             let _ = cache.try_load_v1(config);
         }
         cache.rebuild_latest_request_index();
@@ -137,7 +144,11 @@ impl PacketCache {
             recall_postings: filter_postings_for_live_keys(&self.recall_postings, &live_keys),
             recall_avg_doc_length: self.recall_avg_doc_length,
             file_ref_index: filter_ref_index_for_live_keys(&self.file_ref_index, &live_keys),
-            basename_alias_index: self.basename_alias_index.clone(),
+            basename_alias_index: filter_basename_alias_index_for_live_keys(
+                &self.basename_alias_index,
+                &live_keys,
+                &self.file_ref_index,
+            ),
             symbol_index: filter_ref_index_for_live_keys(&self.symbol_index, &live_keys),
             test_index: filter_ref_index_for_live_keys(&self.test_index, &live_keys),
             task_index: filter_ref_index_for_live_keys(&self.task_index, &live_keys),
@@ -265,6 +276,33 @@ pub(crate) fn filter_ref_index_for_live_keys(
                 .cloned()
                 .collect::<BTreeSet<_>>();
             (!filtered.is_empty()).then(|| (term.clone(), filtered))
+        })
+        .collect()
+}
+
+pub(crate) fn filter_basename_alias_index_for_live_keys(
+    index: &HashMap<String, BTreeSet<String>>,
+    live_keys: &BTreeSet<String>,
+    file_ref_index: &HashMap<String, BTreeSet<String>>,
+) -> HashMap<String, BTreeSet<String>> {
+    index
+        .iter()
+        .filter_map(|(basename, canonicals)| {
+            let filtered = canonicals
+                .iter()
+                .filter(|canonical| {
+                    file_ref_index
+                        .get(*canonical)
+                        .map(|cache_keys| {
+                            cache_keys
+                                .iter()
+                                .any(|cache_key| live_keys.contains(cache_key))
+                        })
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            (!filtered.is_empty()).then(|| (basename.clone(), filtered))
         })
         .collect()
 }

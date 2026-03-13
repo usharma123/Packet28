@@ -285,7 +285,7 @@ pub(crate) fn run_testy_impact_reducer(
                 "testy-{}",
                 envelope.hash.chars().take(12).collect::<String>()
             )),
-            format: "packet-json".to_string(),
+            format: default_packet_format(),
             body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
                 target: ctx.target.clone(),
                 detail: source.to_string(),

@@ -471,7 +471,7 @@ pub(crate) fn build_budget_notes_section(
     {
         saved_by_section
             .entry(candidate.section_id.clone())
-            .and_modify(|saved| *saved = (*saved).max(candidate.est_tokens))
+            .and_modify(|saved| *saved = saved.saturating_add(candidate.est_tokens))
             .or_insert(candidate.est_tokens);
     }
     let lines = saved_by_section

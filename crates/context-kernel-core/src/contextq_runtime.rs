@@ -41,7 +41,9 @@ fn build_context_manage_packet(
     ),
     KernelError,
 > {
-    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default().len();
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map(|buf| buf.len())
+        .unwrap_or(0);
     let envelope = suite_packet_core::EnvelopeV1 {
         version: "1".to_string(),
         tool: "contextq".to_string(),

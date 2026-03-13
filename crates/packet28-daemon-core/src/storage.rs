@@ -1,4 +1,5 @@
 use super::*;
+use fs2::FileExt;
 
 pub fn ensure_daemon_dir(root: &Path) -> Result<PathBuf> {
     let dir = daemon_dir(root);
@@ -95,8 +96,12 @@ pub fn append_task_event(root: &Path, frame: &DaemonEventFrame) -> Result<()> {
         .append(true)
         .open(&path)
         .with_context(|| format!("failed to open task event log '{}'", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("failed to lock task event log '{}'", path.display()))?;
     file.write_all(&bytes)
         .with_context(|| format!("failed to append task event log '{}'", path.display()))?;
+    file.unlock()
+        .with_context(|| format!("failed to unlock task event log '{}'", path.display()))?;
     Ok(())
 }
 

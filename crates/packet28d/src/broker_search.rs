@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Read;
 
 const SEARCH_PLAN_MAX_CANDIDATES: usize = 8;
 const SEARCH_PLAN_PHASE1_MAX_CANDIDATES: usize = 5;
@@ -7,14 +8,14 @@ const SEARCH_BROKER_MAX_MATCHES_PER_FILE: usize = 8;
 const SEARCH_BROKER_MAX_TOTAL_MATCHES: usize = 32;
 
 fn tokenize_task_text(task_text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
     task_text
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
         .map(str::trim)
         .filter(|token| token.len() >= 3)
         .map(|token| token.to_ascii_lowercase())
         .filter(|token| !is_low_signal_query_token(token))
-        .collect::<HashSet<_>>()
-        .into_iter()
+        .filter(|token| seen.insert(token.clone()))
         .collect()
 }
 
@@ -203,11 +204,11 @@ fn looks_like_query_path(value: &str) -> bool {
 }
 
 fn looks_like_symbol_term(value: &str) -> bool {
+    // Keep symbol classification narrow so plain lowercase prose stays in text search.
     value.contains('.')
         || value.contains("::")
         || value.contains('_')
         || value.chars().any(|ch| ch.is_ascii_uppercase())
-        || value.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
 fn scope_group(path: &str) -> String {
@@ -1634,7 +1635,10 @@ fn load_source_file_lines(
     relative_path: &str,
 ) -> Result<Vec<String>> {
     let full_path = root.join(relative_path);
-    let metadata = fs::metadata(&full_path)
+    let mut file = fs::File::open(&full_path)
+        .with_context(|| format!("failed to open '{}'", full_path.display()))?;
+    let metadata = file
+        .metadata()
         .with_context(|| format!("failed to read metadata for '{}'", full_path.display()))?;
     let size = metadata.len();
     let mtime_secs = metadata_mtime_secs(&metadata);
@@ -1650,24 +1654,29 @@ fn load_source_file_lines(
                 return Ok(cached.lines);
             }
         }
-        let lines = fs::read_to_string(&full_path)
-            .with_context(|| format!("failed to read '{}'", full_path.display()))?
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .with_context(|| format!("failed to read '{}'", full_path.display()))?;
+        let lines = contents
             .lines()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        state.lock().map_err(lock_err)?.source_file_cache.insert(
-            relative_path.to_string(),
-            CachedSourceFile {
-                size,
-                mtime_secs,
-                lines: lines.clone(),
-            },
-        );
+        let refreshed = fs::metadata(&full_path)
+            .with_context(|| format!("failed to refresh metadata for '{}'", full_path.display()))?;
+        if refreshed.len() == size && metadata_mtime_secs(&refreshed) == mtime_secs {
+            state.lock().map_err(lock_err)?.source_file_cache.insert(
+                relative_path.to_string(),
+                CachedSourceFile {
+                    size,
+                    mtime_secs,
+                    lines: lines.clone(),
+                },
+            );
+        }
         return Ok(lines);
     }
-    Ok(fs::read_to_string(&full_path)
-        .with_context(|| format!("failed to read '{}'", full_path.display()))?
-        .lines()
-        .map(|line| line.to_string())
-        .collect())
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("failed to read '{}'", full_path.display()))?;
+    Ok(contents.lines().map(|line| line.to_string()).collect())
 }

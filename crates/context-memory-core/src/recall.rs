@@ -41,15 +41,16 @@ impl PacketCache {
                         continue;
                     }
                     if let Some(entry) = self.entries_by_hash.get(cache_key).cloned() {
-                        let item = matches
-                            .entry(cache_key.clone())
-                            .or_insert_with(|| RelatedEntryMatch {
-                                entry,
-                                canonical_path_matches: Vec::new(),
-                                basename_path_matches: Vec::new(),
-                                symbol_matches: Vec::new(),
-                                test_matches: Vec::new(),
-                            });
+                        let item =
+                            matches
+                                .entry(cache_key.clone())
+                                .or_insert_with(|| RelatedEntryMatch {
+                                    entry,
+                                    canonical_path_matches: Vec::new(),
+                                    basename_path_matches: Vec::new(),
+                                    symbol_matches: Vec::new(),
+                                    test_matches: Vec::new(),
+                                });
                         if !item
                             .canonical_path_matches
                             .iter()
@@ -68,17 +69,19 @@ impl PacketCache {
                                     if !task_match_allowed(cache_key, task_keys.as_ref()) {
                                         continue;
                                     }
-                                    if let Some(entry) = self.entries_by_hash.get(cache_key).cloned()
+                                    if let Some(entry) =
+                                        self.entries_by_hash.get(cache_key).cloned()
                                     {
-                                        let item = matches.entry(cache_key.clone()).or_insert_with(
-                                            || RelatedEntryMatch {
-                                                entry,
-                                                canonical_path_matches: Vec::new(),
-                                                basename_path_matches: Vec::new(),
-                                                symbol_matches: Vec::new(),
-                                                test_matches: Vec::new(),
-                                            },
-                                        );
+                                        let item =
+                                            matches.entry(cache_key.clone()).or_insert_with(|| {
+                                                RelatedEntryMatch {
+                                                    entry,
+                                                    canonical_path_matches: Vec::new(),
+                                                    basename_path_matches: Vec::new(),
+                                                    symbol_matches: Vec::new(),
+                                                    test_matches: Vec::new(),
+                                                }
+                                            });
                                         if !item
                                             .basename_path_matches
                                             .iter()
@@ -906,8 +909,8 @@ pub(crate) fn push_unique_text(out: &mut Vec<String>, text: &str, max_items: usi
 }
 
 pub(crate) fn truncate_recall_text(mut text: String, max_len: usize) -> String {
-    if text.len() > max_len {
-        text.truncate(max_len);
+    if text.chars().count() > max_len {
+        text = text.chars().take(max_len).collect();
     }
     text
 }

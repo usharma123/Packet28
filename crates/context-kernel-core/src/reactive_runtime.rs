@@ -159,7 +159,10 @@ pub(crate) fn build_reactive_kernel_mutations(
         && (!snapshot.focus_paths.is_empty() || !snapshot.focus_symbols.is_empty())
         && !remaining.iter().any(|step| step.target == "mapy.repo")
     {
-        if let Some(template) = original_steps.iter().find(|step| step.target == "mapy.repo") {
+        if let Some(template) = original_steps
+            .iter()
+            .find(|step| step.target == "mapy.repo")
+        {
             let appended_id = format!("{}__reactive_focus", template.id);
             if !remaining.iter().any(|step| step.id == appended_id)
                 && !completed_success.contains(&appended_id)
@@ -201,7 +204,9 @@ fn step_affected_by_snapshot(
         if !reactive.path_globs.is_empty() {
             let matched = changed_paths.iter().any(|path| {
                 reactive.path_globs.iter().any(|glob| {
-                    path == glob || path.contains(glob.trim_matches('*')) || glob.contains(path)
+                    glob::Pattern::new(glob)
+                        .map(|pattern| pattern.matches(path))
+                        .unwrap_or(false)
                 })
             });
             if reactive.skip_if_inputs_unchanged {
@@ -316,10 +321,7 @@ pub(crate) fn apply_kernel_mutations(
         .collect()
 }
 
-pub(crate) fn remove_satisfied_dependency(
-    remaining: &mut [KernelStepRequest],
-    completed_id: &str,
-) {
+pub(crate) fn remove_satisfied_dependency(remaining: &mut [KernelStepRequest], completed_id: &str) {
     for step in remaining {
         step.depends_on.retain(|dep| dep != completed_id);
     }

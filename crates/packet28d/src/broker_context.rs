@@ -692,7 +692,8 @@ pub(crate) fn broker_validate_plan(
     let snapshot = load_agent_snapshot_for_task(&state, &request.task_id)?;
     let normalized_steps = normalize_plan_steps(&request.steps);
     let coverage = load_cached_coverage(&root)?;
-    let _testmap = load_cached_testmap(&root)?;
+    // TODO: Use testmap coverage to validate test-oriented plan steps.
+    let _ = load_cached_testmap(&root)?;
     let focus_paths = normalized_steps
         .iter()
         .flat_map(|step| step.paths.iter().cloned())

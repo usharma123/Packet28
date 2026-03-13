@@ -12,6 +12,7 @@ pub(crate) enum SourceLanguage {
     Rust,
     Python,
     TypeScript,
+    TypeScriptJsx,
     JavaScript,
     Go,
     Cpp,
@@ -27,7 +28,10 @@ pub(crate) fn detect_source_language(path: &str) -> Option<SourceLanguage> {
     if path.ends_with(".py") {
         return Some(SourceLanguage::Python);
     }
-    if path.ends_with(".ts") || path.ends_with(".tsx") {
+    if path.ends_with(".tsx") {
+        return Some(SourceLanguage::TypeScriptJsx);
+    }
+    if path.ends_with(".ts") {
         return Some(SourceLanguage::TypeScript);
     }
     if path.ends_with(".js") || path.ends_with(".jsx") {
@@ -91,6 +95,7 @@ thread_local! {
     static RUST_PARSER: RefCell<Option<Parser>> = RefCell::new(init_rust_parser());
     static PYTHON_PARSER: RefCell<Option<Parser>> = RefCell::new(init_python_parser());
     static TYPESCRIPT_PARSER: RefCell<Option<Parser>> = RefCell::new(init_typescript_parser());
+    static TSX_PARSER: RefCell<Option<Parser>> = RefCell::new(init_tsx_parser());
     static JAVASCRIPT_PARSER: RefCell<Option<Parser>> = RefCell::new(init_javascript_parser());
     static GO_PARSER: RefCell<Option<Parser>> = RefCell::new(init_go_parser());
     static CPP_PARSER: RefCell<Option<Parser>> = RefCell::new(init_cpp_parser());
@@ -120,6 +125,13 @@ fn init_python_parser() -> Option<Parser> {
 fn init_typescript_parser() -> Option<Parser> {
     let mut parser = Parser::new();
     let language = tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT);
+    parser.set_language(&language).ok()?;
+    Some(parser)
+}
+
+fn init_tsx_parser() -> Option<Parser> {
+    let mut parser = Parser::new();
+    let language = tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TSX);
     parser.set_language(&language).ok()?;
     Some(parser)
 }
@@ -154,6 +166,7 @@ pub(crate) fn extract_metadata_ast_with_lines(
         SourceLanguage::Rust => extract_rust_metadata_ast(content),
         SourceLanguage::Python => extract_python_metadata_ast(content),
         SourceLanguage::TypeScript => extract_typescript_metadata_ast(content),
+        SourceLanguage::TypeScriptJsx => extract_tsx_metadata_ast(content),
         SourceLanguage::JavaScript => extract_javascript_metadata_ast(content),
         SourceLanguage::Go => extract_go_metadata_ast(content),
         SourceLanguage::Cpp => extract_cpp_metadata_ast(content),
@@ -188,6 +201,10 @@ fn extract_python_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, 
 
 fn extract_typescript_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     TYPESCRIPT_PARSER.with(|cell| extract_with_walker(cell, content, walk_typescript_ast))
+}
+
+fn extract_tsx_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
+    TSX_PARSER.with(|cell| extract_with_walker(cell, content, walk_typescript_ast))
 }
 
 fn extract_javascript_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
