@@ -415,6 +415,7 @@ impl PacketCache {
                 .filter(|token| doc.terms.contains_key(*token))
                 .cloned()
                 .collect::<Vec<_>>();
+            let matched_packet_type = !packet_type_filters.is_empty();
 
             let mut score = base_score;
             if !matched_paths.is_empty() {
@@ -443,7 +444,8 @@ impl PacketCache {
             if score <= 0.0
                 || (query_tokens.is_empty()
                     && matched_paths.is_empty()
-                    && matched_symbols.is_empty())
+                    && matched_symbols.is_empty()
+                    && !matched_packet_type)
             {
                 continue;
             }
@@ -461,6 +463,9 @@ impl PacketCache {
             }
             if !matched_symbols.is_empty() {
                 match_reasons.push("symbol_match".to_string());
+            }
+            if matched_packet_type {
+                match_reasons.push("packet_type_filter".to_string());
             }
             if graph_overlap_candidates.contains(&cache_key)
                 && (matched_tokens.is_empty()
@@ -718,6 +723,40 @@ mod tests {
         let matches = cache.related_entries(Some("missing-task"), &["src/main.rs".to_string()], &[], &[]);
 
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn packet_type_only_queries_can_return_hits() {
+        let mut cache = PacketCache::new();
+        let mut hooks = NoopDeltaReuseHooks;
+        let lookup = cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"pt"}), &mut hooks);
+        cache.put_with_hooks(
+            "demo.reducer",
+            &lookup,
+            vec![CachePacket {
+                body: serde_json::json!({
+                    "packet_type": "suite.context.manage.v1",
+                    "summary": "context packet"
+                }),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        let hits = cache.recall(
+            "",
+            &RecallOptions {
+                packet_types: vec!["context.manage".to_string()],
+                ..RecallOptions::default()
+            },
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0]
+            .match_reasons
+            .iter()
+            .any(|reason| reason == "packet_type_filter"));
     }
 }
 
