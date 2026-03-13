@@ -22,7 +22,12 @@ pub(crate) fn build_context_correlation_packet(
         findings,
         debug,
     };
-    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default().len();
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|source| KernelError::ReducerFailed {
+            target: target.to_string(),
+            detail: source.to_string(),
+        })?
+        .len();
     let mut files = BTreeSet::new();
     let mut symbols = BTreeSet::new();
     for finding in &payload.findings {
