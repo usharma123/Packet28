@@ -708,6 +708,10 @@ fn is_edit_like_action(action: &str) -> bool {
     )
 }
 
+fn is_read_like_action(action: &str) -> bool {
+    matches!(action, "read" | "file_read" | "inspect" | "open")
+}
+
 fn is_test_like_step(step: &BrokerPlanStep) -> bool {
     step.action.contains("test")
         || step

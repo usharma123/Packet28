@@ -786,7 +786,7 @@ pub(crate) fn broker_validate_plan(
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
-    let files_read = snapshot.files_read.iter().cloned().collect::<HashSet<_>>();
+    let mut files_read = snapshot.files_read.iter().cloned().collect::<HashSet<_>>();
     let step_index = normalized_steps
         .iter()
         .enumerate()
@@ -848,6 +848,10 @@ pub(crate) fn broker_validate_plan(
                     related_symbols: step.symbols.clone(),
                 });
             }
+        }
+
+        if is_read_like_action(&step.action) {
+            files_read.extend(step.paths.iter().cloned());
         }
 
         if request.require_read_before_edit.unwrap_or(true) && is_edit_like_action(&step.action) {
