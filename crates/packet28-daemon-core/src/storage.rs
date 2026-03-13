@@ -61,7 +61,8 @@ pub fn load_watch_registry(root: &Path) -> Result<WatchRegistry> {
 pub fn save_watch_registry(root: &Path, registry: &WatchRegistry) -> Result<()> {
     ensure_daemon_dir(root)?;
     let path = watch_registry_path(root);
-    fs::write(&path, serde_json::to_vec_pretty(registry)?)
+    let bytes = serde_json::to_vec_pretty(registry)?;
+    write_atomically(&path, &bytes)
         .with_context(|| format!("failed to write watch registry '{}'", path.display()))?;
     Ok(())
 }
@@ -79,7 +80,8 @@ pub fn load_task_registry(root: &Path) -> Result<TaskRegistry> {
 pub fn save_task_registry(root: &Path, registry: &TaskRegistry) -> Result<()> {
     ensure_daemon_dir(root)?;
     let path = task_registry_path(root);
-    fs::write(&path, serde_json::to_vec_pretty(registry)?)
+    let bytes = serde_json::to_vec_pretty(registry)?;
+    write_atomically(&path, &bytes)
         .with_context(|| format!("failed to write task registry '{}'", path.display()))?;
     Ok(())
 }
@@ -163,6 +165,24 @@ pub fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_path = path.with_extension("tmp");
+    let mut file = fs::File::create(&temp_path)
+        .with_context(|| format!("failed to create temp file '{}'", temp_path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write temp file '{}'", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync temp file '{}'", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to atomically replace '{}' with '{}'",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
