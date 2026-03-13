@@ -187,22 +187,7 @@ pub(crate) fn metadata_mtime_secs(metadata: &Metadata) -> u64 {
 }
 
 pub(crate) fn is_source_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|v| v.to_str()),
-        Some("rs")
-            | Some("py")
-            | Some("js")
-            | Some("jsx")
-            | Some("ts")
-            | Some("tsx")
-            | Some("java")
-            | Some("go")
-            | Some("c")
-            | Some("cc")
-            | Some("cpp")
-            | Some("h")
-            | Some("hpp")
-    )
+    detect_source_language(&path.to_string_lossy()).is_some()
 }
 
 pub(crate) fn is_generated_or_vendor_path(path: &str) -> bool {
