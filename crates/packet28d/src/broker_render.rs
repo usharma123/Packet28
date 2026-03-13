@@ -1586,6 +1586,7 @@ pub(crate) fn build_broker_sections(
                 });
             }
 
+            let max_items = section_item_limit(&effective_limits, "code_evidence");
             let evidence_lines = reducer_files
                 .iter()
                 .flat_map(|file| {
@@ -1594,13 +1595,13 @@ pub(crate) fn build_broker_sections(
                         .map(|summary| summary.rendered_lines.clone())
                         .unwrap_or_default()
                 })
-                .take(15)
+                .take(max_items)
                 .collect::<Vec<_>>();
             if !evidence_lines.is_empty() {
                 sections.push(BrokerSection {
                     id: "code_evidence".to_string(),
                     title: "Code Evidence".to_string(),
-                    body: evidence_lines.join("\n"),
+                    body: truncate_lines(evidence_lines, max_items),
                     priority: if matches!(
                         action,
                         BrokerAction::Inspect
