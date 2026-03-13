@@ -211,11 +211,13 @@ fn step_affected_by_snapshot(
         }
         if !reactive.path_globs.is_empty() {
             let matched = changed_paths.iter().any(|path| {
-                reactive.path_globs.iter().any(|glob| {
-                    glob::Pattern::new(glob)
-                        .map(|pattern| pattern.matches(path))
-                        .unwrap_or(false)
-                })
+                reactive
+                    .path_globs
+                    .iter()
+                    .any(|glob| match glob::Pattern::new(glob) {
+                        Ok(pattern) => pattern.matches(path),
+                        Err(_) => true,
+                    })
             });
             if reactive.skip_if_inputs_unchanged {
                 return matched;
@@ -454,5 +456,25 @@ mod tests {
         };
 
         assert!(!step_affected_by_snapshot(&step, &snapshot));
+    }
+
+    #[test]
+    fn invalid_glob_forces_rerun_instead_of_skipping() {
+        let step = KernelStepRequest {
+            id: "ctx".to_string(),
+            target: "contextq.manage".to_string(),
+            reactive: Some(KernelStepReactiveConfig {
+                path_globs: vec!["[".to_string()],
+                skip_if_inputs_unchanged: true,
+                ..KernelStepReactiveConfig::default()
+            }),
+            ..KernelStepRequest::default()
+        };
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            changed_paths_since_checkpoint: vec!["src/main.rs".to_string()],
+            ..suite_packet_core::AgentSnapshotPayload::default()
+        };
+
+        assert!(step_affected_by_snapshot(&step, &snapshot));
     }
 }
