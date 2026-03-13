@@ -135,6 +135,13 @@ pub fn resolve_workspace_root(start: &Path) -> PathBuf {
 
 pub fn write_socket_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
+    if bytes.len() > MAX_SOCKET_MESSAGE_BYTES {
+        anyhow::bail!(
+            "socket frame too large: {} bytes exceeds limit of {}",
+            bytes.len(),
+            MAX_SOCKET_MESSAGE_BYTES
+        );
+    }
     let len = bytes.len() as u64;
     writer.write_all(&len.to_be_bytes())?;
     writer.write_all(&bytes)?;
