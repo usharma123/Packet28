@@ -1928,19 +1928,13 @@ mod tests {
                 source_kind: BrokerSourceKind::Derived,
             },
         ];
-        let budget_tokens = estimate_text_cost(&sections[0].body).0
-            + estimate_text_cost(&sections[1].body).0
-            + estimate_text_cost(&sections[2].body).0
-            + 2;
-        let budget_bytes = estimate_text_cost(&sections[0].body).1
-            + estimate_text_cost(&sections[1].body).1
-            + estimate_text_cost(&sections[2].body).1
-            + 8;
+        let rendered = render_brief("task-a", "v1", &sections[..3]);
+        let (budget_tokens, budget_bytes) = estimate_text_cost(&rendered);
         let (selected, evicted) = prune_sections_for_budget(
             BrokerAction::Inspect,
             sections,
-            budget_tokens,
-            budget_bytes,
+            budget_tokens + 2,
+            budget_bytes + 8,
             8,
         );
         assert!(selected.iter().any(|section| section.id == "code_evidence"));
@@ -1984,19 +1978,27 @@ mod tests {
                 source_kind: BrokerSourceKind::Derived,
             },
         ];
-        let objective_cost = estimate_text_cost(&sections[0].body);
-        let partial_code_cost = estimate_text_cost(
-            &code_evidence_body
-                .lines()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        let partial_sections = vec![
+            sections[0].clone(),
+            BrokerSection {
+                id: "code_evidence".to_string(),
+                title: "Code Evidence".to_string(),
+                body: code_evidence_body
+                    .lines()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                priority: 1,
+                source_kind: BrokerSourceKind::Derived,
+            },
+        ];
+        let partial_brief = render_brief("task-a", "v1", &partial_sections);
+        let (budget_tokens, budget_bytes) = estimate_text_cost(&partial_brief);
         let (selected, _) = prune_sections_for_budget(
             BrokerAction::Inspect,
             sections,
-            objective_cost.0 + partial_code_cost.0 + 2,
-            objective_cost.1 + partial_code_cost.1 + 8,
+            budget_tokens + 2,
+            budget_bytes + 8,
             8,
         );
         let code_evidence = selected

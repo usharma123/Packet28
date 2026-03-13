@@ -6,6 +6,16 @@ pub(crate) fn estimate_text_cost(text: &str) -> (u64, u64) {
     (est_tokens.max(1), est_bytes)
 }
 
+fn estimate_brief_banner_cost() -> (u64, u64) {
+    estimate_text_cost(
+        "[Packet28 Context v{context_version} — current Packet28 context for task {task_id}; supersedes all prior Packet28 context for this task]",
+    )
+}
+
+fn estimate_rendered_section_cost(section: &BrokerSection) -> (u64, u64) {
+    estimate_text_cost(&format!("## {}\n{}", section.title, section.body))
+}
+
 fn packet_source_kind(packet: &suite_packet_core::ContextManagePacketRef) -> BrokerSourceKind {
     if packet.target.starts_with("agenty.state.") {
         BrokerSourceKind::SelfAuthored
@@ -1064,8 +1074,7 @@ pub(crate) fn prune_sections_for_budget(
         .collect::<HashSet<_>>();
     let mut selected = Vec::new();
     let mut pruned = Vec::new();
-    let mut used_tokens = 0_u64;
-    let mut used_bytes = 0_u64;
+    let (mut used_tokens, mut used_bytes) = estimate_brief_banner_cost();
     let min_remaining_tokens_for_optional = ((budget_tokens as f64) * 0.2).ceil() as u64;
     let min_remaining_bytes_for_optional = ((budget_bytes as f64) * 0.2).ceil() as u64;
 
@@ -1075,7 +1084,7 @@ pub(crate) fn prune_sections_for_budget(
                     pruned: &mut Vec<BrokerEvictionCandidate>,
                     used_tokens: &mut u64,
                     used_bytes: &mut u64| {
-        let (est_tokens, est_bytes) = estimate_text_cost(&section.body);
+        let (est_tokens, est_bytes) = estimate_rendered_section_cost(&section);
         if est_tokens + *used_tokens <= budget_tokens && est_bytes + *used_bytes <= budget_bytes {
             *used_tokens = (*used_tokens).saturating_add(est_tokens);
             *used_bytes = (*used_bytes).saturating_add(est_bytes);
@@ -1088,7 +1097,7 @@ pub(crate) fn prune_sections_for_budget(
             if let Some(shrunk) =
                 shrink_section_to_budget(&section, remaining_tokens, remaining_bytes)
             {
-                let (shrunk_tokens, shrunk_bytes) = estimate_text_cost(&shrunk.body);
+                let (shrunk_tokens, shrunk_bytes) = estimate_rendered_section_cost(&shrunk);
                 *used_tokens = (*used_tokens).saturating_add(shrunk_tokens);
                 *used_bytes = (*used_bytes).saturating_add(shrunk_bytes);
                 selected.push(shrunk);
@@ -1143,7 +1152,7 @@ pub(crate) fn prune_sections_for_budget(
         if remaining_tokens < min_remaining_tokens_for_optional
             || remaining_bytes < min_remaining_bytes_for_optional
         {
-            let (est_tokens, _) = estimate_text_cost(&section.body);
+            let (est_tokens, _) = estimate_rendered_section_cost(&section);
             pruned.push(BrokerEvictionCandidate {
                 section_id: section.id.clone(),
                 reason: "budget_pruned".to_string(),
@@ -1163,7 +1172,7 @@ pub(crate) fn prune_sections_for_budget(
 
     if selected.len() > max_sections {
         for section in selected.drain(max_sections..) {
-            let (est_tokens, _) = estimate_text_cost(&section.body);
+            let (est_tokens, _) = estimate_rendered_section_cost(&section);
             pruned.push(BrokerEvictionCandidate {
                 section_id: section.id,
                 reason: "budget_pruned".to_string(),
@@ -1796,7 +1805,7 @@ pub(crate) fn build_section_estimates(
     sections
         .iter()
         .map(|section| {
-            let (est_tokens, est_bytes) = estimate_text_cost(&section.body);
+            let (est_tokens, est_bytes) = estimate_rendered_section_cost(section);
             BrokerSectionEstimate {
                 id: section.id.clone(),
                 est_tokens,
@@ -1823,7 +1832,7 @@ pub(crate) fn build_eviction_candidates(
             )
         })
         .map(|section| {
-            let (est_tokens, _) = estimate_text_cost(&section.body);
+            let (est_tokens, _) = estimate_rendered_section_cost(section);
             let reason = match section.id.as_str() {
                 "relevant_context" => "refreshable evidence".to_string(),
                 "search_evidence" => "search evidence can be regenerated".to_string(),
