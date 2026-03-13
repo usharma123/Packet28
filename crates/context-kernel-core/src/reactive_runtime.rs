@@ -202,7 +202,8 @@ fn step_affected_by_snapshot(
 ) -> bool {
     let changed_paths = &snapshot.changed_paths_since_checkpoint;
     let changed_symbols = &snapshot.changed_symbols_since_checkpoint;
-    let focus_changed = !snapshot.focus_paths.is_empty() || !snapshot.focus_symbols.is_empty();
+    let focus_changed = snapshot.focus_paths != snapshot.checkpoint_focus_paths
+        || snapshot.focus_symbols != snapshot.checkpoint_focus_symbols;
 
     if let Some(reactive) = step.reactive.as_ref() {
         if reactive.rerun_on_focus_change && focus_changed {
@@ -433,5 +434,25 @@ mod tests {
             step.depends_on,
             vec!["pending".to_string(), "anchor".to_string()]
         );
+    }
+
+    #[test]
+    fn unchanged_checkpoint_focus_does_not_trigger_focus_rerun() {
+        let step = KernelStepRequest {
+            id: "ctx".to_string(),
+            target: "contextq.manage".to_string(),
+            reactive: Some(KernelStepReactiveConfig {
+                rerun_on_focus_change: true,
+                ..KernelStepReactiveConfig::default()
+            }),
+            ..KernelStepRequest::default()
+        };
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            focus_paths: vec!["src/main.rs".to_string()],
+            checkpoint_focus_paths: vec!["src/main.rs".to_string()],
+            ..suite_packet_core::AgentSnapshotPayload::default()
+        };
+
+        assert!(!step_affected_by_snapshot(&step, &snapshot));
     }
 }
