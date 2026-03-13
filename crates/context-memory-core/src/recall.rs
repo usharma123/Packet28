@@ -28,10 +28,13 @@ impl PacketCache {
         tests: &[String],
     ) -> Vec<RelatedEntryMatch> {
         let task_filter = task_id.map(|value| value.to_ascii_lowercase());
-        let task_keys = task_filter
-            .as_ref()
-            .and_then(|task_id| self.task_index.get(task_id))
-            .cloned();
+        let task_keys = match task_filter.as_ref() {
+            Some(task_id) => match self.task_index.get(task_id) {
+                Some(keys) => Some(keys.clone()),
+                None => return Vec::new(),
+            },
+            None => None,
+        };
         let mut matches = HashMap::<String, RelatedEntryMatch>::new();
 
         for path in canonical_paths {
@@ -682,6 +685,39 @@ pub(crate) fn extract_budget_estimate(
             .and_then(Value::as_u64)
             .or(runtime_ms)
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_task_filter_does_not_fall_back_to_global_related_entries() {
+        let mut cache = PacketCache::new();
+        let mut hooks = NoopDeltaReuseHooks;
+        let lookup = cache.lookup_with_hooks(
+            "demo.reducer",
+            &serde_json::json!({"task_id":"known-task"}),
+            &mut hooks,
+        );
+        cache.put_with_hooks(
+            "demo.reducer",
+            &lookup,
+            vec![CachePacket {
+                body: serde_json::json!({
+                    "task_id": "known-task",
+                    "files": [{"path": "src/main.rs"}]
+                }),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        let matches = cache.related_entries(Some("missing-task"), &["src/main.rs".to_string()], &[], &[]);
+
+        assert!(matches.is_empty());
     }
 }
 
