@@ -203,6 +203,14 @@ fn writes_incremental_cache_file() {
 }
 
 #[test]
+fn classifies_top_level_and_windows_test_paths() {
+    assert!(crate::scan::is_test_path("tests/foo.rs"));
+    assert!(crate::scan::is_test_path("test/helpers.py"));
+    assert!(crate::scan::is_test_path(r"tests\foo.rs"));
+    assert!(!crate::scan::is_test_path("src/tests_support.rs"));
+}
+
+#[test]
 fn extracts_symbols_for_non_java_languages() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();

@@ -211,13 +211,14 @@ pub(crate) fn is_generated_or_vendor_path(path: &str) -> bool {
 }
 
 pub(crate) fn is_test_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("/tests/")
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    lower.starts_with("tests/")
+        || lower.starts_with("test/")
+        || lower.contains("/tests/")
         || lower.contains("/test/")
         || lower.ends_with("_test.rs")
         || lower.ends_with("_test.py")
         || lower.ends_with("/test.rs")
-        || lower.ends_with("\\test.rs")
         || lower == "test.rs"
 }
 
