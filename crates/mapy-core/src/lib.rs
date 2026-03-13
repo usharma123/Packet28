@@ -998,6 +998,26 @@ public class Calculator {
     }
 
     #[test]
+    fn extracts_import_leaves_without_mangling_common_syntaxes() {
+        let python = r#"
+import importlib
+from pathlib import Path
+"#;
+        let (_, python_imports) =
+            extract_metadata_ast_with_lines(SourceLanguage::Python, python).unwrap();
+        let python_imports = python_imports.into_iter().collect::<BTreeSet<_>>();
+        assert!(python_imports.contains("importlib"));
+        assert!(python_imports.contains("pathlib"));
+
+        let javascript = r#"
+import { foo } from "pkg";
+"#;
+        let (_, javascript_imports) =
+            extract_metadata_ast_with_lines(SourceLanguage::JavaScript, javascript).unwrap();
+        assert_eq!(javascript_imports, vec!["pkg".to_string()]);
+    }
+
+    #[test]
     fn writes_incremental_cache_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();

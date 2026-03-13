@@ -459,24 +459,18 @@ fn insert_java_import(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
 }
 
 fn insert_import_leaf(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
-    let Ok(raw) = node.utf8_text(src) else {
+    let Some(raw) = find_import_candidate(node, src) else {
         return;
     };
-
-    let mut normalized = raw
-        .replace("import", " ")
-        .replace("from", " ")
-        .replace("use", " ")
-        .replace("#include", " ")
-        .replace("static", " ")
-        .replace(';', " ")
-        .replace('{', " ")
-        .replace('}', " ")
-        .replace('\"', " ")
-        .replace('\'', " ")
-        .replace('<', " ")
-        .replace('>', " ");
-    normalized = normalized.trim().to_string();
+    let normalized = raw
+        .trim()
+        .trim_end_matches(';')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('<')
+        .trim_matches('>')
+        .trim()
+        .to_string();
     if normalized.is_empty() {
         return;
     }
@@ -490,6 +484,79 @@ fn insert_import_leaf(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
     if !leaf.is_empty() && !is_reserved_word(leaf) {
         out.insert(leaf.to_string());
     }
+}
+
+fn find_import_candidate(node: Node<'_>, src: &[u8]) -> Option<String> {
+    for field in ["source", "module", "module_name", "path", "name"] {
+        if let Some(child) = node.child_by_field_name(field) {
+            if let Some(candidate) = find_import_candidate_in_subtree(child, src, 0) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    find_import_candidate_in_subtree(node, src, 0)
+}
+
+fn find_import_candidate_in_subtree(node: Node<'_>, src: &[u8], depth: usize) -> Option<String> {
+    if depth > 6 {
+        return None;
+    }
+
+    if let Some(score) = import_candidate_score(node.kind()) {
+        let text = node.utf8_text(src).ok()?.trim().to_string();
+        if !text.is_empty() {
+            return Some((score, text)).map(|(_, text)| text);
+        }
+    }
+
+    let mut best: Option<(u8, String)> = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        if let Some(candidate) = find_import_candidate_in_subtree(child, src, depth + 1) {
+            let score = import_candidate_score(child.kind()).unwrap_or(3);
+            let replace = best
+                .as_ref()
+                .map(|(best_score, _)| score < *best_score)
+                .unwrap_or(true);
+            if replace {
+                best = Some((score, candidate));
+            }
+        }
+    }
+
+    best.map(|(_, candidate)| candidate)
+}
+
+fn import_candidate_score(kind: &str) -> Option<u8> {
+    if matches!(
+        kind,
+        "string"
+            | "string_literal"
+            | "interpreted_string_literal"
+            | "raw_string_literal"
+            | "string_fragment"
+            | "system_lib_string"
+    ) {
+        return Some(0);
+    }
+    if matches!(
+        kind,
+        "scoped_identifier"
+            | "dotted_name"
+            | "qualified_identifier"
+            | "namespace_identifier"
+            | "field_expression"
+    ) {
+        return Some(1);
+    }
+    if kind.contains("identifier") {
+        return Some(2);
+    }
+    None
 }
 
 fn find_identifier(node: Node<'_>, src: &[u8], depth: usize) -> Option<String> {
