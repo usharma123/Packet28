@@ -111,6 +111,17 @@ pub(crate) fn parse_diagnostics(log_text: &str) -> Vec<BuildDiagnostic> {
         }
     }
 
+    if let Some((severity, code, message)) = pending_rust {
+        diagnostics.push(build_diagnostic(
+            "<unknown>".to_string(),
+            0,
+            0,
+            severity,
+            code,
+            message,
+        ));
+    }
+
     diagnostics
 }
 
@@ -233,4 +244,22 @@ fn rust_location_re() -> &'static Regex {
 fn numeric_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\d+").unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_diagnostics;
+
+    #[test]
+    fn preserves_trailing_rust_header_without_location() {
+        let diagnostics = parse_diagnostics("error[E0308]: mismatched types");
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].file, "<unknown>");
+        assert_eq!(diagnostics[0].line, 0);
+        assert_eq!(diagnostics[0].column, 0);
+        assert_eq!(diagnostics[0].severity, "error");
+        assert_eq!(diagnostics[0].code.as_deref(), Some("E0308"));
+        assert_eq!(diagnostics[0].message, "mismatched types");
+    }
 }
