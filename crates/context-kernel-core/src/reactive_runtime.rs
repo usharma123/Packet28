@@ -138,7 +138,8 @@ pub(crate) fn build_reactive_kernel_mutations(
             continue;
         }
         if mode == ReactiveReplanMode::TaskAware
-            && !snapshot.changed_paths_since_checkpoint.is_empty()
+            && (!snapshot.changed_paths_since_checkpoint.is_empty()
+                || !snapshot.changed_symbols_since_checkpoint.is_empty())
             && !step_affected_by_snapshot(step, snapshot)
         {
             mutations.push(KernelPlanMutation::Cancel {
