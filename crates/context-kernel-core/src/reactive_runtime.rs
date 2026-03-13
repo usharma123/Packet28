@@ -174,6 +174,10 @@ pub(crate) fn build_reactive_kernel_mutations(
             {
                 let mut appended = template.clone();
                 appended.id = appended_id;
+                appended.depends_on.retain(|dep| {
+                    !completed_success.contains(dep)
+                        && !snapshot.completed_steps.iter().any(|done| done == dep)
+                });
                 if let Some(anchor) = anchor_step_id {
                     if !appended.depends_on.iter().any(|dep| dep == anchor) {
                         appended.depends_on.push(anchor.to_string());
@@ -389,5 +393,45 @@ pub(crate) fn record_replan_cancellations(
                 }),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appended_focus_map_prunes_satisfied_dependencies() {
+        let template = KernelStepRequest {
+            id: "map".to_string(),
+            target: "mapy.repo".to_string(),
+            depends_on: vec!["done".to_string(), "pending".to_string()],
+            reducer_input: serde_json::to_value(mapy_core::RepoMapRequest::default()).unwrap(),
+            ..KernelStepRequest::default()
+        };
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            focus_paths: vec!["src/main.rs".to_string()],
+            completed_steps: vec!["done".to_string()],
+            ..suite_packet_core::AgentSnapshotPayload::default()
+        };
+        let completed_success = BTreeSet::from(["done".to_string()]);
+
+        let mutations = build_reactive_kernel_mutations(
+            &[],
+            &[template],
+            &snapshot,
+            &completed_success,
+            ReactiveReplanMode::TaskAware,
+            true,
+            Some("anchor"),
+        );
+
+        let KernelPlanMutation::Append { step, .. } = &mutations[0] else {
+            panic!("expected appended map mutation");
+        };
+        assert_eq!(
+            step.depends_on,
+            vec!["pending".to_string(), "anchor".to_string()]
+        );
     }
 }
