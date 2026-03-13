@@ -8,12 +8,12 @@ use packet28_daemon_core::{
 #[cfg(unix)]
 use std::io::BufReader;
 
+#[cfg(not(unix))]
+use crate::cmd_daemon::daemon_not_supported;
 use crate::cmd_daemon::{
     ensure_daemon, resolve_root_arg, send_request, subscribe_task, IndexArgs, IndexCommands,
     JsonRootArgs, StatusRootArgs, TaskArgs, TaskCommands, WatchArgs, WatchCommands,
 };
-#[cfg(not(unix))]
-use crate::cmd_daemon::daemon_not_supported;
 
 pub(crate) fn run_start(args: StatusRootArgs) -> Result<i32> {
     let root = resolve_root_arg(&args.root);
@@ -83,7 +83,10 @@ pub(crate) fn run_index(args: IndexArgs) -> Result<i32> {
             )? {
                 DaemonResponse::DaemonIndexStatus { response } => {
                     if args.json {
-                        crate::cmd_common::emit_json(&serde_json::to_value(response)?, args.pretty)?;
+                        crate::cmd_common::emit_json(
+                            &serde_json::to_value(response)?,
+                            args.pretty,
+                        )?;
                     } else {
                         println!("status={}", response.manifest.status);
                         println!("generation={}", response.manifest.generation);
@@ -119,7 +122,10 @@ pub(crate) fn run_index(args: IndexArgs) -> Result<i32> {
             )? {
                 DaemonResponse::DaemonIndexRebuild { response } => {
                     if args.json {
-                        crate::cmd_common::emit_json(&serde_json::to_value(response)?, args.pretty)?;
+                        crate::cmd_common::emit_json(
+                            &serde_json::to_value(response)?,
+                            args.pretty,
+                        )?;
                     } else {
                         println!("accepted={}", response.accepted);
                         println!("full={}", response.full);
@@ -149,7 +155,10 @@ pub(crate) fn run_index(args: IndexArgs) -> Result<i32> {
             )? {
                 DaemonResponse::DaemonIndexClear { response } => {
                     if args.json {
-                        crate::cmd_common::emit_json(&serde_json::to_value(response)?, args.pretty)?;
+                        crate::cmd_common::emit_json(
+                            &serde_json::to_value(response)?,
+                            args.pretty,
+                        )?;
                     } else {
                         println!("cleared={}", response.cleared);
                     }
@@ -244,7 +253,10 @@ pub(crate) fn run_task(args: TaskArgs) -> Result<i32> {
             )? {
                 DaemonResponse::TaskAwaitHandoff { response } => {
                     if args.json {
-                        crate::cmd_common::emit_json(&serde_json::to_value(response)?, args.pretty)?;
+                        crate::cmd_common::emit_json(
+                            &serde_json::to_value(response)?,
+                            args.pretty,
+                        )?;
                     } else {
                         println!("waited_ms={}", response.waited_ms);
                         println!("polls={}", response.polls);
@@ -285,7 +297,10 @@ pub(crate) fn run_task(args: TaskArgs) -> Result<i32> {
             )? {
                 DaemonResponse::TaskLaunchAgent { response } => {
                     if args.json {
-                        crate::cmd_common::emit_json(&serde_json::to_value(response)?, args.pretty)?;
+                        crate::cmd_common::emit_json(
+                            &serde_json::to_value(response)?,
+                            args.pretty,
+                        )?;
                     } else {
                         println!("task_id={}", response.task_id);
                         println!("pid={}", response.pid);
@@ -409,7 +424,12 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<i32> {
         WatchCommands::List(args) => {
             let root = resolve_root_arg(&args.root);
             ensure_daemon(&root)?;
-            match send_request(&root, &DaemonRequest::WatchList { task_id: args.task_id })? {
+            match send_request(
+                &root,
+                &DaemonRequest::WatchList {
+                    task_id: args.task_id,
+                },
+            )? {
                 DaemonResponse::WatchList { watches } => {
                     if args.json {
                         crate::cmd_common::emit_json(&serde_json::to_value(watches)?, args.pretty)?;

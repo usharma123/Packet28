@@ -19,7 +19,9 @@ pub(crate) enum McpMessageFraming {
     NewlineJson,
 }
 
-pub(crate) fn read_message(reader: &mut impl BufRead) -> Result<Option<(Value, McpMessageFraming)>> {
+pub(crate) fn read_message(
+    reader: &mut impl BufRead,
+) -> Result<Option<(Value, McpMessageFraming)>> {
     let mut line = String::new();
     loop {
         line.clear();

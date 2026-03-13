@@ -18,10 +18,10 @@ use packet28_daemon_core::{
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-#[path = "cmd_mcp_prompt_resource.rs"]
-mod prompt_resource;
 #[path = "cmd_mcp_native.rs"]
 mod native_tools;
+#[path = "cmd_mcp_prompt_resource.rs"]
+mod prompt_resource;
 #[path = "cmd_mcp_proxy.rs"]
 mod proxy;
 #[path = "cmd_mcp_support.rs"]
@@ -48,7 +48,7 @@ use crate::cmd_mcp::support::{
     track_task, write_auto_capture_state_batch_via_session,
 };
 use crate::cmd_mcp::transport::{
-    render_command_preview, read_message, write_message, McpMessageFraming,
+    read_message, render_command_preview, write_message, McpMessageFraming,
 };
 
 #[derive(Args)]

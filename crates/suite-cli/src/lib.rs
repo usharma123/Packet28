@@ -5,6 +5,8 @@ pub mod broker_client;
 pub mod cmd_agent_prompt;
 pub mod cmd_build;
 pub mod cmd_common;
+pub mod cmd_common_machine;
+pub mod cmd_common_runtime;
 pub mod cmd_context;
 pub mod cmd_context_kernel;
 pub mod cmd_context_recall;

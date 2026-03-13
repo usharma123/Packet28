@@ -1,21 +1,21 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
+#[cfg(not(unix))]
+use crate::cmd_daemon_client::daemon_not_supported;
+#[cfg(unix)]
+pub(crate) use crate::cmd_daemon_client::subscribe_task;
 pub use crate::cmd_daemon_client::{
     daemon_root_env, daemon_workspace_root, execute_context_recall, execute_context_store_get,
     execute_context_store_list, execute_context_store_prune, execute_context_store_stats,
     execute_cover_check, execute_kernel_request, execute_packet_fetch, execute_sequence,
-    execute_test_map, execute_test_shard, send_cover_check, send_kernel_request,
-    send_packet_fetch, send_request, via_daemon_env_enabled, PersistentDaemonClient,
+    execute_test_map, execute_test_shard, send_cover_check, send_kernel_request, send_packet_fetch,
+    send_request, via_daemon_env_enabled, PersistentDaemonClient,
 };
-#[cfg(not(unix))]
-use crate::cmd_daemon_client::daemon_not_supported;
+pub(crate) use crate::cmd_daemon_client::{ensure_daemon, resolve_root_arg};
 pub(crate) use crate::cmd_daemon_commands::{
     run_index, run_start, run_status, run_stop, run_task, run_watch,
 };
-pub(crate) use crate::cmd_daemon_client::{ensure_daemon, resolve_root_arg};
-#[cfg(unix)]
-pub(crate) use crate::cmd_daemon_client::subscribe_task;
 
 #[derive(Args)]
 pub struct DaemonArgs {

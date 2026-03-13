@@ -28,7 +28,11 @@ pub(crate) fn load_proxy_config(path: &Path) -> Result<McpProxyConfig> {
     Ok(config)
 }
 
-pub(crate) fn serve_proxy_stdio(root: PathBuf, config: McpProxyConfig, task_id: String) -> Result<()> {
+pub(crate) fn serve_proxy_stdio(
+    root: PathBuf,
+    config: McpProxyConfig,
+    task_id: String,
+) -> Result<()> {
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let writer = Arc::new(Mutex::new(io::stdout()));

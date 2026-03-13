@@ -8,8 +8,8 @@ use context_memory_core::{
 use serde_json::json;
 
 use crate::cmd_context::{
-    emit_json, load_cache, StoreArgs, StoreCommands, StoreGetArgs, StoreListArgs,
-    StorePruneArgs, StoreStatsArgs,
+    emit_json, load_cache, StoreArgs, StoreCommands, StoreGetArgs, StoreListArgs, StorePruneArgs,
+    StoreStatsArgs,
 };
 
 pub(crate) fn run_store(args: StoreArgs) -> Result<i32> {
