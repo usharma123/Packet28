@@ -3,15 +3,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
 use packet28_daemon_core::{
-    BrokerAction, BrokerDecomposeRequest, BrokerDecomposeResponse, BrokerEstimateContextRequest,
-    BrokerEstimateContextResponse, BrokerGetContextRequest, BrokerGetContextResponse,
-    BrokerTaskStatusRequest, BrokerTaskStatusResponse, BrokerValidatePlanRequest,
-    BrokerValidatePlanResponse, BrokerWriteStateRequest, BrokerWriteStateResponse, DaemonRequest,
-    DaemonResponse,
+    BrokerPrepareHandoffRequest, BrokerPrepareHandoffResponse, BrokerTaskStatusRequest,
+    BrokerTaskStatusResponse, BrokerWriteStateRequest, BrokerWriteStateResponse, DaemonRequest,
+    DaemonResponse, TaskAwaitHandoffRequest, TaskAwaitHandoffResponse,
 };
-
-pub const DEFAULT_BROKER_BUDGET_TOKENS: u64 = 5_000;
-pub const DEFAULT_BROKER_BUDGET_BYTES: usize = 32_000;
 
 pub fn resolve_root(root: &str) -> PathBuf {
     crate::cmd_daemon::resolve_root_arg(root)
@@ -27,50 +22,16 @@ pub fn derive_task_id(task: &str) -> String {
     format!("task-{}", &hasher.finalize().to_hex().to_string()[..12])
 }
 
-pub fn get_context(
+pub fn prepare_handoff(
     root: &Path,
-    mut request: BrokerGetContextRequest,
-) -> Result<BrokerGetContextResponse> {
+    request: BrokerPrepareHandoffRequest,
+) -> Result<BrokerPrepareHandoffResponse> {
     if request.task_id.trim().is_empty() {
-        return Err(anyhow!("broker get_context requires task_id"));
-    }
-    if request.action.is_none() {
-        request.action = Some(BrokerAction::Plan);
-    }
-    if request.budget_tokens.is_none() {
-        request.budget_tokens = Some(DEFAULT_BROKER_BUDGET_TOKENS);
-    }
-    if request.budget_bytes.is_none() {
-        request.budget_bytes = Some(DEFAULT_BROKER_BUDGET_BYTES);
+        return Err(anyhow!("broker prepare_handoff requires task_id"));
     }
     ensure_daemon(root)?;
-    match crate::cmd_daemon::send_request(root, &DaemonRequest::BrokerGetContext { request })? {
-        DaemonResponse::BrokerGetContext { response } => Ok(response),
-        DaemonResponse::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected daemon response: {other:?}")),
-    }
-}
-
-pub fn estimate_context(
-    root: &Path,
-    mut request: BrokerEstimateContextRequest,
-) -> Result<BrokerEstimateContextResponse> {
-    if request.task_id.trim().is_empty() {
-        return Err(anyhow!("broker estimate_context requires task_id"));
-    }
-    if request.action.is_none() {
-        request.action = Some(BrokerAction::Plan);
-    }
-    if request.budget_tokens.is_none() {
-        request.budget_tokens = Some(DEFAULT_BROKER_BUDGET_TOKENS);
-    }
-    if request.budget_bytes.is_none() {
-        request.budget_bytes = Some(DEFAULT_BROKER_BUDGET_BYTES);
-    }
-    ensure_daemon(root)?;
-    match crate::cmd_daemon::send_request(root, &DaemonRequest::BrokerEstimateContext { request })?
-    {
-        DaemonResponse::BrokerEstimateContext { response } => Ok(response),
+    match crate::cmd_daemon::send_request(root, &DaemonRequest::BrokerPrepareHandoff { request })? {
+        DaemonResponse::BrokerPrepareHandoff { response } => Ok(response),
         DaemonResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
     }
@@ -88,27 +49,6 @@ pub fn write_state(
     }
 }
 
-pub fn validate_plan(
-    root: &Path,
-    request: BrokerValidatePlanRequest,
-) -> Result<BrokerValidatePlanResponse> {
-    ensure_daemon(root)?;
-    match crate::cmd_daemon::send_request(root, &DaemonRequest::BrokerValidatePlan { request })? {
-        DaemonResponse::BrokerValidatePlan { response } => Ok(response),
-        DaemonResponse::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected daemon response: {other:?}")),
-    }
-}
-
-pub fn decompose(root: &Path, request: BrokerDecomposeRequest) -> Result<BrokerDecomposeResponse> {
-    ensure_daemon(root)?;
-    match crate::cmd_daemon::send_request(root, &DaemonRequest::BrokerDecompose { request })? {
-        DaemonResponse::BrokerDecompose { response } => Ok(response),
-        DaemonResponse::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected daemon response: {other:?}")),
-    }
-}
-
 pub fn task_status(root: &Path, task_id: &str) -> Result<BrokerTaskStatusResponse> {
     ensure_daemon(root)?;
     match crate::cmd_daemon::send_request(
@@ -120,6 +60,21 @@ pub fn task_status(root: &Path, task_id: &str) -> Result<BrokerTaskStatusRespons
         },
     )? {
         DaemonResponse::BrokerTaskStatus { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+pub fn await_handoff(
+    root: &Path,
+    request: TaskAwaitHandoffRequest,
+) -> Result<TaskAwaitHandoffResponse> {
+    if request.task_id.trim().is_empty() {
+        return Err(anyhow!("daemon task await-handoff requires task_id"));
+    }
+    ensure_daemon(root)?;
+    match crate::cmd_daemon::send_request(root, &DaemonRequest::TaskAwaitHandoff { request })? {
+        DaemonResponse::TaskAwaitHandoff { response } => Ok(response),
         DaemonResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
     }

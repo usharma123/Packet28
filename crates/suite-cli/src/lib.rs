@@ -6,8 +6,14 @@ pub mod cmd_agent_prompt;
 pub mod cmd_build;
 pub mod cmd_common;
 pub mod cmd_context;
+pub mod cmd_context_kernel;
+pub mod cmd_context_recall;
+pub mod cmd_context_state;
+pub mod cmd_context_store;
 pub mod cmd_cover;
 pub mod cmd_daemon;
+pub mod cmd_daemon_client;
+pub mod cmd_daemon_commands;
 pub mod cmd_diff;
 pub mod cmd_doctor;
 pub mod cmd_guard;
@@ -16,7 +22,6 @@ pub mod cmd_map;
 pub mod cmd_map_repo;
 pub mod cmd_mcp;
 pub mod cmd_packet;
-pub mod cmd_preflight;
 pub mod cmd_proxy;
 pub mod cmd_setup;
 pub mod cmd_shard;
@@ -34,7 +39,7 @@ use serde_json::{json, Value};
     name = "Packet28",
     version,
     about = "Umbrella platform CLI for suite domains",
-    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 preflight --task \"investigate flaky parser test\" --json=compact\n  Packet28 agent-prompt --format claude\n  Packet28 daemon status --root . --json\n  Packet28 doctor --root . --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
+    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 agent-prompt --format claude\n  Packet28 daemon status --root . --json\n  Packet28 doctor --root . --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
 )]
 pub struct Cli {
     /// Path to config file
@@ -79,8 +84,6 @@ pub enum Commands {
     Proxy(cmd_proxy::ProxyArgs),
     /// Packet artifact utilities
     Packet(cmd_packet::PacketArgs),
-    /// Bounded agent preflight context for a natural-language task
-    Preflight(cmd_preflight::PreflightArgs),
     /// Emit repo-local agent instruction fragments that describe how to use Packet28
     AgentPrompt(cmd_agent_prompt::AgentPromptArgs),
     /// Run Packet28 as an MCP stdio server
@@ -291,7 +294,6 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         Commands::Packet(packet) => match packet.command {
             cmd_packet::PacketCommands::Fetch(args) => cmd_packet::run_fetch(args),
         },
-        Commands::Preflight(args) => cmd_preflight::run(args, &cli.config),
         Commands::AgentPrompt(args) => cmd_agent_prompt::run(args),
         Commands::Mcp(args) => cmd_mcp::run(args),
         Commands::Daemon(daemon) => cmd_daemon::run(daemon),
@@ -531,12 +533,6 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
                 _ => None,
             }
         }
-        Commands::Preflight(args) if args.machine_output_requested() => Some(machine_error(
-            "Packet28 preflight",
-            args.pretty_output(),
-            "preflight",
-        )),
-        Commands::Preflight(_) => None,
         Commands::Daemon(_)
         | Commands::Guard(_)
         | Commands::AgentPrompt(_)
