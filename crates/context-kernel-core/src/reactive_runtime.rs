@@ -173,9 +173,11 @@ pub(crate) fn build_reactive_kernel_mutations(
             {
                 let mut appended = template.clone();
                 appended.id = appended_id;
-                appended.depends_on = anchor_step_id
-                    .map(|id| vec![id.to_string()])
-                    .unwrap_or_default();
+                if let Some(anchor) = anchor_step_id {
+                    if !appended.depends_on.iter().any(|dep| dep == anchor) {
+                        appended.depends_on.push(anchor.to_string());
+                    }
+                }
                 if let Some(replaced) = merge_focus_into_map_step(&appended, snapshot) {
                     mutations.push(KernelPlanMutation::Append {
                         step: replaced,
