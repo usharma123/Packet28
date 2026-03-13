@@ -33,10 +33,10 @@ pub(crate) fn scan_repo(root: &Path, include_tests: bool) -> Result<Vec<FileScan
     });
 
     for entry in builder.build() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry = entry.map_err(|source| CovyError::Other(format!(
+            "failed to walk repository '{}': {source}",
+            root.display()
+        )))?;
 
         let path = entry.path();
         if !path.is_file() {
