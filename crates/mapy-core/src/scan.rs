@@ -5,6 +5,7 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
+use suite_packet_core::CovyError;
 
 pub(crate) fn scan_repo(root: &Path, include_tests: bool) -> Result<Vec<FileScan>, CovyError> {
     let mut out = Vec::new();
@@ -228,13 +229,13 @@ pub(crate) fn extract_imports(content: &str) -> Vec<String> {
         if target.is_empty() {
             continue;
         }
-        let normalized = target
-            .rsplit(['/', '.', ':'])
-            .next()
-            .unwrap_or(target)
-            .trim()
-            .to_string();
-        if !normalized.is_empty() {
+        let matched_line = cap.get(0).map(|m| m.as_str()).unwrap_or("");
+        let resolved = if matched_line.trim_start().starts_with("import static ") {
+            resolve_java_import_leaf(target, true)
+        } else {
+            resolve_import_leaf(target)
+        };
+        if let Some(normalized) = resolved {
             out.insert(normalized);
         }
     }

@@ -439,22 +439,15 @@ fn insert_java_import(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
         return;
     };
 
-    let mut normalized = import_text.trim().trim_end_matches(';').trim().to_string();
+    let mut normalized = normalize_import_candidate(import_text);
     if let Some(stripped) = normalized.strip_prefix("import") {
         normalized = stripped.trim().to_string();
     }
-    if let Some(stripped) = normalized.strip_prefix("static") {
-        normalized = stripped.trim().to_string();
-    }
+    let is_static = normalized.starts_with("static ");
+    let candidate = normalized.strip_prefix("static ").unwrap_or(&normalized);
 
-    let leaf = normalized
-        .trim_end_matches(".*")
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .trim();
-    if !leaf.is_empty() && !is_reserved_word(leaf) {
-        out.insert(leaf.to_string());
+    if let Some(leaf) = resolve_java_import_leaf(candidate, is_static) {
+        out.insert(leaf);
     }
 }
 
@@ -462,27 +455,85 @@ fn insert_import_leaf(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
     let Some(raw) = find_import_candidate(node, src) else {
         return;
     };
-    let normalized = raw
-        .trim()
+    if let Some(leaf) = resolve_import_leaf(&raw) {
+        out.insert(leaf);
+    }
+}
+
+pub(crate) fn normalize_import_candidate(raw: &str) -> String {
+    raw.trim()
         .trim_end_matches(';')
         .trim_matches('"')
         .trim_matches('\'')
         .trim_matches('<')
         .trim_matches('>')
         .trim()
-        .to_string();
-    if normalized.is_empty() {
-        return;
+        .to_string()
+}
+
+pub(crate) fn resolve_java_import_leaf(raw: &str, is_static: bool) -> Option<String> {
+    let normalized = normalize_import_candidate(raw);
+    let trimmed = normalized.trim_end_matches(".*").trim();
+    if trimmed.is_empty() {
+        return None;
     }
 
-    let leaf = normalized
-        .trim_end_matches(".*")
-        .rsplit(['/', '.', ':'])
-        .next()
-        .unwrap_or("")
+    let segments = trimmed
+        .split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let leaf = if is_static {
+        segments.iter().rev().nth(1).copied()
+    } else {
+        segments.last().copied()
+    }?;
+
+    if is_reserved_word(leaf) {
+        None
+    } else {
+        Some(leaf.to_string())
+    }
+}
+
+pub(crate) fn resolve_import_leaf(raw: &str) -> Option<String> {
+    let normalized = normalize_import_candidate(raw);
+    let trimmed = normalized.trim_end_matches(".*").trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let leaf = if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains(':') {
+        trimmed
+            .rsplit(['/', '\\', ':'])
+            .next()
+            .unwrap_or(trimmed)
+            .trim()
+    } else {
+        trimmed.rsplit('.').next().unwrap_or(trimmed).trim()
+    };
+    if leaf.is_empty() {
+        return None;
+    }
+
+    let stem = leaf
+        .rsplit_once('.')
+        .map(|(base, ext)| {
+            if !base.is_empty()
+                && !ext.is_empty()
+                && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+            {
+                base
+            } else {
+                leaf
+            }
+        })
+        .unwrap_or(leaf)
         .trim();
-    if !leaf.is_empty() && !is_reserved_word(leaf) {
-        out.insert(leaf.to_string());
+    if stem.is_empty() || is_reserved_word(stem) {
+        None
+    } else {
+        Some(stem.to_string())
     }
 }
 
@@ -589,7 +640,9 @@ pub(crate) fn is_reserved_word(name: &str) -> bool {
 pub(crate) fn import_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?m)^\s*(?:use|import|from|#include)\s+(?:<)?(?P<target>[A-Za-z0-9_./:-]+)")
+        Regex::new(
+            r#"(?m)^\s*(?:use|from|#include|import(?:\s+static)?)\s+(?:<|"|')?(?P<target>[A-Za-z0-9_./:-]+)"#,
+        )
             .expect("valid import regex")
     })
 }

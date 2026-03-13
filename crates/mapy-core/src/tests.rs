@@ -161,6 +161,28 @@ import { foo } from "pkg";
     let (_, javascript_imports) =
         extract_metadata_ast_with_lines(SourceLanguage::JavaScript, javascript).unwrap();
     assert_eq!(javascript_imports, vec!["pkg".to_string()]);
+
+    let java = r#"
+import com.example.Util;
+import static com.example.Util.parse;
+"#;
+    let (_, java_imports) = extract_metadata_ast_with_lines(SourceLanguage::Java, java).unwrap();
+    let java_imports = java_imports.into_iter().collect::<BTreeSet<_>>();
+    assert!(java_imports.contains("Util"));
+    assert!(!java_imports.contains("parse"));
+
+    let regex_imports = crate::scan::extract_imports(
+        r#"
+import "./util.ts";
+#include <foo/bar.hpp>
+import static com.example.Util.parse;
+"#,
+    )
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert!(regex_imports.contains("util"));
+    assert!(regex_imports.contains("bar"));
+    assert!(regex_imports.contains("Util"));
 }
 
 #[test]
