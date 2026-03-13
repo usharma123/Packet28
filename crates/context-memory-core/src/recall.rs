@@ -847,13 +847,20 @@ pub(crate) fn collect_task_ids(value: &Value, out: &mut BTreeSet<String>) {
 
 pub(crate) fn looks_like_path(text: &str) -> bool {
     let trimmed = text.trim();
-    !trimmed.is_empty()
-        && (trimmed.contains('/')
-            || trimmed.contains('\\')
-            || trimmed.ends_with(".rs")
-            || trimmed.ends_with(".java")
-            || trimmed.ends_with(".kt")
-            || trimmed.ends_with(".ts"))
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return true;
+    }
+    let Some((stem, ext)) = trimmed.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !ext.is_empty()
+        && ext.len() <= 4
+        && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && ext.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
 pub(crate) fn collect_summary_texts(value: &Value, out: &mut Vec<String>, max_items: usize) {
