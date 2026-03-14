@@ -14,7 +14,8 @@ Root directory: `.packet28/` under the workspace root.
 ├── artifacts/                   Full packet artifacts for --json=handle
 │   └── <handle_id>.json
 ├── agent/
-│   └── latest-preflight.json    Last preflight result from packet28-agent
+│   ├── latest-bootstrap.json    Last worker bootstrap payload from packet28-agent
+│   └── latest-handoff.json      Last checkpointed handoff bootstrap
 └── daemon/
     ├── packet28d.sock           Unix socket
     ├── runtime.json             Daemon PID and metadata

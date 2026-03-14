@@ -232,6 +232,7 @@ def section_body(payload: dict[str, Any], section_id: str) -> str:
 
 def run_case(client: McpClient, case: dict[str, Any]) -> dict[str, Any]:
     task_id = f"bench-{case['name']}-{int(time.time() * 1000)}"
+    expected_path = case["expected_path"]
 
     search_started = time.perf_counter()
     search_payload = client.tool_call(
@@ -247,38 +248,49 @@ def run_case(client: McpClient, case: dict[str, Any]) -> dict[str, Any]:
     )
     search_duration_ms = round((time.perf_counter() - search_started) * 1000.0, 1)
 
-    inspect_started = time.perf_counter()
-    inspect_payload = client.tool_call(
-        "packet28.get_context",
+    client.tool_call(
+        "packet28.write_state",
         {
             "task_id": task_id,
-            "action": case["action"],
-            "query": case["query"],
-            "response_mode": "full",
-            "include_sections": [
-                "task_objective",
-                "search_evidence",
-                "code_evidence",
-                "discovered_scope",
-                "recent_tool_activity",
-            ],
-            "section_item_limits": {"search_evidence": 8, "code_evidence": 6},
-            "default_max_items_per_section": 6,
-            "persist_artifacts": False,
+            "op": "intention",
+            "text": case["query"],
+            "note": "Benchmark handoff packet after targeted search and inspection",
+            "step_id": "investigating",
+            "paths": [expected_path],
         },
     )
-    inspect_duration_ms = round((time.perf_counter() - inspect_started) * 1000.0, 1)
+    client.tool_call(
+        "packet28.write_state",
+        {
+            "task_id": task_id,
+            "op": "checkpoint_save",
+            "checkpoint_id": "bench-handoff",
+            "note": "Benchmark checkpoint for fresh-worker bootstrap",
+            "paths": [expected_path],
+        },
+    )
+    handoff_started = time.perf_counter()
+    handoff_payload = client.tool_call(
+        "packet28.prepare_handoff",
+        {
+            "task_id": task_id,
+            "query": case["query"],
+            "response_mode": "full",
+        },
+    )
+    handoff_duration_ms = round((time.perf_counter() - handoff_started) * 1000.0, 1)
 
     baseline = rg_baseline(case)
 
     search_body = search_payload.get("compact_preview", "") or ""
     search_paths = set(search_payload.get("paths", []))
-    discovered_paths = set(inspect_payload.get("discovered_paths", []))
-    search_evidence = section_body(inspect_payload, "search_evidence")
-    code_evidence = section_body(inspect_payload, "code_evidence")
-    brief = inspect_payload.get("brief", "") or ""
+    handoff_context = handoff_payload.get("context") or {}
+    discovered_paths = set(handoff_context.get("discovered_paths", []))
+    search_evidence = section_body(handoff_context, "search_evidence")
+    code_evidence = section_body(handoff_context, "code_evidence")
+    brief = handoff_context.get("brief", "") or ""
+    handoff_brief = handoff_context.get("brief", "") or ""
 
-    expected_path = case["expected_path"]
     snippet_hits = {
         snippet: (snippet in code_evidence or snippet in brief)
         for snippet in case["expected_snippets"]
@@ -293,7 +305,13 @@ def run_case(client: McpClient, case: dict[str, Any]) -> dict[str, Any]:
 
     broker_bytes = len(brief.encode("utf-8"))
     search_preview_bytes = len(search_body.encode("utf-8"))
-    broker_est_tokens = int(inspect_payload.get("est_tokens") or estimate_tokens_from_bytes(broker_bytes))
+    broker_est_tokens = int(
+        handoff_context.get("est_tokens") or estimate_tokens_from_bytes(broker_bytes)
+    )
+    handoff_bytes = len(handoff_brief.encode("utf-8"))
+    handoff_est_tokens = int(
+        handoff_context.get("est_tokens") or estimate_tokens_from_bytes(handoff_bytes)
+    )
     reduction_vs_rg = None
     search_reduction_vs_rg = None
     if baseline["bytes"] > 0:
@@ -317,12 +335,15 @@ def run_case(client: McpClient, case: dict[str, Any]) -> dict[str, Any]:
         "search_preview_est_tokens": estimate_tokens_from_bytes(search_preview_bytes),
         "broker_brief_bytes": broker_bytes,
         "broker_est_tokens": broker_est_tokens,
+        "handoff_ready": bool(handoff_payload.get("handoff_ready")),
+        "handoff_brief_bytes": handoff_bytes,
+        "handoff_est_tokens": handoff_est_tokens,
         "rg_bytes": baseline["bytes"],
         "rg_est_tokens": baseline["est_tokens"],
         "reduction_vs_rg_pct": reduction_vs_rg,
         "search_reduction_vs_rg_pct": search_reduction_vs_rg,
         "search_duration_ms": search_duration_ms,
-        "inspect_duration_ms": inspect_duration_ms,
+        "handoff_duration_ms": handoff_duration_ms,
         "rg_duration_ms": baseline["duration_ms"],
         "search_evidence_excerpt": search_evidence[:240],
         "code_evidence_excerpt": code_evidence[:240],
@@ -411,7 +432,7 @@ def main() -> int:
             f"search={result['search_match_count']} "
             f"broker={result['broker_est_tokens']}t/{result['broker_brief_bytes']}b "
             f"rg={result['rg_est_tokens']}t/{result['rg_bytes']}b "
-            f"durations(search={result['search_duration_ms']}ms inspect={result['inspect_duration_ms']}ms rg={result['rg_duration_ms']}ms)"
+            f"durations(search={result['search_duration_ms']}ms handoff={result['handoff_duration_ms']}ms rg={result['rg_duration_ms']}ms)"
         )
         print(f"query: {result['query']}")
         print(

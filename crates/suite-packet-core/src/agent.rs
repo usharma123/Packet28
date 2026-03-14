@@ -88,6 +88,23 @@ pub struct SearchQuerySummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
+pub struct AgentIntention {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<String>,
+    pub occurred_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct ToolKindSuccess {
     pub operation_kind: ToolOperationKind,
     pub tool_name: String,
@@ -112,6 +129,7 @@ pub enum AgentStateEventKind {
     ToolInvocationFailed,
     FocusInferred,
     EvidenceCaptured,
+    IntentionRecorded,
 }
 
 impl Default for AgentStateEventKind {
@@ -227,6 +245,15 @@ pub enum AgentStateEventData {
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+    IntentionRecorded {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        question_id: Option<String>,
+    },
 }
 
 impl Default for AgentStateEventData {
@@ -304,4 +331,6 @@ pub struct AgentSnapshotPayload {
     pub evidence_artifact_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_successful_tool_by_kind: Vec<ToolKindSuccess>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_intention: Option<AgentIntention>,
 }

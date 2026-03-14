@@ -84,22 +84,12 @@ Domains with large payloads must emit bounded compact payloads and use handle ex
 
 Compact `map repo` inlines `path`/`name` context in ranked entries so agents do not need to join opaque indices against envelope refs.
 
-## Preflight Profiles
-
-Preflight respects the same `--json` flag but applies profiles to each embedded reducer packet independently. The preflight envelope itself (`suite.preflight.v1`) is always emitted in full — only the individual `results.packets[].packet` entries are profiled.
-
-| Profile | Preflight behavior |
-| --- | --- |
-| `compact` | Each reducer packet uses compact projection |
-| `full` | Each reducer packet uses full projection |
-| `handle` | Each reducer packet uses handle projection with artifact persistence |
-
 ## Semantic Consistency Rule
 
 `compact`, `full`, and `handle` projections for the same semantic packet must preserve the canonical `packet.hash`. The hash is computed before profile projection.
 
 ## Recall Profile
 
-Recall hits in preflight output are also profiled:
-- `compact` and `handle`: `created_at_unix` and `matched_tokens` are stripped
-- `full`: all fields preserved
+Recall entries follow the same projection rules as other reducer packets:
+- `compact` and `handle`: low-signal metadata such as `created_at_unix` and `matched_tokens` may be stripped
+- `full`: all supported fields are preserved

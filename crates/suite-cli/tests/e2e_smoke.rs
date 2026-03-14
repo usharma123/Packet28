@@ -136,15 +136,6 @@ fn read_mcp_message_for_id(stdout: &mut BufReader<ChildStdout>, expected_id: u64
     }
 }
 
-fn read_mcp_notification(stdout: &mut BufReader<ChildStdout>, method: &str) -> Value {
-    loop {
-        let value = read_mcp_message(stdout);
-        if value.get("method").and_then(Value::as_str) == Some(method) {
-            return value;
-        }
-    }
-}
-
 fn start_mcp_server(root: &Path) -> (Child, ChildStdin, BufReader<ChildStdout>) {
     let mut child = mcp_cmd()
         .current_dir(root)
@@ -156,65 +147,6 @@ fn start_mcp_server(root: &Path) -> (Child, ChildStdin, BufReader<ChildStdout>) 
     let stdin = child.stdin.take().unwrap();
     let stdout = BufReader::new(child.stdout.take().unwrap());
     (child, stdin, stdout)
-}
-
-fn write_mock_mcp_script(path: &Path) {
-    fs::write(
-        path,
-        r#"import json, sys
-
-def read_message():
-    headers = {}
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            return None
-        if line in (b"\r\n", b"\n"):
-            break
-        name, value = line.decode("utf-8").split(":", 1)
-        headers[name.lower().strip()] = value.strip()
-    length = int(headers.get("content-length", "0"))
-    body = sys.stdin.buffer.read(length)
-    return json.loads(body)
-
-def write_message(value):
-    body = json.dumps(value).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
-
-while True:
-    message = read_message()
-    if message is None:
-        break
-    method = message.get("method")
-    params = message.get("params", {})
-    msg_id = message.get("id")
-    if msg_id is None:
-        continue
-    if method == "initialize":
-        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "mock-upstream", "version": "1"}}})
-    elif method == "tools/list":
-        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "mock.read", "description": "Read a path", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "symbol": {"type": "string"}}}}, {"name": "mock.fail", "description": "Fail intentionally", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}]}})
-    elif method == "resources/list":
-        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resources": [{"uri": "mock://resource/one", "name": "Mock Resource", "mimeType": "text/plain"}]}})
-    elif method == "resources/templates/list":
-        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": []}})
-    elif method == "resources/read":
-        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"contents": [{"uri": params.get("uri"), "mimeType": "text/plain", "text": "mock resource"}]}})
-    elif method == "tools/call":
-        if params.get("name") == "mock.read":
-            args = params.get("arguments", {})
-            write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": "mock read ok"}], "structuredContent": {"path": args.get("path"), "symbol": args.get("symbol", "ArraySorter.sorted"), "summary": "read captured by proxy"}}})
-        elif params.get("name") == "mock.fail":
-            write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32001, "message": "temporary upstream failure"}})
-        else:
-            write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown tool"}})
-    else:
-        write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown method"}})
-"#,
-    )
-    .unwrap();
 }
 
 fn start_mcp_proxy_server(
@@ -458,25 +390,6 @@ enum Beta {
     .unwrap();
 }
 
-fn write_search_expansion_fixture(root: &Path) {
-    let src = root.join("src");
-    fs::create_dir_all(&src).unwrap();
-    fs::write(
-        src.join("alpha.rs"),
-        r#"
-pub struct AlphaService;
-"#,
-    )
-    .unwrap();
-    fs::write(
-        src.join("alpha_update.rs"),
-        r#"
-pub fn update_state_for_alpha_service() {}
-"#,
-    )
-    .unwrap();
-}
-
 fn git(root: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .current_dir(root)
@@ -546,15 +459,6 @@ fn parse_packet_wrapper(output: &[u8], packet_type: &str) -> Value {
         Some(packet_type)
     );
     assert!(value.get("packet").is_some());
-    value
-}
-
-fn parse_preflight_response(output: &[u8]) -> Value {
-    let value: Value = serde_json::from_slice(output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.preflight.v1")
-    );
     value
 }
 
@@ -2744,6 +2648,69 @@ fn test_suite_daemon_index_rebuild_and_status() {
         .success();
 }
 
+#[cfg(unix)]
+fn seed_checkpointed_handoff_task(
+    dir: &Path,
+    task_id: &str,
+    intention_text: &str,
+    checkpoint_id: &str,
+) {
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":task_id,
+                    "op":"intention",
+                    "text":intention_text,
+                    "note":"Need the next worker to pick up the handoff packet",
+                    "step_id":"investigating",
+                    "paths":["src/alpha.rs"],
+                    "symbols":["Alpha"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 2);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":task_id,
+                    "op":"checkpoint_save",
+                    "checkpoint_id":checkpoint_id,
+                    "note":"Checkpoint before launching a fresh worker",
+                    "paths":["src/alpha.rs"],
+                    "symbols":["Alpha"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 3);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 #[cfg(unix)]
 fn test_packet28_agent_bootstraps_broker_session() {
@@ -2751,16 +2718,24 @@ fn test_packet28_agent_bootstraps_broker_session() {
     let dir = TempDir::new().unwrap();
     init_repo(dir.path());
     write_repo_fixture(dir.path());
+    let task_text = "design auth broker";
+    let task_id = suite_cli::broker_client::derive_task_id(task_text);
+    seed_checkpointed_handoff_task(
+        dir.path(),
+        &task_id,
+        "Continue design auth broker",
+        "cp-bootstrap-1",
+    );
 
     let output = agent_cmd()
         .current_dir(dir.path())
         .args([
             "--task",
-            "design auth broker",
+            task_text,
             "--",
             "sh",
             "-c",
-            "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PACKET28_TASK_ID\" \"$PACKET28_BROKER_BRIEF_PATH\" \"$PACKET28_BROKER_STATE_PATH\" \"$PACKET28_MCP_COMMAND\" \"$PACKET28_BROKER_SYNC_TOOL\" \"$PACKET28_BROKER_ESTIMATE_TOOL\" \"$PACKET28_BROKER_POLL_FIELD\" \"$PACKET28_BROKER_WINDOW_MODE\" \"$PACKET28_BROKER_SUPERSESSION\" \"$PACKET28_BROKER_VALIDATE_PLAN_TOOL\" \"$PACKET28_BROKER_DECOMPOSE_TOOL\"",
+            "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PACKET28_TASK_ID\" \"$PACKET28_BROKER_BRIEF_PATH\" \"$PACKET28_BROKER_STATE_PATH\" \"$PACKET28_MCP_COMMAND\" \"$PACKET28_BROKER_WINDOW_MODE\" \"$PACKET28_BROKER_SUPERSESSION\" \"$PACKET28_BROKER_PREPARE_HANDOFF_TOOL\"",
         ])
         .assert()
         .success()
@@ -2772,18 +2747,517 @@ fn test_packet28_agent_bootstraps_broker_session() {
         .lines()
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
-    assert_eq!(lines.len(), 11);
-    assert!(lines[0].starts_with("task-"));
+    assert_eq!(lines.len(), 7);
+    assert_eq!(lines[0], task_id);
     assert!(Path::new(&lines[1]).exists(), "brief path should exist");
     assert!(Path::new(&lines[2]).exists(), "state path should exist");
     assert!(lines[3].contains("Packet28 mcp serve --root"));
-    assert_eq!(lines[4], "packet28.sync");
-    assert_eq!(lines[5], "packet28.estimate_context");
-    assert_eq!(lines[6], "since_version");
-    assert_eq!(lines[7], "replace");
-    assert_eq!(lines[8], "1");
-    assert_eq!(lines[9], "packet28.validate_plan");
-    assert_eq!(lines[10], "packet28.decompose");
+    assert_eq!(lines[4], "replace");
+    assert_eq!(lines[5], "1");
+    assert_eq!(lines[6], "packet28.prepare_handoff");
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_agent_resumes_from_checkpoint_handoff() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    seed_checkpointed_handoff_task(
+        dir.path(),
+        "task-handoff-agent",
+        "Resume from checkpointed Alpha investigation",
+        "cp-agent-1",
+    );
+
+    let output = agent_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--wait-for-handoff",
+            "--handoff-timeout-secs",
+            "5",
+            "--task-id",
+            "task-handoff-agent",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s\n%s\n%s\n%s\n%s\n%s\n' \"$PACKET28_BOOTSTRAP_MODE\" \"$PACKET28_BOOTSTRAP_PATH\" \"$PACKET28_HANDOFF_PATH\" \"$PACKET28_HANDOFF_ARTIFACT_ID\" \"$PACKET28_HANDOFF_CHECKPOINT_ID\" \"$PACKET28_BROKER_PREPARE_HANDOFF_TOOL\"",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let lines = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 6);
+    assert_eq!(lines[0], "handoff");
+    assert!(Path::new(&lines[1]).exists(), "bootstrap path should exist");
+    assert!(Path::new(&lines[2]).exists(), "handoff path should exist");
+    assert!(
+        !lines[3].is_empty(),
+        "handoff artifact id should be exported"
+    );
+    assert_eq!(lines[4], "cp-agent-1");
+    assert_eq!(lines[5], "packet28.prepare_handoff");
+
+    let bootstrap: Value = serde_json::from_str(&fs::read_to_string(&lines[1]).unwrap()).unwrap();
+    assert_eq!(
+        bootstrap["latest_intention"]["text"],
+        "Resume from checkpointed Alpha investigation"
+    );
+    assert_eq!(bootstrap["response_mode"], "full");
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_agent_wait_for_handoff_times_out_when_checkpoint_missing() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    agent_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--wait-for-handoff",
+            "--handoff-timeout-secs",
+            "1",
+            "--handoff-poll-ms",
+            "50",
+            "--task-id",
+            "task-timeout-handoff",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "timed out waiting for Packet28 handoff",
+        ));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_daemon_task_await_handoff_reports_ready_status() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-daemon-await",
+                    "op":"intention",
+                    "text":"Prepare daemon-owned handoff wait",
+                    "step_id":"investigating",
+                    "paths":["src/alpha.rs"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 2);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-daemon-await",
+                    "op":"checkpoint_save",
+                    "checkpoint_id":"cp-daemon-1",
+                    "paths":["src/alpha.rs"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 3);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let output = suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "await-handoff",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-daemon-await",
+            "--timeout-ms",
+            "1000",
+            "--poll-ms",
+            "50",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["task_status"]["handoff_ready"], true);
+    assert!(value["waited_ms"].as_u64().unwrap() <= 1_000);
+    assert!(value["polls"].as_u64().unwrap() >= 1);
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_daemon_task_launch_agent_spawns_child_from_handoff() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-daemon-launch",
+                    "op":"intention",
+                    "text":"Launch fresh worker from daemon",
+                    "step_id":"handoff",
+                    "paths":["src/alpha.rs"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 2);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-daemon-launch",
+                    "op":"checkpoint_save",
+                    "checkpoint_id":"cp-daemon-launch-1",
+                    "paths":["src/alpha.rs"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 3);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let output = suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "launch-agent",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-daemon-launch",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s\\n%s\\n' \"$PACKET28_BOOTSTRAP_MODE\" \"$PACKET28_TASK_ID\"",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let launch_value: Value = serde_json::from_slice(&output).unwrap();
+    let log_path = launch_value["log_path"].as_str().unwrap();
+    assert_eq!(launch_value["bootstrap_mode"], "handoff");
+    assert!(launch_value["pid"].as_u64().unwrap() > 0);
+
+    let mut log_contents = String::new();
+    for _ in 0..40 {
+        if let Ok(raw) = fs::read_to_string(log_path) {
+            log_contents = raw;
+            if log_contents.contains("handoff") && log_contents.contains("task-daemon-launch") {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(log_contents.contains("handoff"));
+    assert!(log_contents.contains("task-daemon-launch"));
+
+    let status_output = suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "status",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-daemon-launch",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status_value: Value = serde_json::from_slice(&status_output).unwrap();
+    assert_eq!(status_value["latest_agent_bootstrap_mode"], "handoff");
+    assert_eq!(
+        status_value["latest_agent_pid"].as_u64().unwrap(),
+        launch_value["pid"].as_u64().unwrap()
+    );
+    assert_eq!(status_value["latest_agent_log_path"], log_path);
+    assert_eq!(
+        status_value["latest_agent_handoff_artifact_id"],
+        launch_value["handoff_artifact_id"]
+    );
+    assert_eq!(
+        status_value["latest_agent_handoff_checkpoint_id"],
+        launch_value["handoff_checkpoint_id"]
+    );
+    assert!(status_value["latest_agent_context_version"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_daemon_task_await_handoff_can_require_newer_context_version() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-daemon-newer-handoff",
+                    "op":"intention",
+                    "text":"Prepare initial handoff",
+                    "step_id":"handoff",
+                    "paths":["src/alpha.rs"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 2);
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-daemon-newer-handoff",
+                    "op":"checkpoint_save",
+                    "checkpoint_id":"cp-daemon-newer-1",
+                    "paths":["src/alpha.rs"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 3);
+
+    let launch_output = suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "launch-agent",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-daemon-newer-handoff",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s\\n' \"$PACKET28_BOOTSTRAP_MODE\"",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let launch_value: Value = serde_json::from_slice(&launch_output).unwrap();
+    let launched_context_version = suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "status",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-daemon-newer-handoff",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let launched_status: Value = serde_json::from_slice(&launched_context_version).unwrap();
+    let previous_context_version = launched_status["latest_agent_context_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(launch_value["bootstrap_mode"], "handoff");
+
+    suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "await-handoff",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-daemon-newer-handoff",
+            "--after-context-version",
+            &previous_context_version,
+            "--timeout-ms",
+            "100",
+            "--poll-ms",
+            "20",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "newer handoff than context version",
+        ));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_state",
+                "arguments":{
+                    "task_id":"task-daemon-newer-handoff",
+                    "op":"intention",
+                    "text":"Resume from a newer handoff",
+                    "step_id":"editing",
+                    "paths":["src/beta.rs"]
+                }
+            }
+        }),
+    );
+    let _ = read_mcp_message_for_id(&mut stdout, 4);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let output = suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "await-handoff",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-daemon-newer-handoff",
+            "--after-context-version",
+            &previous_context_version,
+            "--timeout-ms",
+            "1000",
+            "--poll-ms",
+            "50",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["task_status"]["handoff_ready"], true);
+    assert_ne!(
+        value["task_status"]["latest_context_version"]
+            .as_str()
+            .unwrap(),
+        previous_context_version
+    );
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
@@ -2844,9 +3318,9 @@ fn test_packet28_doctor_reports_healthy_stack() {
         .iter()
         .any(|item| item["packet28_configured"] == true));
     assert_eq!(payload["handshake"]["ok"], true);
-    assert_eq!(payload["get_context_round_trip"]["ok"], true);
-    assert_eq!(payload["push_notifications"]["ok"], true);
-    assert_eq!(payload["sync_round_trip"]["ok"], true);
+    assert_eq!(payload["reducer_round_trip"]["ok"], true);
+    assert!(payload.get("push_notifications").is_some());
+    assert_eq!(payload["handoff_round_trip"]["ok"], true);
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
@@ -2856,27 +3330,11 @@ fn test_packet28_doctor_reports_healthy_stack() {
 
 #[test]
 #[cfg(unix)]
-fn test_packet28_mcp_get_context_write_state_and_read_brief() {
+fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
     init_repo(dir.path());
     write_repo_fixture(dir.path());
-    git(dir.path(), &["add", "src/alpha.rs", "src/beta.rs"]);
-    git(
-        dir.path(),
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ],
-    );
-    fs::remove_file(dir.path().join("src/beta.rs")).unwrap();
-    write_cached_coverage_state(dir.path());
-    write_cached_testmap_state(dir.path());
 
     let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
 
@@ -2889,9 +3347,7 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
         }),
     );
-    let initialize = read_mcp_message_for_id(&mut stdout, 1);
-    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
-    assert!(initialize["result"]["capabilities"]["prompts"].is_object());
+    let _ = read_mcp_message_for_id(&mut stdout, 1);
 
     write_mcp_message(
         &mut stdin,
@@ -2900,88 +3356,21 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             "id":2,
             "method":"tools/call",
             "params":{
-                "name":"packet28.get_context",
+                "name":"packet28.write_state",
                 "arguments":{
-                    "task_id":"task-mcp",
-                    "action":"plan",
-                    "query":"What does Alpha do?",
-                    "verbosity":"compact",
-                    "include_sections":["task_objective","search_evidence","relevant_context"],
-                    "max_sections":2,
-                    "default_max_items_per_section":2,
-                    "section_item_limits":{"search_evidence":1}
+                    "task_id":"task-handoff",
+                    "op":"intention",
+                    "text":"Inspect Alpha before editing it",
+                    "note":"Need a clean resume breadcrumb for the next worker",
+                    "step_id":"investigating",
+                    "paths":["src/alpha.rs"],
+                    "symbols":["Alpha"]
                 }
             }
         }),
     );
-    let first = read_mcp_message_for_id(&mut stdout, 2);
-    let first_context = &first["result"]["structuredContent"];
-    assert_eq!(
-        first["result"]["content"][0]["text"].as_str().unwrap(),
-        first_context["brief"].as_str().unwrap()
-    );
-    assert!(first_context["brief"]
-        .as_str()
-        .unwrap()
-        .starts_with("[Packet28 Context v"));
-    let first_version = first_context["context_version"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(first_context["supersedes_prior_context"], true);
-    assert_eq!(first_context["supersession_mode"], "replace");
-    assert_eq!(
-        first_context["superseded_before_version"].as_str().unwrap(),
-        first_version
-    );
-    assert!(first_context["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Task Objective"));
-    assert!(first_context["est_tokens"].as_u64().unwrap() > 0);
-    assert!(first_context["budget_remaining_tokens"].as_u64().unwrap() > 0);
-    assert_eq!(first_context["effective_max_sections"].as_u64().unwrap(), 2);
-    assert_eq!(
-        first_context["effective_default_max_items_per_section"]
-            .as_u64()
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        first_context["effective_section_item_limits"]["search_evidence"]
-            .as_u64()
-            .unwrap(),
-        1
-    );
-    assert!(first_context["sections"].as_array().unwrap().len() <= 2);
-    assert!(first_context["sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|section| {
-            matches!(
-                section["id"].as_str().unwrap_or_default(),
-                "task_objective" | "search_evidence" | "relevant_context"
-            )
-        }));
-    let search_evidence_section = first_context["sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|section| section["id"] == "search_evidence")
-        .unwrap();
-    assert_eq!(
-        search_evidence_section["title"].as_str().unwrap(),
-        "Relevant Files"
-    );
-    assert!(search_evidence_section["body"]
-        .as_str()
-        .unwrap()
-        .contains("direct reducer hit"));
-    assert!(search_evidence_section["body"]
-        .as_str()
-        .unwrap()
-        .contains("src/alpha.rs"));
+    let intention = read_mcp_message_for_id(&mut stdout, 2);
+    assert_eq!(intention["result"]["structuredContent"]["accepted"], true);
 
     write_mcp_message(
         &mut stdin,
@@ -2990,31 +3379,17 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             "id":3,
             "method":"tools/call",
             "params":{
-                "name":"packet28.estimate_context",
+                "name":"packet28.prepare_handoff",
                 "arguments":{
-                    "task_id":"task-mcp",
-                    "action":"plan",
-                    "include_sections":["task_objective","search_evidence"],
-                    "max_sections":2,
-                    "default_max_items_per_section":2
+                    "task_id":"task-handoff"
                 }
             }
         }),
     );
-    let estimate = read_mcp_message_for_id(&mut stdout, 3);
-    let estimate_context = &estimate["result"]["structuredContent"];
-    assert!(estimate["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("context estimate"));
-    assert!(estimate_context["selected_section_ids"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "task_objective"));
-    assert!(estimate_context["est_tokens"].as_u64().unwrap() > 0);
-    assert!(estimate_context.get("brief").is_none());
-    assert!(estimate_context.get("sections").is_none());
+    let not_ready = read_mcp_message_for_id(&mut stdout, 3);
+    let not_ready_payload = &not_ready["result"]["structuredContent"];
+    assert_eq!(not_ready_payload["handoff_ready"], false);
+    assert!(not_ready_payload["context"].is_null());
 
     write_mcp_message(
         &mut stdin,
@@ -3025,19 +3400,18 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             "params":{
                 "name":"packet28.write_state",
                 "arguments":{
-                    "task_id":"task-mcp",
-                    "op":"decision_add",
-                    "decision_id":"decision-1",
-                    "text":"Use brokered context"
+                    "task_id":"task-handoff",
+                    "op":"checkpoint_save",
+                    "checkpoint_id":"cp-1",
+                    "note":"Ready for manual worker relaunch",
+                    "paths":["src/alpha.rs"],
+                    "symbols":["Alpha"]
                 }
             }
         }),
     );
-    let write_response = read_mcp_message_for_id(&mut stdout, 4);
-    assert_eq!(
-        write_response["result"]["structuredContent"]["accepted"],
-        true
-    );
+    let checkpoint = read_mcp_message_for_id(&mut stdout, 4);
+    assert_eq!(checkpoint["result"]["structuredContent"]["accepted"], true);
 
     write_mcp_message(
         &mut stdin,
@@ -3046,36 +3420,30 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             "id":5,
             "method":"tools/call",
             "params":{
-                "name":"packet28.get_context",
+                "name":"packet28.prepare_handoff",
                 "arguments":{
-                    "task_id":"task-mcp",
-                    "action":"summarize",
-                    "since_version": first_version,
-                    "response_mode":"delta"
+                    "task_id":"task-handoff",
+                    "response_mode":"slim"
                 }
             }
         }),
     );
-    let second = read_mcp_message_for_id(&mut stdout, 5);
-    let second_context = &second["result"]["structuredContent"];
-    assert_eq!(second_context["invalidates_since_version"], true);
-    assert!(second_context["active_decisions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["id"] == "decision-1"));
-    assert!(second_context["delta"]["changed_sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["id"] == "active_decisions"));
-    assert!(
-        second_context["sections"].as_array().unwrap().len()
-            <= second_context["delta"]["changed_sections"]
-                .as_array()
-                .unwrap()
-                .len()
+    let handoff = read_mcp_message_for_id(&mut stdout, 5);
+    let handoff_payload = &handoff["result"]["structuredContent"];
+    assert_eq!(handoff_payload["handoff_ready"], true);
+    assert_eq!(handoff_payload["latest_checkpoint_id"], "cp-1");
+    assert_eq!(
+        handoff_payload["latest_intention"]["text"],
+        "Inspect Alpha before editing it"
     );
+    let handoff_context = &handoff_payload["context"];
+    assert_eq!(handoff_context["response_mode"], "slim");
+    assert_eq!(handoff_context["handoff_ready"], true);
+    assert!(handoff_context["brief"]
+        .as_str()
+        .unwrap()
+        .contains("Latest Intention"));
+    let handoff_artifact_id = handoff_context["artifact_id"].as_str().unwrap().to_string();
 
     write_mcp_message(
         &mut stdin,
@@ -3084,24 +3452,26 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             "id":6,
             "method":"tools/call",
             "params":{
-                "name":"packet28.write_state",
+                "name":"packet28.fetch_context",
                 "arguments":{
-                    "task_id":"task-mcp",
-                    "op":"tool_result",
-                    "tool_name":"manual.read",
-                    "operation_kind":"read",
-                    "request_summary":"Read alpha implementation",
-                    "result_summary":"Found struct Alpha and alpha function",
-                    "paths":["src/alpha.rs"],
-                    "symbols":["Alpha","alpha"],
-                    "artifact_id":"manual-alpha-evidence",
-                    "sequence":42
+                    "task_id":"task-handoff",
+                    "artifact_id": handoff_artifact_id
                 }
             }
         }),
     );
-    let tool_result = read_mcp_message_for_id(&mut stdout, 6);
-    assert_eq!(tool_result["result"]["structuredContent"]["accepted"], true);
+    let fetched = read_mcp_message_for_id(&mut stdout, 6);
+    let fetched_payload = &fetched["result"]["structuredContent"];
+    assert_eq!(fetched_payload["response_mode"], "full");
+    assert_eq!(
+        fetched_payload["latest_intention"]["step_id"],
+        "investigating"
+    );
+    assert!(fetched_payload["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|section| section["id"] == "agent_intention"));
 
     write_mcp_message(
         &mut stdin,
@@ -3110,563 +3480,21 @@ fn test_packet28_mcp_get_context_write_state_and_read_brief() {
             "id":7,
             "method":"tools/call",
             "params":{
-                "name":"packet28.get_context",
+                "name":"packet28.task_status",
                 "arguments":{
-                    "task_id":"task-mcp",
-                    "action":"inspect",
-                    "response_mode":"full"
+                    "task_id":"task-handoff"
                 }
             }
         }),
     );
-    let inspect = read_mcp_message_for_id(&mut stdout, 7);
-    let inspect_context = &inspect["result"]["structuredContent"];
-    assert!(inspect_context["recent_tool_invocations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["tool_name"] == "manual.read"));
-    assert!(inspect_context["discovered_paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "src/alpha.rs"));
-    assert!(inspect_context["evidence_artifact_ids"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "manual-alpha-evidence"));
-    assert!(inspect_context["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Task Memory"));
-    assert!(inspect_context["sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|section| section["id"] == "task_memory"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":8,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.get_context",
-                "arguments":{
-                    "task_id":"task-mcp",
-                    "action":"inspect",
-                    "query":"Alpha",
-                    "budget_tokens":90,
-                    "budget_bytes":360,
-                    "response_mode":"full",
-                    "include_sections":["task_objective","current_focus","discovered_scope","recent_tool_activity","code_evidence","search_evidence","relevant_context"]
-                }
-            }
-        }),
-    );
-    let tight = read_mcp_message_for_id(&mut stdout, 8);
-    let tight_context = &tight["result"]["structuredContent"];
-    assert!(tight_context["sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|section| section["id"] == "search_evidence"));
-    assert!(tight_context["sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|section| section["id"] == "code_evidence"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":9,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.capabilities",
-                "arguments":{}
-            }
-        }),
-    );
-    let capabilities = read_mcp_message_for_id(&mut stdout, 9);
+    let status = read_mcp_message_for_id(&mut stdout, 7);
+    let status_payload = &status["result"]["structuredContent"];
+    assert_eq!(status_payload["handoff_ready"], false);
+    assert_eq!(status_payload["latest_handoff_checkpoint_id"], "cp-1");
     assert_eq!(
-        capabilities["result"]["structuredContent"]["push_notifications"]["supported"],
-        true
+        status_payload["latest_handoff_artifact_id"],
+        handoff_context["artifact_id"]
     );
-    assert_eq!(
-        capabilities["result"]["structuredContent"]["estimate_context"],
-        true
-    );
-    assert_eq!(
-        capabilities["result"]["structuredContent"]["planning_tools"]["validate_plan"],
-        true
-    );
-    assert_eq!(
-        capabilities["result"]["structuredContent"]["planning_tools"]["decompose"],
-        true
-    );
-    assert_eq!(
-        capabilities["result"]["structuredContent"]["supersession"]["mode"],
-        "replace"
-    );
-    assert_eq!(
-        capabilities["result"]["structuredContent"]["section_limits"]["explicit_limits_supported"],
-        true
-    );
-    assert_eq!(
-        capabilities["result"]["structuredContent"]["planning_tools"]["validate_plan"],
-        true
-    );
-    assert_eq!(
-        capabilities["result"]["structuredContent"]["planning_tools"]["decompose"],
-        true
-    );
-    assert!(capabilities["result"]["structuredContent"]["section_ids"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "resolved_questions"));
-    assert!(capabilities["result"]["structuredContent"]["prompts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "packet28.start_task"));
-
-    let notification = read_mcp_notification(&mut stdout, "notifications/packet28.context_updated");
-    assert_eq!(
-        notification["params"]["task_id"].as_str().unwrap(),
-        "task-mcp"
-    );
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":10,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.validate_plan",
-                "arguments":{
-                    "task_id":"task-mcp",
-                    "steps":[
-                        {
-                            "id":"step-edit-deleted",
-                            "action":"edit",
-                            "paths":["src/beta.rs"]
-                        }
-                    ],
-                    "require_read_before_edit":true,
-                    "require_test_gate":true
-                }
-            }
-        }),
-    );
-    let validate = read_mcp_message_for_id(&mut stdout, 10);
-    let validate_payload = &validate["result"]["structuredContent"];
-    assert_eq!(validate_payload["valid"], false);
-    assert!(validate_payload["violations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["rule"] == "deleted_path"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":11,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.decompose",
-                "arguments":{
-                    "task_id":"task-mcp",
-                    "task_text":"restructure alpha module",
-                    "intent":"restructure_module",
-                    "scope_paths":["src/alpha.rs"],
-                    "max_steps":4
-                }
-            }
-        }),
-    );
-    let decompose = read_mcp_message_for_id(&mut stdout, 11);
-    let decompose_payload = &decompose["result"]["structuredContent"];
-    assert!(decompose_payload["steps"].as_array().unwrap().len() >= 1);
-    assert_eq!(
-        decompose_payload["steps"][0]["action"].as_str().unwrap(),
-        "restructure_module"
-    );
-    assert!(decompose_payload["selected_scope_paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "src/alpha.rs"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":12,
-            "method":"resources/read",
-            "params":{"uri":"packet28://task/task-mcp/brief"}
-        }),
-    );
-    let brief = read_mcp_message_for_id(&mut stdout, 12);
-    assert!(brief["result"]["contents"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("Relevant Files"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":13,
-            "method":"resources/read",
-            "params":{"uri":"packet28://task/task-mcp/state"}
-        }),
-    );
-    let state = read_mcp_message_for_id(&mut stdout, 13);
-    assert!(state["result"]["contents"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("\"supports_push\": true"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":14,
-            "method":"resources/list"
-        }),
-    );
-    let resources = read_mcp_message_for_id(&mut stdout, 14);
-    assert!(resources["result"]["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["uri"] == "packet28://current/task"));
-    assert!(resources["result"]["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["uri"] == "packet28://current/brief"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":15,
-            "method":"resources/read",
-            "params":{"uri":"packet28://current/task"}
-        }),
-    );
-    let current_task = read_mcp_message_for_id(&mut stdout, 15);
-    assert!(current_task["result"]["contents"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("\"task_id\": \"task-mcp\""));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":16,
-            "method":"resources/read",
-            "params":{"uri":"packet28://current/brief"}
-        }),
-    );
-    let current_brief = read_mcp_message_for_id(&mut stdout, 16);
-    assert!(current_brief["result"]["contents"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("Relevant Files"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":17,
-            "method":"prompts/list"
-        }),
-    );
-    let prompts = read_mcp_message_for_id(&mut stdout, 17);
-    assert!(prompts["result"]["prompts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["name"] == "packet28.start_task"));
-    assert!(prompts["result"]["prompts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["name"] == "packet28.continue_task"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":18,
-            "method":"prompts/get",
-            "params":{
-                "name":"packet28.start_task",
-                "arguments":{"task":"inspect alpha behavior"}
-            }
-        }),
-    );
-    let start_prompt = read_mcp_message_for_id(&mut stdout, 18);
-    assert!(start_prompt["result"]["messages"][0]["content"]["text"]
-        .as_str()
-        .unwrap()
-        .contains("packet28.get_context"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":19,
-            "method":"prompts/get",
-            "params":{
-                "name":"packet28.continue_task",
-                "arguments":{"task_id":"task-mcp"}
-            }
-        }),
-    );
-    let continue_prompt = read_mcp_message_for_id(&mut stdout, 19);
-    let continue_text = continue_prompt["result"]["messages"][0]["content"]["text"]
-        .as_str()
-        .unwrap();
-    assert!(continue_text.contains("packet28://current/brief"));
-    assert!(continue_text.contains("task-mcp"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":20,
-            "method":"prompts/get",
-            "params":{
-                "name":"packet28.summarize_current_context",
-                "arguments":{"task_id":"task-mcp"}
-            }
-        }),
-    );
-    let summarize_prompt = read_mcp_message_for_id(&mut stdout, 20);
-    assert!(summarize_prompt["result"]["messages"][0]["content"]["text"]
-        .as_str()
-        .unwrap()
-        .contains("Current brief"));
-
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    suite_cmd()
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .assert()
-        .success();
-}
-
-#[test]
-#[cfg(unix)]
-fn test_packet28_mcp_native_grep_auto_captures_tool_activity() {
-    ensure_packet28d_built();
-    let dir = TempDir::new().unwrap();
-    init_repo(dir.path());
-    write_repo_fixture(dir.path());
-    git(dir.path(), &["add", "src/alpha.rs", "src/beta.rs"]);
-    git(
-        dir.path(),
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ],
-    );
-    write_cached_coverage_state(dir.path());
-    write_cached_testmap_state(dir.path());
-
-    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
-    );
-    let initialize = read_mcp_message_for_id(&mut stdout, 1);
-    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/list"
-        }),
-    );
-    let tools = read_mcp_message_for_id(&mut stdout, 2);
-    assert!(tools["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["name"] == "packet28.search"));
-    assert!(tools["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["name"] == "packet28.fetch_tool_result"));
-    assert!(tools["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["name"] == "packet28.read_regions"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.search",
-                "arguments":{
-                    "task_id":"task-native-grep",
-                    "query":"Alpha",
-                    "paths":["src"],
-                    "whole_word":true
-                }
-            }
-        }),
-    );
-    let grep = read_mcp_message_for_id(&mut stdout, 3);
-    assert!(
-        grep.get("error").is_none(),
-        "native grep returned MCP error: {grep}"
-    );
-    let grep_payload = &grep["result"]["structuredContent"];
-    assert_eq!(grep_payload["match_count"].as_u64().unwrap(), 1);
-    assert_eq!(grep_payload["response_mode"], "slim");
-    assert!(grep_payload["compact_preview"]
-        .as_str()
-        .unwrap()
-        .contains("src/alpha.rs"));
-    assert!(grep_payload.get("task_id").is_none());
-    assert!(grep_payload.get("invocation_id").is_none());
-    assert!(grep_payload.get("sequence").is_none());
-    assert!(grep_payload.get("query").is_none());
-    assert!(grep_payload.get("returned_match_count").is_none());
-    assert!(grep_payload.get("truncated").is_none());
-    assert!(grep_payload.get("paths").is_none());
-    assert!(grep_payload.get("regions").is_none());
-    assert!(grep_payload.get("diagnostics").is_none());
-    assert!(grep_payload.get("groups").is_none());
-    assert!(grep_payload.get("symbols").is_none());
-    let artifact_id = grep_payload["artifact_id"].as_str().unwrap().to_string();
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":35,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.fetch_tool_result",
-                "arguments":{
-                    "task_id":"task-native-grep",
-                    "artifact_id": artifact_id
-                }
-            }
-        }),
-    );
-    let grep_full = read_mcp_message_for_id(&mut stdout, 35);
-    let grep_full_payload = &grep_full["result"]["structuredContent"];
-    assert_eq!(grep_full_payload["response_mode"], "full");
-    assert!(grep_full_payload["symbols"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "Alpha"));
-    assert!(grep_full_payload["groups"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(
-            |group| group["matches"].as_array().is_some_and(|matches| matches
-                .iter()
-                .any(|item| item["text"].as_str().unwrap_or_default().contains("Alpha")))
-        ));
-    assert!(grep_full_payload.get("matches").is_none());
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.get_context",
-                "arguments":{
-                    "task_id":"task-native-grep",
-                    "action":"inspect",
-                    "query":"Where is Alpha defined?",
-                    "response_mode":"full",
-                    "include_sections":["task_objective","discovered_scope","recent_tool_activity","code_evidence","search_evidence"]
-                }
-            }
-        }),
-    );
-    let inspect = read_mcp_message_for_id(&mut stdout, 4);
-    let inspect_payload = &inspect["result"]["structuredContent"];
-    assert!(inspect_payload["recent_tool_invocations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| {
-            item["tool_name"] == "packet28.search"
-                && item["regions"]
-                    .as_array()
-                    .is_some_and(|regions| !regions.is_empty())
-        }));
-    assert!(inspect_payload["discovered_paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "src/alpha.rs"));
-    assert!(inspect_payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Recent Tool Activity"));
-    assert!(inspect_payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Discovered Scope"));
-    assert!(inspect_payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Code Evidence"));
-    assert!(inspect_payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("struct Alpha;"));
-    let search_evidence_section = inspect_payload["sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|section| section["id"] == "search_evidence")
-        .unwrap();
-    assert!(search_evidence_section["body"]
-        .as_str()
-        .unwrap()
-        .contains("src/alpha.rs"));
 
     child.kill().unwrap();
     child.wait().unwrap();
@@ -3756,19 +3584,40 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
             "id":3,
             "method":"tools/call",
             "params":{
-                "name":"packet28.get_context",
+                "name":"packet28.write_state",
                 "arguments":{
                     "task_id":"task-native-read",
-                    "action":"inspect",
-                    "query":"Where is Alpha defined?",
-                    "response_mode":"full",
-                    "include_sections":["task_objective","discovered_scope","recent_tool_activity","code_evidence","search_evidence"]
+                    "op":"checkpoint_save",
+                    "checkpoint_id":"cp-native-read",
+                    "note":"Checkpoint before preparing handoff for read_regions evidence"
                 }
             }
         }),
     );
-    let inspect = read_mcp_message_for_id(&mut stdout, 3);
-    let inspect_payload = &inspect["result"]["structuredContent"];
+    let checkpoint = read_mcp_message_for_id(&mut stdout, 3);
+    assert_eq!(checkpoint["result"]["structuredContent"]["accepted"], true);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.prepare_handoff",
+                "arguments":{
+                    "task_id":"task-native-read",
+                    "query":"Where is Alpha defined?",
+                    "response_mode":"full"
+                }
+            }
+        }),
+    );
+    let inspect = read_mcp_message_for_id(&mut stdout, 4);
+    let inspect_payload = &inspect["result"]["structuredContent"]["context"];
+    assert!(inspect["result"]["structuredContent"]["handoff_ready"]
+        .as_bool()
+        .unwrap());
     assert!(inspect_payload["recent_tool_invocations"]
         .as_array()
         .unwrap()
@@ -3784,257 +3633,6 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
         .unwrap()
         .iter()
         .any(|item| item == "src/alpha.rs"));
-    assert!(inspect_payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Code Evidence"));
-    assert!(inspect_payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("src/alpha.rs:5"));
-    assert!(inspect_payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("struct Alpha;"));
-
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    suite_cmd()
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .assert()
-        .success();
-}
-
-#[test]
-#[cfg(unix)]
-fn test_packet28_mcp_sync_uses_current_task_and_optional_task_ids() {
-    ensure_packet28d_built();
-    let dir = TempDir::new().unwrap();
-    init_repo(dir.path());
-    write_repo_fixture(dir.path());
-    git(dir.path(), &["add", "src/alpha.rs", "src/beta.rs"]);
-    git(
-        dir.path(),
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ],
-    );
-    write_cached_coverage_state(dir.path());
-    write_cached_testmap_state(dir.path());
-
-    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
-    );
-    let initialize = read_mcp_message_for_id(&mut stdout, 1);
-    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.get_context",
-                "arguments":{
-                    "task_id":"task-sync",
-                    "action":"plan",
-                    "query":"How does Alpha work?",
-                    "response_mode":"full"
-                }
-            }
-        }),
-    );
-    let first = read_mcp_message_for_id(&mut stdout, 2);
-    let first_payload = &first["result"]["structuredContent"];
-    let first_version = first_payload["context_version"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "op":"decision_add",
-                    "decision_id":"sync-decision",
-                    "text":"Use sync with current task"
-                }
-            }
-        }),
-    );
-    let write_response = read_mcp_message_for_id(&mut stdout, 3);
-    assert_eq!(
-        write_response["result"]["structuredContent"]["accepted"],
-        true
-    );
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.sync",
-                "arguments":{
-                    "action":"inspect",
-                    "query":"Summarize Alpha",
-                    "include_estimate":true,
-                    "writes":[
-                        {
-                            "op":"checkpoint_save",
-                            "checkpoint_id":"sync-checkpoint",
-                            "note":"sync verification"
-                        }
-                    ]
-                }
-            }
-        }),
-    );
-    let sync = read_mcp_message_for_id(&mut stdout, 4);
-    let sync_payload = &sync["result"]["structuredContent"];
-    assert_eq!(sync_payload["task_id"], "task-sync");
-    assert_eq!(sync_payload["used_current_task"], true);
-    assert_eq!(sync_payload["used_since_version"], first_version);
-    assert_eq!(sync_payload["writes_applied"], 1);
-    assert_eq!(sync_payload["context"]["task_id"], "task-sync");
-    assert!(sync_payload["estimate"]["selected_section_ids"]
-        .as_array()
-        .is_some_and(|items| !items.is_empty()));
-    assert!(sync_payload["context"]["active_decisions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["id"] == "sync-decision"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":5,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.task_status",
-                "arguments":{}
-            }
-        }),
-    );
-    let status = read_mcp_message_for_id(&mut stdout, 5);
-    assert_eq!(
-        status["result"]["structuredContent"]["task"]["task_id"],
-        "task-sync"
-    );
-
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    suite_cmd()
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .assert()
-        .success();
-}
-
-#[test]
-#[cfg(unix)]
-fn test_packet28_mcp_inspect_expands_vague_update_query() {
-    ensure_packet28d_built();
-    let dir = TempDir::new().unwrap();
-    init_repo(dir.path());
-    write_search_expansion_fixture(dir.path());
-    git(dir.path(), &["add", "src/alpha.rs", "src/alpha_update.rs"]);
-    git(
-        dir.path(),
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ],
-    );
-    write_cached_coverage_state(dir.path());
-    write_cached_testmap_state(dir.path());
-
-    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
-    );
-    let initialize = read_mcp_message_for_id(&mut stdout, 1);
-    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.get_context",
-                "arguments":{
-                    "task_id":"task-vague-inspect",
-                    "action":"inspect",
-                    "query":"How is AlphaService.updateState updated?",
-                    "response_mode":"full",
-                    "include_sections":["task_objective","discovered_scope","code_evidence","search_evidence"]
-                }
-            }
-        }),
-    );
-    let inspect = read_mcp_message_for_id(&mut stdout, 2);
-    let inspect_payload = &inspect["result"]["structuredContent"];
-    let search_evidence_section = inspect_payload["sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|section| section["id"] == "search_evidence")
-        .unwrap();
-    assert!(search_evidence_section["body"]
-        .as_str()
-        .unwrap()
-        .contains("src/alpha"));
-    let code_evidence_section = inspect_payload["sections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|section| section["id"] == "code_evidence")
-        .unwrap();
-    let code_evidence_body = code_evidence_section["body"].as_str().unwrap();
-    assert!(code_evidence_body.contains("src/alpha"));
-    assert!(
-        code_evidence_body.contains("AlphaService")
-            || code_evidence_body.contains("update_state_for_alpha_service")
-    );
-
     child.kill().unwrap();
     child.wait().unwrap();
 
@@ -4080,160 +3678,14 @@ fn test_packet28_mcp_accepts_newline_json_stdio() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "packet28.get_context"));
+        .any(|tool| tool["name"] == "packet28.search"));
+    assert!(!tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.sync"));
 
     let _ = child.kill();
-}
-
-#[test]
-#[cfg(unix)]
-fn test_packet28_mcp_proxy_auto_captures_tool_activity() {
-    ensure_packet28d_built();
-    let dir = TempDir::new().unwrap();
-    init_repo(dir.path());
-    write_repo_fixture(dir.path());
-    let script_path = dir.path().join("mock_mcp.py");
-    write_mock_mcp_script(&script_path);
-    let config_path = dir.path().join(".mcp.proxy.json");
-    fs::write(
-        &config_path,
-        json!({
-            "mcpServers": {
-                "mock": {
-                    "command": "python3",
-                    "args": ["-u", script_path.to_str().unwrap()]
-                }
-            }
-        })
-        .to_string(),
-    )
-    .unwrap();
-
-    let (mut child, mut stdin, mut stdout) =
-        start_mcp_proxy_server(dir.path(), &config_path, "task-proxy");
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
-    );
-    let initialize = read_mcp_message_for_id(&mut stdout, 1);
-    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/list"
-        }),
-    );
-    let tools = read_mcp_message_for_id(&mut stdout, 2);
-    assert!(tools["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["name"] == "packet28.get_context"));
-    assert!(tools["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["name"] == "mock.read"));
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"mock.read",
-                "arguments":{
-                    "path":"src/alpha.rs",
-                    "symbol":"ArraySorter.sorted"
-                }
-            }
-        }),
-    );
-    let read = read_mcp_message_for_id(&mut stdout, 3);
-    assert_eq!(
-        read["result"]["structuredContent"]["path"]
-            .as_str()
-            .unwrap(),
-        "src/alpha.rs"
-    );
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"mock.fail",
-                "arguments":{
-                    "path":"src/beta.rs"
-                }
-            }
-        }),
-    );
-    let failed = read_mcp_message_for_id(&mut stdout, 4);
-    assert_eq!(failed["error"]["message"], "temporary upstream failure");
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":5,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.get_context",
-                "arguments":{
-                    "task_id":"task-proxy",
-                    "action":"inspect"
-                }
-            }
-        }),
-    );
-    let context = read_mcp_message_for_id(&mut stdout, 5);
-    let payload = &context["result"]["structuredContent"];
-    assert!(payload["recent_tool_invocations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["tool_name"] == "mock.read"));
-    assert!(payload["tool_failures"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["tool_name"] == "mock.fail"));
-    assert!(payload["discovered_paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "src/alpha.rs"));
-    assert!(payload["evidence_artifact_ids"].as_array().unwrap().len() >= 1);
-    assert!(payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Recent Tool Activity"));
-    assert!(payload["brief"].as_str().unwrap().contains("Tool Failures"));
-    assert!(payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Discovered Scope"));
-
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    suite_cmd()
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .assert()
-        .success();
 }
 
 #[test]
@@ -4574,391 +4026,6 @@ while True:
 
 #[test]
 #[cfg(unix)]
-fn test_packet28_mcp_links_decisions_and_questions() {
-    ensure_packet28d_built();
-    let dir = TempDir::new().unwrap();
-    init_repo(dir.path());
-    write_repo_fixture(dir.path());
-
-    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 1);
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-links",
-                    "op":"question_open",
-                    "question_id":"q1",
-                    "text":"Should Packet28 auto-resolve linked questions?"
-                }
-            }
-        }),
-    );
-    let open = read_mcp_message_for_id(&mut stdout, 2);
-    assert_eq!(open["result"]["structuredContent"]["accepted"], true);
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-links",
-                    "op":"decision_add",
-                    "decision_id":"d1",
-                    "text":"Yes, resolve via broker write",
-                    "resolves_question_id":"q1"
-                }
-            }
-        }),
-    );
-    let decision = read_mcp_message_for_id(&mut stdout, 3);
-    assert_eq!(decision["result"]["structuredContent"]["accepted"], true);
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.get_context",
-                "arguments":{
-                    "task_id":"task-links",
-                    "action":"summarize"
-                }
-            }
-        }),
-    );
-    let context = read_mcp_message_for_id(&mut stdout, 4);
-    let payload = &context["result"]["structuredContent"];
-    assert!(payload["open_questions"].as_array().unwrap().is_empty());
-    assert!(payload["resolved_questions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["id"] == "q1" && item["resolved_by_decision_id"] == "d1"));
-    assert!(payload["active_decisions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["id"] == "d1" && item["resolves_question_id"] == "q1"));
-    assert!(payload["brief"]
-        .as_str()
-        .unwrap()
-        .contains("Resolved Questions"));
-
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    suite_cmd()
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .assert()
-        .success();
-}
-
-#[test]
-#[cfg(unix)]
-fn test_packet28_mcp_decompose_and_validate_plan() {
-    ensure_packet28d_built();
-    let dir = TempDir::new().unwrap();
-    init_repo(dir.path());
-    write_repo_fixture(dir.path());
-    write_cached_coverage_state(dir.path());
-    write_cached_testmap_state(dir.path());
-
-    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 1);
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.decompose",
-                "arguments":{
-                    "task_id":"task-plan",
-                    "task_text":"restructure beta module",
-                    "intent":"restructure_module",
-                    "max_steps":4
-                }
-            }
-        }),
-    );
-    let decompose = read_mcp_message_for_id(&mut stdout, 2);
-    let decompose_payload = &decompose["result"]["structuredContent"];
-    assert!(decompose["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("decomposition returned"));
-    assert!(decompose_payload["selected_scope_paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "src/beta.rs"));
-    assert!(decompose_payload["steps"].as_array().unwrap().len() >= 1);
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.validate_plan",
-                "arguments":{
-                    "task_id":"task-plan",
-                    "steps":[
-                        {
-                            "id":"step-1",
-                            "action":"edit",
-                            "paths":["src/beta.rs"]
-                        }
-                    ],
-                    "require_read_before_edit":true,
-                    "require_test_gate":true
-                }
-            }
-        }),
-    );
-    let validate = read_mcp_message_for_id(&mut stdout, 3);
-    let validate_payload = &validate["result"]["structuredContent"];
-    assert_eq!(validate_payload["valid"], false);
-    assert!(validate_payload["violations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["rule"] == "read_before_edit"));
-    assert!(validate_payload["violations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["rule"] == "missing_test_gate"));
-
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    suite_cmd()
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .assert()
-        .success();
-}
-
-#[test]
-fn test_suite_preflight_json_selects_expected_reducers() {
-    let dir = TempDir::new().unwrap();
-    setup_changed_repo(dir.path());
-
-    let output = suite_cmd()
-        .current_dir(dir.path())
-        .args([
-            "preflight",
-            "--task",
-            "fix coverage gap in FooService",
-            "--coverage",
-            &fixture("lcov/basic.info"),
-            "--include",
-            "impact",
-            "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    let value = parse_preflight_response(&output);
-    let selected = value
-        .get("selection")
-        .and_then(|selection| selection.get("selected_reducers"))
-        .and_then(Value::as_array)
-        .unwrap();
-    assert!(selected.iter().any(|item| item.as_str() == Some("cover")));
-    assert!(selected.iter().any(|item| item.as_str() == Some("diff")));
-    assert!(selected.iter().any(|item| item.as_str() == Some("recall")));
-    assert!(!selected.iter().any(|item| item.as_str() == Some("map")));
-    assert!(value
-        .get("selection")
-        .and_then(|selection| selection.get("anchors"))
-        .and_then(|anchors| anchors.get("symbols"))
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .any(|item| item.as_str() == Some("FooService")));
-    assert!(value
-        .get("selection")
-        .and_then(|selection| selection.get("skipped"))
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .any(|item| {
-            item.get("reducer").and_then(Value::as_str) == Some("impact")
-                && item.get("reason").and_then(Value::as_str) == Some("no_testmap")
-        }));
-}
-
-#[test]
-fn test_suite_preflight_prefers_explicit_coverage_over_cached_state() {
-    let dir = TempDir::new().unwrap();
-    setup_changed_repo(dir.path());
-    write_cached_coverage_state(dir.path());
-
-    let output = suite_cmd()
-        .current_dir(dir.path())
-        .args([
-            "preflight",
-            "--task",
-            "fix coverage gap in FooService",
-            "--coverage",
-            &fixture("lcov/basic.info"),
-            "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    let value = parse_preflight_response(&output);
-    assert!(value
-        .get("selection")
-        .and_then(|selection| selection.get("selected_reducers"))
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .any(|item| item.as_str() == Some("cover")));
-}
-
-#[test]
-fn test_suite_preflight_handle_outputs_fetchable_packet_handles() {
-    let dir = TempDir::new().unwrap();
-    setup_changed_repo(dir.path());
-
-    let output = suite_cmd()
-        .current_dir(dir.path())
-        .args([
-            "preflight",
-            "--task",
-            "fix coverage gap in FooService",
-            "--coverage",
-            &fixture("lcov/basic.info"),
-            "--json=handle",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    let value = parse_preflight_response(&output);
-    let handle = value
-        .get("results")
-        .and_then(|results| results.get("packets"))
-        .and_then(Value::as_array)
-        .and_then(|packets| packets.first())
-        .and_then(|packet| packet.get("packet"))
-        .and_then(|wrapper| wrapper.get("packet"))
-        .and_then(|packet| {
-            packet.get("artifact_handle").or_else(|| {
-                packet
-                    .get("payload")
-                    .and_then(|payload| payload.get("artifact_handle"))
-            })
-        })
-        .and_then(|handle| handle.get("handle_id"))
-        .and_then(Value::as_str)
-        .unwrap()
-        .to_string();
-
-    let fetched = suite_cmd()
-        .current_dir(dir.path())
-        .args(["packet", "fetch", "--handle", &handle, "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let fetched_value: Value = serde_json::from_slice(&fetched).unwrap();
-    assert_eq!(
-        fetched_value.get("schema_version").and_then(Value::as_str),
-        Some("suite.packet.v1")
-    );
-}
-
-#[test]
-#[cfg(unix)]
-fn test_suite_preflight_via_daemon_composes_existing_remote_calls() {
-    ensure_packet28d_built();
-    let dir = TempDir::new().unwrap();
-    setup_changed_repo(dir.path());
-
-    let output = suite_cmd()
-        .current_dir(dir.path())
-        .args([
-            "--via-daemon",
-            "--daemon-root",
-            dir.path().to_str().unwrap(),
-            "preflight",
-            "--task",
-            "fix coverage gap in FooService",
-            "--coverage",
-            &fixture("lcov/basic.info"),
-            "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    let value = parse_preflight_response(&output);
-    assert!(value
-        .get("selection")
-        .and_then(|selection| selection.get("selected_reducers"))
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .any(|item| item.as_str() == Some("diff")));
-    assert!(dir.path().join(".packet28/daemon/runtime.json").exists());
-
-    suite_cmd()
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .assert()
-        .success();
-}
-
-#[test]
 fn test_suite_agent_prompt_outputs_all_supported_fragments() {
     for format in ["claude", "agents", "cursor"] {
         let output = suite_cmd()
@@ -4971,9 +4038,9 @@ fn test_suite_agent_prompt_outputs_all_supported_fragments() {
         let rendered = String::from_utf8(output).unwrap();
         assert!(!rendered.trim().is_empty());
         assert!(rendered.contains("Packet28 mcp serve"));
-        assert!(rendered.contains("packet28.sync"));
-        assert!(rendered.contains("packet28.get_context"));
-        assert!(rendered.contains("packet28.validate_plan"));
+        assert!(rendered.contains("packet28.search"));
+        assert!(rendered.contains("packet28.read_regions"));
+        assert!(rendered.contains("packet28.prepare_handoff"));
         assert!(rendered
             .to_ascii_lowercase()
             .contains("fall back to direct file reads"));
@@ -4991,20 +4058,28 @@ fn test_suite_agent_prompt_root_is_reflected_in_command_example() {
 
 #[test]
 #[cfg(unix)]
-fn test_packet28_agent_persists_preflight_and_exports_env() {
+fn test_packet28_agent_persists_bootstrap_and_exports_env() {
     let dir = TempDir::new().unwrap();
     setup_changed_repo(dir.path());
+    let task_text = "trace Alpha";
+    let task_id = suite_cli::broker_client::derive_task_id(task_text);
+    seed_checkpointed_handoff_task(
+        dir.path(),
+        &task_id,
+        "Trace Alpha from checkpointed handoff",
+        "cp-env-1",
+    );
     let env_dump = dir.path().join("env.txt");
 
     agent_cmd()
         .current_dir(dir.path())
         .args([
             "--task",
-            "trace Alpha",
+            task_text,
             "--",
             "sh",
             "-c",
-            "printf '%s\\n%s\\n' \"$PACKET28_ROOT\" \"$PACKET28_PREFLIGHT_PATH\" > \"$1\"",
+            "printf '%s\\n%s\\n' \"$PACKET28_ROOT\" \"$PACKET28_BOOTSTRAP_PATH\" > \"$1\"",
             "sh",
             env_dump.to_str().unwrap(),
         ])
@@ -5015,7 +4090,7 @@ fn test_packet28_agent_persists_preflight_and_exports_env() {
         .path()
         .join(".packet28")
         .join("agent")
-        .join("latest-preflight.json");
+        .join("latest-bootstrap.json");
     assert!(persisted_path.exists());
 
     let env_lines = fs::read_to_string(&env_dump)
@@ -5042,10 +4117,18 @@ fn test_packet28_agent_persists_preflight_and_exports_env() {
 fn test_packet28_agent_returns_child_exit_code() {
     let dir = TempDir::new().unwrap();
     setup_changed_repo(dir.path());
+    let task_text = "trace Alpha";
+    let task_id = suite_cli::broker_client::derive_task_id(task_text);
+    seed_checkpointed_handoff_task(
+        dir.path(),
+        &task_id,
+        "Trace Alpha and preserve child exit code",
+        "cp-exit-1",
+    );
 
     agent_cmd()
         .current_dir(dir.path())
-        .args(["--task", "trace Alpha", "--", "sh", "-c", "exit 7"])
+        .args(["--task", task_text, "--", "sh", "-c", "exit 7"])
         .assert()
         .code(7);
 }
@@ -5057,63 +4140,6 @@ fn test_packet28_agent_requires_child_command() {
         .assert()
         .failure()
         .stdout(predicate::str::contains("Usage:"));
-}
-
-#[test]
-#[cfg(unix)]
-fn test_packet28_agent_runs_without_cached_coverage_state() {
-    let dir = TempDir::new().unwrap();
-    let marker = dir.path().join("child-ran.txt");
-
-    agent_cmd()
-        .current_dir(dir.path())
-        .args([
-            "--task",
-            "fix coverage gap",
-            "--",
-            "sh",
-            "-c",
-            "touch \"$1\"",
-            "sh",
-            marker.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-
-    assert!(marker.exists());
-}
-
-#[test]
-fn test_suite_preflight_machine_failure_emits_suite_error_v1() {
-    let dir = TempDir::new().unwrap();
-
-    let output = suite_cmd()
-        .current_dir(dir.path())
-        .args([
-            "preflight",
-            "--task",
-            "debug stack failure",
-            "--include",
-            "stack",
-            "--stack-input",
-            "missing.log",
-            "--json",
-        ])
-        .assert()
-        .code(2)
-        .get_output()
-        .stdout
-        .clone();
-
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        value.get("schema_version").and_then(Value::as_str),
-        Some("suite.error.v1")
-    );
-    assert_eq!(
-        value.get("target").and_then(Value::as_str),
-        Some("preflight")
-    );
 }
 
 #[test]

@@ -13,17 +13,15 @@ All Packet28 machine-mode commands emit `suite.packet.v1` JSON wrappers. Parse p
 
 ### Live Broker (Recommended Entry Point)
 
-Packet28 is now intended to sit in the live agent loop, not just before it starts. The normal loop is:
+Packet28 is intended to sit alongside the live agent loop as a reducer plus handoff broker. The normal loop is:
 
 1. Start `Packet28 mcp serve`
-2. Keep `task_id`, `context_version`, and a local section cache
-3. Call `packet28.estimate_context` before cheap or budget-constrained actions
-4. For constrained refactors, call `packet28.decompose`, refine the steps locally, then run `packet28.validate_plan`
-5. Call `packet28.get_context(..., since_version, response_mode="auto")`
-6. Patch the local section cache from `delta.changed_sections` and `delta.removed_section_ids`
-7. Replace the prior Packet28 context block instead of appending old Packet28 briefs
-8. Call `packet28.write_state` after file reads, edits, checkpoints, decisions, and question updates
-9. Listen for `notifications/packet28.context_updated`, with polling fallback via `since_version`
+2. Keep `task_id` and let reducers persist slim packets during the active turn
+3. Use reducer tools like `packet28.search` and `packet28.read_regions`
+4. Call `packet28.write_state` after file reads, edits, checkpoints, decisions, question updates, and intention changes
+5. Fetch full tool artifacts only when a slim reducer packet is not enough
+6. Once the turn reaches a checkpoint, call `packet28.prepare_handoff`
+7. Let the daemon or wrapper relaunch a fresh worker with the handoff packet
 
 ### MCP Startup
 
@@ -32,24 +30,21 @@ Packet28 is now intended to sit in the live agent loop, not just before it start
 Packet28 mcp serve --root .
 ```
 
-### Cost Preview
+### Stored Context Inspection
 
-Ask Packet28 whether a full fetch is worth it before spending tokens:
+Use stored handoff/context artifacts for explicit inspection instead of fetching thick context mid-turn.
+
+Use `packet28.fetch_context` only when you need to inspect a stored handoff/context artifact in full:
 
 ```json
 {
-  "name": "packet28.estimate_context",
+  "name": "packet28.fetch_context",
   "arguments": {
     "task_id": "task-auth-broker",
-    "action": "plan",
-    "budget_tokens": 4000,
-    "response_mode": "auto",
-    "include_sections": ["task_objective", "repo_map", "recommended_actions"]
+    "artifact_id": "artifact-123"
   }
 }
 ```
-
-The estimate response includes `selected_section_ids`, `est_tokens`, `budget_remaining_tokens`, `section_estimates`, and `eviction_candidates`.
 
 ### Slim Search First
 
@@ -80,78 +75,59 @@ The slim response returns only `compact_preview`, `match_count`, and `artifact_i
 }
 ```
 
-### Deterministic Planning
+### Checkpointed Handoff
 
-Use Packet28 to generate and validate constrained refactor plans before execution. `packet28.decompose` is experimental and intentionally narrow in this milestone:
+Use a dedicated handoff packet for fresh-worker bootstrap instead of pulling full broker context mid-turn:
 
 ```json
 {
-  "name": "packet28.decompose",
+  "name": "packet28.write_state",
   "arguments": {
     "task_id": "task-auth-broker",
-    "task_text": "restructure auth module",
-    "intent": "restructure_module",
-    "max_steps": 6
+    "op": "intention",
+    "text": "Wire the broker handoff flow through the MCP surface.",
+    "note": "The next worker should resume from the handoff artifact rather than a thick mid-turn context fetch.",
+    "step_id": "editing",
+    "paths": ["crates/suite-cli/src/cmd_mcp.rs"],
+    "symbols": ["handle_packet28_prepare_handoff"]
   }
 }
 ```
 
 ```json
 {
-  "name": "packet28.validate_plan",
+  "name": "packet28.write_state",
   "arguments": {
     "task_id": "task-auth-broker",
-    "steps": [
-      {"id": "step-1", "action": "edit", "paths": ["src/auth.rs"]},
-      {"id": "step-2", "action": "add_tests", "paths": ["tests/auth_test.rs"], "depends_on": ["step-1"]}
-    ],
-    "require_read_before_edit": true,
-    "require_test_gate": true
+    "op": "checkpoint_save",
+    "step_id": "editing-complete"
   }
 }
 ```
-
-### Full Context Fetch
-
-Fetch the rendered brief plus the structured delta payload only when needed:
 
 ```json
 {
-  "name": "packet28.get_context",
+  "name": "packet28.prepare_handoff",
   "arguments": {
     "task_id": "task-auth-broker",
-    "action": "edit",
-    "since_version": "12",
-    "response_mode": "auto",
-    "include_sections": ["task_objective", "current_focus", "checkpoint_deltas", "repo_map"],
-    "section_item_limits": {
-      "repo_map": 6,
-      "checkpoint_deltas": 6
-    }
+    "response_mode": "slim"
   }
 }
 ```
 
-### Preflight (Compatibility Path)
+The handoff response returns a compact worker-bootstrap packet with the latest intention, checkpoint state, recent deltas, and an `artifact_id` for full retrieval if needed.
 
-Preflight remains available for one-shot startup context and compatibility wrappers.
+### Fresh-Worker Bootstrap
+
+Fresh workers should start from a checkpointed handoff, not from a one-shot planning envelope.
 
 ```bash
-# Run preflight for a task
-out="$(Packet28 preflight \
-  --task "fix coverage regression in AuthService" \
-  --json)"
-
-# Parse the result
-selected="$(jq -r '.selection.selected_reducers | join(",")' <<<"$out")"
-est_tokens="$(jq -r '.totals.est_tokens' <<<"$out")"
-echo "reducers=$selected tokens=$est_tokens"
-
-# Extract individual reducer packets
-jq -r '.results.packets[] | "\(.reducer): \(.packet.packet.summary)"' <<<"$out"
-
-# Extract recall hits
-jq -r '.results.recall.hits[] | "score=\(.score) target=\(.target)"' <<<"$out"
+Packet28 daemon task await-handoff \
+  --root . \
+  --task-id task-auth-broker \
+  --timeout-ms 300000 \
+  --poll-ms 250 \
+  --json
 ```
 
 ### Agent Prompt Fragments
@@ -174,70 +150,96 @@ Packet28 agent-prompt --format cursor
 #### Claude
 
 - Start `Packet28 mcp serve`
-- Keep `task_id`, `context_version`, and a local section cache in the agent session
+- Keep `task_id` and a single mutable Packet28 context block in the agent session
 - Treat the latest Packet28 brief as the only canonical Packet28 context block; replace older Packet28 briefs instead of appending them
-- Call `packet28.estimate_context` before low-cost planning or summarization steps
-- Use `packet28.decompose` and `packet28.validate_plan` for constrained refactors before execution
-- Call `packet28.get_context(..., since_version, response_mode="auto")` before each substantive invocation
-- Patch the local section cache from `delta.changed_sections` and `delta.removed_section_ids`
-- On `notifications/packet28.context_updated`, refresh on the next invocation
-- If notifications are unavailable, fall back to polling with `since_version`
+- Use slim reducers inside the turn and fetch full artifacts only when needed
+- Persist reads, edits, checkpoints, and intentions with `packet28.write_state`
+- Assemble handoff only after checkpoint and relaunch a fresh worker instead of bloating the active session
 
 #### Codex / AGENTS.md
 
 - Use `Packet28 agent-prompt --format agents` to seed the runtime instructions
-- Keep the local section cache as the authoritative broker state inside the session
 - Keep one mutable Packet28 block in the prompt and replace it when a newer brief supersedes the old one
-- Use `packet28.decompose` and `packet28.validate_plan` for constrained planning flows
-- Prefer explicit `include_sections`, `exclude_sections`, and `section_item_limits`
-- Use `packet28.write_state` after file reads, edits, checkpoints, decisions, and question changes
-- Poll with `since_version` whenever notification delivery is unavailable or disabled
+- Use `packet28.write_state` after file reads, edits, checkpoints, decisions, question changes, and intention updates
+- For long-running work, keep in-turn packets slim and use `packet28.prepare_handoff` only after a checkpoint when bootstrapping a fresh worker
 
 #### Cursor
 
 - Start MCP once per workspace
-- Use `packet28.estimate_context` when near the model budget
-- Use `packet28.decompose` and `packet28.validate_plan` before executing constrained refactors
-- Use `packet28.get_context(..., response_mode="auto")` for full or delta fetches
 - Replace the prior Packet28 context block instead of appending Packet28 history
+- Use slim reducers in the turn, then relaunch from handoff after checkpoint
 - Keep `.packet28/task/<task_id>/brief.md` only as a fallback bridge
 - Treat `verbosity` as a compatibility alias; prefer explicit section limits
 
 ### Wrapper Binary
 
-`packet28-agent` runs preflight automatically before delegating to an agent runtime:
+`packet28-agent` bootstraps a worker from a checkpointed handoff:
 
 ```bash
 packet28-agent \
   --task "investigate flaky parser test" \
+  --wait-for-handoff \
   -- codex exec "review the failure"
 ```
 
-The wrapper:
-1. Runs preflight with the task description
-2. Persists the result to `.packet28/agent/latest-preflight.json`
-3. Exports `PACKET28_PREFLIGHT_PATH` and `PACKET28_ROOT` to the child process
-4. Executes the delegated command, propagating its exit code
+```bash
+packet28-agent \
+  --task-id task-auth-broker \
+  --wait-for-handoff \
+  -- codex exec "continue the task"
+```
 
-### Reading Preflight in an Agent
+The wrapper:
+1. Waits for a checkpointed handoff when `--wait-for-handoff` is enabled
+2. Persists the startup packet to `.packet28/agent/latest-bootstrap.json` and the assembled handoff to `.packet28/agent/latest-handoff.json`
+3. Exports `PACKET28_BOOTSTRAP_MODE`, `PACKET28_BOOTSTRAP_PATH`, and `PACKET28_ROOT` to the child process
+4. Exports `PACKET28_HANDOFF_PATH`, `PACKET28_HANDOFF_ARTIFACT_ID`, and `PACKET28_HANDOFF_CHECKPOINT_ID` for resumed workers
+5. Asks `packet28d` to block until a ready handoff exists; if the last worker already consumed a handoff, the wait targets a newer context version
+6. Executes the delegated command, propagating its exit code
+
+You can also wait on the daemon directly before choosing how to relaunch:
+
+```bash
+Packet28 daemon task await-handoff \
+  --root . \
+  --task-id task-auth-broker \
+  --after-context-version 42 \
+  --timeout-ms 300000 \
+  --poll-ms 250 \
+  --json
+```
+
+Or let the daemon wait and spawn the next worker itself:
+
+```bash
+Packet28 daemon task launch-agent \
+  --root . \
+  --task-id task-auth-broker \
+  --wait-for-handoff \
+  --json \
+  -- codex exec "continue the task"
+```
+
+### Reading Bootstrap Context in an Agent
 
 ```python
 import json
 import os
 
-# Read the preflight payload injected by packet28-agent
-preflight_path = os.environ.get("PACKET28_PREFLIGHT_PATH")
-if preflight_path:
-    with open(preflight_path) as f:
-        preflight = json.load(f)
+# Read the broker bootstrap payload injected by packet28-agent.
+bootstrap_path = os.environ.get("PACKET28_BOOTSTRAP_PATH")
+bootstrap_mode = os.environ.get("PACKET28_BOOTSTRAP_MODE", "handoff")
+if bootstrap_path:
+    with open(bootstrap_path) as f:
+        broker_context = json.load(f)
 
-    for packet in preflight["results"]["packets"]:
-        reducer = packet["reducer"]
-        summary = packet["packet"]["packet"]["summary"]
-        print(f"[{reducer}] {summary}")
+    print(f"bootstrap_mode={bootstrap_mode}")
+    print(f"context_version={broker_context['context_version']}")
+    print(broker_context["brief"])
 
-    for hit in preflight["results"]["recall"]["hits"]:
-        print(f"recall: score={hit['score']:.3f} {hit['summary']}")
+    latest_intention = broker_context.get("latest_intention")
+    if latest_intention:
+        print(f"resume: {latest_intention['text']}")
 ```
 
 ### Daemon Task Workflow
@@ -364,15 +366,6 @@ jobs:
       - name: Build Packet28
         run: cargo build --release -p suite-cli -p packet28d
 
-      - name: Run preflight
-        id: preflight
-        run: |
-          OUT=$(./target/release/Packet28 preflight \
-            --task "review PR changes" \
-            --json)
-          echo "$OUT" > preflight.json
-          echo "est_tokens=$(jq -r '.totals.est_tokens' preflight.json)" >> "$GITHUB_OUTPUT"
-
       - name: Run diff gate
         id: diff
         run: |
@@ -408,9 +401,9 @@ When a command fails in machine mode, it emits a structured error:
 ```json
 {
   "schema_version": "suite.error.v1",
-  "command": "Packet28 preflight",
-  "target": "preflight",
-  "message": "No coverage input found",
+  "command": "Packet28 diff analyze",
+  "target": "diff analyze",
+  "message": "No coverage input found for diff gate",
   "causes": [],
   "retry_hint": null
 }

@@ -17,17 +17,17 @@ This costs 10-20 tool calls and 5-50K tokens of raw content before the agent sta
 ## The Solution
 
 ```bash
-Packet28 preflight --task "fix coverage regression in AuthService" --json
+Packet28 mcp serve --root .
 ```
 
-Packet28 classifies the task, selects the right reducers (cover, diff, map, recall), runs them, and returns one bounded JSON payload with pre-analyzed results:
+Packet28 keeps the live turn cheap and moves thicker memory assembly out of the worker loop:
 
-- Coverage gate status with percentages and violations (~800 tokens)
-- Diff analysis with changed files and coverage impact (~1200 tokens)
-- Repo map focused on AuthService with ranked files and symbols (~2000 tokens)
-- Recall hits from prior related work (~600 tokens)
+- Slim reducers such as `packet28.search` and `packet28.read_regions` return compact previews plus artifact ids
+- The daemon persists reducer packets and explicit state writes like intention, decisions, and checkpoints
+- `packet28.prepare_handoff` assembles a denoised handoff packet only at checkpoint boundaries
+- The daemon or wrapper relaunches a fresh worker from that handoff packet instead of expanding the current session forever
 
-Total: ~4600 tokens, 0 tool calls, under 150ms. The agent starts working immediately with structured, relevant context.
+This keeps Packet28 useful as both a context broker and a reducer layer: small in-turn packets, explicit persistence, and compressed cross-turn memory.
 
 ## Architecture
 
@@ -36,7 +36,7 @@ Packet28 is a Rust workspace of 24 crates organized into four layers:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Agent Surface                            │
-│  packet28-agent wrapper · agent-prompt generator · preflight    │
+│  packet28-agent wrapper · agent-prompt generator · MCP surface  │
 ├─────────────────────────────────────────────────────────────────┤
 │                     CLI + Daemon Layer                          │
 │  Packet28 CLI · packet28d daemon · task/watch/stream protocol   │
@@ -286,14 +286,13 @@ Packet28 context recall       BM25 + structured recall query
 Packet28 guard validate       Validate policy config
 Packet28 guard check          Evaluate packet against policy
 Packet28 packet fetch         Retrieve persisted artifact by handle
-Packet28 preflight            Bounded agent context for a task
 Packet28 agent-prompt         Generate agent instruction fragments
 Packet28 mcp serve|proxy      Expose Packet28 as an MCP server or proxy upstream MCP servers
 Packet28 daemon               Daemon lifecycle and task management
 Packet28 setup                Configure Claude/Cursor/Codex integration files
 ```
 
-Reducer, packet, preflight, and context commands emit `suite.packet.v1` JSON wrappers. Three output profiles:
+Reducer, packet, and context commands emit `suite.packet.v1` JSON wrappers. Three output profiles:
 
 - `--json` or `--json=compact`: Bounded compact payload
 - `--json=full`: Complete payload with all fields
@@ -365,7 +364,7 @@ It updates project-local MCP config where supported (`.mcp.json`, `.cursor/mcp.j
 
 Packet28's MCP surface includes:
 
-- Tools for broker context, search, region reads, planning, and state writes
+- Tools for slim reducer search, region reads, state writes, handoff assembly, and stored artifact fetches
 - Prompt entry points such as `packet28.start_task`, `packet28.continue_task`, and `packet28.summarize_current_context`
 - Task resources plus ergonomic current-task aliases like `packet28://current/task` and `packet28://current/brief`
 
@@ -377,9 +376,9 @@ Packet28 agent-prompt --format agents    # AGENTS.md fragment
 Packet28 agent-prompt --format cursor    # .cursorrules fragment
 ```
 
-Output tells the agent how to use Packet28's broker and bounded context flow before broad file reads, while still falling back to direct reads for trivial edits or broker failures.
+Output tells the agent how to use Packet28's slim reducer loop and checkpointed handoff flow before broad file reads, while still falling back to direct reads for trivial edits or broker failures.
 
-**`packet28-agent`** is a wrapper binary that fetches broker context automatically before delegating to an agent runtime:
+**`packet28-agent`** is a wrapper binary that bootstraps a delegated agent runtime from a checkpointed handoff:
 
 ```bash
 packet28-agent \
@@ -389,50 +388,37 @@ packet28-agent \
 
 The wrapper:
 1. Resolves a stable task ID from `--task`
-2. Fetches bounded broker context and persists it to `.packet28/agent/latest-preflight.json`
-3. Exports `PACKET28_*` environment variables for the brief, state snapshot, broker tools, MCP command, and repo root
-4. Executes the delegated command, propagating its exit code
+2. Waits for or fetches a checkpointed handoff packet
+3. Persists it to `.packet28/agent/latest-bootstrap.json`
+4. Exports `PACKET28_*` environment variables for the bootstrap packet, state snapshot, broker tools, MCP command, and repo root
+5. Executes the delegated command, propagating its exit code
 
-#### Preflight
+#### Handoff Flow
 
-Preflight is the primary agent entry point. It maps a natural language task description to the right reducers, runs them, and returns one bounded payload.
+The reducer-plus-handoff loop is the primary agent entry point.
 
 ```mermaid
 flowchart LR
-  TASK["Natural language task"] --> CLASSIFY["Classify tags\n(coverage, diff, build,\nstack, test)"]
-  CLASSIFY --> SELECT["Select reducers\nby tag + availability\n+ budget"]
-  SELECT --> ANCHOR["Extract anchors\n(paths, symbols, terms)\nfrom task text"]
-
-  ANCHOR --> COVER["cover check"]
-  ANCHOR --> DIFF["diff analyze"]
-  ANCHOR --> MAP["map repo\n--focus-path/symbol"]
-  ANCHOR --> STACK["stack slice"]
-  ANCHOR --> BUILD["build reduce"]
-  ANCHOR --> IMPACT["test impact"]
-  ANCHOR --> RECALL["BM25 recall\nquery from task + anchors"]
-
-  COVER & DIFF & MAP & STACK & BUILD & IMPACT & RECALL --> RESULT["suite.preflight.v1\nselection + packets + recall + totals"]
+  WORKER["Worker agent turn"] --> REDUCERS["Slim reducers\nsearch/read/tool packets"]
+  REDUCERS --> STATE["write_state\nintention + decisions + checkpoints"]
+  STATE --> HANDOFF["prepare_handoff\ncompressed context packet"]
+  HANDOFF --> RELAUNCH["daemon/wrapper\nfresh worker relaunch"]
+  RELAUNCH --> WORKER
 ```
 
-Heuristic selection:
+Operationally:
 
-| Task mentions | Reducers selected |
-| --- | --- |
-| coverage, jacoco, lcov, gate | cover + diff + map + recall |
-| diff, change, regression, review, pr | diff + map + recall |
-| build, compile, lint, warning, error | build + diff + recall |
-| stack, trace, exception, crash, panic | stack + map + recall |
-| test, impact, flaky | impact + diff + recall |
-| (none of the above) | diff + map + recall |
-
-Reducers are selected in execution order (cover → diff → map → stack → build → impact → recall) and trimmed when cumulative planned cost exceeds `--budget-tokens` (default 5000). `--include` and `--exclude` flags override heuristics. Recall always runs last and always uses BM25 against the task description + extracted anchors.
+1. The live worker stays on slim reducer packets during the turn.
+2. The worker persists intention and progress via `packet28.write_state`.
+3. Once a checkpoint is reached, the daemon assembles a denoised handoff packet.
+4. A fresh worker resumes from that handoff packet instead of growing the original session indefinitely.
 
 ## Binaries
 
 | Binary | Package | Purpose |
 | --- | --- | --- |
 | `Packet28` | `suite-cli` | Umbrella CLI for all domains |
-| `packet28-agent` | `suite-cli` | Wrapper that runs preflight before delegating to an agent |
+| `packet28-agent` | `suite-cli` | Wrapper that relaunches delegated agents from checkpointed handoff packets |
 | `packet28d` | `packet28d` | Local daemon for persistent state and file watching |
 | `covy` | `covy-cli` | Legacy coverage CLI: check, ingest, report, diff, testmap, impact, shard, merge |
 | `diffy` | `diffy-cli` | Diff-focused gate analysis |
@@ -532,7 +518,7 @@ All persistent state lives under `.packet28/` at the workspace root:
 ├── packet-cache-v2.bin          Packet cache with BM25 + ref indexes (bincode)
 ├── artifacts/                   Full packet artifacts for --json=handle
 ├── agent/
-│   └── latest-preflight.json    Last preflight result from packet28-agent
+│   └── latest-bootstrap.json    Last handoff bootstrap from packet28-agent
 └── daemon/
     ├── packet28d.sock           Unix socket
     ├── runtime.json             Daemon PID and metadata
@@ -587,20 +573,12 @@ Prefer Packet28 as an MCP proxy when you want upstream tool usage to become part
 ./target/release/Packet28 mcp proxy --root . --upstream-config .mcp.proxy.json
 ```
 
-Example auto-capture loop:
+Example reducer-plus-handoff loop:
 
-1. Call `packet28.get_context` for a task and inspect the brief.
-2. Call an upstream MCP tool through `Packet28 mcp proxy`, for example a repo search or file reader.
-3. Call `packet28.get_context` again for the same task.
-4. The next brief now includes the proxied tool activity under sections like `Recent Tool Activity`, `Tool Failures`, and `Discovered Scope`.
-
-Run preflight for a task:
-
-```bash
-./target/release/Packet28 preflight \
-  --task "fix coverage regression in AuthService" \
-  --json
-```
+1. Use `packet28.search` and `packet28.read_regions` for cheap steering during the turn.
+2. Call `packet28.write_state` for intention, edits, decisions, and checkpoints.
+3. Call `packet28.prepare_handoff` once a checkpoint is reached.
+4. Relaunch a fresh worker from the handoff packet through `packet28-agent` or `Packet28 daemon task launch-agent`.
 
 Generate agent instructions directly:
 
@@ -608,7 +586,7 @@ Generate agent instructions directly:
 ./target/release/Packet28 agent-prompt --format claude >> CLAUDE.md
 ```
 
-Use the wrapper to launch an agent with broker context:
+Use the wrapper to launch an agent from a checkpointed handoff:
 
 ```bash
 ./target/release/packet28-agent \

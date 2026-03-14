@@ -458,7 +458,10 @@ fn write_agent_file(path: &Path, content: &str) -> Result<bool> {
     // If file exists, check if it already contains Packet28 guidance
     if path.exists() {
         let existing = fs::read_to_string(path)?;
-        if existing.contains("packet28.get_context") || existing.contains("Packet28 mcp serve") {
+        if existing.contains("packet28.search")
+            || existing.contains("packet28.prepare_handoff")
+            || existing.contains("Packet28 mcp serve")
+        {
             return Ok(false); // already has Packet28 instructions
         }
 
