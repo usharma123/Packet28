@@ -52,6 +52,7 @@ use packet28_daemon_core::{
 use serde_json::{json, Value};
 
 mod launch;
+mod broker_handoff;
 mod broker_ops;
 mod broker_context;
 mod broker_limits;
@@ -68,9 +69,10 @@ mod state;
 mod watch;
 
 use crate::broker_context::{
-    broker_decompose, broker_estimate_context, broker_get_context, broker_prepare_handoff,
-    broker_validate_plan, compute_handoff_state, refresh_broker_context_for_task,
+    broker_decompose, broker_estimate_context, broker_get_context, broker_validate_plan,
+    refresh_broker_context_for_task,
 };
+use crate::broker_handoff::{broker_prepare_handoff, compute_handoff_state};
 use crate::commands::{
     run_context_recall, run_context_store_get, run_context_store_list, run_context_store_prune,
     run_context_store_stats, run_cover_check, run_test_map, run_test_shard,
