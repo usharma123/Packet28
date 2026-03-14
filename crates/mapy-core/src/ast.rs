@@ -103,57 +103,65 @@ thread_local! {
 
 fn init_java_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    let language = tree_sitter::Language::new(tree_sitter_java::LANGUAGE);
-    parser.set_language(&language).ok()?;
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .ok()?;
     Some(parser)
 }
 
 fn init_rust_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
-    parser.set_language(&language).ok()?;
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
     Some(parser)
 }
 
 fn init_python_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    let language = tree_sitter::Language::new(tree_sitter_python::LANGUAGE);
-    parser.set_language(&language).ok()?;
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .ok()?;
     Some(parser)
 }
 
 fn init_typescript_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    let language = tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT);
-    parser.set_language(&language).ok()?;
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .ok()?;
     Some(parser)
 }
 
 fn init_tsx_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    let language = tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TSX);
-    parser.set_language(&language).ok()?;
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+        .ok()?;
     Some(parser)
 }
 
 fn init_javascript_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    let language = tree_sitter::Language::new(tree_sitter_javascript::LANGUAGE);
-    parser.set_language(&language).ok()?;
+    parser
+        .set_language(&tree_sitter_javascript::LANGUAGE.into())
+        .ok()?;
     Some(parser)
 }
 
 fn init_go_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    let language = tree_sitter::Language::new(tree_sitter_go::LANGUAGE);
-    parser.set_language(&language).ok()?;
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .ok()?;
     Some(parser)
 }
 
 fn init_cpp_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    let language = tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE);
-    parser.set_language(&language).ok()?;
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
     Some(parser)
 }
 
