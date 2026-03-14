@@ -1,0 +1,76 @@
+name: Hook Benchmark Suite
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/benchmark-hook-suite.yml"
+      - "scripts/benchmark_hook_rewrite.py"
+      - "scripts/benchmark_hook_suite.py"
+      - "crates/packet28-reducer-core/**"
+      - "crates/suite-cli/**"
+      - "crates/packet28d/**"
+      - "crates/packet28-daemon-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/benchmark-hook-suite.yml"
+      - "scripts/benchmark_hook_rewrite.py"
+      - "scripts/benchmark_hook_suite.py"
+      - "crates/packet28-reducer-core/**"
+      - "crates/suite-cli/**"
+      - "crates/packet28d/**"
+      - "crates/packet28-daemon-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build benchmark dependencies
+        run: cargo build -p suite-cli -p packet28d -p packet28-reducer-core
+
+      - name: Run hook benchmark suite
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/benchmark_hook_suite.py \
+            --root "$GITHUB_WORKSPACE" \
+            --gh-repo "${{ github.repository }}" \
+            --artifact-dir "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-hook-suite"
+
+      - name: Validate hook benchmark thresholds
+        run: |
+          python3 scripts/validate_hook_benchmarks.py \
+            "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-hook-suite/summary.json" \
+            --markdown-path "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-hook-suite/validation.md"
+
+      - name: Publish workflow summary
+        run: |
+          cat .packet28/benchmarks/ci-hook-suite/summary.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n' >> "$GITHUB_STEP_SUMMARY"
+          cat .packet28/benchmarks/ci-hook-suite/validation.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload hook benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hook-benchmark-suite
+          path: .packet28/benchmarks/ci-hook-suite

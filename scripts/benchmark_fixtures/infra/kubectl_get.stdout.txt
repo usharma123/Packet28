@@ -1,0 +1,4 @@
+NAME                           READY   STATUS    RESTARTS   AGE
+api-6d4f7d9b58-7h9vk           1/1     Running   0          2d
+worker-79b7fd4c8c-kp8mz        1/1     Running   1          2d
+cron-processor-6bf7fd9f        0/1     Pending   0          4m

@@ -1,0 +1,9 @@
+ok	github.com/acme/core	0.113s
+ok	github.com/acme/util	0.091s
+--- FAIL: TestCreateUser (0.00s)
+    api_test.go:42: expected status 201, got 500
+--- FAIL: TestDeleteUser (0.00s)
+    api_test.go:78: unexpected error: context deadline exceeded
+FAIL
+FAIL	github.com/acme/api	0.222s
+FAIL

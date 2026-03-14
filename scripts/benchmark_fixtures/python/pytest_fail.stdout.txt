@@ -1,0 +1,17 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.2, pytest-8.4.1
+collected 5 items
+
+tests/test_demo.py ....F                                                  [100%]
+
+=================================== FAILURES ===================================
+_______________________________ test_example_fail _______________________________
+
+    def test_example_fail():
+>       assert 2 == 3
+E       assert 2 == 3
+
+tests/test_demo.py:14: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_demo.py::test_example_fail - assert 2 == 3
+========================= 4 passed, 1 failed in 0.42s ==========================
