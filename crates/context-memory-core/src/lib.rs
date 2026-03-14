@@ -10,6 +10,7 @@ mod cache;
 mod normalize;
 mod persist;
 mod recall;
+mod recall_document;
 mod types;
 
 pub(crate) use cache::*;
@@ -18,7 +19,7 @@ pub(crate) use normalize::*;
 pub use normalize::{basename_alias, normalize_context_path};
 #[cfg(test)]
 pub(crate) use persist::*;
-pub(crate) use recall::*;
+pub(crate) use recall_document::*;
 pub use types::*;
 
 const PERSIST_CACHE_VERSION: u32 = 2;
