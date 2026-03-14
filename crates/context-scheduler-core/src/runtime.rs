@@ -133,12 +133,13 @@ pub fn apply_mutations(
 fn validate_request(request: &ScheduleRequest) -> Result<(), ScheduleError> {
     let mut known = HashMap::<String, ()>::new();
     for step in &request.steps {
-        let id = step.id.trim();
-        if id.is_empty() {
+        if step.id.trim().is_empty() {
             return Err(ScheduleError::EmptyStepId);
         }
-        if known.insert(id.to_string(), ()).is_some() {
-            return Err(ScheduleError::DuplicateStepId { id: id.to_string() });
+        if known.insert(step.id.clone(), ()).is_some() {
+            return Err(ScheduleError::DuplicateStepId {
+                id: step.id.clone(),
+            });
         }
     }
 

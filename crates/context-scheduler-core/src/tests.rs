@@ -75,6 +75,22 @@ fn rejects_dependency_cycles() {
 }
 
 #[test]
+fn uses_raw_step_ids_consistently_during_validation_and_sorting() {
+    let result = schedule(ScheduleRequest {
+        steps: vec![step(" a ", &[], 1), step("b", &[" a "], 1)],
+        budget: ScheduleBudget::default(),
+    })
+    .unwrap();
+
+    let ids = result
+        .ordered_steps
+        .iter()
+        .map(|step| step.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![" a ", "b"]);
+}
+
+#[test]
 fn apply_mutations_supports_cancel_replace_and_append() {
     let steps = vec![step("a", &[], 1), step("b", &["a"], 1)];
     let result = apply_mutations(
