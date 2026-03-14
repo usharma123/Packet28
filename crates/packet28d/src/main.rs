@@ -57,6 +57,7 @@ mod broker_context;
 mod broker_limits;
 mod broker_render;
 mod broker_search;
+mod broker_search_plan;
 mod broker_snapshot;
 mod commands;
 mod index;
@@ -77,6 +78,7 @@ use crate::commands::{
 use crate::broker_limits::*;
 use crate::broker_render::*;
 use crate::broker_search::*;
+use crate::broker_search_plan::*;
 use crate::broker_snapshot::*;
 use crate::broker_ops::{broker_task_status, broker_write_state, broker_write_state_batch};
 use crate::index::{
