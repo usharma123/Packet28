@@ -54,8 +54,10 @@ use serde_json::{json, Value};
 mod launch;
 mod broker_ops;
 mod broker_context;
+mod broker_limits;
 mod broker_render;
 mod broker_search;
+mod broker_snapshot;
 mod commands;
 mod index;
 mod planning;
@@ -72,8 +74,10 @@ use crate::commands::{
     run_context_recall, run_context_store_get, run_context_store_list, run_context_store_prune,
     run_context_store_stats, run_cover_check, run_test_map, run_test_shard,
 };
+use crate::broker_limits::*;
 use crate::broker_render::*;
 use crate::broker_search::*;
+use crate::broker_snapshot::*;
 use crate::broker_ops::{broker_task_status, broker_write_state, broker_write_state_batch};
 use crate::index::{
     build_index_status, daemon_index_clear, daemon_index_rebuild, daemon_index_status,
