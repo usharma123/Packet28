@@ -847,8 +847,11 @@ mod tests {
     fn basename_aliases_index_each_path_independently() {
         let mut cache = PacketCache::new();
         let mut hooks = NoopDeltaReuseHooks;
-        let lookup =
-            cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"paths"}), &mut hooks);
+        let lookup = cache.lookup_with_hooks(
+            "demo.reducer",
+            &serde_json::json!({"task":"paths"}),
+            &mut hooks,
+        );
         cache.put_with_hooks(
             "demo.reducer",
             &lookup,
@@ -880,8 +883,11 @@ mod tests {
         let mut cache = PacketCache::new();
         let mut hooks = NoopDeltaReuseHooks;
 
-        let first_lookup =
-            cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"one"}), &mut hooks);
+        let first_lookup = cache.lookup_with_hooks(
+            "demo.reducer",
+            &serde_json::json!({"task":"one"}),
+            &mut hooks,
+        );
         let first = cache.put_with_hooks(
             "demo.reducer",
             &first_lookup,
@@ -893,8 +899,11 @@ mod tests {
             &mut hooks,
         );
 
-        let second_lookup =
-            cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"two"}), &mut hooks);
+        let second_lookup = cache.lookup_with_hooks(
+            "demo.reducer",
+            &serde_json::json!({"task":"two"}),
+            &mut hooks,
+        );
         cache.put_with_hooks(
             "demo.reducer",
             &second_lookup,
@@ -906,7 +915,10 @@ mod tests {
             &mut hooks,
         );
 
-        cache.remove_where(|entry, _| entry.cache_key == first.cache_key, EvictionReason::ManualPrune);
+        cache.remove_where(
+            |entry, _| entry.cache_key == first.cache_key,
+            EvictionReason::ManualPrune,
+        );
 
         assert_eq!(
             cache.basename_alias_index.get("shared.rs"),

@@ -419,8 +419,7 @@ impl PacketCache {
                     };
                 }
             }
-            score += (1.0_f64 / (1.0_f64 + (age_secs as f64 / 86_400.0_f64))).min(1.0_f64)
-                * 0.25;
+            score += (1.0_f64 / (1.0_f64 + (age_secs as f64 / 86_400.0_f64))).min(1.0_f64) * 0.25;
 
             if score <= 0.0
                 || (query_tokens.is_empty()
@@ -559,7 +558,8 @@ mod tests {
             &mut hooks,
         );
 
-        let matches = cache.related_entries(Some("missing-task"), &["src/main.rs".to_string()], &[], &[]);
+        let matches =
+            cache.related_entries(Some("missing-task"), &["src/main.rs".to_string()], &[], &[]);
 
         assert!(matches.is_empty());
     }
@@ -568,7 +568,11 @@ mod tests {
     fn packet_type_only_queries_can_return_hits() {
         let mut cache = PacketCache::new();
         let mut hooks = NoopDeltaReuseHooks;
-        let lookup = cache.lookup_with_hooks("demo.reducer", &serde_json::json!({"task":"pt"}), &mut hooks);
+        let lookup = cache.lookup_with_hooks(
+            "demo.reducer",
+            &serde_json::json!({"task":"pt"}),
+            &mut hooks,
+        );
         cache.put_with_hooks(
             "demo.reducer",
             &lookup,

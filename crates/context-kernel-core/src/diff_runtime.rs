@@ -96,7 +96,8 @@ fn format_pct(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
-pub(crate) fn default_diff_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineIngestAdapters {
+pub(crate) fn default_diff_pipeline_ingest_adapters() -> diffy_core::pipeline::PipelineIngestAdapters
+{
     diffy_core::pipeline::PipelineIngestAdapters {
         ingest_coverage_auto,
         ingest_coverage_with_format,

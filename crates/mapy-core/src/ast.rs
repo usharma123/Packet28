@@ -151,9 +151,7 @@ fn init_javascript_parser() -> Option<Parser> {
 
 fn init_go_parser() -> Option<Parser> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .ok()?;
+    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
     Some(parser)
 }
 

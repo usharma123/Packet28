@@ -165,12 +165,10 @@ policy:
     assert!(result.errors.iter().any(|e| {
         e.contains("policy.reducers.allowlist conflicts with policy.allowed_reducers")
     }));
-    assert!(
-        result
-            .errors
-            .iter()
-            .any(|e| e.contains("policy.token_budget.cap conflicts with policy.budgets.token_cap"))
-    );
+    assert!(result
+        .errors
+        .iter()
+        .any(|e| e.contains("policy.token_budget.cap conflicts with policy.budgets.token_cap")));
     assert!(result.errors.iter().any(|e| {
         e.contains("policy.runtime_budget.cap_ms conflicts with policy.budgets.runtime_ms_cap")
     }));

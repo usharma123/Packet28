@@ -16,25 +16,25 @@ use context_memory_core::{
 
 pub use context_memory_core::PersistConfig;
 
-mod kernel_types;
-mod kernel_runtime;
-mod kernel_registry;
-mod diff_runtime;
 mod agenty_runtime;
 mod contextq_runtime;
-mod tool_reducers_runtime;
 mod correlation_runtime;
+mod diff_runtime;
 mod governance_runtime;
+mod kernel_registry;
+mod kernel_runtime;
+mod kernel_types;
 mod reactive_runtime;
+mod tool_reducers_runtime;
 
-pub use diff_runtime::*;
-pub use kernel_types::*;
-pub use kernel_runtime::*;
-pub use kernel_registry::*;
 pub(crate) use agenty_runtime::*;
-pub(crate) use correlation_runtime::*;
 pub(crate) use contextq_runtime::*;
+pub(crate) use correlation_runtime::*;
+pub use diff_runtime::*;
 pub(crate) use governance_runtime::*;
+pub use kernel_registry::*;
+pub use kernel_runtime::*;
+pub use kernel_types::*;
 pub(crate) use reactive_runtime::*;
 pub(crate) use tool_reducers_runtime::*;
 

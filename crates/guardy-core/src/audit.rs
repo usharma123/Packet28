@@ -80,7 +80,10 @@ impl GuardPacket {
                 paths.insert(normalize_path(file));
             }
         }
-        for ToolInvocation { paths: tool_paths, .. } in &self.tool_invocations {
+        for ToolInvocation {
+            paths: tool_paths, ..
+        } in &self.tool_invocations
+        {
             for path in tool_paths {
                 if let Some(path) = non_empty(Some(path.as_str())) {
                     paths.insert(normalize_path(path));
