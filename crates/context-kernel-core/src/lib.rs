@@ -16,6 +16,7 @@ use context_memory_core::{
 
 pub use context_memory_core::PersistConfig;
 
+mod kernel_types;
 mod kernel_runtime;
 mod diff_runtime;
 mod agenty_runtime;
@@ -26,6 +27,7 @@ mod governance_runtime;
 mod reactive_runtime;
 
 pub use diff_runtime::*;
+pub use kernel_types::*;
 pub use kernel_runtime::*;
 pub(crate) use agenty_runtime::*;
 pub(crate) use correlation_runtime::*;
