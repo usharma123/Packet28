@@ -24,6 +24,8 @@ mod native_tools;
 mod prompt_resource;
 #[path = "cmd_mcp_proxy.rs"]
 mod proxy;
+#[path = "cmd_mcp_proxy_upstream.rs"]
+mod proxy_upstream;
 #[path = "cmd_mcp_support.rs"]
 mod support;
 #[path = "cmd_mcp_transport.rs"]
