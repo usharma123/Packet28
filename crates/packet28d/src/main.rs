@@ -51,18 +51,19 @@ use packet28_daemon_core::{
 };
 use serde_json::{json, Value};
 
-mod launch;
-mod broker_handoff;
-mod broker_ops;
 mod broker_context;
+mod broker_handoff;
 mod broker_limits;
+mod broker_ops;
 mod broker_render;
 mod broker_search;
 mod broker_search_plan;
 mod broker_snapshot;
 mod broker_support;
 mod commands;
+mod hooks;
 mod index;
+mod launch;
 mod planning;
 mod runtime_files;
 mod server;
@@ -74,17 +75,18 @@ use crate::broker_context::{
     refresh_broker_context_for_task,
 };
 use crate::broker_handoff::{broker_prepare_handoff, compute_handoff_state};
-use crate::commands::{
-    run_context_recall, run_context_store_get, run_context_store_list, run_context_store_prune,
-    run_context_store_stats, run_cover_check, run_test_map, run_test_shard,
-};
 use crate::broker_limits::*;
+use crate::broker_ops::{broker_task_status, broker_write_state, broker_write_state_batch};
 use crate::broker_render::*;
 use crate::broker_search::*;
 use crate::broker_search_plan::*;
 use crate::broker_snapshot::*;
 use crate::broker_support::*;
-use crate::broker_ops::{broker_task_status, broker_write_state, broker_write_state_batch};
+use crate::commands::{
+    run_context_recall, run_context_store_get, run_context_store_list, run_context_store_prune,
+    run_context_store_stats, run_cover_check, run_test_map, run_test_shard,
+};
+use crate::hooks::hook_ingest;
 use crate::index::{
     build_index_status, daemon_index_clear, daemon_index_rebuild, daemon_index_status,
     enqueue_full_index_rebuild, enqueue_incremental_index_paths, spawn_index_worker,
@@ -101,8 +103,8 @@ use crate::state::{
     TaskSequenceObserver, WatchEventMsg,
 };
 use crate::watch::{
-    cancel_task, register_task_and_watches, remove_watch, restore_watchers,
-    run_sequence_for_task, spawn_watch_processor,
+    cancel_task, register_task_and_watches, remove_watch, restore_watchers, run_sequence_for_task,
+    spawn_watch_processor,
 };
 
 #[derive(Parser)]
@@ -229,9 +231,6 @@ fn serve(root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-
-
-
 fn persist_state(state: &DaemonState) -> Result<()> {
     save_watch_registry(&state.root, &state.watches)?;
     save_task_registry(&state.root, &state.tasks)?;
@@ -311,7 +310,6 @@ fn resolve_root(path: &Path) -> PathBuf {
 fn lock_err<T>(err: std::sync::PoisonError<T>) -> anyhow::Error {
     anyhow!("daemon state lock poisoned: {err}")
 }
-
 
 #[cfg(test)]
 mod tests;

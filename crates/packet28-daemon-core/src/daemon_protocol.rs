@@ -84,6 +84,9 @@ pub enum DaemonRequest {
     BrokerTaskStatus {
         request: BrokerTaskStatusRequest,
     },
+    HookIngest {
+        request: HookIngestRequest,
+    },
     DaemonIndexStatus {
         request: DaemonIndexStatusRequest,
     },
@@ -185,6 +188,9 @@ pub enum DaemonResponse {
     },
     BrokerTaskStatus {
         response: BrokerTaskStatusResponse,
+    },
+    HookIngest {
+        response: HookIngestResponse,
     },
     DaemonIndexStatus {
         response: DaemonIndexStatusResponse,

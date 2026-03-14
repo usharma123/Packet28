@@ -3,7 +3,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::search::{format_region, infer_symbols_from_lines, normalize_capture_path, parse_region_for_path};
+use crate::search::{
+    format_region, infer_symbols_from_lines, normalize_capture_path, parse_region_for_path,
+};
 use crate::types::{ReadLine, ReadRegionsRequest, ReadRegionsResult};
 
 pub fn read_regions(root: &Path, request: &ReadRegionsRequest) -> Result<ReadRegionsResult> {

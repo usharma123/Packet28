@@ -44,8 +44,9 @@ fn compact_preview_mentions_groups() {
 #[test]
 fn parse_grep_output_line_accepts_grep_h_output_for_single_file() {
     let root = Path::new("/tmp/example");
-    let parsed = parse_grep_output_line(root, "src/lib.rs:41:pub struct Alpha;", Some("src/lib.rs"))
-        .expect("single-file grep -H output should parse");
+    let parsed =
+        parse_grep_output_line(root, "src/lib.rs:41:pub struct Alpha;", Some("src/lib.rs"))
+            .expect("single-file grep -H output should parse");
     assert_eq!(parsed.0, "src/lib.rs");
     assert_eq!(parsed.1, 41);
     assert_eq!(parsed.2, "pub struct Alpha;");

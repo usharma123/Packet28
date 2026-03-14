@@ -446,7 +446,18 @@ pub(crate) fn broker_task_status(
         .tasks
         .get(&request.task_id)
         .cloned();
-    let (handoff_ready, handoff_reason) = compute_handoff_state(task.as_ref(), &snapshot);
+    let (handoff_needed, handoff_reason) = compute_handoff_state(task.as_ref(), &snapshot);
+    let handoff_available = task.as_ref().is_some_and(|task| {
+        task.latest_handoff_artifact_id.is_some() && task.latest_context_version.is_some()
+    });
+    let handoff_ready = handoff_needed || handoff_available;
+    let handoff_reason = if handoff_needed {
+        handoff_reason
+    } else if handoff_available {
+        "Latest handoff artifact is available for resume.".to_string()
+    } else {
+        handoff_reason
+    };
     Ok(BrokerTaskStatusResponse {
         latest_context_version: task
             .as_ref()

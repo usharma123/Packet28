@@ -13,7 +13,6 @@ fn packet_source_kind(packet: &suite_packet_core::ContextManagePacketRef) -> Bro
     }
 }
 
-
 pub(crate) fn load_task_record(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,

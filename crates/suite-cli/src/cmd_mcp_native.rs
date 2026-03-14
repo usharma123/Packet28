@@ -1,4 +1,8 @@
 use super::*;
+use crate::cmd_mcp::support::{
+    load_tool_result_artifact, next_task_invocation, store_result_artifact,
+    write_auto_capture_state_batch_via_session,
+};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +59,18 @@ pub(crate) struct Packet28PrepareHandoffArgs {
     pub(crate) task_id: String,
     pub(crate) query: Option<String>,
     pub(crate) response_mode: Option<BrokerResponseMode>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct Packet28WriteIntentionArgs {
+    pub(crate) task_id: String,
+    pub(crate) text: String,
+    pub(crate) note: Option<String>,
+    pub(crate) step_id: Option<String>,
+    pub(crate) question_id: Option<String>,
+    pub(crate) paths: Vec<String>,
+    pub(crate) symbols: Vec<String>,
 }
 
 fn json_array_strings(value: &Value, key: &str) -> Vec<String> {
@@ -392,6 +408,31 @@ pub(crate) fn handle_packet28_prepare_handoff(
             task_id: args.task_id,
             query: args.query,
             response_mode: args.response_mode,
+        },
+    )?;
+    Ok(serde_json::to_value(response)?)
+}
+
+pub(crate) fn handle_packet28_write_intention(
+    root: &Path,
+    args: Packet28WriteIntentionArgs,
+) -> Result<Value> {
+    let text = args.text.trim();
+    if text.is_empty() {
+        return Err(anyhow!("packet28.write_intention requires text"));
+    }
+    let response = crate::broker_client::write_intention(
+        root,
+        BrokerWriteStateRequest {
+            task_id: args.task_id,
+            text: Some(text.to_string()),
+            note: args.note,
+            step_id: args.step_id,
+            question_id: args.question_id,
+            paths: args.paths,
+            symbols: args.symbols,
+            refresh_context: Some(false),
+            ..BrokerWriteStateRequest::default()
         },
     )?;
     Ok(serde_json::to_value(response)?)

@@ -6,9 +6,9 @@ use serde_json::{json, Value};
 
 use crate::{
     cmd_agent_prompt, cmd_build, cmd_common, cmd_context, cmd_cover, cmd_daemon, cmd_diff,
-    cmd_doctor, cmd_guard, cmd_impact, cmd_map, cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy,
-    cmd_setup, cmd_shard, cmd_stack, BuildCommands, Cli, Commands, ContextCommands, CoverCommands,
-    DiffCommands, GuardCommands, MapCommands, StackCommands, TestCommands,
+    cmd_doctor, cmd_guard, cmd_hook, cmd_impact, cmd_map, cmd_map_repo, cmd_mcp, cmd_packet,
+    cmd_proxy, cmd_setup, cmd_shard, cmd_stack, BuildCommands, Cli, Commands, ContextCommands,
+    CoverCommands, DiffCommands, GuardCommands, MapCommands, StackCommands, TestCommands,
 };
 
 pub fn main_entry() {
@@ -95,6 +95,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         },
         Commands::AgentPrompt(args) => cmd_agent_prompt::run(args),
         Commands::Mcp(args) => cmd_mcp::run(args),
+        Commands::Hook(args) => cmd_hook::run(args),
         Commands::Daemon(daemon) => cmd_daemon::run(daemon),
         Commands::Doctor(args) => cmd_doctor::run(args),
         Commands::Setup(args) => cmd_setup::run(args),
@@ -324,20 +325,19 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
             }
             _ => None,
         },
-        Commands::Packet(packet) => match &packet.command {
-            cmd_packet::PacketCommands::Fetch(args) if args.json.is_some() => {
-                Some(machine_error(
-                    "Packet28 packet fetch",
-                    args.pretty,
-                    "packet.fetch",
-                ))
+        Commands::Packet(packet) => {
+            match &packet.command {
+                cmd_packet::PacketCommands::Fetch(args) if args.json.is_some() => Some(
+                    machine_error("Packet28 packet fetch", args.pretty, "packet.fetch"),
+                ),
+                _ => None,
             }
-            _ => None,
-        },
+        }
         Commands::Daemon(_)
         | Commands::Guard(_)
         | Commands::AgentPrompt(_)
         | Commands::Mcp(_)
+        | Commands::Hook(_)
         | Commands::Setup(_)
         | Commands::Doctor(_) => None,
     }

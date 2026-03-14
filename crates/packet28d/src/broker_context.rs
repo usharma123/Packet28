@@ -333,7 +333,12 @@ pub(crate) fn broker_get_context(
     let persist_artifacts = should_persist_broker_artifacts(&request);
     if persist_artifacts {
         response.artifact_id = Some(response.context_version.clone());
-        write_broker_artifacts(&state, &request.task_id, request.since_version.as_deref(), &response)?;
+        write_broker_artifacts(
+            &state,
+            &request.task_id,
+            request.since_version.as_deref(),
+            &response,
+        )?;
     }
     if matches!(
         broker_request_response_mode(&request),

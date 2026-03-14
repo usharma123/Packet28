@@ -14,17 +14,19 @@ use context_memory_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-mod paths;
 mod broker_types;
 mod context_store_types;
 mod daemon_protocol;
+mod hook_types;
 mod index_types;
+mod paths;
 mod storage;
 mod task_types;
 
 pub use broker_types::*;
 pub use context_store_types::*;
 pub use daemon_protocol::*;
+pub use hook_types::*;
 pub use index_types::*;
 pub use paths::*;
 pub use storage::*;
@@ -43,6 +45,8 @@ pub const TASK_ARTIFACTS_DIR_NAME: &str = "task";
 pub const TASK_BRIEF_MARKDOWN_FILE_NAME: &str = "brief.md";
 pub const TASK_BRIEF_JSON_FILE_NAME: &str = "brief.json";
 pub const TASK_STATE_JSON_FILE_NAME: &str = "state.json";
+pub const HOOK_RUNTIME_CONFIG_FILE_NAME: &str = "hook-runtime-v1.json";
+pub const AGENT_ACTIVE_TASK_FILE_NAME: &str = "active-task.json";
 pub const INDEX_DIR_NAME: &str = ".packet28/index";
 pub const INDEX_MANIFEST_FILE_NAME: &str = "manifest.json";
 pub const INDEX_SNAPSHOT_FILE_NAME: &str = "repo-index-v1.bin";

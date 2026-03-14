@@ -301,6 +301,10 @@ fn handle_request(
             let response = broker_task_status(state, request)?;
             Ok(DaemonResponse::BrokerTaskStatus { response })
         }
+        DaemonRequest::HookIngest { request } => {
+            let response = hook_ingest(state, request)?;
+            Ok(DaemonResponse::HookIngest { response })
+        }
         DaemonRequest::DaemonIndexStatus { request: _ } => {
             let response = daemon_index_status(state)?;
             Ok(DaemonResponse::DaemonIndexStatus { response })

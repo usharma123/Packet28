@@ -2,8 +2,8 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::{
     cmd_agent_prompt, cmd_build, cmd_context, cmd_cover, cmd_daemon, cmd_diff, cmd_doctor,
-    cmd_guard, cmd_impact, cmd_map, cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy, cmd_setup,
-    cmd_shard, cmd_stack,
+    cmd_guard, cmd_hook, cmd_impact, cmd_map, cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy,
+    cmd_setup, cmd_shard, cmd_stack,
 };
 
 #[derive(Parser)]
@@ -60,6 +60,8 @@ pub enum Commands {
     AgentPrompt(cmd_agent_prompt::AgentPromptArgs),
     /// Run Packet28 as an MCP stdio server
     Mcp(cmd_mcp::McpArgs),
+    /// Run Packet28-managed Claude hook handlers
+    Hook(cmd_hook::HookArgs),
     /// Daemon lifecycle and task commands
     Daemon(cmd_daemon::DaemonArgs),
     /// Verify Packet28 daemon, index, MCP, notifications, and broker round-trip health

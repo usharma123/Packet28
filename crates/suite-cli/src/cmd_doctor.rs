@@ -145,6 +145,32 @@ impl Drop for McpHarness {
     }
 }
 
+fn run_claude_hook(root: &Path, payload: &Value) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
+    let mut child = Command::new(exe)
+        .current_dir(root)
+        .arg("hook")
+        .arg("claude")
+        .arg("--root")
+        .arg(root.to_str().unwrap_or("."))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start Packet28 Claude hook for doctor")?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(serde_json::to_string(payload)?.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() && status.code() != Some(2) {
+        return Err(anyhow!(
+            "claude hook exited with status {:?}",
+            status.code()
+        ));
+    }
+    Ok(())
+}
+
 pub fn run(args: DoctorArgs) -> Result<i32> {
     let root = crate::cmd_daemon::resolve_root_arg(&args.root);
     let report = build_report(&root);
@@ -229,38 +255,48 @@ fn check_daemon(root: &Path) -> DoctorCheck {
 }
 
 fn check_index(root: &Path) -> DoctorCheck {
-    match crate::cmd_daemon::send_request(
-        root,
-        &DaemonRequest::DaemonIndexStatus {
-            request: DaemonIndexStatusRequest {
-                root: root.display().to_string(),
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match crate::cmd_daemon::send_request(
+            root,
+            &DaemonRequest::DaemonIndexStatus {
+                request: DaemonIndexStatusRequest {
+                    root: root.display().to_string(),
+                },
             },
-        },
-    ) {
-        Ok(DaemonResponse::DaemonIndexStatus { response }) => {
-            let ok = response.ready && response.manifest.status == "ready";
-            DoctorCheck {
-                name: "index",
-                ok,
-                required: true,
-                detail: format!(
-                    "ready={} status={} generation={}",
-                    response.ready, response.manifest.status, response.manifest.generation
-                ),
+        ) {
+            Ok(DaemonResponse::DaemonIndexStatus { response }) => {
+                let ok = response.ready && response.manifest.status == "ready";
+                if ok || std::time::Instant::now() >= deadline {
+                    return DoctorCheck {
+                        name: "index",
+                        ok,
+                        required: true,
+                        detail: format!(
+                            "ready={} status={} generation={}",
+                            response.ready, response.manifest.status, response.manifest.generation
+                        ),
+                    };
+                }
+            }
+            Ok(other) => {
+                return DoctorCheck {
+                    name: "index",
+                    ok: false,
+                    required: true,
+                    detail: format!("unexpected index status response: {other:?}"),
+                };
+            }
+            Err(err) => {
+                return DoctorCheck {
+                    name: "index",
+                    ok: false,
+                    required: true,
+                    detail: err.to_string(),
+                };
             }
         }
-        Ok(other) => DoctorCheck {
-            name: "index",
-            ok: false,
-            required: true,
-            detail: format!("unexpected index status response: {other:?}"),
-        },
-        Err(err) => DoctorCheck {
-            name: "index",
-            ok: false,
-            required: true,
-            detail: err.to_string(),
-        },
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -412,10 +448,9 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
         for required_tool in [
-            "packet28.search",
-            "packet28.read_regions",
-            "packet28.write_state",
+            "packet28.write_intention",
             "packet28.prepare_handoff",
+            "packet28.fetch_context",
         ] {
             if !tool_names.iter().any(|name| *name == required_tool) {
                 return Err(anyhow!("{required_tool} missing from tools/list"));
@@ -436,64 +471,35 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             "id":3,
             "method":"tools/call",
             "params":{
-                "name":"packet28.search",
+                "name":"packet28.write_intention",
                 "arguments":{
                     "task_id":task_id,
-                    "query":"Alpha",
-                    "paths":["src"],
-                    "response_mode":"slim"
+                    "text":"Doctor handoff probe",
+                    "step_id":"hooks-first"
                 }
             }
         }))?;
-        let search = harness.read_response(3, timeout)?;
-        let artifact_id = search["result"]["structuredContent"]["artifact_id"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let intention = harness.read_response(3, timeout)?;
+        if intention["result"]["structuredContent"]["accepted"] != json!(true) {
+            return Err(anyhow!("write_intention was not accepted"));
+        }
+        run_claude_hook(
+            root,
+            &json!({
+                "hook_event_name":"PostToolUse",
+                "session_id":"doctor-session",
+                "cwd": root.display().to_string(),
+                "tool_name":"Bash",
+                "tool_input":{"command":"git status --short src/lib.rs"},
+                "tool_response":{"stdout":" M src/lib.rs\n","stderr":"","is_error":false}
+            }),
+        )?;
         reducer_round_trip = DoctorCheck {
             name: "reducer_round_trip",
             ok: true,
             required: true,
-            detail: format!("task_id={task_id} reducer artifact_id={artifact_id}"),
+            detail: format!("task_id={task_id} hook reducer ingest ok"),
         };
-
-        harness.send(&json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":task_id,
-                    "op":"intention",
-                    "text":"Doctor handoff probe",
-                    "step_id":"handoff"
-                }
-            }
-        }))?;
-        let intention = harness.read_response(4, timeout)?;
-        if intention["result"]["structuredContent"]["accepted"] != json!(true) {
-            return Err(anyhow!("intention write_state was not accepted"));
-        }
-
-        harness.send(&json!({
-            "jsonrpc":"2.0",
-            "id":5,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":task_id,
-                    "op":"checkpoint_save",
-                    "checkpoint_id":"doctor-smoke-checkpoint",
-                    "note":"doctor notification probe"
-                }
-            }
-        }))?;
-        let write = harness.read_response(5, timeout)?;
-        if write["result"]["structuredContent"]["accepted"] != json!(true) {
-            return Err(anyhow!("write_state was not accepted"));
-        }
 
         push_notifications =
             match harness.read_notification("notifications/packet28.context_updated", timeout) {
@@ -521,7 +527,26 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                 },
             };
 
-        harness.send(&json!({
+        drop(harness);
+        let mut handoff_harness = McpHarness::start(root)?;
+        handoff_harness.send(&json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"packet28-doctor-handoff","version":"1"}}
+        }))?;
+        let _ = handoff_harness.read_response(1, timeout)?;
+
+        run_claude_hook(
+            root,
+            &json!({
+                "hook_event_name":"Stop",
+                "task_id":task_id,
+                "session_id":"doctor-session",
+                "cwd": root.display().to_string()
+            }),
+        )?;
+        handoff_harness.send(&json!({
             "jsonrpc":"2.0",
             "id":6,
             "method":"tools/call",
@@ -533,7 +558,7 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                 }
             }
         }))?;
-        let handoff = harness.read_response(6, timeout)?;
+        let handoff = handoff_harness.read_response(6, timeout)?;
         let handoff_task_id = handoff["result"]["structuredContent"]["task_id"]
             .as_str()
             .unwrap_or("unknown");

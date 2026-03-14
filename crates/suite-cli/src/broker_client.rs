@@ -4,8 +4,9 @@ use anyhow::{anyhow, Result};
 use blake3::Hasher;
 use packet28_daemon_core::{
     BrokerPrepareHandoffRequest, BrokerPrepareHandoffResponse, BrokerTaskStatusRequest,
-    BrokerTaskStatusResponse, BrokerWriteStateRequest, BrokerWriteStateResponse, DaemonRequest,
-    DaemonResponse, TaskAwaitHandoffRequest, TaskAwaitHandoffResponse,
+    BrokerTaskStatusResponse, BrokerWriteOp, BrokerWriteStateRequest, BrokerWriteStateResponse,
+    DaemonRequest, DaemonResponse, HookIngestRequest, HookIngestResponse, TaskAwaitHandoffRequest,
+    TaskAwaitHandoffResponse,
 };
 
 pub fn resolve_root(root: &str) -> PathBuf {
@@ -49,6 +50,14 @@ pub fn write_state(
     }
 }
 
+pub fn write_intention(
+    root: &Path,
+    mut request: BrokerWriteStateRequest,
+) -> Result<BrokerWriteStateResponse> {
+    request.op = Some(BrokerWriteOp::Intention);
+    write_state(root, request)
+}
+
 pub fn task_status(root: &Path, task_id: &str) -> Result<BrokerTaskStatusResponse> {
     ensure_daemon(root)?;
     match crate::cmd_daemon::send_request(
@@ -60,6 +69,15 @@ pub fn task_status(root: &Path, task_id: &str) -> Result<BrokerTaskStatusRespons
         },
     )? {
         DaemonResponse::BrokerTaskStatus { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+pub fn hook_ingest(root: &Path, request: HookIngestRequest) -> Result<HookIngestResponse> {
+    ensure_daemon(root)?;
+    match crate::cmd_daemon::send_request(root, &DaemonRequest::HookIngest { request })? {
+        DaemonResponse::HookIngest { response } => Ok(response),
         DaemonResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
     }

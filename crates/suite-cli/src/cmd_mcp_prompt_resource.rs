@@ -66,12 +66,12 @@ pub(crate) fn handle_prompt_get(
             let prompt = format!(
                 "Start Packet28 task `{task_id}` for: {task}\n\n\
 Use Packet28 as the primary context broker for this task.\n\
-- Use slim in-turn reducers such as `packet28.search` and `packet28.read_regions`.\n\
-- Persist important reads, edits, decisions, checkpoints, and intent changes with `packet28.write_state`.\n\
+- Let Claude hooks rewrite supported Bash commands through Packet28 reducers and capture native tool activity automatically; do not call reducer MCP tools in the active loop.\n\
+- Use `packet28.write_intention` when the current objective or next step changes materially.\n\
 - Keep one mutable Packet28 context block and replace older briefs when a newer brief supersedes them.\n\
 - If Packet28 is fronting upstream MCP tools via proxy, prefer those proxied tools so activity is auto-captured into the next brief.\n\
-- During the active turn, prefer slim Packet28 packets and fetch full artifacts only on demand.\n\
-- For long-running work, record the current objective with `packet28.write_state(op=\"intention\", ...)`, save a checkpoint, then call `packet28.prepare_handoff` before launching a fresh worker.\n\
+- During the active turn, keep MCP usage to intent and explicit handoff/context inspection only.\n\
+- For long-running work, record the current objective with `packet28.write_intention`, then let the daemon assemble handoff at threshold or stop boundaries.\n\
 - Use `packet28.fetch_context` only when you explicitly need to inspect a stored handoff/context artifact.\n\
 - If Packet28 is unavailable, fall back to direct reads and commands."
             );
@@ -94,9 +94,9 @@ Latest known status:\n\
 - supports push notifications: {}\n\n\
 Recommended flow:\n\
 - Read `packet28://current/brief` or `packet28://task/{task_id}/brief` to review the latest rendered brief.\n\
-- Use slim reducers such as `packet28.search` and `packet28.read_regions` inside the active turn.\n\
-- Persist state changes with `packet28.write_state` and fetch full artifacts only when you need detail.\n\
-- If you are about to hand work to a fresh worker, write the latest intention, save a checkpoint, and call `packet28.prepare_handoff`.\n\
+- Let Claude hooks rewrite supported shell commands and persist reducer activity automatically inside the active turn.\n\
+- Use `packet28.write_intention` only for semantic objective changes and fetch full artifacts only when you need detail.\n\
+- If you are about to hand work to a fresh worker, write the latest intention and call `packet28.prepare_handoff` only for explicit bootstrap or inspection.\n\
 - Use `packet28.fetch_context` only to inspect a stored handoff/context artifact.\n\
 - If you use Packet28 proxy mode, prefer proxied upstream tools so tool activity is captured automatically.\n\n\
 Latest brief excerpt:\n{}",
@@ -183,6 +183,10 @@ pub(crate) fn resolve_current_task_id(
         if let Some(task_id) = guard.current_task_id.clone() {
             return Ok(task_id);
         }
+    }
+    if let Some(active) = crate::task_runtime::load_active_task(root) {
+        track_task(session, root, &active.task_id)?;
+        return Ok(active.task_id);
     }
     let status = daemon_status(root)?;
     let current = select_current_task(&status.tasks)

@@ -1,9 +1,19 @@
+mod command;
+mod fs;
+mod git;
+mod github;
+mod go;
+mod infra;
+mod javascript;
+mod python;
 mod read;
+mod rust;
 mod search;
 #[cfg(test)]
 mod tests;
 mod types;
 
+pub use command::{classify_command, classify_command_argv, reduce_command_output};
 pub use read::read_regions;
 pub use search::{
     format_region, infer_symbols_from_lines, infer_symbols_from_pattern, normalize_capture_path,

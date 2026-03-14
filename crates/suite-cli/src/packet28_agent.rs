@@ -6,9 +6,11 @@ use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser};
 use packet28_daemon_core::{
     task_brief_json_path, task_brief_markdown_path, task_state_json_path, BrokerGetContextResponse,
-    BrokerPrepareHandoffRequest, TaskAwaitHandoffRequest,
+    BrokerPrepareHandoffRequest, BrokerResponseMode, BrokerSupersessionMode,
+    TaskAwaitHandoffRequest,
 };
 
+const BOOTSTRAP_MODE_FRESH: &str = "fresh";
 const BOOTSTRAP_MODE_HANDOFF: &str = "handoff";
 
 #[derive(Debug, Parser)]
@@ -91,6 +93,42 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
     let brief_json_path = task_brief_json_path(&root, &bootstrap.task_id);
     let brief_md_path = task_brief_markdown_path(&root, &bootstrap.task_id);
     let state_json_path = task_state_json_path(&root, &bootstrap.task_id);
+    if let Some(parent) = brief_md_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create Packet28 task artifact directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(&brief_md_path, &bootstrap.response.brief).with_context(|| {
+        format!(
+            "failed to persist broker brief to '{}'",
+            brief_md_path.display()
+        )
+    })?;
+    fs::write(&brief_json_path, serde_json::to_vec(&bootstrap.response)?).with_context(|| {
+        format!(
+            "failed to persist broker brief json to '{}'",
+            brief_json_path.display()
+        )
+    })?;
+    fs::write(
+        &state_json_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "task_id": &bootstrap.task_id,
+            "context_version": &bootstrap.response.context_version,
+            "latest_brief_path": brief_md_path,
+            "brief_json_path": brief_json_path,
+            "supports_push": true,
+        }))?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to persist broker state json to '{}'",
+            state_json_path.display()
+        )
+    })?;
     let proxy_config = std::env::var_os("PACKET28_MCP_UPSTREAM_CONFIG")
         .map(PathBuf::from)
         .or_else(|| {
@@ -201,14 +239,76 @@ fn prepare_bootstrap(
                 "packet28-agent requires a checkpointed task via --task-id or a derivable --task"
             )
         })?;
-    let task_id = maybe_wait_for_handoff(root, cli, task_id)?;
-    prepare_handoff_bootstrap(
+    crate::task_runtime::store_active_task(
         root,
+        &packet28_daemon_core::ActiveTaskRecord {
+            task_id: task_id.clone(),
+            session_id: None,
+            updated_at_unix: packet28_daemon_core::now_unix(),
+        },
+    )?;
+    if cli.wait_for_handoff {
+        let task_id = maybe_wait_for_handoff(root, cli, task_id)?;
+        return prepare_handoff_bootstrap(
+            root,
+            task_id,
+            cli.task.clone(),
+            bootstrap_path,
+            handoff_path,
+        );
+    }
+    Ok(prepare_fresh_bootstrap(task_id, bootstrap_path))
+}
+
+fn prepare_fresh_bootstrap(task_id: String, bootstrap_path: &std::path::Path) -> BootstrapContext {
+    let response = BrokerGetContextResponse {
+        context_version: format!("fresh-{}", packet28_daemon_core::now_unix()),
+        response_mode: BrokerResponseMode::Full,
+        artifact_id: None,
+        latest_intention: None,
+        next_action_summary: None,
+        handoff_ready: false,
+        stale: false,
+        brief: "Packet28 fresh session bootstrap.\n- Claude hooks will capture reducer packets automatically.\n- Use packet28.write_intention when the objective changes materially.\n- Prepare handoff only after threshold or stop boundaries.".to_string(),
+        supersedes_prior_context: true,
+        supersession_mode: BrokerSupersessionMode::Replace,
+        superseded_before_version: String::new(),
+        sections: Vec::new(),
+        est_tokens: 0,
+        est_bytes: 0,
+        budget_remaining_tokens: 0,
+        budget_remaining_bytes: 0,
+        section_estimates: Vec::new(),
+        eviction_candidates: Vec::new(),
+        delta: Default::default(),
+        working_set: Vec::new(),
+        recommended_actions: Vec::new(),
+        active_decisions: Vec::new(),
+        open_questions: Vec::new(),
+        resolved_questions: Vec::new(),
+        changed_paths_since_checkpoint: Vec::new(),
+        changed_symbols_since_checkpoint: Vec::new(),
+        recent_tool_invocations: Vec::new(),
+        tool_failures: Vec::new(),
+        discovered_paths: Vec::new(),
+        discovered_symbols: Vec::new(),
+        evidence_artifact_ids: Vec::new(),
+        invalidates_since_version: false,
+        effective_max_sections: 0,
+        effective_default_max_items_per_section: 0,
+        effective_section_item_limits: Default::default(),
+        diagnostics_ms: Default::default(),
+    };
+    BootstrapContext {
+        mode: BOOTSTRAP_MODE_FRESH,
         task_id,
-        cli.task.clone(),
-        bootstrap_path,
-        handoff_path,
-    )
+        response,
+        bootstrap_path: bootstrap_path.to_path_buf(),
+        handoff_path: None,
+        handoff_artifact_id: None,
+        handoff_checkpoint_id: None,
+        handoff_reason: None,
+    }
 }
 
 fn prepare_handoff_bootstrap(

@@ -28,13 +28,38 @@ pub(crate) fn compute_handoff_state(
     task: Option<&TaskRecord>,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
 ) -> (bool, String) {
-    let Some(checkpoint_id) = snapshot.latest_checkpoint_id.as_ref() else {
+    let latest_handoff_at = task.and_then(|task| task.latest_handoff_generated_at_unix);
+    let latest_hook_boundary_at = task.and_then(|task| task.latest_hook_boundary_at_unix);
+    let latest_hook_boundary_kind = task.and_then(|task| task.latest_hook_boundary_kind.as_deref());
+    let threshold_exceeded = task.is_some_and(|task| task.hook_threshold_exceeded);
+    if snapshot.latest_checkpoint_id.is_none() {
+        if snapshot.latest_intention.is_none() {
+            return (
+                false,
+                "Intent required before preparing a handoff.".to_string(),
+            );
+        }
+        if latest_hook_boundary_at.is_some_and(|boundary_at| {
+            latest_handoff_at.is_none_or(|handoff_at| boundary_at > handoff_at)
+        }) {
+            let reason = latest_hook_boundary_kind.unwrap_or("boundary");
+            return (
+                true,
+                format!("Hook boundary '{reason}' is available for handoff."),
+            );
+        }
+        if threshold_exceeded {
+            return (
+                true,
+                "Soft context threshold reached and intent is available.".to_string(),
+            );
+        }
         return (
             false,
-            "Checkpoint required before preparing a handoff.".to_string(),
+            "Hook boundary or threshold required before preparing a handoff.".to_string(),
         );
-    };
-    let latest_handoff_at = task.and_then(|task| task.latest_handoff_generated_at_unix);
+    }
+    let checkpoint_id = snapshot.latest_checkpoint_id.as_ref().unwrap();
     let latest_handoff_checkpoint_id =
         task.and_then(|task| task.latest_handoff_checkpoint_id.as_ref());
     let has_newer_intention = snapshot.latest_intention.as_ref().is_some_and(|intention| {
@@ -123,7 +148,8 @@ pub(crate) fn write_broker_artifacts(
     let brief_json_path = task_brief_json_path(&root, task_id);
     let state_json_path = task_state_json_path(&root, task_id);
     let version_json_path = task_version_json_path(&root, task_id, &response.context_version);
-    let version_snapshot = build_version_snapshot_response(&root, task_id, since_version, response)?;
+    let version_snapshot =
+        build_version_snapshot_response(&root, task_id, since_version, response)?;
     if let Some(parent) = brief_md_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!("failed to create task artifact dir '{}'", parent.display())
@@ -141,8 +167,11 @@ pub(crate) fn write_broker_artifacts(
         .with_context(|| format!("failed to write '{}'", brief_md_path.display()))?;
     fs::write(&brief_json_path, serde_json::to_vec_pretty(response)?)
         .with_context(|| format!("failed to write '{}'", brief_json_path.display()))?;
-    fs::write(&version_json_path, serde_json::to_vec_pretty(&version_snapshot)?)
-        .with_context(|| format!("failed to write '{}'", version_json_path.display()))?;
+    fs::write(
+        &version_json_path,
+        serde_json::to_vec_pretty(&version_snapshot)?,
+    )
+    .with_context(|| format!("failed to write '{}'", version_json_path.display()))?;
 
     let hash = blake3::hash(serde_json::to_string(response)?.as_bytes())
         .to_hex()
@@ -234,7 +263,11 @@ pub(crate) fn merge_version_snapshot_sections(
         .collect::<Vec<_>>();
 
     for section in &response.delta.changed_sections {
-        if !previous.sections.iter().any(|existing| existing.id == section.id) {
+        if !previous
+            .sections
+            .iter()
+            .any(|existing| existing.id == section.id)
+        {
             merged.push(section.clone());
         }
     }
@@ -306,6 +339,47 @@ pub(crate) fn broker_prepare_handoff(
     let latest_intention = snapshot.latest_intention.clone();
     let next_action_summary = next_action_summary(None, &snapshot);
     if !handoff_ready {
+        if let Some(existing_task) = task.as_ref() {
+            if let Some(existing_context_version) = existing_task.latest_context_version.as_deref()
+            {
+                let root = state.lock().map_err(lock_err)?.root.clone();
+                if let Some(existing_context) = load_versioned_broker_response(
+                    &root,
+                    &request.task_id,
+                    existing_context_version,
+                )? {
+                    let context = if matches!(
+                        request.response_mode.unwrap_or(BrokerResponseMode::Slim),
+                        BrokerResponseMode::Slim
+                    ) {
+                        slim_broker_response(
+                            &existing_context,
+                            existing_task.latest_handoff_artifact_id.clone(),
+                        )
+                    } else {
+                        existing_context
+                    };
+                    return Ok(BrokerPrepareHandoffResponse {
+                        task_id: request.task_id,
+                        handoff_ready: true,
+                        handoff_reason: "Latest handoff artifact is available for resume."
+                            .to_string(),
+                        latest_checkpoint_id: snapshot.latest_checkpoint_id,
+                        latest_handoff_artifact_id: existing_task
+                            .latest_handoff_artifact_id
+                            .clone(),
+                        latest_handoff_generated_at_unix: existing_task
+                            .latest_handoff_generated_at_unix,
+                        latest_handoff_checkpoint_id: existing_task
+                            .latest_handoff_checkpoint_id
+                            .clone(),
+                        latest_intention,
+                        next_action_summary: context.next_action_summary.clone(),
+                        context: Some(context),
+                    });
+                }
+            }
+        }
         return Ok(BrokerPrepareHandoffResponse {
             task_id: request.task_id,
             handoff_ready,

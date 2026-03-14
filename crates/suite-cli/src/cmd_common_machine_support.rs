@@ -821,12 +821,10 @@ mod tests {
         assert!(payload.get("tool_invocations").is_none());
         assert!(payload.get("reducer_invocations").is_none());
         assert!(payload.get("debug").is_none());
-        assert!(
-            payload
-                .get("truncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        );
+        assert!(payload
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false));
 
         let section = payload
             .get("sections")
@@ -875,13 +873,11 @@ mod tests {
         let wrapper = PacketWrapperV1::new("proxy.run".to_string(), envelope.clone());
         let mut packet = serde_json::to_value(&wrapper.packet).unwrap();
         compact_packet_payload(suite_packet_core::PACKET_TYPE_PROXY_RUN, &mut packet);
-        assert!(
-            packet
-                .get("payload")
-                .and_then(Value::as_object)
-                .unwrap()
-                .get("debug")
-                .is_none()
-        );
+        assert!(packet
+            .get("payload")
+            .and_then(Value::as_object)
+            .unwrap()
+            .get("debug")
+            .is_none());
     }
 }
