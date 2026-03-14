@@ -156,9 +156,19 @@ pub(crate) fn build_reactive_kernel_mutations(
         }
     }
 
+    let has_uncancelled_map = remaining.iter().any(|step| {
+        step.target == "mapy.repo"
+            && !mutations.iter().any(|mutation| {
+                matches!(
+                    mutation,
+                    KernelPlanMutation::Cancel { step_id, .. } if step_id == &step.id
+                )
+            })
+    });
+
     if append_focused_map
         && (!snapshot.focus_paths.is_empty() || !snapshot.focus_symbols.is_empty())
-        && !remaining.iter().any(|step| step.target == "mapy.repo")
+        && !has_uncancelled_map
     {
         if let Some(template) = original_steps
             .iter()
@@ -476,5 +486,37 @@ mod tests {
         };
 
         assert!(step_affected_by_snapshot(&step, &snapshot));
+    }
+
+    #[test]
+    fn canceled_map_step_does_not_block_focus_followup_append() {
+        let remaining = vec![KernelStepRequest {
+            id: "map".to_string(),
+            target: "mapy.repo".to_string(),
+            reducer_input: serde_json::to_value(mapy_core::RepoMapRequest::default()).unwrap(),
+            ..KernelStepRequest::default()
+        }];
+        let snapshot = suite_packet_core::AgentSnapshotPayload {
+            focus_paths: vec!["src/main.rs".to_string()],
+            completed_steps: vec!["map".to_string()],
+            ..suite_packet_core::AgentSnapshotPayload::default()
+        };
+
+        let mutations = build_reactive_kernel_mutations(
+            &remaining,
+            &remaining,
+            &snapshot,
+            &BTreeSet::new(),
+            ReactiveReplanMode::TaskAware,
+            true,
+            None,
+        );
+
+        assert!(mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                KernelPlanMutation::Append { step, .. } if step.id == "map__reactive_focus"
+            )
+        }));
     }
 }
