@@ -120,23 +120,36 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          REGISTRY="https://registry.npmjs.org"
 
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             PKG_DIR="dist/platforms/pkg-${platform}"
-            if npm view "@packet28/${platform}@${VERSION}" version >/dev/null 2>&1; then
-              echo "@packet28/${platform}@${VERSION} already published, skipping"
+            PACKAGE_NAME="@packet28/${platform}"
+
+            if npm view "${PACKAGE_NAME}@${VERSION}" version --registry="$REGISTRY" >/dev/null 2>&1; then
+              echo "${PACKAGE_NAME}@${VERSION} already published, skipping"
               continue
             fi
-            echo "Publishing @packet28/${platform}@${VERSION}..."
-            (cd "$PKG_DIR" && npm publish --access public --provenance)
+
+            echo "Publishing ${PACKAGE_NAME}@${VERSION}..."
+            if ! (cd "$PKG_DIR" && npm publish --access public --provenance --registry="$REGISTRY"); then
+              if npm view "${PACKAGE_NAME}@${VERSION}" version --registry="$REGISTRY" >/dev/null 2>&1; then
+                echo "${PACKAGE_NAME}@${VERSION} was published concurrently, skipping"
+                continue
+              fi
+              exit 1
+            fi
           done
 
       - name: Publish root package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          REGISTRY="https://registry.npmjs.org"
 
           # Stage root package
           ROOT_DIR="dist/packet28"
@@ -156,12 +169,18 @@ jobs:
           NODE
           chmod +x "$ROOT_DIR/bin/packet28.js" "$ROOT_DIR/bin/packet28-mcp.js"
 
-          if npm view "packet28@${VERSION}" version >/dev/null 2>&1; then
+          if npm view "packet28@${VERSION}" version --registry="$REGISTRY" >/dev/null 2>&1; then
             echo "packet28@${VERSION} already published, skipping"
             exit 0
           fi
           echo "Publishing packet28@${VERSION}..."
-          (cd "$ROOT_DIR" && npm publish --access public --provenance)
+          if ! (cd "$ROOT_DIR" && npm publish --access public --provenance --registry="$REGISTRY"); then
+            if npm view "packet28@${VERSION}" version --registry="$REGISTRY" >/dev/null 2>&1; then
+              echo "packet28@${VERSION} was published concurrently, skipping"
+              exit 0
+            fi
+            exit 1
+          fi
 
       - name: Create GitHub Release
         env:
