@@ -142,3 +142,23 @@ fn apply_mutations_rejects_duplicate_input_ids() {
         }
     );
 }
+
+#[test]
+fn apply_mutations_rejects_cycles_introduced_by_mutations() {
+    let err = apply_mutations(
+        &[step("a", &[], 1)],
+        &[
+            ScheduleMutation::Replace {
+                step: step("a", &["b"], 1),
+                reason: "focus".to_string(),
+            },
+            ScheduleMutation::Append {
+                step: step("b", &["a"], 1),
+                reason: "followup".to_string(),
+            },
+        ],
+    )
+    .unwrap_err();
+
+    assert_eq!(err, ScheduleError::DependencyCycle);
+}

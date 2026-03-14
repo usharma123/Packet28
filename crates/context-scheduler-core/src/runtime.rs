@@ -128,6 +128,7 @@ pub fn apply_mutations(
         steps: result_steps.clone(),
         budget: ScheduleBudget::default(),
     })?;
+    topological_order(&result_steps)?;
 
     Ok(MutationResult {
         steps: result_steps,
