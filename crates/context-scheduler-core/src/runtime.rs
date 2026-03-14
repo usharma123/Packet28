@@ -68,6 +68,11 @@ pub fn apply_mutations(
     steps: &[ScheduleStep],
     mutations: &[ScheduleMutation],
 ) -> Result<MutationResult, ScheduleError> {
+    validate_request(&ScheduleRequest {
+        steps: steps.to_vec(),
+        budget: ScheduleBudget::default(),
+    })?;
+
     let mut by_id = steps
         .iter()
         .cloned()

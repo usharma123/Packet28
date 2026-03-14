@@ -130,3 +130,15 @@ fn apply_mutations_supports_cancel_replace_and_append() {
     assert_eq!(result.steps[0].target, "b.focused");
     assert_eq!(result.applied.len(), 3);
 }
+
+#[test]
+fn apply_mutations_rejects_duplicate_input_ids() {
+    let err = apply_mutations(&[step("a", &[], 1), step("a", &[], 1)], &[]).unwrap_err();
+
+    assert_eq!(
+        err,
+        ScheduleError::DuplicateStepId {
+            id: "a".to_string()
+        }
+    );
+}
