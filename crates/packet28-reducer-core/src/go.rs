@@ -56,8 +56,20 @@ pub fn reduce_go_command(
     let (diagnostic_count, diagnostic_paths) = extract_go_diagnostics(&combined);
     let summary = match spec.canonical_kind.as_str() {
         "go_test" => summarize_go_test(&combined, failed),
-        "go_build" => summarize_go_build_like("go build", diagnostic_count, &diagnostic_paths, &combined, failed),
-        "go_vet" => summarize_go_build_like("go vet", diagnostic_count, &diagnostic_paths, &combined, failed),
+        "go_build" => summarize_go_build_like(
+            "go build",
+            diagnostic_count,
+            &diagnostic_paths,
+            &combined,
+            failed,
+        ),
+        "go_vet" => summarize_go_build_like(
+            "go vet",
+            diagnostic_count,
+            &diagnostic_paths,
+            &combined,
+            failed,
+        ),
         "golangci_lint" => summarize_go_build_like(
             "golangci-lint",
             diagnostic_count,
@@ -127,9 +139,7 @@ fn summarize_go_build_like(
     if failed {
         if diagnostic_count > 0 {
             let lead = diagnostic_paths.first().cloned().unwrap_or_default();
-            format!(
-                "{label}: {diagnostic_count} diagnostics in {lead}",
-            )
+            format!("{label}: {diagnostic_count} diagnostics in {lead}",)
         } else {
             first_nonempty_line(output).unwrap_or_else(|| format!("{label} failed"))
         }

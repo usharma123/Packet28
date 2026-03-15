@@ -275,7 +275,6 @@ fn vague_query_triggers_fallback_only_after_weak_first_pass() {
             .rendered_lines
             .iter()
             .any(|line| line.contains("update_state_for_alpha_service"))));
-
 }
 
 #[test]

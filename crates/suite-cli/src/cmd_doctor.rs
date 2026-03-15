@@ -518,7 +518,9 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             ok: reducer_ok,
             required: true,
             detail: if reducer_ok {
-                format!("task_id={task_id} hook reducer ingest ok ({hook_kind}, {hook_tokens} tokens)")
+                format!(
+                    "task_id={task_id} hook reducer ingest ok ({hook_kind}, {hook_tokens} tokens)"
+                )
             } else {
                 format!(
                     "task_id={task_id} reducer ingest missing: {}",

@@ -201,11 +201,7 @@ fn explicit_curl_method(argv: &[String]) -> Option<String> {
 }
 
 fn summarize_kubectl_get(spec: &CommandReducerSpec, lines: &[String]) -> String {
-    let resource = spec
-        .argv
-        .get(2)
-        .map(String::as_str)
-        .unwrap_or("resource");
+    let resource = spec.argv.get(2).map(String::as_str).unwrap_or("resource");
     let rows = data_rows(lines);
     if lines.is_empty() || rows == 0 {
         return format!("kubectl get {resource} returned 0 row(s)");
@@ -277,9 +273,13 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let spec = classify_infra_command("kubectl get pods", &argv).unwrap();
-        let output = "NAME READY STATUS RESTARTS AGE\napi 1/1 Running 0 2d\ncron 0/1 Pending 0 4m\n";
+        let output =
+            "NAME READY STATUS RESTARTS AGE\napi 1/1 Running 0 2d\ncron 0/1 Pending 0 4m\n";
         let reduction = reduce_infra_command(&spec, output, "", 0);
-        assert_eq!(reduction.summary, "kubectl get pods returned 2 row(s), 1 pending");
+        assert_eq!(
+            reduction.summary,
+            "kubectl get pods returned 2 row(s), 1 pending"
+        );
     }
 
     #[test]

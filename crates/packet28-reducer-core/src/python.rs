@@ -316,6 +316,9 @@ mod tests {
             "",
             1,
         );
-        assert_eq!(reduction.summary, "ruff check: 2 diagnostics in src/demo.py");
+        assert_eq!(
+            reduction.summary,
+            "ruff check: 2 diagnostics in src/demo.py"
+        );
     }
 }

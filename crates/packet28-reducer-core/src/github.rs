@@ -181,11 +181,7 @@ fn summarize_run_view(lines: &[String]) -> String {
 fn summarize_list_entries(label: &str, lines: &[String], noun: &str) -> String {
     let count = lines.len();
     if let Some(first) = lines.first() {
-        let preview = first
-            .split('\t')
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" ");
+        let preview = first.split('\t').take(2).collect::<Vec<_>>().join(" ");
         if !preview.is_empty() {
             return format!("{label}: {count} {noun}(s); first {preview}");
         }
