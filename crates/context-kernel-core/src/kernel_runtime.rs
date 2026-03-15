@@ -170,7 +170,10 @@ impl Kernel {
             None
         };
 
-        if let Some(entry) = cache_lookup.as_ref().and_then(|lookup| lookup.entry.clone()) {
+        if let Some(entry) = cache_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.entry.clone())
+        {
             let output_packets = entry
                 .packets
                 .into_iter()

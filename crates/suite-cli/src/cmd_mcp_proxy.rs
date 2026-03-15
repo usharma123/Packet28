@@ -86,7 +86,6 @@ pub(crate) fn serve_proxy_stdio(
     Ok(())
 }
 
-
 fn handle_proxy_notification(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,

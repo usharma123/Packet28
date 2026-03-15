@@ -175,6 +175,101 @@ fn start_mcp_proxy_server(
     (child, stdin, stdout)
 }
 
+fn start_mcp_proxy_server_with_tool(
+    root: &Path,
+    config_path: &Path,
+    task_id: &str,
+    tool_name: &str,
+) -> (Child, ChildStdin, BufReader<ChildStdout>, Value) {
+    for _ in 0..3 {
+        let (mut child, mut stdin, mut stdout) = start_mcp_proxy_server(root, config_path, task_id);
+        initialize_mcp_session(&mut stdin, &mut stdout);
+        write_mcp_message(
+            &mut stdin,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/list"
+            }),
+        );
+        let tools = read_mcp_message_for_id(&mut stdout, 2);
+        let has_tool = tools["result"]["tools"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|tool| tool["name"] == tool_name));
+        if has_tool {
+            return (child, stdin, stdout, tools);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("proxy tool catalog never exposed required tool '{tool_name}'");
+}
+
+fn initialize_mcp_session(stdin: &mut ChildStdin, stdout: &mut BufReader<ChildStdout>) {
+    write_mcp_message(
+        stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+        }),
+    );
+    let _ = read_mcp_message_for_id(stdout, 1);
+}
+
+fn write_intention_via_mcp(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    id: u64,
+    task_id: &str,
+    text: &str,
+    step_id: &str,
+    paths: &[&str],
+) -> Value {
+    write_mcp_message(
+        stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.write_intention",
+                "arguments":{
+                    "task_id":task_id,
+                    "text":text,
+                    "step_id":step_id,
+                    "paths":paths,
+                }
+            }
+        }),
+    );
+    read_mcp_message_for_id(stdout, id)
+}
+
+fn run_claude_hook(root: &Path, payload: &Value) -> (i32, String) {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_Packet28"))
+        .current_dir(root)
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(serde_json::to_string(payload).unwrap().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    (
+        output.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+    )
+}
+
 fn write_invalid_guard_context(path: &Path) {
     fs::write(
         path,
@@ -2653,62 +2748,30 @@ fn seed_checkpointed_handoff_task(
     dir: &Path,
     task_id: &str,
     intention_text: &str,
-    checkpoint_id: &str,
+    _checkpoint_id: &str,
 ) {
     let (mut child, mut stdin, mut stdout) = start_mcp_server(dir);
-    write_mcp_message(
+    initialize_mcp_session(&mut stdin, &mut stdout);
+    let _ = write_intention_via_mcp(
         &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
+        &mut stdout,
+        2,
+        task_id,
+        intention_text,
+        "investigating",
+        &["src/alpha.rs"],
     );
-    let _ = read_mcp_message_for_id(&mut stdout, 1);
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":task_id,
-                    "op":"intention",
-                    "text":intention_text,
-                    "note":"Need the next worker to pick up the handoff packet",
-                    "step_id":"investigating",
-                    "paths":["src/alpha.rs"],
-                    "symbols":["Alpha"]
-                }
-            }
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 2);
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":task_id,
-                    "op":"checkpoint_save",
-                    "checkpoint_id":checkpoint_id,
-                    "note":"Checkpoint before launching a fresh worker",
-                    "paths":["src/alpha.rs"],
-                    "symbols":["Alpha"]
-                }
-            }
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 3);
     let _ = child.kill();
     let _ = child.wait();
+    let (status, _) = run_claude_hook(
+        dir,
+        &json!({
+            "hook_event_name":"Stop",
+            "task_id":task_id,
+            "session_id": format!("session-{task_id}"),
+        }),
+    );
+    assert_eq!(status, 0);
 }
 
 #[test]
@@ -2720,12 +2783,6 @@ fn test_packet28_agent_bootstraps_broker_session() {
     write_repo_fixture(dir.path());
     let task_text = "design auth broker";
     let task_id = suite_cli::broker_client::derive_task_id(task_text);
-    seed_checkpointed_handoff_task(
-        dir.path(),
-        &task_id,
-        "Continue design auth broker",
-        "cp-bootstrap-1",
-    );
 
     let output = agent_cmd()
         .current_dir(dir.path())
@@ -2735,7 +2792,7 @@ fn test_packet28_agent_bootstraps_broker_session() {
             "--",
             "sh",
             "-c",
-            "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PACKET28_TASK_ID\" \"$PACKET28_BROKER_BRIEF_PATH\" \"$PACKET28_BROKER_STATE_PATH\" \"$PACKET28_MCP_COMMAND\" \"$PACKET28_BROKER_WINDOW_MODE\" \"$PACKET28_BROKER_SUPERSESSION\" \"$PACKET28_BROKER_PREPARE_HANDOFF_TOOL\"",
+            "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PACKET28_BOOTSTRAP_MODE\" \"$PACKET28_TASK_ID\" \"$PACKET28_BROKER_BRIEF_PATH\" \"$PACKET28_BROKER_STATE_PATH\" \"$PACKET28_MCP_COMMAND\" \"$PACKET28_BROKER_WINDOW_MODE\" \"$PACKET28_BROKER_SUPERSESSION\" \"$PACKET28_BROKER_PREPARE_HANDOFF_TOOL\"",
         ])
         .assert()
         .success()
@@ -2747,14 +2804,15 @@ fn test_packet28_agent_bootstraps_broker_session() {
         .lines()
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
-    assert_eq!(lines.len(), 7);
-    assert_eq!(lines[0], task_id);
-    assert!(Path::new(&lines[1]).exists(), "brief path should exist");
-    assert!(Path::new(&lines[2]).exists(), "state path should exist");
-    assert!(lines[3].contains("Packet28 mcp serve --root"));
-    assert_eq!(lines[4], "replace");
-    assert_eq!(lines[5], "1");
-    assert_eq!(lines[6], "packet28.prepare_handoff");
+    assert_eq!(lines.len(), 8);
+    assert_eq!(lines[0], "fresh");
+    assert_eq!(lines[1], task_id);
+    assert!(Path::new(&lines[2]).exists(), "brief path should exist");
+    assert!(Path::new(&lines[3]).exists(), "state path should exist");
+    assert!(lines[4].contains("Packet28 mcp serve --root"));
+    assert_eq!(lines[5], "replace");
+    assert_eq!(lines[6], "1");
+    assert_eq!(lines[7], "packet28.prepare_handoff");
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
@@ -2807,7 +2865,7 @@ fn test_packet28_agent_resumes_from_checkpoint_handoff() {
         !lines[3].is_empty(),
         "handoff artifact id should be exported"
     );
-    assert_eq!(lines[4], "cp-agent-1");
+    assert!(lines[4].is_empty());
     assert_eq!(lines[5], "packet28.prepare_handoff");
 
     let bootstrap: Value = serde_json::from_str(&fs::read_to_string(&lines[1]).unwrap()).unwrap();
@@ -2865,56 +2923,12 @@ fn test_packet28_daemon_task_await_handoff_reports_ready_status() {
     let dir = TempDir::new().unwrap();
     init_repo(dir.path());
     write_repo_fixture(dir.path());
-    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
+    seed_checkpointed_handoff_task(
+        dir.path(),
+        "task-daemon-await",
+        "Prepare daemon-owned handoff wait",
+        "cp-daemon-1",
     );
-    let _ = read_mcp_message_for_id(&mut stdout, 1);
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-daemon-await",
-                    "op":"intention",
-                    "text":"Prepare daemon-owned handoff wait",
-                    "step_id":"investigating",
-                    "paths":["src/alpha.rs"]
-                }
-            }
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 2);
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-daemon-await",
-                    "op":"checkpoint_save",
-                    "checkpoint_id":"cp-daemon-1",
-                    "paths":["src/alpha.rs"]
-                }
-            }
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 3);
-    child.kill().unwrap();
-    child.wait().unwrap();
 
     let output = suite_cmd()
         .args([
@@ -2954,56 +2968,12 @@ fn test_packet28_daemon_task_launch_agent_spawns_child_from_handoff() {
     let dir = TempDir::new().unwrap();
     init_repo(dir.path());
     write_repo_fixture(dir.path());
-    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
+    seed_checkpointed_handoff_task(
+        dir.path(),
+        "task-daemon-launch",
+        "Launch fresh worker from daemon",
+        "cp-daemon-launch-1",
     );
-    let _ = read_mcp_message_for_id(&mut stdout, 1);
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-daemon-launch",
-                    "op":"intention",
-                    "text":"Launch fresh worker from daemon",
-                    "step_id":"handoff",
-                    "paths":["src/alpha.rs"]
-                }
-            }
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 2);
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-daemon-launch",
-                    "op":"checkpoint_save",
-                    "checkpoint_id":"cp-daemon-launch-1",
-                    "paths":["src/alpha.rs"]
-                }
-            }
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 3);
-    child.kill().unwrap();
-    child.wait().unwrap();
 
     let output = suite_cmd()
         .args([
@@ -3091,54 +3061,14 @@ fn test_packet28_daemon_task_await_handoff_can_require_newer_context_version() {
     let dir = TempDir::new().unwrap();
     init_repo(dir.path());
     write_repo_fixture(dir.path());
+    seed_checkpointed_handoff_task(
+        dir.path(),
+        "task-daemon-newer-handoff",
+        "Prepare initial handoff",
+        "cp-daemon-newer-1",
+    );
     let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 1);
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-daemon-newer-handoff",
-                    "op":"intention",
-                    "text":"Prepare initial handoff",
-                    "step_id":"handoff",
-                    "paths":["src/alpha.rs"]
-                }
-            }
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 2);
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-daemon-newer-handoff",
-                    "op":"checkpoint_save",
-                    "checkpoint_id":"cp-daemon-newer-1",
-                    "paths":["src/alpha.rs"]
-                }
-            }
-        }),
-    );
-    let _ = read_mcp_message_for_id(&mut stdout, 3);
+    initialize_mcp_session(&mut stdin, &mut stdout);
 
     let launch_output = suite_cmd()
         .args([
@@ -3206,27 +3136,26 @@ fn test_packet28_daemon_task_await_handoff_can_require_newer_context_version() {
             "newer handoff than context version",
         ));
 
-    write_mcp_message(
+    let _ = write_intention_via_mcp(
         &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-daemon-newer-handoff",
-                    "op":"intention",
-                    "text":"Resume from a newer handoff",
-                    "step_id":"editing",
-                    "paths":["src/beta.rs"]
-                }
-            }
-        }),
+        &mut stdout,
+        4,
+        "task-daemon-newer-handoff",
+        "Resume from a newer handoff",
+        "editing",
+        &["src/beta.rs"],
     );
-    let _ = read_mcp_message_for_id(&mut stdout, 4);
     child.kill().unwrap();
     child.wait().unwrap();
+    let (status, _) = run_claude_hook(
+        dir.path(),
+        &json!({
+            "hook_event_name":"PreCompact",
+            "task_id":"task-daemon-newer-handoff",
+            "session_id":"session-daemon-newer-handoff",
+        }),
+    );
+    assert_eq!(status, 0);
 
     let output = suite_cmd()
         .args([
@@ -3338,38 +3267,16 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
 
     let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
 
-    write_mcp_message(
+    initialize_mcp_session(&mut stdin, &mut stdout);
+    let intention = write_intention_via_mcp(
         &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
+        &mut stdout,
+        2,
+        "task-handoff",
+        "Inspect Alpha before editing it",
+        "investigating",
+        &["src/alpha.rs"],
     );
-    let _ = read_mcp_message_for_id(&mut stdout, 1);
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-handoff",
-                    "op":"intention",
-                    "text":"Inspect Alpha before editing it",
-                    "note":"Need a clean resume breadcrumb for the next worker",
-                    "step_id":"investigating",
-                    "paths":["src/alpha.rs"],
-                    "symbols":["Alpha"]
-                }
-            }
-        }),
-    );
-    let intention = read_mcp_message_for_id(&mut stdout, 2);
     assert_eq!(intention["result"]["structuredContent"]["accepted"], true);
 
     write_mcp_message(
@@ -3391,33 +3298,21 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
     assert_eq!(not_ready_payload["handoff_ready"], false);
     assert!(not_ready_payload["context"].is_null());
 
-    write_mcp_message(
-        &mut stdin,
+    let (status, _) = run_claude_hook(
+        dir.path(),
         &json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-handoff",
-                    "op":"checkpoint_save",
-                    "checkpoint_id":"cp-1",
-                    "note":"Ready for manual worker relaunch",
-                    "paths":["src/alpha.rs"],
-                    "symbols":["Alpha"]
-                }
-            }
+            "hook_event_name":"Stop",
+            "task_id":"task-handoff",
+            "session_id":"session-task-handoff",
         }),
     );
-    let checkpoint = read_mcp_message_for_id(&mut stdout, 4);
-    assert_eq!(checkpoint["result"]["structuredContent"]["accepted"], true);
+    assert_eq!(status, 0);
 
     write_mcp_message(
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":5,
+            "id":4,
             "method":"tools/call",
             "params":{
                 "name":"packet28.prepare_handoff",
@@ -3428,10 +3323,10 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
             }
         }),
     );
-    let handoff = read_mcp_message_for_id(&mut stdout, 5);
+    let handoff = read_mcp_message_for_id(&mut stdout, 4);
     let handoff_payload = &handoff["result"]["structuredContent"];
     assert_eq!(handoff_payload["handoff_ready"], true);
-    assert_eq!(handoff_payload["latest_checkpoint_id"], "cp-1");
+    assert!(handoff_payload["latest_checkpoint_id"].is_null());
     assert_eq!(
         handoff_payload["latest_intention"]["text"],
         "Inspect Alpha before editing it"
@@ -3449,7 +3344,7 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":6,
+            "id":5,
             "method":"tools/call",
             "params":{
                 "name":"packet28.fetch_context",
@@ -3460,7 +3355,7 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
             }
         }),
     );
-    let fetched = read_mcp_message_for_id(&mut stdout, 6);
+    let fetched = read_mcp_message_for_id(&mut stdout, 5);
     let fetched_payload = &fetched["result"]["structuredContent"];
     assert_eq!(fetched_payload["response_mode"], "full");
     assert_eq!(
@@ -3477,7 +3372,7 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":7,
+            "id":6,
             "method":"tools/call",
             "params":{
                 "name":"packet28.task_status",
@@ -3487,13 +3382,66 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
             }
         }),
     );
-    let status = read_mcp_message_for_id(&mut stdout, 7);
+    let status = read_mcp_message_for_id(&mut stdout, 6);
     let status_payload = &status["result"]["structuredContent"];
-    assert_eq!(status_payload["handoff_ready"], false);
-    assert_eq!(status_payload["latest_handoff_checkpoint_id"], "cp-1");
+    assert_eq!(status_payload["handoff_ready"], true);
+    assert!(status_payload["latest_handoff_checkpoint_id"].is_null());
     assert_eq!(
         status_payload["latest_handoff_artifact_id"],
         handoff_context["artifact_id"]
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_mcp_write_intention_derives_task_id_from_full_text() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+    initialize_mcp_session(&mut stdin, &mut stdout);
+
+    let intention_text = "Investigate parser regression in the handoff pipeline";
+    let derived_task_id = suite_cli::broker_client::derive_task_id(intention_text);
+    let response = write_intention_via_mcp(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "",
+        intention_text,
+        "investigating",
+        &["crates/packet28d/src/hooks.rs"],
+    );
+    assert_eq!(response["result"]["structuredContent"]["accepted"], true);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.task_status",
+                "arguments":{
+                    "task_id": derived_task_id
+                }
+            }
+        }),
+    );
+    let status = read_mcp_message_for_id(&mut stdout, 3);
+    assert_eq!(
+        status["result"]["structuredContent"]["task"]["task_id"],
+        derived_task_id
     );
 
     child.kill().unwrap();
@@ -3529,79 +3477,48 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
     write_cached_testmap_state(dir.path());
 
     let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
-
-    write_mcp_message(
+    initialize_mcp_session(&mut stdin, &mut stdout);
+    let _ = write_intention_via_mcp(
         &mut stdin,
+        &mut stdout,
+        2,
+        "task-native-read",
+        "Locate the Alpha definition",
+        "investigating",
+        &["src/alpha.rs"],
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let (status, _) = run_claude_hook(
+        dir.path(),
         &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+            "hook_event_name":"PostToolUse",
+            "task_id":"task-native-read",
+            "session_id":"session-native-read",
+            "tool_name":"Read",
+            "tool_input":{"file_path":"src/alpha.rs","offset":4,"limit":1},
+            "tool_response":{"content":"fn alpha() {}\nstruct Alpha;\n","symbols":["Alpha"],"regions":["src/alpha.rs:4-5"]}
         }),
     );
-    let initialize = read_mcp_message_for_id(&mut stdout, 1);
-    assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
-
-    write_mcp_message(
-        &mut stdin,
+    assert_eq!(status, 0);
+    let (status, _) = run_claude_hook(
+        dir.path(),
         &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.read_regions",
-                "arguments":{
-                    "task_id":"task-native-read",
-                    "path":"src/alpha.rs",
-                    "regions":["src/alpha.rs:4-5"]
-                }
-            }
+            "hook_event_name":"Stop",
+            "task_id":"task-native-read",
+            "session_id":"session-native-read",
         }),
     );
-    let read = read_mcp_message_for_id(&mut stdout, 2);
-    assert!(
-        read.get("error").is_none(),
-        "native read returned MCP error: {read}"
-    );
-    let read_payload = &read["result"]["structuredContent"];
-    assert_eq!(read_payload["path"].as_str().unwrap(), "src/alpha.rs");
-    assert!(read_payload["regions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "src/alpha.rs:4-5"));
-    assert_eq!(read_payload["lines"].as_array().unwrap().len(), 2);
-    assert!(read_payload["symbols"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "Alpha"));
+    assert_eq!(status, 0);
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+    initialize_mcp_session(&mut stdin, &mut stdout);
 
     write_mcp_message(
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
             "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"packet28.write_state",
-                "arguments":{
-                    "task_id":"task-native-read",
-                    "op":"checkpoint_save",
-                    "checkpoint_id":"cp-native-read",
-                    "note":"Checkpoint before preparing handoff for read_regions evidence"
-                }
-            }
-        }),
-    );
-    let checkpoint = read_mcp_message_for_id(&mut stdout, 3);
-    assert_eq!(checkpoint["result"]["structuredContent"]["accepted"], true);
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":4,
             "method":"tools/call",
             "params":{
                 "name":"packet28.prepare_handoff",
@@ -3613,7 +3530,7 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
             }
         }),
     );
-    let inspect = read_mcp_message_for_id(&mut stdout, 4);
+    let inspect = read_mcp_message_for_id(&mut stdout, 3);
     let inspect_payload = &inspect["result"]["structuredContent"]["context"];
     assert!(inspect["result"]["structuredContent"]["handoff_ready"]
         .as_bool()
@@ -3623,7 +3540,7 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
         .unwrap()
         .iter()
         .any(|item| {
-            item["tool_name"] == "packet28.read_regions"
+            item["tool_name"] == "Read"
                 && item["regions"].as_array().is_some_and(|regions| {
                     regions.iter().any(|region| region == "src/alpha.rs:4-5")
                 })
@@ -3635,6 +3552,210 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
         .any(|item| item == "src/alpha.rs"));
     child.kill().unwrap();
     child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_hook_pretool_rewrites_supported_git_command() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (status, stdout) = run_claude_hook(
+        dir.path(),
+        &json!({
+            "hook_event_name":"PreToolUse",
+            "task_id":"task-pretool-rewrite",
+            "session_id":"session-pretool-rewrite",
+            "cwd":dir.path().to_str().unwrap(),
+            "tool_name":"Bash",
+            "tool_input":{"command":"git status --short src/alpha.rs"}
+        }),
+    );
+    assert_eq!(status, 0);
+    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(rewritten.contains("hook reducer-runner"));
+    assert!(rewritten.contains("--family git"));
+    assert!(rewritten.contains("--kind git_status"));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_hook_pretool_rewrites_supported_github_command() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (status, stdout) = run_claude_hook(
+        dir.path(),
+        &json!({
+            "hook_event_name":"PreToolUse",
+            "task_id":"task-pretool-gh-rewrite",
+            "session_id":"session-pretool-gh-rewrite",
+            "cwd":dir.path().to_str().unwrap(),
+            "tool_name":"Bash",
+            "tool_input":{"command":"gh pr list --limit 5"}
+        }),
+    );
+    assert_eq!(status, 0);
+    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(rewritten.contains("hook reducer-runner"));
+    assert!(rewritten.contains("--family github"));
+    assert!(rewritten.contains("--kind gh_pr_list"));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_hook_pretool_rewrites_supported_python_command() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (status, stdout) = run_claude_hook(
+        dir.path(),
+        &json!({
+            "hook_event_name":"PreToolUse",
+            "task_id":"task-pretool-python-rewrite",
+            "session_id":"session-pretool-python-rewrite",
+            "cwd":dir.path().to_str().unwrap(),
+            "tool_name":"Bash",
+            "tool_input":{"command":"python3 -m pytest tests"}
+        }),
+    );
+    assert_eq!(status, 0);
+    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(rewritten.contains("hook reducer-runner"));
+    assert!(rewritten.contains("--family python"));
+    assert!(rewritten.contains("--kind python_pytest"));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_hook_pretool_rewrites_supported_javascript_command() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (status, stdout) = run_claude_hook(
+        dir.path(),
+        &json!({
+            "hook_event_name":"PreToolUse",
+            "task_id":"task-pretool-js-rewrite",
+            "session_id":"session-pretool-js-rewrite",
+            "cwd":dir.path().to_str().unwrap(),
+            "tool_name":"Bash",
+            "tool_input":{"command":"npx tsc --noEmit"}
+        }),
+    );
+    assert_eq!(status, 0);
+    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(rewritten.contains("hook reducer-runner"));
+    assert!(rewritten.contains("--family javascript"));
+    assert!(rewritten.contains("--kind javascript_tsc"));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_hook_pretool_rewrites_supported_go_command() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (status, stdout) = run_claude_hook(
+        dir.path(),
+        &json!({
+            "hook_event_name":"PreToolUse",
+            "task_id":"task-pretool-go-rewrite",
+            "session_id":"session-pretool-go-rewrite",
+            "cwd":dir.path().to_str().unwrap(),
+            "tool_name":"Bash",
+            "tool_input":{"command":"go test ./..."}
+        }),
+    );
+    assert_eq!(status, 0);
+    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(rewritten.contains("hook reducer-runner"));
+    assert!(rewritten.contains("--family go"));
+    assert!(rewritten.contains("--kind go_test"));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_hook_pretool_rewrites_supported_infra_command() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (status, stdout) = run_claude_hook(
+        dir.path(),
+        &json!({
+            "hook_event_name":"PreToolUse",
+            "task_id":"task-pretool-infra-rewrite",
+            "session_id":"session-pretool-infra-rewrite",
+            "cwd":dir.path().to_str().unwrap(),
+            "tool_name":"Bash",
+            "tool_input":{"command":"kubectl get pods"}
+        }),
+    );
+    assert_eq!(status, 0);
+    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(rewritten.contains("hook reducer-runner"));
+    assert!(rewritten.contains("--family infra"));
+    assert!(rewritten.contains("--kind kubectl_get"));
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
@@ -3675,6 +3796,11 @@ fn test_packet28_mcp_accepts_newline_json_stdio() {
     );
     let tools = read_mcp_message_newline(&mut stdout);
     assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.write_intention"));
+    assert!(!tools["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
@@ -3962,41 +4088,29 @@ while True:
     )
     .unwrap();
 
-    let (mut child, mut stdin, mut stdout) =
-        start_mcp_proxy_server(dir.path(), &config_path, "task-proxy-timeout");
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
-        }),
+    let (mut child, mut stdin, mut stdout, tools) = start_mcp_proxy_server_with_tool(
+        dir.path(),
+        &config_path,
+        "task-proxy-timeout",
+        "slow.read",
     );
-    let _ = read_mcp_message_for_id(&mut stdout, 1);
-
-    write_mcp_message(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/list"
-        }),
-    );
-    let tools = read_mcp_message_for_id(&mut stdout, 2);
     assert!(tools["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .any(|tool| tool["name"] == "slow.read"));
-    assert_eq!(fs::read_to_string(&counter_path).unwrap().trim(), "1");
+    let catalog_refresh_count = fs::read_to_string(&counter_path)
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    assert!(catalog_refresh_count >= 1);
 
     write_mcp_message(
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":3,
+            "id":10,
             "method":"tools/call",
             "params":{
                 "name":"slow.read",
@@ -4004,7 +4118,7 @@ while True:
             }
         }),
     );
-    let timeout = read_mcp_message_for_id(&mut stdout, 3);
+    let timeout = read_mcp_message_for_id(&mut stdout, 10);
     assert!(timeout["error"]["message"]
         .as_str()
         .unwrap()
@@ -4013,7 +4127,14 @@ while True:
         .as_str()
         .unwrap()
         .contains("python3 -u"));
-    assert_eq!(fs::read_to_string(&counter_path).unwrap().trim(), "1");
+    assert_eq!(
+        fs::read_to_string(&counter_path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap(),
+        catalog_refresh_count
+    );
 
     child.kill().unwrap();
     child.wait().unwrap();
@@ -4038,9 +4159,10 @@ fn test_suite_agent_prompt_outputs_all_supported_fragments() {
         let rendered = String::from_utf8(output).unwrap();
         assert!(!rendered.trim().is_empty());
         assert!(rendered.contains("Packet28 mcp serve"));
-        assert!(rendered.contains("packet28.search"));
-        assert!(rendered.contains("packet28.read_regions"));
-        assert!(rendered.contains("packet28.prepare_handoff"));
+        assert!(rendered.contains("packet28.write_intention"));
+        assert!(rendered.to_ascii_lowercase().contains("handoff"));
+        assert!(!rendered.contains("packet28.search"));
+        assert!(!rendered.contains("packet28.read_regions"));
         assert!(rendered
             .to_ascii_lowercase()
             .contains("fall back to direct file reads"));
@@ -4062,13 +4184,6 @@ fn test_packet28_agent_persists_bootstrap_and_exports_env() {
     let dir = TempDir::new().unwrap();
     setup_changed_repo(dir.path());
     let task_text = "trace Alpha";
-    let task_id = suite_cli::broker_client::derive_task_id(task_text);
-    seed_checkpointed_handoff_task(
-        dir.path(),
-        &task_id,
-        "Trace Alpha from checkpointed handoff",
-        "cp-env-1",
-    );
     let env_dump = dir.path().join("env.txt");
 
     agent_cmd()
@@ -4108,8 +4223,11 @@ fn test_packet28_agent_persists_bootstrap_and_exports_env() {
     );
 
     let value = parse_broker_response(&fs::read(&persisted_path).unwrap());
-    assert!(value["brief"].as_str().unwrap().contains("Task Objective"));
-    assert!(value["sections"].as_array().unwrap().len() >= 2);
+    assert!(value["brief"]
+        .as_str()
+        .unwrap()
+        .contains("fresh session bootstrap"));
+    assert_eq!(value["response_mode"], "full");
 }
 
 #[test]
@@ -4118,13 +4236,6 @@ fn test_packet28_agent_returns_child_exit_code() {
     let dir = TempDir::new().unwrap();
     setup_changed_repo(dir.path());
     let task_text = "trace Alpha";
-    let task_id = suite_cli::broker_client::derive_task_id(task_text);
-    seed_checkpointed_handoff_task(
-        dir.path(),
-        &task_id,
-        "Trace Alpha and preserve child exit code",
-        "cp-exit-1",
-    );
 
     agent_cmd()
         .current_dir(dir.path())

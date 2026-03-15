@@ -22,6 +22,7 @@ pub mod cmd_daemon_commands;
 pub mod cmd_diff;
 pub mod cmd_doctor;
 pub mod cmd_guard;
+pub mod cmd_hook;
 pub mod cmd_impact;
 pub mod cmd_map;
 pub mod cmd_map_repo;
@@ -32,6 +33,7 @@ pub mod cmd_setup;
 pub mod cmd_shard;
 pub mod cmd_stack;
 pub mod packet28_agent;
+pub mod task_runtime;
 
 pub use cli_defs::*;
 pub use cli_runtime::*;

@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Packet28 Fixture</title>
+  </head>
+  <body>
+    <main>fixture response body for curl benchmarking</main>
+  </body>
+</html>

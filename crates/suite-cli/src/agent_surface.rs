@@ -51,18 +51,16 @@ pub fn render_prompt_fragment(format: AgentPromptFormat, root: Option<&str>) -> 
     match format {
         AgentPromptFormat::Claude => format!(
             "## Packet28\n\
-Use Packet28 as a live context broker for non-trivial coding, debugging, test, review, refactor, or design tasks.\n\
+Use Packet28 as a hooks-first reducer runtime for non-trivial coding, debugging, test, review, refactor, or design tasks.\n\
 \n\
-- Prefer `{mcp}` and treat Packet28 as a reducer plus handoff broker, not a thick mid-turn context fetcher.\n\
-- When you can put Packet28 in front of your MCP tools, prefer `{proxy}` so tool activity is auto-captured.\n\
-- Use slim in-turn reducers such as `packet28.search` and `packet28.read_regions`; fetch full artifacts only on demand.\n\
-- Persist reads, edits, checkpoints, and worker intent with `packet28.write_state`.\n\
-- For long-running work, write the latest intention, save a checkpoint, assemble handoff with `packet28.prepare_handoff`, then relaunch a fresh worker.\n\
+- Start with `{mcp}` for Packet28 control-plane tools and install Claude hooks with `Packet28 setup`.\n\
+- Let Claude hooks rewrite supported Bash commands through Packet28 reducers and capture native tool activity automatically; do not call reducer MCP tools in the active loop.\n\
+- Use `packet28.write_intention` only when the task objective or next step changes materially.\n\
+- Let the daemon assemble handoff context after threshold or stop boundaries; do not grow one worker session indefinitely.\n\
+- Use `packet28.prepare_handoff` and `packet28.fetch_context` only for explicit handoff/bootstrap or inspection flows.\n\
 - Treat the latest Packet28 brief as the only canonical Packet28 context block; replace older Packet28 blocks instead of appending them.\n\
-- Use `packet28.fetch_context` only for explicit inspection or debugging of an assembled handoff/context artifact.\n\
 - Respect the supersession header in each brief and use it to ignore older Packet28 context.\n\
 - Use explicit section filters and section-item limits before falling back to deprecated `verbosity`.\n\
-- The daemon or wrapper should own relaunch timing; do not grow one worker session indefinitely.\n\
 - Use `packet28://task/<task_id>/brief` or `.packet28/task/<task_id>/brief.md` only as a fallback bridge when MCP is unavailable.\n\
 - If Packet28 is unavailable or returns insufficient context, fall back to direct file reads and commands.\n\
 - Do not force handoff/bootstrap orchestration for trivial conversational requests or narrow single-file edits.\n\
@@ -70,12 +68,13 @@ Use Packet28 as a live context broker for non-trivial coding, debugging, test, r
         ),
         AgentPromptFormat::Agents => format!(
             "## Packet28 Guidance\n\
-When the task is substantial, use Packet28 as a live broker with slim reducers in-turn and checkpointed handoff between workers.\n\
+When the task is substantial, use Packet28 as a hooks-first reducer runtime with checkpointed handoff between workers.\n\
 \n\
 - MCP command: `{mcp}`\n\
 - Preferred MCP endpoint when available: `{proxy}`\n\
-- Use slim in-turn reducers such as `packet28.search` and `packet28.read_regions`; fetch full artifacts only when needed.\n\
-- For long-running work, persist worker intent with `packet28.write_state(op=\"intention\", ...)`, checkpoint explicitly, then use `packet28.prepare_handoff` to bootstrap a fresh worker.\n\
+- Claude hooks, not MCP reducer tools, should rewrite supported shell commands and capture routine tool activity into Packet28.\n\
+- Use `packet28.write_intention` only for semantic task intent; avoid repeated generic state writes in the loop.\n\
+- Let the daemon prepare handoff context after threshold or stop boundaries, then resume from the latest handoff packet.\n\
 - Replace the prior Packet28 context block each turn instead of appending historical Packet28 briefs.\n\
 - Keep thick context assembly out of the active worker loop; use `packet28.fetch_context` only for explicit artifact inspection.\n\
 - The daemon or wrapper should own fresh-worker relaunch after checkpointed handoff assembly.\n\
@@ -88,10 +87,10 @@ When the task is substantial, use Packet28 as a live broker with slim reducers i
         ),
         AgentPromptFormat::Cursor => format!(
             "Packet28 integration:\n\
-- Start `{mcp}` and use Packet28 as a reducer plus handoff broker.\n\
-- Prefer `{proxy}` when you want Packet28 to auto-capture tool activity.\n\
-- Prefer slim in-turn reducers such as `packet28.search` and `packet28.read_regions`, plus explicit artifact fetches for detail.\n\
-- For checkpointed relaunch flows, write the latest worker intention and use `packet28.prepare_handoff` to seed the next worker.\n\
+- Start `{mcp}` and use Packet28 as a control-plane plus handoff broker.\n\
+- Prefer `{proxy}` when you want Packet28 to auto-capture upstream tool activity.\n\
+- Use `packet28.write_intention` for semantic objective updates and keep rewrite/capture out of the visible MCP loop.\n\
+- For checkpointed relaunch flows, use `packet28.prepare_handoff` to seed the next worker.\n\
 - Keep one mutable Packet28 context block and replace it whenever a newer brief supersedes the old one.\n\
 - Use `packet28.fetch_context` only when you explicitly need to inspect a stored handoff or context artifact.\n\
 - Prefer relaunching a fresh worker after checkpointed handoff assembly instead of keeping one session hot.\n\
@@ -127,10 +126,8 @@ mod tests {
     #[test]
     fn claude_fragment_contains_required_guidance() {
         let rendered = render_prompt_fragment(AgentPromptFormat::Claude, None);
-        assert!(rendered.contains("Packet28 as a live context broker"));
-        assert!(rendered.contains("packet28.search"));
-        assert!(rendered.contains("packet28.read_regions"));
-        assert!(rendered.contains("packet28.write_state"));
+        assert!(rendered.contains("hooks-first reducer runtime"));
+        assert!(rendered.contains("packet28.write_intention"));
         assert!(rendered.contains("packet28.prepare_handoff"));
         assert!(rendered.contains("fall back to direct file reads and commands"));
         assert!(rendered.contains("brief.md"));

@@ -32,3 +32,6 @@ suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
 testy-core = { version = "0.2.0", path = "../testy-core" }
 blake3.workspace = true
 bincode.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

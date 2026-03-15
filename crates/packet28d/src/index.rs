@@ -74,10 +74,7 @@ pub(crate) fn enqueue_incremental_index_paths(
     Ok(normalized)
 }
 
-pub(crate) fn spawn_index_worker(
-    state: Arc<Mutex<DaemonState>>,
-    index_rx: Receiver<IndexCommand>,
-) {
+pub(crate) fn spawn_index_worker(state: Arc<Mutex<DaemonState>>, index_rx: Receiver<IndexCommand>) {
     thread::spawn(move || {
         let mut pending_paths = BTreeSet::<String>::new();
         let mut full_rebuild = false;

@@ -276,6 +276,8 @@ pub(crate) fn resolve_session_task_id(
         explicit_task_id.trim().to_string()
     } else if let Some(task_id) = session_current_task_id(session) {
         task_id
+    } else if let Some(task) = crate::task_runtime::load_active_task(root) {
+        task.task_id
     } else if let Ok(task_id) = resolve_current_task_id(root, session) {
         task_id
     } else if let Some(hint) = derive_hint.filter(|hint| !hint.trim().is_empty()) {

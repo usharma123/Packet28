@@ -6,7 +6,9 @@ use std::time::Instant;
 use regex::Regex;
 use suite_packet_core::{BudgetCost, CovyError, EnvelopeV1, FileRef, Provenance};
 
-use crate::types::{CommandSummaryPayload, DroppedSummary, PacketDetail, ProxyRunRequest, SummaryGroup};
+use crate::types::{
+    CommandSummaryPayload, DroppedSummary, PacketDetail, ProxyRunRequest, SummaryGroup,
+};
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 24_000;
 const DEFAULT_MAX_LINES: usize = 160;

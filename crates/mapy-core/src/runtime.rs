@@ -11,8 +11,7 @@ use crate::scan::{
 use crate::types::{
     FocusHit, FocusHitRich, IndexedSymbolDef, RankedFile, RankedFileRich, RankedSymbol,
     RankedSymbolRich, RepoEdge, RepoEdgeRich, RepoIndexFileEntry, RepoIndexSnapshot,
-    RepoIndexUpdateSummary, RepoMapPayload, RepoMapPayloadRich, RepoMapRequest,
-    TruncationSummary,
+    RepoIndexUpdateSummary, RepoMapPayload, RepoMapPayloadRich, RepoMapRequest, TruncationSummary,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -96,7 +95,11 @@ fn build_repo_map_from_scans(
     files: Vec<FileScan>,
 ) -> Result<EnvelopeV1<RepoMapPayload>, CovyError> {
     let started = Instant::now();
-    let max_files = if req.max_files == 0 { 80 } else { req.max_files };
+    let max_files = if req.max_files == 0 {
+        80
+    } else {
+        req.max_files
+    };
     let max_symbols = if req.max_symbols == 0 {
         300
     } else {
@@ -576,10 +579,13 @@ pub fn expand_repo_map_payload(envelope: &EnvelopeV1<RepoMapPayload>) -> RepoMap
                 kind: "file".to_string(),
                 value: file.path.clone(),
             }),
-            "symbol" => envelope.symbols.get(hit.ref_idx).map(|symbol| FocusHitRich {
-                kind: "symbol".to_string(),
-                value: symbol.name.clone(),
-            }),
+            "symbol" => envelope
+                .symbols
+                .get(hit.ref_idx)
+                .map(|symbol| FocusHitRich {
+                    kind: "symbol".to_string(),
+                    value: symbol.name.clone(),
+                }),
             _ => None,
         })
         .collect::<Vec<_>>();

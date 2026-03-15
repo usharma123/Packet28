@@ -35,6 +35,7 @@ struct RuntimeInfo {
     name: &'static str,
     slug: &'static str,
     mcp_config_path: Option<PathBuf>,
+    hook_config_path: Option<PathBuf>,
     agent_file_path: PathBuf,
     agent_format: agent_surface::AgentPromptFormat,
     detected: bool,
@@ -87,6 +88,8 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     let selected_runtimes = select_setup_runtimes(&runtimes, args.runtime != "all");
     let mut agent_targets = Vec::new();
     let mut mcp_configured = false;
+    let mut hook_configured = false;
+    let mut any_hooks_configured = false;
     let mut agent_files_ready = false;
 
     // Phase 1: MCP config
@@ -130,6 +133,56 @@ pub fn run(args: SetupArgs) -> Result<i32> {
             }
             println!();
         }
+    }
+
+    let hook_targets: Vec<&RuntimeInfo> = selected_runtimes
+        .iter()
+        .copied()
+        .filter(|runtime| runtime.hook_config_path.is_some())
+        .collect();
+    if !hook_targets.is_empty() {
+        println!("  {}", "Installing Claude hooks:".bold());
+        for rt in &hook_targets {
+            let config_path = rt.hook_config_path.as_ref().unwrap();
+            match write_claude_hook_config(config_path, &root, args.yes)? {
+                McpConfigStatus::Written => {
+                    hook_configured = true;
+                    any_hooks_configured = true;
+                    println!(
+                        "    {} {} hooks → {}",
+                        "✓".green().bold(),
+                        rt.name,
+                        config_path.display().to_string().dimmed()
+                    );
+                }
+                McpConfigStatus::AlreadyConfigured => {
+                    hook_configured = true;
+                    any_hooks_configured = true;
+                    println!(
+                        "    {} {} hooks (already configured)",
+                        "·".dimmed(),
+                        rt.name
+                    );
+                }
+                McpConfigStatus::Declined => {
+                    println!("    {} {} hooks (skipped)", "·".dimmed(), rt.name);
+                }
+            }
+        }
+        if matches!(
+            write_hook_runtime_config(&root, any_hooks_configured)?,
+            McpConfigStatus::Written
+        ) {
+            println!(
+                "    {} Packet28 hook runtime → {}",
+                "✓".green().bold(),
+                packet28_daemon_core::hook_runtime_config_path(&root)
+                    .display()
+                    .to_string()
+                    .dimmed()
+            );
+        }
+        println!();
     }
 
     for rt in selected_runtimes
@@ -265,8 +318,11 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     println!("  {}", "Quick start:".bold());
 
     if mcp_configured && !args.fallback_only {
-        println!("    Your agent runtimes are configured to use Packet28 via MCP.");
-        println!("    Start a new session and Packet28 context tools will be available.");
+        println!("    Your agent runtimes are configured to use Packet28 control-plane MCP tools.");
+        if hook_configured {
+            println!("    Claude hooks will capture tool activity directly into Packet28.");
+        }
+        println!("    Start a new session and Packet28 intent/handoff tools will be available.");
     } else if agent_files_ready {
         println!("    Agent instruction files have been written.");
         println!("    Include them in your agent's context or system prompt.");
@@ -292,6 +348,7 @@ fn detect_runtimes(root: &Path) -> Vec<RuntimeInfo> {
             name: "Claude Code",
             slug: "claude",
             mcp_config_path: find_claude_mcp_config(&home, root),
+            hook_config_path: Some(root.join(".claude").join("settings.json")),
             agent_file_path: root.join("CLAUDE.md"),
             agent_format: agent_surface::AgentPromptFormat::Claude,
             detected: detect_claude(&home),
@@ -300,6 +357,7 @@ fn detect_runtimes(root: &Path) -> Vec<RuntimeInfo> {
             name: "Cursor",
             slug: "cursor",
             mcp_config_path: find_cursor_mcp_config(root),
+            hook_config_path: None,
             agent_file_path: root.join(".cursorrules"),
             agent_format: agent_surface::AgentPromptFormat::Cursor,
             detected: detect_cursor(&home),
@@ -308,6 +366,7 @@ fn detect_runtimes(root: &Path) -> Vec<RuntimeInfo> {
             name: "Codex",
             slug: "codex",
             mcp_config_path: None, // Codex doesn't have MCP config yet
+            hook_config_path: None,
             agent_file_path: root.join("AGENTS.md"),
             agent_format: agent_surface::AgentPromptFormat::Agents,
             detected: detect_codex(),
@@ -439,6 +498,114 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<McpConfi
     Ok(McpConfigStatus::Written)
 }
 
+fn write_claude_hook_config(path: &Path, root: &Path, auto_yes: bool) -> Result<McpConfigStatus> {
+    let command = resolve_packet28_cli_command();
+    let root_arg = shell_escape(root.display().to_string());
+    let hook_command = format!("{command} hook claude --root \"{root_arg}\"");
+    let packet28_hooks = json!({
+        "SessionStart": [{
+            "matcher": "startup|resume|clear|compact",
+            "hooks": [{"type": "command", "command": hook_command}]
+        }],
+        "UserPromptSubmit": [{
+            "matcher": ".*",
+            "hooks": [{"type": "command", "command": hook_command}]
+        }],
+        "PreToolUse": [{
+            "matcher": ".*",
+            "hooks": [{"type": "command", "command": hook_command}]
+        }],
+        "PostToolUse": [{
+            "matcher": ".*",
+            "hooks": [{"type": "command", "command": hook_command}]
+        }],
+        "Stop": [{
+            "matcher": ".*",
+            "hooks": [{"type": "command", "command": hook_command}]
+        }],
+        "SubagentStop": [{
+            "matcher": ".*",
+            "hooks": [{"type": "command", "command": hook_command}]
+        }],
+        "PreCompact": [{
+            "matcher": "manual|auto",
+            "hooks": [{"type": "command", "command": hook_command}]
+        }],
+        "SessionEnd": [{
+            "matcher": ".*",
+            "hooks": [{"type": "command", "command": hook_command}]
+        }]
+    });
+    let mut config: BTreeMap<String, Value> = if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "refusing to overwrite invalid JSON in '{}'; fix the file and rerun setup",
+                path.display()
+            )
+        })?
+    } else {
+        BTreeMap::new()
+    };
+    if !auto_yes {
+        eprint!(
+            "    Write Claude hook config to {}? [Y/n] ",
+            path.display().to_string().dimmed()
+        );
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        let trimmed = input.trim().to_lowercase();
+        if !trimmed.is_empty() && trimmed != "y" && trimmed != "yes" {
+            return Ok(McpConfigStatus::Declined);
+        }
+    }
+    let mut hooks = config
+        .get("hooks")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if hooks.get("packet28") == Some(&packet28_hooks) {
+        return Ok(McpConfigStatus::AlreadyConfigured);
+    }
+    hooks.insert("packet28".to_string(), packet28_hooks);
+    config.insert("hooks".to_string(), Value::Object(hooks));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&config)?),
+    )?;
+    Ok(McpConfigStatus::Written)
+}
+
+fn write_hook_runtime_config(root: &Path, any_hooks_configured: bool) -> Result<McpConfigStatus> {
+    if !any_hooks_configured {
+        return Ok(McpConfigStatus::Declined);
+    }
+    let path = packet28_daemon_core::hook_runtime_config_path(root);
+    if path.exists() {
+        return Ok(McpConfigStatus::AlreadyConfigured);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let config = packet28_daemon_core::HookRuntimeConfig::default();
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&config)?),
+    )?;
+    Ok(McpConfigStatus::Written)
+}
+
+fn shell_escape(value: String) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+}
+
 fn resolve_packet28_mcp_command() -> String {
     let output = std::process::Command::new("which")
         .arg("packet28-mcp")
@@ -454,13 +621,29 @@ fn resolve_packet28_mcp_command() -> String {
     "packet28-mcp".to_string()
 }
 
+fn resolve_packet28_cli_command() -> String {
+    for candidate in ["Packet28", "packet28"] {
+        let output = std::process::Command::new("which").arg(candidate).output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !command.is_empty() {
+                    return command;
+                }
+            }
+        }
+    }
+    "Packet28".to_string()
+}
+
 fn write_agent_file(path: &Path, content: &str) -> Result<bool> {
     // If file exists, check if it already contains Packet28 guidance
     if path.exists() {
         let existing = fs::read_to_string(path)?;
-        if existing.contains("packet28.search")
+        if existing.contains("packet28.write_intention")
             || existing.contains("packet28.prepare_handoff")
             || existing.contains("Packet28 mcp serve")
+            || existing.contains("hook claude")
         {
             return Ok(false); // already has Packet28 instructions
         }
@@ -486,6 +669,7 @@ fn write_agent_file(path: &Path, content: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn runtime(
         name: &'static str,
@@ -497,6 +681,7 @@ mod tests {
             name,
             slug,
             mcp_config_path: has_mcp.then(|| PathBuf::from(format!("{slug}.json"))),
+            hook_config_path: (slug == "claude").then(|| PathBuf::from(".claude/settings.json")),
             agent_file_path: PathBuf::from(format!("{slug}.md")),
             agent_format: agent_surface::AgentPromptFormat::Agents,
             detected,
@@ -525,5 +710,16 @@ mod tests {
         let slugs: Vec<&str> = selected.iter().map(|runtime| runtime.slug).collect();
 
         assert_eq!(slugs, vec!["claude"]);
+    }
+
+    #[test]
+    fn write_claude_hook_config_installs_packet28_hooks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".claude").join("settings.json");
+        let status = write_claude_hook_config(&path, dir.path(), true).unwrap();
+        assert!(matches!(status, McpConfigStatus::Written));
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(value["hooks"]["packet28"]["SessionStart"].is_array());
+        assert!(value["hooks"]["packet28"]["PostToolUse"].is_array());
     }
 }

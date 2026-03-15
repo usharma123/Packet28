@@ -1,0 +1,11 @@
+src/index.ts:4:1 - error TS2322: Type 'string' is not assignable to type 'number'.
+
+4 value = "demo";
+  ~~~~~
+
+src/index.ts:9:7 - error TS2304: Cannot find name 'missingValue'.
+
+9 console.log(missingValue);
+        ~~~~~~~~~~~~
+
+Found 2 errors in the same file, starting at: src/index.ts:4

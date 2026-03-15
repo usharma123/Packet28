@@ -22,9 +22,9 @@ Packet28 mcp serve --root .
 
 Packet28 keeps the live turn cheap and moves thicker memory assembly out of the worker loop:
 
-- Slim reducers such as `packet28.search` and `packet28.read_regions` return compact previews plus artifact ids
-- The daemon persists reducer packets and explicit state writes like intention, decisions, and checkpoints
-- `packet28.prepare_handoff` assembles a denoised handoff packet only at checkpoint boundaries
+- Claude `PreToolUse` hooks rewrite supported Bash commands through Packet28 reducers, and fallback hooks capture native tool activity into compact persisted packets
+- MCP is reduced to semantic control-plane tools like `packet28.write_intention` and handoff/context inspection
+- `packet28.prepare_handoff` assembles a denoised handoff packet after threshold or stop boundaries
 - The daemon or wrapper relaunches a fresh worker from that handoff packet instead of expanding the current session forever
 
 This keeps Packet28 useful as both a context broker and a reducer layer: small in-turn packets, explicit persistence, and compressed cross-turn memory.
@@ -400,7 +400,9 @@ The reducer-plus-handoff loop is the primary agent entry point.
 ```mermaid
 flowchart LR
   WORKER["Worker agent turn"] --> REDUCERS["Slim reducers\nsearch/read/tool packets"]
-  REDUCERS --> STATE["write_state\nintention + decisions + checkpoints"]
+  REDUCERS --> STATE["hooks -> daemon\npersisted slim packets"]
+  WORKER --> INTENT["write_intention\nsemantic objective only"]
+  INTENT --> STATE
   STATE --> HANDOFF["prepare_handoff\ncompressed context packet"]
   HANDOFF --> RELAUNCH["daemon/wrapper\nfresh worker relaunch"]
   RELAUNCH --> WORKER
@@ -408,9 +410,9 @@ flowchart LR
 
 Operationally:
 
-1. The live worker stays on slim reducer packets during the turn.
-2. The worker persists intention and progress via `packet28.write_state`.
-3. Once a checkpoint is reached, the daemon assembles a denoised handoff packet.
+1. Claude hooks keep reducer traffic out of the visible MCP loop.
+2. The worker writes intent only when the objective or next step changes materially.
+3. The daemon assembles a denoised handoff packet after threshold or stop boundaries.
 4. A fresh worker resumes from that handoff packet instead of growing the original session indefinitely.
 
 ## Binaries
@@ -575,10 +577,21 @@ Prefer Packet28 as an MCP proxy when you want upstream tool usage to become part
 
 Example reducer-plus-handoff loop:
 
-1. Use `packet28.search` and `packet28.read_regions` for cheap steering during the turn.
-2. Call `packet28.write_state` for intention, edits, decisions, and checkpoints.
-3. Call `packet28.prepare_handoff` once a checkpoint is reached.
-4. Relaunch a fresh worker from the handoff packet through `packet28-agent` or `Packet28 daemon task launch-agent`.
+1. Install Claude hooks with `Packet28 setup --runtime claude`.
+2. Let hooks persist reducer packets into the daemon automatically during the turn.
+3. Call `packet28.write_intention` only for semantic objective changes.
+4. Call `packet28.prepare_handoff` only for explicit bootstrap or inspection.
+5. Relaunch a fresh worker from the handoff packet through `packet28-agent` or `Packet28 daemon task launch-agent`.
+
+Run the local hook benchmark suite:
+
+```bash
+python3 scripts/benchmark_hook_suite.py --root .
+python3 scripts/benchmark_hook_suite.py --root . --derive-gh-repo
+```
+
+The suite writes per-case JSON plus a `summary.json` under `.packet28/benchmarks/...`. CI also runs the suite and uploads the artifact bundle through the `Hook Benchmark Suite` workflow.
+CI validates the results against conservative regression thresholds with `scripts/validate_hook_benchmarks.py` and publishes both the benchmark table and validation report into the workflow summary.
 
 Generate agent instructions directly:
 
@@ -688,6 +701,9 @@ Optional governance via `context.yaml` for policy-constrained execution. The cur
 | GitLab CI example | `scripts/ci/gitlab-ci.yml` |
 | Benchmark notes | `scripts/benchmark_packet28.md` |
 | Agent search benchmark harness | `scripts/benchmark_agent_search.md` |
+| Hook rewrite benchmark | `scripts/benchmark_hook_rewrite.py` |
+| Hook rewrite suite | `scripts/benchmark_hook_suite.py` |
+| Hook benchmark validator | `scripts/validate_hook_benchmarks.py` |
 
 Repository-local MCP config example: `.mcp.json`.
 

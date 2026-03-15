@@ -364,9 +364,7 @@ pub(crate) fn build_repo_map_envelope(
     .map_err(|source| anyhow!(source.to_string()))
 }
 
-pub(crate) fn load_cached_coverage(
-    root: &Path,
-) -> Result<Option<suite_packet_core::CoverageData>> {
+pub(crate) fn load_cached_coverage(root: &Path) -> Result<Option<suite_packet_core::CoverageData>> {
     let path = root.join(".covy").join("state").join("latest.bin");
     if !path.exists() {
         return Ok(None);
@@ -378,9 +376,7 @@ pub(crate) fn load_cached_coverage(
     Ok(Some(coverage))
 }
 
-pub(crate) fn load_cached_testmap(
-    root: &Path,
-) -> Result<Option<suite_packet_core::TestMapIndex>> {
+pub(crate) fn load_cached_testmap(root: &Path) -> Result<Option<suite_packet_core::TestMapIndex>> {
     let path = root.join(".covy").join("state").join("testmap.bin");
     if !path.exists() {
         return Ok(None);
@@ -566,10 +562,12 @@ pub(crate) fn material_write_is_noop(
             .paths
             .iter()
             .all(|path| snapshot.files_read.iter().any(|existing| existing == path)),
-        BrokerWriteOp::FileEdit => request
-            .paths
-            .iter()
-            .all(|path| snapshot.files_edited.iter().any(|existing| existing == path)),
+        BrokerWriteOp::FileEdit => request.paths.iter().all(|path| {
+            snapshot
+                .files_edited
+                .iter()
+                .any(|existing| existing == path)
+        }),
         BrokerWriteOp::Intention => snapshot.latest_intention.as_ref().is_some_and(|intention| {
             intention.text == request.text.clone().unwrap_or_default()
                 && intention.note == request.note
@@ -578,14 +576,16 @@ pub(crate) fn material_write_is_noop(
                 && intention.paths == request.paths
                 && intention.symbols == request.symbols
         }),
-        BrokerWriteOp::CheckpointSave => snapshot
-            .latest_checkpoint_id
-            .as_ref()
-            .zip(request.checkpoint_id.as_ref())
-            .is_some_and(|(current, requested)| current == requested)
-            && snapshot.checkpoint_note == request.note
-            && snapshot.checkpoint_focus_paths == request.paths
-            && snapshot.checkpoint_focus_symbols == request.symbols,
+        BrokerWriteOp::CheckpointSave => {
+            snapshot
+                .latest_checkpoint_id
+                .as_ref()
+                .zip(request.checkpoint_id.as_ref())
+                .is_some_and(|(current, requested)| current == requested)
+                && snapshot.checkpoint_note == request.note
+                && snapshot.checkpoint_focus_paths == request.paths
+                && snapshot.checkpoint_focus_symbols == request.symbols
+        }
         BrokerWriteOp::QuestionOpen => request.question_id.as_ref().is_some_and(|question_id| {
             snapshot
                 .open_questions
@@ -604,15 +604,14 @@ pub(crate) fn material_write_is_noop(
                 .iter()
                 .any(|decision| decision.id == *decision_id)
         }),
-        BrokerWriteOp::DecisionSupersede => request
-            .decision_id
-            .as_ref()
-            .is_some_and(|decision_id| {
+        BrokerWriteOp::DecisionSupersede => {
+            request.decision_id.as_ref().is_some_and(|decision_id| {
                 !snapshot
                     .active_decisions
                     .iter()
                     .any(|decision| decision.id == *decision_id)
-            }),
+            })
+        }
         BrokerWriteOp::StepComplete => request.step_id.as_ref().is_some_and(|step_id| {
             snapshot
                 .completed_steps

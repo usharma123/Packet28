@@ -12,8 +12,8 @@ pub(crate) fn render_recent_tool_activity_lines(
     snapshot: &suite_packet_core::AgentSnapshotPayload,
     compact: bool,
 ) -> Vec<String> {
-    snapshot
-        .recent_tool_invocations
+    let invocations = dedup_recent_invocations(&snapshot.recent_tool_invocations);
+    invocations
         .iter()
         .rev()
         .map(|invocation| {
@@ -58,6 +58,43 @@ pub(crate) fn render_recent_tool_activity_lines(
             }
         })
         .collect()
+}
+
+fn dedup_recent_invocations(
+    invocations: &[suite_packet_core::ToolInvocationSummary],
+) -> Vec<suite_packet_core::ToolInvocationSummary> {
+    let mut by_fingerprint = BTreeMap::<String, suite_packet_core::ToolInvocationSummary>::new();
+    let mut passthrough = Vec::new();
+    for invocation in invocations {
+        if let Some(fingerprint) = invocation
+            .request_fingerprint
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let replace = match by_fingerprint.get(fingerprint) {
+                None => true,
+                Some(existing) => invocation_richness(invocation) >= invocation_richness(existing),
+            };
+            if replace {
+                by_fingerprint.insert(fingerprint.clone(), invocation.clone());
+            }
+        } else {
+            passthrough.push(invocation.clone());
+        }
+    }
+    let mut merged = passthrough;
+    merged.extend(by_fingerprint.into_values());
+    merged.sort_by(|a, b| {
+        a.sequence
+            .cmp(&b.sequence)
+            .then_with(|| a.occurred_at_unix.cmp(&b.occurred_at_unix))
+            .then_with(|| a.invocation_id.cmp(&b.invocation_id))
+    });
+    merged
+}
+
+fn invocation_richness(invocation: &suite_packet_core::ToolInvocationSummary) -> usize {
+    invocation.paths.len() + invocation.regions.len() * 3 + invocation.symbols.len() * 2
 }
 
 pub(crate) fn render_task_memory_lines(

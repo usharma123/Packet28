@@ -13,14 +13,14 @@ All Packet28 machine-mode commands emit `suite.packet.v1` JSON wrappers. Parse p
 
 ### Live Broker (Recommended Entry Point)
 
-Packet28 is intended to sit alongside the live agent loop as a reducer plus handoff broker. The normal loop is:
+Packet28 is intended to sit alongside the live agent loop as a hooks-first reducer plus handoff broker. The normal loop is:
 
 1. Start `Packet28 mcp serve`
-2. Keep `task_id` and let reducers persist slim packets during the active turn
-3. Use reducer tools like `packet28.search` and `packet28.read_regions`
-4. Call `packet28.write_state` after file reads, edits, checkpoints, decisions, question updates, and intention changes
-5. Fetch full tool artifacts only when a slim reducer packet is not enough
-6. Once the turn reaches a checkpoint, call `packet28.prepare_handoff`
+2. Install Claude hooks with `Packet28 setup --runtime claude`
+3. Let hooks persist slim reducer packets during the active turn
+4. Use `packet28.write_intention` only when the task objective changes materially
+5. Fetch full context artifacts only when explicit inspection is needed.
+6. Let the daemon assemble handoff after threshold or stop boundaries
 7. Let the daemon or wrapper relaunch a fresh worker with the handoff packet
 
 ### MCP Startup
@@ -46,45 +46,15 @@ Use `packet28.fetch_context` only when you need to inspect a stored handoff/cont
 }
 ```
 
-### Slim Search First
-
-Use `packet28.search` when you want cheap steering before asking for full grouped matches:
-
-```json
-{
-  "name": "packet28.search",
-  "arguments": {
-    "task_id": "task-auth-broker",
-    "query": "BrokerWriteStateRequest",
-    "paths": ["crates"],
-    "whole_word": true,
-    "response_mode": "slim"
-  }
-}
-```
-
-The slim response returns only `compact_preview`, `match_count`, and `artifact_id`. If the preview looks promising, expand the stored full result on demand:
-
-```json
-{
-  "name": "packet28.fetch_tool_result",
-  "arguments": {
-    "task_id": "task-auth-broker",
-    "artifact_id": "artifact-123"
-  }
-}
-```
-
 ### Checkpointed Handoff
 
-Use a dedicated handoff packet for fresh-worker bootstrap instead of pulling full broker context mid-turn:
+Use a dedicated intention write for semantic objective changes:
 
 ```json
 {
-  "name": "packet28.write_state",
+  "name": "packet28.write_intention",
   "arguments": {
     "task_id": "task-auth-broker",
-    "op": "intention",
     "text": "Wire the broker handoff flow through the MCP surface.",
     "note": "The next worker should resume from the handoff artifact rather than a thick mid-turn context fetch.",
     "step_id": "editing",
@@ -94,28 +64,7 @@ Use a dedicated handoff packet for fresh-worker bootstrap instead of pulling ful
 }
 ```
 
-```json
-{
-  "name": "packet28.write_state",
-  "arguments": {
-    "task_id": "task-auth-broker",
-    "op": "checkpoint_save",
-    "step_id": "editing-complete"
-  }
-}
-```
-
-```json
-{
-  "name": "packet28.prepare_handoff",
-  "arguments": {
-    "task_id": "task-auth-broker",
-    "response_mode": "slim"
-  }
-}
-```
-
-The handoff response returns a compact worker-bootstrap packet with the latest intention, checkpoint state, recent deltas, and an `artifact_id` for full retrieval if needed.
+The daemon uses that intention plus hook-captured reducer packets to prepare the next handoff packet automatically at threshold or stop boundaries. Use `packet28.prepare_handoff` only when you need to inspect or bootstrap explicitly.
 
 ### Fresh-Worker Bootstrap
 
@@ -152,22 +101,22 @@ Packet28 agent-prompt --format cursor
 - Start `Packet28 mcp serve`
 - Keep `task_id` and a single mutable Packet28 context block in the agent session
 - Treat the latest Packet28 brief as the only canonical Packet28 context block; replace older Packet28 briefs instead of appending them
-- Use slim reducers inside the turn and fetch full artifacts only when needed
-- Persist reads, edits, checkpoints, and intentions with `packet28.write_state`
-- Assemble handoff only after checkpoint and relaunch a fresh worker instead of bloating the active session
+- Let Claude hooks rewrite supported Bash commands and capture reducer packets invisibly inside the turn
+- Use `packet28.write_intention` only when the objective changes materially
+- Assemble handoff at stop/threshold boundaries and relaunch a fresh worker instead of bloating the active session
 
 #### Codex / AGENTS.md
 
 - Use `Packet28 agent-prompt --format agents` to seed the runtime instructions
 - Keep one mutable Packet28 block in the prompt and replace it when a newer brief supersedes the old one
-- Use `packet28.write_state` after file reads, edits, checkpoints, decisions, question changes, and intention updates
-- For long-running work, keep in-turn packets slim and use `packet28.prepare_handoff` only after a checkpoint when bootstrapping a fresh worker
+- Let hooks rewrite supported shell commands and capture routine tool activity without visible MCP reducer calls
+- Use `packet28.write_intention` for semantic resume breadcrumbs and `packet28.prepare_handoff` only for explicit bootstrap or inspection
 
 #### Cursor
 
 - Start MCP once per workspace
 - Replace the prior Packet28 context block instead of appending Packet28 history
-- Use slim reducers in the turn, then relaunch from handoff after checkpoint
+- Let hooks rewrite supported shell commands and capture reducer packets in the turn, then relaunch from handoff after threshold or stop boundaries
 - Keep `.packet28/task/<task_id>/brief.md` only as a fallback bridge
 - Treat `verbosity` as a compatibility alias; prefer explicit section limits
 

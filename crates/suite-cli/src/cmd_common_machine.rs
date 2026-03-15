@@ -5,11 +5,11 @@ use clap::ValueEnum;
 use serde_json::{json, Value};
 use suite_packet_core::{EnvelopeV1, JsonProfile, PacketWrapperV1};
 
-pub use crate::cmd_common_machine_support::{budget_retry_hint, cache_summary_line};
 use crate::cmd_common_machine_support::{
     attach_artifact_handle, compact_packet_payload, extract_cache_hit, insert_payload_debug,
     refresh_packet_budget,
 };
+pub use crate::cmd_common_machine_support::{budget_retry_hint, cache_summary_line};
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
 pub enum JsonProfileArg {

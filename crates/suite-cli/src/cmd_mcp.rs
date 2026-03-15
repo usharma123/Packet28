@@ -18,6 +18,7 @@ use packet28_daemon_core::{
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+#[allow(dead_code)]
 #[path = "cmd_mcp_native.rs"]
 mod native_tools;
 #[path = "cmd_mcp_prompt_resource.rs"]
@@ -28,16 +29,16 @@ mod proxy;
 mod proxy_catalog;
 #[path = "cmd_mcp_proxy_upstream.rs"]
 mod proxy_upstream;
+#[allow(dead_code)]
 #[path = "cmd_mcp_support.rs"]
 mod support;
 #[path = "cmd_mcp_transport.rs"]
 mod transport;
 
 use crate::cmd_mcp::native_tools::{
-    handle_packet28_fetch_context, handle_packet28_fetch_tool_result,
-    handle_packet28_prepare_handoff, handle_packet28_read_regions, handle_packet28_search,
-    Packet28FetchContextArgs, Packet28FetchToolResultArgs, Packet28PrepareHandoffArgs,
-    Packet28ReadRegionsArgs, Packet28SearchArgs,
+    handle_packet28_fetch_context, handle_packet28_prepare_handoff,
+    handle_packet28_write_intention, Packet28FetchContextArgs, Packet28PrepareHandoffArgs,
+    Packet28WriteIntentionArgs,
 };
 use crate::cmd_mcp::prompt_resource::{
     handle_prompt_get, handle_resource_read, handle_resources_list, prompt_descriptors,
@@ -45,11 +46,9 @@ use crate::cmd_mcp::prompt_resource::{
 };
 use crate::cmd_mcp::proxy::{load_proxy_config, serve_proxy_stdio};
 use crate::cmd_mcp::support::{
-    broker_task_status_via_session, broker_write_state_via_session, classify_error_message,
-    extract_named_string, extract_paths, extract_symbols, is_retryable_error,
-    load_tool_result_artifact, maybe_store_result_artifact, next_task_invocation,
-    resolve_session_task_id, store_result_artifact, store_tool_artifact, summarize_json_value,
-    track_task, write_auto_capture_state_batch_via_session,
+    broker_task_status_via_session, classify_error_message, extract_named_string, extract_paths,
+    extract_symbols, is_retryable_error, maybe_store_result_artifact, resolve_session_task_id,
+    store_tool_artifact, summarize_json_value, track_task,
 };
 use crate::cmd_mcp::transport::{
     read_message, render_command_preview, write_message, McpMessageFraming,
@@ -375,38 +374,6 @@ fn handle_method(
         "tools/list" => Ok(json!({
             "tools": [
                 {
-                    "name": "packet28.search",
-                    "description": "Search repository files under the Packet28 root with reducer-backed grouped results and auto-capture the result into broker state. Returns only compact_preview, match_count, and artifact_id by default; fetch full details later by artifact or invocation id.",
-                    "inputSchema": {
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": {
-                            "task_id": {"type":"string"},
-                            "query": {"type":"string"},
-                            "paths": {"type":"array","items":{"type":"string"}},
-                            "fixed_string": {"type":"boolean"},
-                            "case_sensitive": {"type":"boolean"},
-                            "whole_word": {"type":"boolean"},
-                            "context_lines": {"type":"number"},
-                            "max_matches_per_file": {"type":"number"},
-                            "max_total_matches": {"type":"number"},
-                            "response_mode": {"type":"string","enum":["slim","full"]}
-                        }
-                    }
-                },
-                {
-                    "name": "packet28.fetch_tool_result",
-                    "description": "Fetch a previously stored full native Packet28 tool result by artifact_id or invocation_id.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "task_id": {"type":"string"},
-                            "artifact_id": {"type":"string"},
-                            "invocation_id": {"type":"string"}
-                        }
-                    }
-                },
-                {
                     "name": "packet28.fetch_context",
                     "description": "Fetch a previously stored full Packet28 broker context by context_version or artifact_id.",
                     "inputSchema": {
@@ -431,62 +398,25 @@ fn handle_method(
                     }
                 },
                 {
-                    "name": "packet28.read_regions",
-                    "description": "Read file content under the Packet28 root using explicit region hints and auto-capture the result into broker state.",
+                    "name": "packet28.write_intention",
+                    "description": "Persist the current task objective and worker intent into Packet28.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["path"],
+                        "required": ["text"],
                         "properties": {
                             "task_id": {"type":"string"},
-                            "path": {"type":"string"},
-                            "regions": {"type":"array","items":{"type":"string"}},
-                            "line_start": {"type":"number"},
-                            "line_end": {"type":"number"}
-                        }
-                    }
-                },
-                {
-                    "name": "packet28.write_state",
-                    "description": "Write one structured agent-state update into Packet28.",
-                    "inputSchema": {
-                        "type": "object",
-                        "required": ["op"],
-                        "properties": {
-                            "task_id": {"type":"string"},
-                            "op": {"type":"string","enum":["focus_set","focus_clear","file_read","file_edit","intention","checkpoint_save","decision_add","decision_supersede","step_complete","question_open","question_resolve","tool_invocation_started","tool_invocation_completed","tool_invocation_failed","tool_result","focus_inferred","evidence_captured"]},
-                            "paths": {"type":"array","items":{"type":"string"}},
-                            "symbols": {"type":"array","items":{"type":"string"}},
-                            "note": {"type":"string"},
-                            "decision_id": {"type":"string"},
-                            "question_id": {"type":"string"},
-                            "checkpoint_id": {"type":"string"},
-                            "step_id": {"type":"string"},
                             "text": {"type":"string"},
-                            "regions": {"type":"array","items":{"type":"string"}},
-                            "resolves_question_id": {"type":"string"},
-                            "resolution_decision_id": {"type":"string"},
-                            "invocation_id": {"type":"string"},
-                            "tool_name": {"type":"string"},
-                            "server_name": {"type":"string"},
-                            "operation_kind": {"type":"string","enum":["search","read","edit","build","test","diff","git","fetch","generic"]},
-                            "request_summary": {"type":"string"},
-                            "result_summary": {"type":"string"},
-                            "request_fingerprint": {"type":"string"},
-                            "search_query": {"type":"string"},
-                            "command": {"type":"string"},
-                            "sequence": {"type":"number"},
-                            "duration_ms": {"type":"number"},
-                            "error_class": {"type":"string"},
-                            "error_message": {"type":"string"},
-                            "retryable": {"type":"boolean"},
-                            "artifact_id": {"type":"string"},
-                            "refresh_context": {"type":"boolean"}
+                            "note": {"type":"string"},
+                            "step_id": {"type":"string"},
+                            "question_id": {"type":"string"},
+                            "paths": {"type":"array","items":{"type":"string"}},
+                            "symbols": {"type":"array","items":{"type":"string"}}
                         }
                     }
                 },
                 {
                     "name": "packet28.task_status",
-                    "description": "Return current Packet28 task status and broker artifact paths.",
+                    "description": "Return current Packet28 task status and handoff state.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -496,7 +426,7 @@ fn handle_method(
                 },
                 {
                     "name": "packet28.capabilities",
-                    "description": "Describe Packet28 broker capabilities and supported section/filter modes.",
+                    "description": "Describe the active Packet28 hooks-first runtime contract.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
@@ -550,25 +480,6 @@ fn handle_tool_call(
         .ok_or_else(|| anyhow!("missing tool name"))?;
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     let payload = match name {
-        "packet28.search" => {
-            let mut request: Packet28SearchArgs = serde_json::from_value(arguments)?;
-            request.task_id =
-                resolve_session_task_id(session, root, &request.task_id, None, "packet28.search")?;
-            track_task(session, root, &request.task_id)?;
-            handle_packet28_search(root, session, request)?
-        }
-        "packet28.fetch_tool_result" => {
-            let mut request: Packet28FetchToolResultArgs = serde_json::from_value(arguments)?;
-            request.task_id = resolve_session_task_id(
-                session,
-                root,
-                &request.task_id,
-                None,
-                "packet28.fetch_tool_result",
-            )?;
-            track_task(session, root, &request.task_id)?;
-            handle_packet28_fetch_tool_result(root, request)?
-        }
         "packet28.fetch_context" => {
             let mut request: Packet28FetchContextArgs = serde_json::from_value(arguments)?;
             request.task_id = resolve_session_task_id(
@@ -593,29 +504,25 @@ fn handle_tool_call(
             track_task(session, root, &request.task_id)?;
             handle_packet28_prepare_handoff(root, request)?
         }
-        "packet28.read_regions" => {
-            let mut request: Packet28ReadRegionsArgs = serde_json::from_value(arguments)?;
+        "packet28.write_intention" => {
+            let mut request: Packet28WriteIntentionArgs = serde_json::from_value(arguments)?;
             request.task_id = resolve_session_task_id(
                 session,
                 root,
                 &request.task_id,
-                None,
-                "packet28.read_regions",
+                Some(request.text.as_str()),
+                "packet28.write_intention",
             )?;
             track_task(session, root, &request.task_id)?;
-            handle_packet28_read_regions(root, session, request)?
-        }
-        "packet28.write_state" => {
-            let mut request: BrokerWriteStateRequest = serde_json::from_value(arguments)?;
-            request.task_id = resolve_session_task_id(
-                session,
+            crate::task_runtime::store_active_task(
                 root,
-                &request.task_id,
-                None,
-                "packet28.write_state",
+                &packet28_daemon_core::ActiveTaskRecord {
+                    task_id: request.task_id.clone(),
+                    session_id: None,
+                    updated_at_unix: packet28_daemon_core::now_unix(),
+                },
             )?;
-            track_task(session, root, &request.task_id)?;
-            serde_json::to_value(broker_write_state_via_session(root, session, request)?)?
+            handle_packet28_write_intention(root, request)?
         }
         "packet28.task_status" => {
             let task_id = resolve_session_task_id(
@@ -650,7 +557,7 @@ fn capabilities_payload() -> Value {
         "section_ids": BROKER_SECTION_IDS,
         "verbosity_modes": ["compact", "standard", "rich"],
         "response_modes": ["slim", "full"],
-        "tools": ["packet28.search", "packet28.fetch_tool_result", "packet28.fetch_context", "packet28.prepare_handoff", "packet28.read_regions", "packet28.write_state", "packet28.task_status", "packet28.capabilities"],
+        "tools": ["packet28.fetch_context", "packet28.prepare_handoff", "packet28.write_intention", "packet28.task_status", "packet28.capabilities"],
         "prompts": ["packet28.start_task", "packet28.continue_task", "packet28.summarize_current_context"],
         "tool_result_kinds": ["build", "stack", "test", "diff", "generic"],
         "push_notifications": {
@@ -669,22 +576,21 @@ fn capabilities_payload() -> Value {
             "current_task_default": true,
             "task_id_optional_after_first_task": true
         },
-        "search": {
-            "response_modes": ["slim", "full"],
-            "default_response_mode": "slim",
-            "detail_fetch_tool": "packet28.fetch_tool_result",
-            "slim_fields": ["compact_preview", "match_count", "artifact_id"]
-        },
         "context": {
             "response_modes": ["full"],
             "default_response_mode": "full",
             "detail_fetch_tool": "packet28.fetch_context",
             "use_case": "artifact_inspection_only"
         },
+        "hooks": {
+            "primary_runtime": "claude",
+            "reducers_visible_via_mcp": false,
+            "ingest_path": "daemon_hook_ingest"
+        },
         "handoff": {
             "tool": "packet28.prepare_handoff",
             "default_response_mode": "slim",
-            "checkpoint_required": true,
+            "checkpoint_required": false,
             "detail_fetch_tool": "packet28.fetch_context"
         },
         "section_limits": {
@@ -714,28 +620,6 @@ fn capabilities_payload() -> Value {
 
 fn summarize_tool_payload(name: &str, payload: &Value) -> String {
     match name {
-        "packet28.search" => {
-            let matches = payload
-                .get("match_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if let Some(files) = payload
-                .get("paths")
-                .and_then(Value::as_array)
-                .map(|items| items.len())
-            {
-                format!("Packet28 search found {matches} match(es) across {files} file(s).")
-            } else {
-                format!("Packet28 search found {matches} match(es).")
-            }
-        }
-        "packet28.fetch_tool_result" => {
-            let artifact_id = payload
-                .get("artifact_id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            format!("Packet28 fetched tool result artifact {artifact_id}.")
-        }
         "packet28.fetch_context" => {
             let artifact_id = payload
                 .get("artifact_id")
@@ -757,29 +641,6 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
             } else {
                 format!("Packet28 did not prepare a handoff: {reason}")
             }
-        }
-        "packet28.read_regions" => {
-            let path = payload
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let lines = payload
-                .get("lines")
-                .and_then(Value::as_array)
-                .map(|items| items.len())
-                .unwrap_or(0);
-            format!("Packet28 read_regions returned {lines} line(s) from {path}.")
-        }
-        "packet28.write_state" => {
-            let accepted = payload
-                .get("accepted")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let version = payload
-                .get("context_version")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            format!("Packet28 state write accepted={accepted} context_version={version}.")
         }
         "packet28.task_status" => "Packet28 task status.".to_string(),
         "packet28.capabilities" => "Packet28 broker capabilities.".to_string(),

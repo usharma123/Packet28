@@ -73,3 +73,69 @@ pub struct ReadRegionsResult {
     pub lines: Vec<ReadLine>,
     pub compact_preview: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandReducerFamily {
+    Git,
+    Fs,
+    Rust,
+    Github,
+    Python,
+    Javascript,
+    Go,
+    Infra,
+}
+
+impl CommandReducerFamily {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Fs => "fs",
+            Self::Rust => "rust",
+            Self::Github => "github",
+            Self::Python => "python",
+            Self::Javascript => "javascript",
+            Self::Go => "go",
+            Self::Infra => "infra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct CommandReducerSpec {
+    pub family: String,
+    pub canonical_kind: String,
+    pub packet_type: String,
+    pub operation_kind: suite_packet_core::ToolOperationKind,
+    pub command: String,
+    pub argv: Vec<String>,
+    pub cache_fingerprint: String,
+    pub cacheable: bool,
+    pub mutation: bool,
+    pub paths: Vec<String>,
+    pub equivalence_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct CommandReduction {
+    pub family: String,
+    pub canonical_kind: String,
+    pub packet_type: String,
+    pub operation_kind: suite_packet_core::ToolOperationKind,
+    pub summary: String,
+    pub paths: Vec<String>,
+    pub regions: Vec<String>,
+    pub symbols: Vec<String>,
+    pub failed: bool,
+    pub error_class: Option<String>,
+    pub error_message: Option<String>,
+    pub retryable: Option<bool>,
+    pub exit_code: i32,
+    pub cache_fingerprint: String,
+    pub cacheable: bool,
+    pub mutation: bool,
+    pub equivalence_key: Option<String>,
+}

@@ -109,7 +109,10 @@ fn start_upstream_reader_thread(
     });
 }
 
-pub(crate) fn send_message_to_upstream(upstream: &mut UpstreamClient, request: &Value) -> Result<()> {
+pub(crate) fn send_message_to_upstream(
+    upstream: &mut UpstreamClient,
+    request: &Value,
+) -> Result<()> {
     let body = serde_json::to_vec(request)?;
     write!(upstream.stdin, "Content-Length: {}\r\n\r\n", body.len())?;
     upstream.stdin.write_all(&body)?;
@@ -117,7 +120,10 @@ pub(crate) fn send_message_to_upstream(upstream: &mut UpstreamClient, request: &
     Ok(())
 }
 
-pub(crate) fn send_request_to_upstream(upstream: &mut UpstreamClient, request: &Value) -> Result<Value> {
+pub(crate) fn send_request_to_upstream(
+    upstream: &mut UpstreamClient,
+    request: &Value,
+) -> Result<Value> {
     send_message_to_upstream(upstream, request)?;
     upstream
         .responses

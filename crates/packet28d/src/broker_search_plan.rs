@@ -327,7 +327,11 @@ pub(crate) fn expand_scope_paths(
             score += (path_token_hits + explicit_symbol_hits) * 35;
             score += symbol_hits.get(&file.path).copied().unwrap_or(0) * 30;
             score += role_file_weight(&file.path)
-                * if primary_scopes.contains(&scope) { 25 } else { 10 };
+                * if primary_scopes.contains(&scope) {
+                    25
+                } else {
+                    10
+                };
 
             (score, file.score, file.path.clone())
         })

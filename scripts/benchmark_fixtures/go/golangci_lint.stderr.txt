@@ -1,0 +1,6 @@
+pkg/service/service.go:17:2: undefined: missingHelper (typecheck)
+    missingHelper()
+    ^
+pkg/service/service.go:22:9: Error return value of `w.Write` is not checked (errcheck)
+    w.Write([]byte("ok"))
+        ^

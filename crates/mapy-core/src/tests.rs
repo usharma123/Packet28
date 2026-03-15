@@ -319,9 +319,10 @@ fn build_repo_index_captures_symbol_lines_and_token_regions() {
 
     let snapshot = build_repo_index(root, true).unwrap();
     let file = snapshot.files.get("src/Sample.java").unwrap();
-    assert!(file.symbols.iter().any(|symbol| {
-        symbol.name == "isBlank" && symbol.kind == "method" && symbol.line == 2
-    }));
+    assert!(file
+        .symbols
+        .iter()
+        .any(|symbol| { symbol.name == "isBlank" && symbol.kind == "method" && symbol.line == 2 }));
     assert_eq!(file.token_lines.get("isblank").cloned(), Some(vec![2, 3]));
 }
 
@@ -337,8 +338,7 @@ fn update_repo_index_only_touches_changed_files() {
     let original_beta = snapshot.files.get("src/b.rs").cloned().unwrap();
 
     std::fs::write(root.join("src/a.rs"), "fn alpha() {}\nfn gamma() {}\n").unwrap();
-    let summary =
-        update_repo_index(root, &mut snapshot, &["src/a.rs".to_string()], true).unwrap();
+    let summary = update_repo_index(root, &mut snapshot, &["src/a.rs".to_string()], true).unwrap();
 
     assert_eq!(summary.changed_paths, vec!["src/a.rs".to_string()]);
     assert_eq!(summary.indexed_files, 1);

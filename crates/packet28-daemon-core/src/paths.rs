@@ -61,6 +61,18 @@ pub fn task_artifacts_dir(root: &Path) -> PathBuf {
     root.join(".packet28").join(TASK_ARTIFACTS_DIR_NAME)
 }
 
+pub fn agent_runtime_dir(root: &Path) -> PathBuf {
+    root.join(".packet28").join("agent")
+}
+
+pub fn hook_runtime_config_path(root: &Path) -> PathBuf {
+    daemon_dir(root).join(HOOK_RUNTIME_CONFIG_FILE_NAME)
+}
+
+pub fn active_task_path(root: &Path) -> PathBuf {
+    agent_runtime_dir(root).join(AGENT_ACTIVE_TASK_FILE_NAME)
+}
+
 pub fn task_event_log_path(root: &Path, task_id: &str) -> PathBuf {
     let safe = safe_task_id(task_id);
     task_events_dir(root).join(format!("{safe}.events.jsonl"))

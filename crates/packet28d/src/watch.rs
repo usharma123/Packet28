@@ -50,45 +50,10 @@ pub(crate) fn register_task_and_watches(
             .collect::<Vec<_>>();
         let task = TaskRecord {
             task_id: spec.task_id.clone(),
-            running: false,
-            cancel_requested: false,
-            pending_replan: false,
-            last_request_id: None,
-            last_started_at_unix: None,
-            last_completed_at_unix: None,
-            last_replan_at_unix: None,
-            last_error: None,
             watch_ids,
             sequence_present: true,
             sequence: Some(spec.sequence.clone()),
-            last_sequence_metadata: None,
-            last_event_seq: 0,
-            last_context_refresh_at_unix: None,
-            working_set_est_tokens: 0,
-            evictable_est_tokens: 0,
-            changed_since_checkpoint_paths: 0,
-            changed_since_checkpoint_symbols: 0,
-            latest_context_version: None,
-            latest_brief_path: None,
-            latest_brief_hash: None,
-            latest_brief_generated_at_unix: None,
-            latest_context_reason: None,
-            latest_handoff_artifact_id: None,
-            latest_handoff_generated_at_unix: None,
-            latest_handoff_checkpoint_id: None,
-            latest_agent_pid: None,
-            latest_agent_bootstrap_mode: None,
-            latest_agent_log_path: None,
-            latest_agent_started_at_unix: None,
-            latest_agent_completed_at_unix: None,
-            latest_agent_exit_code: None,
-            latest_agent_context_version: None,
-            latest_agent_handoff_artifact_id: None,
-            latest_agent_handoff_checkpoint_id: None,
-            latest_broker_request: None,
-            linked_decisions: BTreeMap::new(),
-            resolved_questions: BTreeMap::new(),
-            question_texts: BTreeMap::new(),
+            ..TaskRecord::default()
         };
         guard.tasks.tasks.insert(spec.task_id.clone(), task.clone());
     }
@@ -225,7 +190,10 @@ pub(crate) fn run_sequence_for_task(
                                 .collect(),
                         ),
                     );
-                    object.insert("reason".to_string(), Value::String("replan_applied".to_string()));
+                    object.insert(
+                        "reason".to_string(),
+                        Value::String("replan_applied".to_string()),
+                    );
                     object.insert(
                         "context_version".to_string(),
                         Value::String(response.context_version.clone()),
@@ -625,15 +593,12 @@ fn next_watch_timeout(pending: &HashMap<String, PendingWatchEvent>) -> Option<Du
 }
 
 fn watch_debounce_ms(state: &Arc<Mutex<DaemonState>>, watch_id: &str) -> Option<u64> {
-    state
-        .lock()
-        .ok()
-        .and_then(|guard| {
-            guard
-                .watches
-                .watches
-                .iter()
-                .find(|watch| watch.watch_id == watch_id)
-                .and_then(|watch| watch.spec.debounce_ms)
-        })
+    state.lock().ok().and_then(|guard| {
+        guard
+            .watches
+            .watches
+            .iter()
+            .find(|watch| watch.watch_id == watch_id)
+            .and_then(|watch| watch.spec.debounce_ms)
+    })
 }

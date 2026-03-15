@@ -11,4 +11,6 @@ homepage.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-
+shell-words.workspace = true
+serde_json.workspace = true
+suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }

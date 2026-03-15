@@ -2,7 +2,9 @@ use std::path::Path;
 
 use super::*;
 
-pub(crate) fn load_policy_guard(policy_context: &Value) -> Result<Option<PolicyGuard>, KernelError> {
+pub(crate) fn load_policy_guard(
+    policy_context: &Value,
+) -> Result<Option<PolicyGuard>, KernelError> {
     let Some(config_path) = policy_context
         .get("config_path")
         .and_then(Value::as_str)

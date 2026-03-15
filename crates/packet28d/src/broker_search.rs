@@ -368,7 +368,6 @@ fn parse_region_hint_for_path(region: &str, path: &str) -> Option<(usize, usize)
     parse_region_line_range(maybe_range)
 }
 
-
 pub(crate) fn build_reducer_search_evidence(
     state: Option<&Arc<Mutex<DaemonState>>>,
     root: &Path,

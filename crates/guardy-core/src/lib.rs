@@ -1,8 +1,8 @@
 mod audit;
-mod types;
-mod validate;
 #[cfg(test)]
 mod tests;
+mod types;
+mod validate;
 
 pub use audit::{check_packet, check_packet_file};
 pub use types::*;

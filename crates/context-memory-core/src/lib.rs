@@ -13,8 +13,8 @@ mod recall;
 mod recall_document;
 mod types;
 
-pub(crate) use cache::*;
 pub use cache::PacketCache;
+pub(crate) use cache::*;
 pub(crate) use normalize::*;
 pub use normalize::{basename_alias, normalize_context_path};
 #[cfg(test)]
