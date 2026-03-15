@@ -510,7 +510,7 @@ fn handle_tool_call(
                 session,
                 root,
                 &request.task_id,
-                request.text.split_whitespace().next(),
+                Some(request.text.as_str()),
                 "packet28.write_intention",
             )?;
             track_task(session, root, &request.task_id)?;

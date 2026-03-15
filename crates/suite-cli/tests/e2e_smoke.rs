@@ -3402,6 +3402,59 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
 
 #[test]
 #[cfg(unix)]
+fn test_packet28_mcp_write_intention_derives_task_id_from_full_text() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+    initialize_mcp_session(&mut stdin, &mut stdout);
+
+    let intention_text = "Investigate parser regression in the handoff pipeline";
+    let derived_task_id = suite_cli::broker_client::derive_task_id(intention_text);
+    let response = write_intention_via_mcp(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "",
+        intention_text,
+        "investigating",
+        &["crates/packet28d/src/hooks.rs"],
+    );
+    assert_eq!(response["result"]["structuredContent"]["accepted"], true);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.task_status",
+                "arguments":{
+                    "task_id": derived_task_id
+                }
+            }
+        }),
+    );
+    let status = read_mcp_message_for_id(&mut stdout, 3);
+    assert_eq!(
+        status["result"]["structuredContent"]["task"]["task_id"],
+        derived_task_id
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
 fn test_packet28_mcp_native_read_auto_captures_regions() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();

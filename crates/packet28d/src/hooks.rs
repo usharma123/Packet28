@@ -136,11 +136,13 @@ fn maybe_prepare_handoff_from_hooks(
             .as_ref()
             .map(|context| context.context_version.clone())
             .or(status.latest_context_version);
-        {
+        if prepared.handoff_ready {
             let mut guard = state.lock().map_err(lock_err)?;
             let task = ensure_task_record_mut(&mut guard.tasks, task_id);
             task.latest_hook_handoff_reason = response.handoff_reason.clone();
             task.hook_threshold_exceeded = false;
+            task.hook_window_est_tokens = 0;
+            task.hook_window_est_bytes = 0;
             persist_state(&guard)?;
         }
     } else if threshold_reason.is_some() && snapshot.latest_intention.is_none() {
@@ -716,5 +718,43 @@ mod tests {
         )
         .unwrap();
         assert!(!after_edit.cache_hit);
+    }
+
+    #[test]
+    fn successful_handoff_preparation_clears_hook_window() {
+        let state = test_state();
+        let _ = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: "task-handoff-reset".to_string(),
+                reducer_packet: Some(packet("first read")),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+        let _ = broker_write_state(
+            state.clone(),
+            BrokerWriteStateRequest {
+                task_id: "task-handoff-reset".to_string(),
+                op: Some(BrokerWriteOp::Intention),
+                text: Some("Investigate hook handoff reset".to_string()),
+                refresh_context: Some(false),
+                ..BrokerWriteStateRequest::default()
+            },
+        )
+        .unwrap();
+
+        let response = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            "task-handoff-reset",
+            HookBoundaryKind::Stop,
+        )
+        .unwrap();
+
+        assert!(response.handoff_ready);
+        let task = load_task_record(&state, "task-handoff-reset").unwrap();
+        assert_eq!(task.hook_window_est_tokens, 0);
+        assert_eq!(task.hook_window_est_bytes, 0);
+        assert!(!task.hook_threshold_exceeded);
     }
 }
