@@ -340,43 +340,47 @@ pub(crate) fn broker_prepare_handoff(
     let next_action_summary = next_action_summary(None, &snapshot);
     if !handoff_ready {
         if let Some(existing_task) = task.as_ref() {
-            if let Some(existing_context_version) = existing_task.latest_context_version.as_deref()
-            {
+            if let (Some(existing_context_version), Some(latest_handoff_artifact_id)) = (
+                existing_task.latest_context_version.as_deref(),
+                existing_task.latest_handoff_artifact_id.as_deref(),
+            ) {
                 let root = state.lock().map_err(lock_err)?.root.clone();
                 if let Some(existing_context) = load_versioned_broker_response(
                     &root,
                     &request.task_id,
                     existing_context_version,
                 )? {
-                    let context = if matches!(
-                        request.response_mode.unwrap_or(BrokerResponseMode::Slim),
-                        BrokerResponseMode::Slim
-                    ) {
-                        slim_broker_response(
-                            &existing_context,
-                            existing_task.latest_handoff_artifact_id.clone(),
-                        )
-                    } else {
-                        existing_context
-                    };
-                    return Ok(BrokerPrepareHandoffResponse {
-                        task_id: request.task_id,
-                        handoff_ready: true,
-                        handoff_reason: "Latest handoff artifact is available for resume."
-                            .to_string(),
-                        latest_checkpoint_id: snapshot.latest_checkpoint_id,
-                        latest_handoff_artifact_id: existing_task
-                            .latest_handoff_artifact_id
-                            .clone(),
-                        latest_handoff_generated_at_unix: existing_task
-                            .latest_handoff_generated_at_unix,
-                        latest_handoff_checkpoint_id: existing_task
-                            .latest_handoff_checkpoint_id
-                            .clone(),
-                        latest_intention,
-                        next_action_summary: context.next_action_summary.clone(),
-                        context: Some(context),
-                    });
+                    if existing_context.artifact_id.as_deref() == Some(latest_handoff_artifact_id) {
+                        let context = if matches!(
+                            request.response_mode.unwrap_or(BrokerResponseMode::Slim),
+                            BrokerResponseMode::Slim
+                        ) {
+                            slim_broker_response(
+                                &existing_context,
+                                existing_task.latest_handoff_artifact_id.clone(),
+                            )
+                        } else {
+                            existing_context
+                        };
+                        return Ok(BrokerPrepareHandoffResponse {
+                            task_id: request.task_id,
+                            handoff_ready: true,
+                            handoff_reason: "Latest handoff artifact is available for resume."
+                                .to_string(),
+                            latest_checkpoint_id: snapshot.latest_checkpoint_id,
+                            latest_handoff_artifact_id: existing_task
+                                .latest_handoff_artifact_id
+                                .clone(),
+                            latest_handoff_generated_at_unix: existing_task
+                                .latest_handoff_generated_at_unix,
+                            latest_handoff_checkpoint_id: existing_task
+                                .latest_handoff_checkpoint_id
+                                .clone(),
+                            latest_intention,
+                            next_action_summary: context.next_action_summary.clone(),
+                            context: Some(context),
+                        });
+                    }
                 }
             }
         }

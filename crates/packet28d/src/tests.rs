@@ -1,4 +1,36 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn daemon_test_state() -> Arc<Mutex<DaemonState>> {
+    let root = std::env::temp_dir().join(format!(
+        "packet28-broker-test-{}-{}",
+        now_unix_millis(),
+        TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    ensure_daemon_dir(&root).unwrap();
+    let kernel = Arc::new(Kernel::with_v1_reducers_and_persistence(
+        PersistConfig::new(root.clone()),
+    ));
+    let (index_tx, index_rx) = mpsc::channel();
+    thread::spawn(move || while index_rx.recv().is_ok() {});
+    Arc::new(Mutex::new(DaemonState {
+        root,
+        kernel,
+        runtime: DaemonRuntimeInfo::default(),
+        tasks: TaskRegistry::default(),
+        agent_snapshots: BTreeMap::new(),
+        watches: WatchRegistry::default(),
+        watcher_handles: HashMap::new(),
+        subscribers: HashMap::new(),
+        source_file_cache: BTreeMap::new(),
+        interactive_index: InteractiveIndexRuntime::default(),
+        index_tx,
+        shutting_down: false,
+    }))
+}
 
 #[test]
 fn explicit_limits_override_verbosity_alias() {
@@ -963,4 +995,46 @@ fn checkpoint_context_lines_surface_saved_focus() {
     assert!(rendered
         .iter()
         .any(|line| line.contains("focus symbol: shuffle")));
+}
+
+#[test]
+fn prepare_handoff_only_resumes_recorded_handoff_artifacts() {
+    let state = daemon_test_state();
+    let root = state.lock().unwrap().root.clone();
+    let context = BrokerGetContextResponse {
+        context_version: "ctx-1".to_string(),
+        response_mode: BrokerResponseMode::Full,
+        artifact_id: Some("ctx-1".to_string()),
+        brief: "context".to_string(),
+        ..BrokerGetContextResponse::default()
+    };
+    let version_path = task_version_json_path(&root, "task-resume-guard", "ctx-1");
+    std::fs::create_dir_all(version_path.parent().unwrap()).unwrap();
+    std::fs::write(&version_path, serde_json::to_vec_pretty(&context).unwrap()).unwrap();
+
+    {
+        let mut guard = state.lock().unwrap();
+        let task = ensure_task_record_mut(&mut guard.tasks, "task-resume-guard");
+        task.task_id = "task-resume-guard".to_string();
+        task.latest_context_version = Some("ctx-1".to_string());
+        task.latest_handoff_artifact_id = Some("handoff-1".to_string());
+        persist_state(&guard).unwrap();
+    }
+
+    let response = broker_prepare_handoff(
+        state,
+        BrokerPrepareHandoffRequest {
+            task_id: "task-resume-guard".to_string(),
+            query: None,
+            response_mode: Some(BrokerResponseMode::Slim),
+        },
+    )
+    .unwrap();
+
+    assert!(!response.handoff_ready);
+    assert!(response.context.is_none());
+    assert_eq!(
+        response.latest_handoff_artifact_id.as_deref(),
+        Some("handoff-1")
+    );
 }
