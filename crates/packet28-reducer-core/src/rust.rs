@@ -126,10 +126,17 @@ fn first_nonempty_line(value: &str) -> Option<String> {
 
 fn compact(value: &str, limit: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= limit {
+    let char_count = compact.chars().count();
+    if char_count <= limit {
         compact
+    } else if limit <= 3 {
+        "...".to_string()
     } else {
-        format!("{}...", &compact[..limit.saturating_sub(3)])
+        let shortened = compact
+            .chars()
+            .take(limit.saturating_sub(3))
+            .collect::<String>();
+        format!("{shortened}...")
     }
 }
 
@@ -201,13 +208,18 @@ fn looks_like_rust_path(path: &str) -> bool {
 }
 
 fn parse_cargo_test_result(output: &str) -> Option<CargoTestResult> {
-    let line = output
+    let mut matched = false;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for line in output
         .lines()
-        .find(|line| line.trim_start().starts_with("test result:"))?
-        .trim();
-    let passed = extract_result_count(line, "passed").unwrap_or(0);
-    let failed = extract_result_count(line, "failed").unwrap_or(0);
-    Some(CargoTestResult { passed, failed })
+        .filter(|line| line.trim_start().starts_with("test result:"))
+    {
+        matched = true;
+        passed += extract_result_count(line.trim(), "passed").unwrap_or(0);
+        failed += extract_result_count(line.trim(), "failed").unwrap_or(0);
+    }
+    matched.then_some(CargoTestResult { passed, failed })
 }
 
 fn extract_result_count(line: &str, label: &str) -> Option<usize> {

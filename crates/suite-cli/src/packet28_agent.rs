@@ -107,12 +107,18 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
             brief_md_path.display()
         )
     })?;
-    fs::write(&brief_json_path, serde_json::to_vec(&bootstrap.response)?).with_context(|| {
-        format!(
-            "failed to persist broker brief json to '{}'",
-            brief_json_path.display()
-        )
-    })?;
+    // Reuse the serialized bootstrap payload instead of encoding the same response twice.
+    if brief_json_path != bootstrap_path {
+        let _ = fs::remove_file(&brief_json_path);
+        fs::hard_link(&bootstrap_path, &brief_json_path)
+            .or_else(|_| fs::copy(&bootstrap_path, &brief_json_path).map(|_| ()))
+            .with_context(|| {
+                format!(
+                    "failed to persist broker brief json to '{}'",
+                    brief_json_path.display()
+                )
+            })?;
+    }
     fs::write(
         &state_json_path,
         serde_json::to_vec_pretty(&serde_json::json!({

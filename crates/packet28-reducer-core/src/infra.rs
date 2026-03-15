@@ -15,7 +15,7 @@ pub fn classify_infra_command(command: &str, argv: &[String]) -> Option<CommandR
             _ => return None,
         },
         "kubectl" => match argv.get(1)?.as_str() {
-            "get" if !contains_any(argv, &["-o", "--output", "--watch"]) => {
+            "get" if !contains_any(argv, &["-o", "--output", "--watch", "-w"]) => {
                 ("kubectl_get", suite_packet_core::ToolOperationKind::Fetch)
             }
             "logs" if !contains_any(argv, &["-f", "--follow", "--prefix"]) => {
@@ -104,7 +104,7 @@ pub fn reduce_infra_command(
 }
 
 fn classify_curl(argv: &[String]) -> bool {
-    !contains_any(
+    if contains_any(
         argv,
         &[
             "-o",
@@ -113,11 +113,23 @@ fn classify_curl(argv: &[String]) -> bool {
             "--remote-name",
             "-w",
             "--write-out",
+            "-d",
+            "--data",
+            "--data-binary",
+            "--data-raw",
+            "--data-urlencode",
             "--head",
             "-I",
         ],
-    ) && argv
-        .iter()
+    ) {
+        return false;
+    }
+    if let Some(method) = explicit_curl_method(argv) {
+        if method != "GET" && method != "HEAD" {
+            return false;
+        }
+    }
+    argv.iter()
         .any(|arg| arg.starts_with("http://") || arg.starts_with("https://"))
 }
 
@@ -156,11 +168,36 @@ fn first_nonempty_line(value: &str) -> Option<String> {
 
 fn compact(value: &str, limit: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= limit {
+    let char_count = compact.chars().count();
+    if char_count <= limit {
         compact
+    } else if limit <= 3 {
+        "...".to_string()
     } else {
-        format!("{}...", &compact[..limit.saturating_sub(3)])
+        let shortened = compact
+            .chars()
+            .take(limit.saturating_sub(3))
+            .collect::<String>();
+        format!("{shortened}...")
     }
+}
+
+fn explicit_curl_method(argv: &[String]) -> Option<String> {
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-X" {
+            return iter.next().map(|value| value.to_ascii_uppercase());
+        }
+        if let Some(method) = arg.strip_prefix("-X") {
+            if !method.is_empty() {
+                return Some(method.to_ascii_uppercase());
+            }
+        }
+        if let Some(method) = arg.strip_prefix("--request=") {
+            return Some(method.to_ascii_uppercase());
+        }
+    }
+    None
 }
 
 fn summarize_kubectl_get(spec: &CommandReducerSpec, lines: &[String]) -> String {

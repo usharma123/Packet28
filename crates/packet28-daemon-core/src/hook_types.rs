@@ -128,16 +128,15 @@ pub struct HookRuntimeConfig {
     pub rewrite_enabled: bool,
     pub fallback_post_tool_capture: bool,
     pub context_budget_tokens: u64,
-    pub soft_threshold_fraction: String,
+    #[serde(deserialize_with = "deserialize_soft_threshold_fraction")]
+    pub soft_threshold_fraction: f64,
     pub relaunch_preference: RelaunchPreference,
     pub reducer_allowlist: Vec<String>,
 }
 
 impl HookRuntimeConfig {
     pub fn soft_threshold_fraction_value(&self) -> f64 {
-        self.soft_threshold_fraction
-            .parse::<f64>()
-            .ok()
+        Some(self.soft_threshold_fraction)
             .filter(|value| *value > 0.0)
             .unwrap_or(0.5)
     }
@@ -155,7 +154,7 @@ impl Default for HookRuntimeConfig {
             rewrite_enabled: true,
             fallback_post_tool_capture: true,
             context_budget_tokens: 10_000,
-            soft_threshold_fraction: "0.5".to_string(),
+            soft_threshold_fraction: 0.5,
             relaunch_preference: RelaunchPreference::ClearOrNewSession,
             reducer_allowlist: vec![
                 "claude_native".to_string(),
@@ -196,4 +195,26 @@ pub struct HookReducerCacheEntry {
     pub git_epoch: u64,
     pub fs_epoch: u64,
     pub rust_epoch: u64,
+}
+
+fn deserialize_soft_threshold_fraction<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SoftThresholdFraction {
+        Number(f64),
+        String(String),
+    }
+
+    match Option::<SoftThresholdFraction>::deserialize(deserializer)? {
+        Some(SoftThresholdFraction::Number(value)) if value > 0.0 => Ok(value),
+        Some(SoftThresholdFraction::String(value)) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|parsed| *parsed > 0.0)
+            .ok_or_else(|| serde::de::Error::custom("soft_threshold_fraction must be > 0")),
+        _ => Ok(0.5),
+    }
 }

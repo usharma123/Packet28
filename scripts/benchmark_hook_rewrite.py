@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -45,7 +46,7 @@ def main() -> int:
         parser.error("command required after '--'")
 
     root = Path(args.root).resolve()
-    command_text = " ".join(args.command)
+    command_text = shlex.join(args.command)
     task_id = args.task_id or f"bench-hook-{int(time.time())}"
     session_id = args.session_id or f"bench-session-{int(time.time())}"
 

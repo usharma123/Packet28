@@ -200,7 +200,18 @@ def run_case(root: Path, artifact_dir: Path, case_name: str, argv: list[str]) ->
         check=False,
     )
     if completed.returncode == 0:
-        payload = json.loads(completed.stdout)
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            error_payload = {
+                "case": case_name,
+                "status": "error",
+                "command": " ".join(argv),
+                "error": f"Invalid JSON output: {exc}: {(completed.stderr or completed.stdout).strip()}",
+                "artifact_path": str(artifact_path),
+            }
+            artifact_path.write_text(json.dumps(error_payload, indent=2) + "\n", encoding="utf-8")
+            return error_payload
         payload["case"] = case_name
         payload["status"] = "ok"
         payload["artifact_path"] = str(artifact_path)
@@ -247,7 +258,18 @@ def run_fixture_case(root: Path, artifact_dir: Path, case: dict) -> dict:
         check=False,
     )
     if completed.returncode == 0:
-        payload = json.loads(completed.stdout)
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            error_payload = {
+                "case": case["case"],
+                "status": "error",
+                "command": case["command"],
+                "error": f"Invalid JSON output: {exc}: {(completed.stderr or completed.stdout).strip()}",
+                "artifact_path": str(artifact_path),
+            }
+            artifact_path.write_text(json.dumps(error_payload, indent=2) + "\n", encoding="utf-8")
+            return error_payload
         payload["case"] = case["case"]
         payload["status"] = "ok"
         payload["artifact_path"] = str(artifact_path)

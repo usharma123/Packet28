@@ -66,7 +66,7 @@ pub fn reduce_git_command(
         "git_log" => {
             let commits = stdout
                 .lines()
-                .filter(|line| !line.trim().is_empty())
+                .filter(|line| looks_like_commit_line(line.trim()))
                 .count();
             if failed {
                 output.unwrap_or_else(|| "git log failed".to_string())
@@ -80,11 +80,7 @@ pub fn reduce_git_command(
         "git_diff" => {
             let files = stdout
                 .lines()
-                .filter(|line| {
-                    line.starts_with("diff --git ")
-                        || line.starts_with("--- ")
-                        || line.starts_with("+++ ")
-                })
+                .filter(|line| line.starts_with("diff --git "))
                 .count();
             if failed {
                 output.unwrap_or_else(|| "git diff failed".to_string())
@@ -143,9 +139,24 @@ fn first_nonempty_line(value: &str) -> Option<String> {
 
 fn compact(value: &str, limit: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= limit {
+    let char_count = compact.chars().count();
+    if char_count <= limit {
         compact
+    } else if limit <= 3 {
+        "...".to_string()
     } else {
-        format!("{}...", &compact[..limit.saturating_sub(3)])
+        let shortened = compact
+            .chars()
+            .take(limit.saturating_sub(3))
+            .collect::<String>();
+        format!("{shortened}...")
     }
+}
+
+fn looks_like_commit_line(line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    (7..=40).contains(&first.len()) && first.chars().all(|ch| ch.is_ascii_hexdigit())
 }

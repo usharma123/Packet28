@@ -620,28 +620,6 @@ fn capabilities_payload() -> Value {
 
 fn summarize_tool_payload(name: &str, payload: &Value) -> String {
     match name {
-        "packet28.search" => {
-            let matches = payload
-                .get("match_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if let Some(files) = payload
-                .get("paths")
-                .and_then(Value::as_array)
-                .map(|items| items.len())
-            {
-                format!("Packet28 search found {matches} match(es) across {files} file(s).")
-            } else {
-                format!("Packet28 search found {matches} match(es).")
-            }
-        }
-        "packet28.fetch_tool_result" => {
-            let artifact_id = payload
-                .get("artifact_id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            format!("Packet28 fetched tool result artifact {artifact_id}.")
-        }
         "packet28.fetch_context" => {
             let artifact_id = payload
                 .get("artifact_id")
@@ -663,29 +641,6 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
             } else {
                 format!("Packet28 did not prepare a handoff: {reason}")
             }
-        }
-        "packet28.read_regions" => {
-            let path = payload
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let lines = payload
-                .get("lines")
-                .and_then(Value::as_array)
-                .map(|items| items.len())
-                .unwrap_or(0);
-            format!("Packet28 read_regions returned {lines} line(s) from {path}.")
-        }
-        "packet28.write_state" => {
-            let accepted = payload
-                .get("accepted")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let version = payload
-                .get("context_version")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            format!("Packet28 state write accepted={accepted} context_version={version}.")
         }
         "packet28.task_status" => "Packet28 task status.".to_string(),
         "packet28.capabilities" => "Packet28 broker capabilities.".to_string(),

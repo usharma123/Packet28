@@ -123,7 +123,14 @@ pub fn reduce_fs_command(
                 "diff completed".to_string()
             }
         }
-        _ => first_nonempty_line(stdout).unwrap_or_else(|| format!("{} completed", spec.argv[0])),
+        _ => {
+            let command = spec
+                .argv
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "<unknown command>".to_string());
+            first_nonempty_line(stdout).unwrap_or_else(|| format!("{command} completed"))
+        }
     };
     let mut regions = Vec::new();
     if let Some(path) = spec.paths.first() {
@@ -296,10 +303,17 @@ fn parse_sed_region(argv: &[String]) -> Option<(usize, usize)> {
 
 fn compact(value: &str, limit: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= limit {
+    let char_count = compact.chars().count();
+    if char_count <= limit {
         compact
+    } else if limit <= 3 {
+        "...".to_string()
     } else {
-        format!("{}...", &compact[..limit.saturating_sub(3)])
+        let shortened = compact
+            .chars()
+            .take(limit.saturating_sub(3))
+            .collect::<String>();
+        format!("{shortened}...")
     }
 }
 

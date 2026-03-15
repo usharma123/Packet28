@@ -402,7 +402,9 @@ fn resolve_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Re
         return Ok(task_id);
     }
     if let Some(active) = crate::task_runtime::load_active_task(root) {
-        return Ok(active.task_id);
+        if session_id.is_none() || active.session_id.as_deref() == session_id {
+            return Ok(active.task_id);
+        }
     }
     let task_id = session_id
         .map(crate::task_runtime::derive_claude_task_id)
@@ -628,16 +630,9 @@ fn build_read_packet(input: &Value, response: &Value) -> Option<HookReducerPacke
         .or_else(|| json_string(input, "path"))
         .or_else(|| json_string(input, "target"))?;
     let line_start = input.get("offset").and_then(Value::as_u64).unwrap_or(1);
-    let line_end = input
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|limit| line_start.saturating_add(limit))
-        .unwrap_or(line_start);
-    let summary = format!(
-        "Read {} lines from {}",
-        line_end.saturating_sub(line_start) + 1,
-        path
-    );
+    let count = input.get("limit").and_then(Value::as_u64).unwrap_or(1);
+    let line_end = line_start.saturating_add(count.saturating_sub(1));
+    let summary = format!("Read {} lines from {}", count, path);
     let mut regions = json_array_strings(response, "regions");
     if regions.is_empty() {
         regions.push(format!("{path}:{line_start}-{line_end}"));
@@ -882,10 +877,17 @@ fn first_nonempty_line(value: &str) -> Option<String> {
 
 fn compact_text(value: &str, limit: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= limit {
+    let char_count = compact.chars().count();
+    if char_count <= limit {
         compact
+    } else if limit <= 3 {
+        "...".to_string()
     } else {
-        format!("{}...", &compact[..limit.saturating_sub(3)])
+        let shortened = compact
+            .chars()
+            .take(limit.saturating_sub(3))
+            .collect::<String>();
+        format!("{shortened}...")
     }
 }
 
@@ -1352,7 +1354,7 @@ mod tests {
         assert_eq!(packet.paths, vec!["src/lib.rs".to_string()]);
         assert_eq!(
             packet.cache_fingerprint.as_deref(),
-            Some("read:src/lib.rs:10:15")
+            Some("read:src/lib.rs:10:14")
         );
     }
 }

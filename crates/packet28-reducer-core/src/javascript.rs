@@ -105,7 +105,7 @@ pub fn reduce_javascript_command(
 }
 
 fn classify_package_manager(argv: &[String], first: &str, second: Option<&str>) -> bool {
-    if argv.get(1).is_none_or(|arg| arg != first) {
+    if !matches!(argv.get(1), Some(arg) if arg == first) {
         return false;
     }
     if let Some(second) = second {

@@ -192,7 +192,6 @@ fn expand_scope_paths_pulls_adjacent_role_files() {
 }
 
 fn write_search_fixture(root: &std::path::Path, files: &[(&str, &str)]) {
-    let _ = std::fs::remove_dir_all(root);
     for (relative_path, contents) in files {
         let path = root.join(relative_path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -218,9 +217,10 @@ fn run_search_execution_for_query(
 
 #[test]
 fn exact_symbol_query_returns_definition_first_without_fallback() {
-    let root = std::env::temp_dir().join(format!("packet28d-search-exact-{}", std::process::id()));
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path();
     write_search_fixture(
-        &root,
+        root,
         &[
             (
                 "src/alpha.rs",
@@ -234,23 +234,21 @@ fn exact_symbol_query_returns_definition_first_without_fallback() {
     );
 
     let execution =
-        run_search_execution_for_query(&root, "Where is Alpha defined?", BrokerAction::Inspect);
+        run_search_execution_for_query(root, "Where is Alpha defined?", BrokerAction::Inspect);
     assert!(!execution.used_fallback);
     assert_eq!(
         execution.files.first().map(|file| file.path.as_str()),
         Some("src/alpha.rs")
     );
     assert!(execution.files[0].definition_hits > 0);
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn vague_query_triggers_fallback_only_after_weak_first_pass() {
-    let root =
-        std::env::temp_dir().join(format!("packet28d-search-fallback-{}", std::process::id()));
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path();
     write_search_fixture(
-        &root,
+        root,
         &[
             ("src/alpha.rs", "pub struct AlphaService;\n"),
             (
@@ -261,7 +259,7 @@ fn vague_query_triggers_fallback_only_after_weak_first_pass() {
     );
 
     let execution = run_search_execution_for_query(
-        &root,
+        root,
         "How is AlphaService.updateState updated?",
         BrokerAction::Inspect,
     );
@@ -278,7 +276,6 @@ fn vague_query_triggers_fallback_only_after_weak_first_pass() {
             .iter()
             .any(|line| line.contains("update_state_for_alpha_service"))));
 
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

@@ -145,7 +145,7 @@ impl Drop for McpHarness {
     }
 }
 
-fn run_claude_hook(root: &Path, payload: &Value) -> Result<()> {
+fn run_claude_hook(root: &Path, payload: &Value) -> Result<i32> {
     let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
     let mut child = Command::new(exe)
         .current_dir(root)
@@ -168,7 +168,7 @@ fn run_claude_hook(root: &Path, payload: &Value) -> Result<()> {
             status.code()
         ));
     }
-    Ok(())
+    Ok(status.code().unwrap_or_default())
 }
 
 pub fn run(args: DoctorArgs) -> Result<i32> {
@@ -483,10 +483,11 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         if intention["result"]["structuredContent"]["accepted"] != json!(true) {
             return Err(anyhow!("write_intention was not accepted"));
         }
-        run_claude_hook(
+        let hook_status = run_claude_hook(
             root,
             &json!({
                 "hook_event_name":"PostToolUse",
+                "task_id": task_id,
                 "session_id":"doctor-session",
                 "cwd": root.display().to_string(),
                 "tool_name":"Bash",
@@ -494,11 +495,36 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                 "tool_response":{"stdout":" M src/lib.rs\n","stderr":"","is_error":false}
             }),
         )?;
+        harness.send(&json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.task_status",
+                "arguments":{"task_id":task_id}
+            }
+        }))?;
+        let task_status = harness.read_response(4, timeout)?;
+        let task_status_payload = &task_status["result"]["structuredContent"];
+        let hook_tokens = task_status_payload["hook_window_est_tokens"]
+            .as_u64()
+            .unwrap_or(0);
+        let hook_kind = task_status_payload["latest_hook_command_kind"]
+            .as_str()
+            .unwrap_or_default();
+        let reducer_ok = hook_status == 0 && hook_tokens > 0 && !hook_kind.is_empty();
         reducer_round_trip = DoctorCheck {
             name: "reducer_round_trip",
-            ok: true,
+            ok: reducer_ok,
             required: true,
-            detail: format!("task_id={task_id} hook reducer ingest ok"),
+            detail: if reducer_ok {
+                format!("task_id={task_id} hook reducer ingest ok ({hook_kind}, {hook_tokens} tokens)")
+            } else {
+                format!(
+                    "task_id={task_id} reducer ingest missing: {}",
+                    serde_json::to_string(task_status_payload).unwrap_or_default()
+                )
+            },
         };
 
         push_notifications =

@@ -3,6 +3,9 @@ use packet28_daemon_core::{
     hook_runtime_config_path, HookBoundaryKind, HookEventKind, HookIngestRequest,
     HookIngestResponse, HookReducerCacheEntry, HookRuntimeConfig,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static HOOK_ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn load_hook_runtime_config(root: &Path) -> HookRuntimeConfig {
     let path = hook_runtime_config_path(root);
@@ -15,7 +18,11 @@ fn load_hook_runtime_config(root: &Path) -> HookRuntimeConfig {
 fn store_hook_artifact(root: &Path, task_id: &str, prefix: &str, value: &Value) -> Result<String> {
     let dir = task_artifact_dir(root, task_id).join("hook-artifacts");
     fs::create_dir_all(&dir).with_context(|| format!("failed to create '{}'", dir.display()))?;
-    let id = format!("{prefix}-{}", now_unix_millis());
+    let id = format!(
+        "{prefix}-{}-{:x}",
+        now_unix_millis(),
+        HOOK_ARTIFACT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let path = dir.join(format!("{id}.json"));
     fs::write(&path, serde_json::to_vec_pretty(value)?)
         .with_context(|| format!("failed to write '{}'", path.display()))?;

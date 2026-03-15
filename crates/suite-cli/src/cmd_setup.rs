@@ -89,6 +89,7 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     let mut agent_targets = Vec::new();
     let mut mcp_configured = false;
     let mut hook_configured = false;
+    let mut any_hooks_configured = false;
     let mut agent_files_ready = false;
 
     // Phase 1: MCP config
@@ -146,6 +147,7 @@ pub fn run(args: SetupArgs) -> Result<i32> {
             match write_claude_hook_config(config_path, &root, args.yes)? {
                 McpConfigStatus::Written => {
                     hook_configured = true;
+                    any_hooks_configured = true;
                     println!(
                         "    {} {} hooks → {}",
                         "✓".green().bold(),
@@ -155,6 +157,7 @@ pub fn run(args: SetupArgs) -> Result<i32> {
                 }
                 McpConfigStatus::AlreadyConfigured => {
                     hook_configured = true;
+                    any_hooks_configured = true;
                     println!(
                         "    {} {} hooks (already configured)",
                         "·".dimmed(),
@@ -166,15 +169,19 @@ pub fn run(args: SetupArgs) -> Result<i32> {
                 }
             }
         }
-        write_hook_runtime_config(&root)?;
-        println!(
-            "    {} Packet28 hook runtime → {}",
-            "✓".green().bold(),
-            packet28_daemon_core::hook_runtime_config_path(&root)
-                .display()
-                .to_string()
-                .dimmed()
-        );
+        if matches!(
+            write_hook_runtime_config(&root, any_hooks_configured)?,
+            McpConfigStatus::Written
+        ) {
+            println!(
+                "    {} Packet28 hook runtime → {}",
+                "✓".green().bold(),
+                packet28_daemon_core::hook_runtime_config_path(&root)
+                    .display()
+                    .to_string()
+                    .dimmed()
+            );
+        }
         println!();
     }
 
@@ -493,7 +500,7 @@ fn write_mcp_config(path: &Path, root: &Path, auto_yes: bool) -> Result<McpConfi
 
 fn write_claude_hook_config(path: &Path, root: &Path, auto_yes: bool) -> Result<McpConfigStatus> {
     let command = resolve_packet28_cli_command();
-    let root_arg = root.display().to_string();
+    let root_arg = shell_escape(root.display().to_string());
     let hook_command = format!("{command} hook claude --root \"{root_arg}\"");
     let packet28_hooks = json!({
         "SessionStart": [{
@@ -553,11 +560,16 @@ fn write_claude_hook_config(path: &Path, root: &Path, auto_yes: bool) -> Result<
             return Ok(McpConfigStatus::Declined);
         }
     }
-    let needs_write = config.get("hooks") != Some(&packet28_hooks);
-    if !needs_write {
+    let mut hooks = config
+        .get("hooks")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if hooks.get("packet28") == Some(&packet28_hooks) {
         return Ok(McpConfigStatus::AlreadyConfigured);
     }
-    config.insert("hooks".to_string(), packet28_hooks);
+    hooks.insert("packet28".to_string(), packet28_hooks);
+    config.insert("hooks".to_string(), Value::Object(hooks));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -568,8 +580,14 @@ fn write_claude_hook_config(path: &Path, root: &Path, auto_yes: bool) -> Result<
     Ok(McpConfigStatus::Written)
 }
 
-fn write_hook_runtime_config(root: &Path) -> Result<()> {
+fn write_hook_runtime_config(root: &Path, any_hooks_configured: bool) -> Result<McpConfigStatus> {
+    if !any_hooks_configured {
+        return Ok(McpConfigStatus::Declined);
+    }
     let path = packet28_daemon_core::hook_runtime_config_path(root);
+    if path.exists() {
+        return Ok(McpConfigStatus::AlreadyConfigured);
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -578,7 +596,14 @@ fn write_hook_runtime_config(root: &Path) -> Result<()> {
         path,
         format!("{}\n", serde_json::to_string_pretty(&config)?),
     )?;
-    Ok(())
+    Ok(McpConfigStatus::Written)
+}
+
+fn shell_escape(value: String) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
 }
 
 fn resolve_packet28_mcp_command() -> String {
@@ -694,7 +719,7 @@ mod tests {
         let status = write_claude_hook_config(&path, dir.path(), true).unwrap();
         assert!(matches!(status, McpConfigStatus::Written));
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(value["hooks"]["SessionStart"].is_array());
-        assert!(value["hooks"]["PostToolUse"].is_array());
+        assert!(value["hooks"]["packet28"]["SessionStart"].is_array());
+        assert!(value["hooks"]["packet28"]["PostToolUse"].is_array());
     }
 }

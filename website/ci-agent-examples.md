@@ -19,7 +19,7 @@ Packet28 is intended to sit alongside the live agent loop as a hooks-first reduc
 2. Install Claude hooks with `Packet28 setup --runtime claude`
 3. Let hooks persist slim reducer packets during the active turn
 4. Use `packet28.write_intention` only when the task objective changes materially
-5. Fetch full context artifacts only when explicit inspection is needed
+5. Fetch full context artifacts only when explicit inspection is needed.
 6. Let the daemon assemble handoff after threshold or stop boundaries
 7. Let the daemon or wrapper relaunch a fresh worker with the handoff packet
 
