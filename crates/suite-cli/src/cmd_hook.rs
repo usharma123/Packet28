@@ -54,6 +54,8 @@ pub struct ReducerRunnerArgs {
     pub fingerprint: String,
     #[arg(long)]
     pub cwd: Option<String>,
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
     #[arg(trailing_var_arg = true)]
     pub argv: Vec<String>,
 }
@@ -245,6 +247,10 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
         .current_dir(&cwd)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
+        .envs(args.env.iter().filter_map(|entry| {
+            entry.split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+        }))
         .spawn()
         .with_context(|| format!("failed to spawn '{}'", args.argv[0]))?;
 
@@ -351,6 +357,10 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
                 summary: reduced.summary.clone(),
                 command: Some(command_text),
                 search_query: None,
+                compact_path: Some("reducer_rewrite".to_string()),
+                passthrough_reason: None,
+                raw_est_tokens: Some((((stdout.len() + stderr.len()) as f64) / 4.0).ceil() as u64),
+                reduced_est_tokens: Some(est_tokens),
                 paths: reduced.paths,
                 regions: reduced.regions,
                 symbols: reduced.symbols,
@@ -367,6 +377,7 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
                 cacheable: Some(reduced.cacheable),
                 mutation: Some(reduced.mutation),
                 raw_artifact_handle: Some(stdout_path.display().to_string()),
+                raw_artifact_available: true,
                 artifact: Some(artifact),
             }),
             host_context_budget_tokens: None,
@@ -443,6 +454,10 @@ fn cached_reducer_packet(
             summary: entry.summary.clone(),
             command: Some(command_text.to_string()),
             search_query: None,
+            compact_path: Some("reducer_rewrite".to_string()),
+            passthrough_reason: None,
+            raw_est_tokens: None,
+            reduced_est_tokens: Some(est_tokens),
             paths: entry.paths.clone(),
             regions: entry.regions.clone(),
             symbols: entry.symbols.clone(),
@@ -459,6 +474,7 @@ fn cached_reducer_packet(
             cacheable: Some(spec.cacheable),
             mutation: Some(spec.mutation),
             raw_artifact_handle: entry.raw_artifact_handle.clone(),
+            raw_artifact_available: entry.raw_artifact_handle.is_some(),
             artifact: None,
         },
         exit_code,
@@ -633,29 +649,24 @@ fn build_pretool_rewrite(
     let Some(command) = json_string(tool_input, "command") else {
         return Ok(None);
     };
-    let Some(spec) = classify_command(&command) else {
-        return Ok(None);
-    };
-    if !runtime_config
-        .reducer_allowlist
-        .iter()
-        .any(|entry| entry == &spec.family)
+    let decision = crate::route_registry::decide_command_route(&command);
+    if matches!(
+        decision.kind,
+        crate::route_registry::RouteKind::ReducerRewrite
+    ) && !decision
+        .reducer_spec
+        .as_ref()
+        .is_some_and(|spec| runtime_config.reducer_allowlist.iter().any(|entry| entry == &spec.family))
     {
         return Ok(None);
     }
-    let argv = shell_words::split(command.trim()).map_err(|error| anyhow!(error.to_string()))?;
     let mut updated_input = tool_input.clone();
     let hook_cwd = json_string(payload, "cwd").unwrap_or_else(|| root.display().to_string());
-    let rewritten = rewrite_command_string(
-        root,
-        task_id,
-        session_id,
-        &spec.family,
-        &spec.canonical_kind,
-        &spec.cache_fingerprint,
-        &hook_cwd,
-        &argv,
-    );
+    let Some(rewritten) =
+        crate::route_registry::build_route_rewrite(root, task_id, session_id, &hook_cwd, &decision)
+    else {
+        return Ok(None);
+    };
     if let Some(object) = updated_input.as_object_mut() {
         object.insert("command".to_string(), Value::String(rewritten));
     } else {
@@ -911,8 +922,18 @@ fn packet_from_parts(
     artifact: Value,
     failed: bool,
 ) -> HookReducerPacket {
+    let raw_text = hook_output_text(&artifact);
+    let raw_est_tokens = (((raw_text.len()) as f64) / 4.0).ceil() as u64;
     let est_bytes = summary.len() as u64;
     let est_tokens = ((est_bytes as f64) / 4.0).ceil() as u64;
+    let compact_path = if reducer_family.as_deref() == Some("claude_native") {
+        Some("native_tool".to_string())
+    } else if tool_name == "Bash" {
+        Some("raw_passthrough".to_string())
+    } else {
+        Some("native_tool".to_string())
+    };
+    let passthrough_reason = (tool_name == "Bash").then(|| "post_tool_capture".to_string());
     HookReducerPacket {
         packet_type: packet_type.to_string(),
         tool_name: tool_name.to_string(),
@@ -922,6 +943,10 @@ fn packet_from_parts(
         summary,
         command,
         search_query,
+        compact_path,
+        passthrough_reason,
+        raw_est_tokens: Some(raw_est_tokens),
+        reduced_est_tokens: Some(est_tokens),
         paths,
         regions,
         symbols,
@@ -938,6 +963,7 @@ fn packet_from_parts(
         cacheable,
         mutation: Some(false),
         raw_artifact_handle: None,
+        raw_artifact_available: false,
         artifact: Some(artifact),
     }
 }
@@ -1031,45 +1057,6 @@ fn extract_command_paths(command: &str) -> Vec<String> {
                 .to_string()
         })
         .collect()
-}
-
-fn rewrite_command_string(
-    root: &Path,
-    task_id: &str,
-    session_id: Option<&str>,
-    family: &str,
-    kind: &str,
-    fingerprint: &str,
-    cwd: &str,
-    argv: &[String],
-) -> String {
-    let exe = std::env::current_exe()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "Packet28".to_string());
-    let mut parts = vec![
-        shell_quote(&exe),
-        "hook".to_string(),
-        "reducer-runner".to_string(),
-        "--root".to_string(),
-        shell_quote(&root.display().to_string()),
-        "--task-id".to_string(),
-        shell_quote(task_id),
-        "--family".to_string(),
-        shell_quote(family),
-        "--kind".to_string(),
-        shell_quote(kind),
-        "--fingerprint".to_string(),
-        shell_quote(fingerprint),
-    ];
-    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
-        parts.push("--session-id".to_string());
-        parts.push(shell_quote(session_id));
-    }
-    parts.push("--cwd".to_string());
-    parts.push(shell_quote(cwd));
-    parts.push("--".to_string());
-    parts.extend(argv.iter().map(|arg| shell_quote(arg)));
-    parts.join(" ")
 }
 
 fn shell_quote(value: &str) -> String {

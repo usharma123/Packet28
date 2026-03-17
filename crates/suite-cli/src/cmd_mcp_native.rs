@@ -1,6 +1,6 @@
 use super::*;
 use crate::cmd_mcp::support::{
-    load_tool_result_artifact, next_task_invocation, store_result_artifact,
+    load_raw_output_artifact, load_tool_result_artifact, next_task_invocation, store_result_artifact,
     write_auto_capture_state_batch_via_session,
 };
 use glob::Pattern;
@@ -55,6 +55,13 @@ pub(crate) struct Packet28FetchToolResultArgs {
     pub(crate) task_id: String,
     pub(crate) artifact_id: Option<String>,
     pub(crate) invocation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct Packet28FetchRawOutputArgs {
+    pub(crate) task_id: String,
+    pub(crate) handle: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -142,6 +149,11 @@ fn glob_request_summary(args: &Packet28GlobArgs) -> String {
     }
 }
 
+fn estimate_tokens_for_value(value: &Value) -> u64 {
+    let bytes = serde_json::to_vec(value).unwrap_or_default().len() as f64;
+    (bytes / 4.0).ceil() as u64
+}
+
 fn write_native_tool_result(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
@@ -152,12 +164,16 @@ fn write_native_tool_result(
     operation_kind: suite_packet_core::ToolOperationKind,
     request_summary: String,
     result_summary: String,
+    compact_path: &str,
+    raw_est_tokens: Option<u64>,
+    reduced_est_tokens: Option<u64>,
     search_query: Option<String>,
     command: Option<String>,
     paths: Vec<String>,
     regions: Vec<String>,
     symbols: Vec<String>,
     artifact_id: Option<String>,
+    raw_artifact_handle: Option<String>,
     duration_ms: u64,
 ) -> Result<()> {
     write_auto_capture_state_batch_via_session(
@@ -171,6 +187,9 @@ fn write_native_tool_result(
             operation_kind: Some(operation_kind),
             request_summary: Some(request_summary),
             result_summary: Some(result_summary),
+            compact_path: Some(compact_path.to_string()),
+            raw_est_tokens,
+            reduced_est_tokens,
             search_query,
             command,
             sequence: Some(sequence),
@@ -179,6 +198,8 @@ fn write_native_tool_result(
             regions,
             symbols,
             artifact_id,
+            raw_artifact_handle: raw_artifact_handle.clone(),
+            raw_artifact_available: Some(raw_artifact_handle.is_some()),
             refresh_context: Some(false),
             ..BrokerWriteStateRequest::default()
         }],
@@ -195,7 +216,11 @@ fn write_native_tool_failure(
     operation_kind: suite_packet_core::ToolOperationKind,
     request_summary: String,
     error_message: String,
+    compact_path: &str,
+    raw_est_tokens: Option<u64>,
+    reduced_est_tokens: Option<u64>,
     command: Option<String>,
+    raw_artifact_handle: Option<String>,
     duration_ms: u64,
 ) -> Result<()> {
     write_auto_capture_state_batch_via_session(
@@ -208,12 +233,17 @@ fn write_native_tool_failure(
             tool_name: Some(tool_name.to_string()),
             operation_kind: Some(operation_kind),
             request_summary: Some(request_summary),
+            compact_path: Some(compact_path.to_string()),
             error_class: Some(classify_error_message(&error_message)),
             error_message: Some(error_message.clone()),
+            raw_est_tokens,
+            reduced_est_tokens,
             retryable: Some(is_retryable_error(&error_message)),
             sequence: Some(sequence),
             duration_ms: Some(duration_ms),
             command,
+            raw_artifact_handle: raw_artifact_handle.clone(),
+            raw_artifact_available: Some(raw_artifact_handle.is_some()),
             refresh_context: Some(false),
             ..BrokerWriteStateRequest::default()
         }],
@@ -263,6 +293,10 @@ pub(crate) fn handle_packet28_search(
                 suite_packet_core::ToolOperationKind::Search,
                 request_summary,
                 error.to_string(),
+                "native_tool",
+                None,
+                None,
+                None,
                 None,
                 duration_ms,
             )?;
@@ -351,6 +385,8 @@ pub(crate) fn handle_packet28_search(
             "response_mode": "slim",
         }),
     };
+    let raw_est_tokens = Some(estimate_tokens_for_value(&full_payload));
+    let reduced_est_tokens = Some(estimate_tokens_for_value(&payload));
     write_native_tool_result(
         root,
         session,
@@ -361,12 +397,16 @@ pub(crate) fn handle_packet28_search(
         suite_packet_core::ToolOperationKind::Search,
         request_summary,
         result_summary,
+        "native_tool",
+        raw_est_tokens,
+        reduced_est_tokens,
         Some(query.to_string()),
         None,
         search_result.paths.clone(),
         search_result.regions.clone(),
         search_result.symbols.clone(),
         artifact_id,
+        None,
         duration_ms,
     )?;
     Ok(payload)
@@ -393,6 +433,24 @@ pub(crate) fn handle_packet28_fetch_tool_result(
         payload["response_mode"] = json!("full");
     }
     Ok(payload)
+}
+
+pub(crate) fn handle_packet28_fetch_raw_output(
+    root: &Path,
+    args: Packet28FetchRawOutputArgs,
+) -> Result<Value> {
+    let task_id = args.task_id.trim();
+    if task_id.is_empty() {
+        return Err(anyhow!("packet28.fetch_raw_output requires task_id"));
+    }
+    let (path, content) = load_raw_output_artifact(root, task_id, &args.handle)?;
+    Ok(json!({
+        "task_id": task_id,
+        "handle": args.handle,
+        "path": path,
+        "content": content,
+        "line_count": content.lines().count(),
+    }))
 }
 
 pub(crate) fn handle_packet28_fetch_context(
@@ -510,6 +568,10 @@ pub(crate) fn handle_packet28_read_regions(
                 suite_packet_core::ToolOperationKind::Read,
                 request_summary,
                 error.to_string(),
+                "native_tool",
+                None,
+                None,
+                None,
                 None,
                 duration_ms,
             )?;
@@ -555,6 +617,8 @@ pub(crate) fn handle_packet28_read_regions(
             "response_mode": "slim",
         }),
     };
+    let raw_est_tokens = Some(estimate_tokens_for_value(&full_payload));
+    let reduced_est_tokens = Some(estimate_tokens_for_value(&payload));
     write_native_tool_result(
         root,
         session,
@@ -565,12 +629,16 @@ pub(crate) fn handle_packet28_read_regions(
         suite_packet_core::ToolOperationKind::Read,
         request_summary,
         result_summary,
+        "native_tool",
+        raw_est_tokens,
+        reduced_est_tokens,
         None,
         None,
         vec![payload["path"].as_str().unwrap_or_default().to_string()],
         json_array_strings(&full_payload, "regions"),
         json_array_strings(&full_payload, "symbols"),
         artifact_id,
+        None,
         duration_ms,
     )?;
     Ok(payload)
@@ -671,6 +739,10 @@ pub(crate) fn handle_packet28_glob(
                 suite_packet_core::ToolOperationKind::Search,
                 request_summary,
                 error.to_string(),
+                "native_tool",
+                None,
+                None,
+                None,
                 None,
                 duration_ms,
             )?;
@@ -689,6 +761,7 @@ pub(crate) fn handle_packet28_glob(
         .next()
         .unwrap_or("Glob completed")
         .to_string();
+    let slim_preview = result_summary.clone();
     let matched_paths = matches.clone();
     let symbols = packet28_reducer_core::infer_symbols_from_pattern(pattern);
     let full_payload = json!({
@@ -719,11 +792,13 @@ pub(crate) fn handle_packet28_glob(
         }
         Packet28SearchResponseMode::Slim => json!({
             "match_count": matches.len(),
-            "compact_preview": compact_preview,
+            "compact_preview": slim_preview,
             "artifact_id": artifact_id.clone(),
             "response_mode": "slim",
         }),
     };
+    let raw_est_tokens = Some(estimate_tokens_for_value(&full_payload));
+    let reduced_est_tokens = Some(estimate_tokens_for_value(&payload));
     write_native_tool_result(
         root,
         session,
@@ -734,12 +809,16 @@ pub(crate) fn handle_packet28_glob(
         suite_packet_core::ToolOperationKind::Search,
         request_summary,
         result_summary,
+        "native_tool",
+        raw_est_tokens,
+        reduced_est_tokens,
         Some(pattern.to_string()),
         None,
         matched_paths,
         Vec::new(),
         symbols,
         artifact_id,
+        None,
         duration_ms,
     )?;
     Ok(payload)

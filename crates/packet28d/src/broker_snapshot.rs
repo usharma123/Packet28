@@ -26,16 +26,25 @@ pub(crate) fn render_recent_tool_activity_lines(
                 .unwrap_or_else(|_| "\"generic\"".to_string())
                 .trim_matches('"')
                 .to_string();
+            let route = invocation
+                .compact_path
+                .as_deref()
+                .unwrap_or("unknown");
+            let savings = invocation_savings_label(invocation);
             if compact {
                 let mut metadata = vec![
                     format!("paths={}", invocation.paths.len()),
                     format!("symbols={}", invocation.symbols.len()),
+                    format!("route={route}"),
                 ];
                 if !invocation.regions.is_empty() {
                     metadata.push(format!("regions={}", invocation.regions.len()));
                 }
                 if let Some(duration_ms) = invocation.duration_ms {
                     metadata.push(format!("duration={}ms", duration_ms));
+                }
+                if let Some(savings) = savings.as_deref() {
+                    metadata.push(savings.to_string());
                 }
                 format!(
                     "- #{} {} [{}] {} ({})",
@@ -51,12 +60,84 @@ pub(crate) fn render_recent_tool_activity_lines(
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or("no result summary");
+                let mut tail = vec![format!("route={route}")];
+                if let Some(reason) = invocation
+                    .passthrough_reason
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    tail.push(format!("reason={reason}"));
+                }
+                if let Some(savings) = savings.as_deref() {
+                    tail.push(savings.to_string());
+                }
                 format!(
-                    "- #{} {} [{}] {} -> {}",
-                    invocation.sequence, invocation.tool_name, operation_kind, request, result
+                    "- #{} {} [{}] {} -> {} ({})",
+                    invocation.sequence,
+                    invocation.tool_name,
+                    operation_kind,
+                    request,
+                    result,
+                    tail.join(", ")
                 )
             }
         })
+        .collect()
+}
+
+pub(crate) fn render_missed_savings_lines(
+    snapshot: &suite_packet_core::AgentSnapshotPayload,
+) -> Vec<String> {
+    dedup_recent_invocations(&snapshot.recent_tool_invocations)
+        .into_iter()
+        .rev()
+        .filter_map(|invocation| {
+            let route = invocation
+                .compact_path
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let raw = invocation.raw_est_tokens.unwrap_or(0);
+            let reduced = invocation.reduced_est_tokens.unwrap_or(0);
+            let pct_saved = if raw == 0 {
+                None
+            } else {
+                Some(((raw.saturating_sub(reduced)) as f64 / raw as f64) * 100.0)
+            };
+            let missed = route == "raw_passthrough"
+                || invocation.passthrough_reason.is_some()
+                || pct_saved.is_some_and(|value| value < 50.0);
+            if !missed {
+                return None;
+            }
+            let request = invocation
+                .request_summary
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("no request summary");
+            let mut metadata = vec![format!("route={route}")];
+            if let Some(reason) = invocation
+                .passthrough_reason
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                metadata.push(format!("reason={reason}"));
+            }
+            if raw > 0 {
+                metadata.push(format!("raw~{raw}tok"));
+                metadata.push(format!("reduced~{reduced}tok"));
+            }
+            if invocation.raw_artifact_available {
+                metadata.push("raw_artifact=yes".to_string());
+            }
+            Some(format!(
+                "- #{} {} {} ({})",
+                invocation.sequence,
+                invocation.tool_name,
+                request,
+                metadata.join(", ")
+            ))
+        })
+        .take(8)
         .collect()
 }
 
@@ -95,6 +176,18 @@ fn dedup_recent_invocations(
 
 fn invocation_richness(invocation: &suite_packet_core::ToolInvocationSummary) -> usize {
     invocation.paths.len() + invocation.regions.len() * 3 + invocation.symbols.len() * 2
+}
+
+fn invocation_savings_label(invocation: &suite_packet_core::ToolInvocationSummary) -> Option<String> {
+    let raw = invocation.raw_est_tokens?;
+    if raw == 0 {
+        return None;
+    }
+    let reduced = invocation.reduced_est_tokens.unwrap_or(0);
+    Some(format!(
+        "saved={:.0}%",
+        ((raw.saturating_sub(reduced)) as f64 / raw as f64) * 100.0
+    ))
 }
 
 pub(crate) fn render_task_memory_lines(
@@ -380,9 +473,15 @@ fn apply_agent_snapshot_event(
             request_summary,
             result_summary,
             request_fingerprint,
+            compact_path,
+            passthrough_reason,
+            raw_est_tokens,
+            reduced_est_tokens,
             search_query,
             command,
             artifact_id,
+            raw_artifact_handle,
+            raw_artifact_available,
             regions,
             duration_ms,
         } => {
@@ -456,9 +555,15 @@ fn apply_agent_snapshot_event(
                     request_summary: request_summary.clone(),
                     result_summary: result_summary.clone(),
                     request_fingerprint: request_fingerprint.clone(),
+                    compact_path: compact_path.clone(),
+                    passthrough_reason: passthrough_reason.clone(),
+                    raw_est_tokens: *raw_est_tokens,
+                    reduced_est_tokens: *reduced_est_tokens,
                     search_query: search_query.clone(),
                     command: command.clone(),
                     artifact_id: artifact_id.clone(),
+                    raw_artifact_handle: raw_artifact_handle.clone(),
+                    raw_artifact_available: *raw_artifact_available,
                     paths: event.paths.clone(),
                     regions: regions.clone(),
                     symbols: event.symbols.clone(),
@@ -496,6 +601,12 @@ fn apply_agent_snapshot_event(
             error_class,
             error_message,
             request_fingerprint,
+            compact_path,
+            passthrough_reason,
+            raw_est_tokens,
+            reduced_est_tokens,
+            raw_artifact_handle,
+            raw_artifact_available,
             retryable,
             duration_ms,
         } => {
@@ -514,6 +625,12 @@ fn apply_agent_snapshot_event(
                     error_class: error_class.clone(),
                     error_message: error_message.clone(),
                     request_fingerprint: request_fingerprint.clone(),
+                    compact_path: compact_path.clone(),
+                    passthrough_reason: passthrough_reason.clone(),
+                    raw_est_tokens: *raw_est_tokens,
+                    reduced_est_tokens: *reduced_est_tokens,
+                    raw_artifact_handle: raw_artifact_handle.clone(),
+                    raw_artifact_available: *raw_artifact_available,
                     retryable: *retryable,
                     duration_ms: *duration_ms,
                     occurred_at_unix: event.occurred_at_unix,

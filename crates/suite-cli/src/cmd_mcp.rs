@@ -36,9 +36,10 @@ mod support;
 mod transport;
 
 use crate::cmd_mcp::native_tools::{
-    handle_packet28_fetch_context, handle_packet28_fetch_tool_result, handle_packet28_glob,
-    handle_packet28_prepare_handoff, handle_packet28_read_regions, handle_packet28_search,
-    handle_packet28_write_intention, Packet28FetchContextArgs, Packet28FetchToolResultArgs,
+    handle_packet28_fetch_context, handle_packet28_fetch_raw_output,
+    handle_packet28_fetch_tool_result, handle_packet28_glob, handle_packet28_prepare_handoff,
+    handle_packet28_read_regions, handle_packet28_search, handle_packet28_write_intention,
+    Packet28FetchContextArgs, Packet28FetchRawOutputArgs, Packet28FetchToolResultArgs,
     Packet28GlobArgs, Packet28PrepareHandoffArgs, Packet28ReadRegionsArgs, Packet28SearchArgs,
     Packet28WriteIntentionArgs,
 };
@@ -419,6 +420,17 @@ fn handle_method(
                     }
                 },
                 {
+                    "name": "packet28.fetch_raw_output",
+                    "description": "Fetch raw output from a hook spool file or other Packet28 raw artifact handle.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "handle": {"type":"string"}
+                        }
+                    }
+                },
+                {
                     "name": "packet28.fetch_context",
                     "description": "Fetch a stored Packet28 broker context by context_version or artifact_id. Use response_mode='slim' to omit heavy sections.",
                     "inputSchema": {
@@ -574,6 +586,18 @@ fn handle_tool_call(
             track_task(session, root, &request.task_id)?;
             handle_packet28_fetch_tool_result(root, request)?
         }
+        "packet28.fetch_raw_output" => {
+            let mut request: Packet28FetchRawOutputArgs = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                Some(request.handle.as_str()),
+                "packet28.fetch_raw_output",
+            )?;
+            track_task(session, root, &request.task_id)?;
+            handle_packet28_fetch_raw_output(root, request)?
+        }
         "packet28.fetch_context" => {
             let mut request: Packet28FetchContextArgs = serde_json::from_value(arguments)?;
             request.task_id = resolve_session_task_id(
@@ -674,6 +698,13 @@ fn summarize_tool_payload(name: &str, payload: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             format!("Packet28 fetched tool artifact {artifact_id}.")
+        }
+        "packet28.fetch_raw_output" => {
+            let path = payload
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!("Packet28 fetched raw output from {path}.")
         }
         "packet28.fetch_context" => {
             let artifact_id = payload

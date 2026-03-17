@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+from hook_benchmark_thresholds import DEFAULT_THRESHOLDS, eligible_for_mean
+
 
 def default_cases(gh_repo: str | None, gh_pr_number: str | None, gh_run_id: str | None) -> list[tuple[str, list[str]]]:
     cases = [
@@ -179,7 +181,7 @@ def discover_latest_run_id(root: Path, gh_repo: str) -> str | None:
     )
 
 
-def run_case(root: Path, artifact_dir: Path, case_name: str, argv: list[str]) -> dict:
+def run_case(root: Path, artifact_dir: Path, case_name: str, argv: list[str], shell: str | None) -> dict:
     artifact_path = artifact_dir / f"{case_name}.json"
     cmd = [
         sys.executable,
@@ -189,9 +191,10 @@ def run_case(root: Path, artifact_dir: Path, case_name: str, argv: list[str]) ->
         "--json",
         "--artifact-path",
         str(artifact_path),
-        "--",
-        *argv,
     ]
+    if shell:
+        cmd.extend(["--shell", shell])
+    cmd.extend(["--", *argv])
     completed = subprocess.run(
         cmd,
         cwd=str(root),
@@ -206,6 +209,7 @@ def run_case(root: Path, artifact_dir: Path, case_name: str, argv: list[str]) ->
             error_payload = {
                 "case": case_name,
                 "status": "error",
+                "surface": "live",
                 "command": " ".join(argv),
                 "error": f"Invalid JSON output: {exc}: {(completed.stderr or completed.stdout).strip()}",
                 "artifact_path": str(artifact_path),
@@ -213,12 +217,15 @@ def run_case(root: Path, artifact_dir: Path, case_name: str, argv: list[str]) ->
             artifact_path.write_text(json.dumps(error_payload, indent=2) + "\n", encoding="utf-8")
             return error_payload
         payload["case"] = case_name
-        payload["status"] = "ok"
+        payload["status"] = payload.get("status", "ok")
+        payload["surface"] = "live"
+        payload.setdefault("raw_output_recoverable", True)
         payload["artifact_path"] = str(artifact_path)
         return payload
     error_payload = {
         "case": case_name,
         "status": "error",
+        "surface": "live",
         "command": " ".join(argv),
         "error": (completed.stderr or completed.stdout).strip(),
         "artifact_path": str(artifact_path),
@@ -264,6 +271,7 @@ def run_fixture_case(root: Path, artifact_dir: Path, case: dict) -> dict:
             error_payload = {
                 "case": case["case"],
                 "status": "error",
+                "surface": "fixture",
                 "command": case["command"],
                 "error": f"Invalid JSON output: {exc}: {(completed.stderr or completed.stdout).strip()}",
                 "artifact_path": str(artifact_path),
@@ -272,12 +280,16 @@ def run_fixture_case(root: Path, artifact_dir: Path, case: dict) -> dict:
             return error_payload
         payload["case"] = case["case"]
         payload["status"] = "ok"
+        payload["surface"] = "fixture"
+        payload.setdefault("compact_path", "fixture_reduce")
+        payload.setdefault("raw_output_recoverable", False)
         payload["artifact_path"] = str(artifact_path)
         artifact_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return payload
     error_payload = {
         "case": case["case"],
         "status": "error",
+        "surface": "fixture",
         "command": case["command"],
         "error": (completed.stderr or completed.stdout).strip(),
         "artifact_path": str(artifact_path),
@@ -295,11 +307,27 @@ def build_summary(
     gh_run_id: str | None,
 ) -> dict:
     ok_results = [result for result in results if result["status"] == "ok"]
-    token_reductions = [
-        result["token_reduction_pct"]
-        for result in ok_results
-        if result.get("raw_est_tokens", 0) > 0
+    live_results = [result for result in results if result.get("surface") == "live"]
+    fixture_results = [result for result in results if result.get("surface") == "fixture"]
+    eligible_results = [result for result in ok_results if eligible_for_mean(result)]
+    eligible_live_results = [result for result in eligible_results if result.get("surface") == "live"]
+    eligible_fixture_results = [
+        result for result in eligible_results if result.get("surface") == "fixture"
     ]
+    live_failures = [result["case"] for result in live_results if result["status"] != "ok"]
+    compact_coverage = [
+        result for result in ok_results if result.get("compact_path") and result.get("raw_est_tokens", 0) > 0
+    ]
+
+    def mean_reduction(items: list[dict]) -> float | None:
+        if not items:
+            return None
+        raw_total = sum(result["raw_est_tokens"] for result in items)
+        reduced_total = sum(result["reduced_est_tokens"] for result in items)
+        if raw_total <= 0:
+            return None
+        return round(100.0 * (raw_total - reduced_total) / raw_total, 1)
+
     return {
         "root": str(root),
         "gh_repo": gh_repo,
@@ -310,10 +338,21 @@ def build_summary(
         "case_count": len(results),
         "success_count": len(ok_results),
         "error_count": len(results) - len(ok_results),
-        "mean_token_reduction_pct": (
-            round(sum(token_reductions) / len(token_reductions), 1)
-            if token_reductions
-            else None
+        "mean_token_reduction_pct": mean_reduction(eligible_results),
+        "live_case_mean_token_reduction_pct": mean_reduction(eligible_live_results),
+        "fixture_mean_token_reduction_pct": mean_reduction(eligible_fixture_results),
+        "eligible_case_count": len(eligible_results),
+        "eligible_live_case_count": len(eligible_live_results),
+        "eligible_fixture_case_count": len(eligible_fixture_results),
+        "expected_live_case_count": len(live_results),
+        "successful_live_case_count": sum(1 for result in live_results if result["status"] == "ok"),
+        "live_case_integrity_ok": not live_failures,
+        "live_case_failures": live_failures,
+        "compact_path_coverage_pct": (
+            round(100.0 * len(compact_coverage) / len(ok_results), 1) if ok_results else None
+        ),
+        "recoverable_output_case_count": sum(
+            1 for result in ok_results if result.get("raw_output_recoverable")
         ),
         "results": results,
     }
@@ -326,6 +365,16 @@ def render_text(summary: dict) -> str:
         f"gh pr: {summary['gh_pr_number'] or '<none>'}",
         f"gh run: {summary['gh_run_id'] or '<none>'}",
     ]
+    if summary.get("mean_token_reduction_pct") is not None:
+        lines.append(
+            f"eligible weighted mean reduction: {summary['mean_token_reduction_pct']}% "
+            f"(live={summary.get('live_case_mean_token_reduction_pct')}, "
+            f"fixture={summary.get('fixture_mean_token_reduction_pct')})"
+        )
+    lines.append(
+        "live integrity: "
+        f"{summary['successful_live_case_count']}/{summary['expected_live_case_count']} successful"
+    )
     for result in summary["results"]:
         if result["status"] != "ok":
             lines.append(f"{result['case']}: ERROR")
@@ -356,7 +405,22 @@ def render_markdown(summary: dict) -> str:
     ]
     if summary.get("mean_token_reduction_pct") is not None:
         lines.append(
-            f"- Mean token reduction across non-empty raw outputs: `{summary['mean_token_reduction_pct']}%`"
+            f"- Weighted mean token reduction across eligible cases: `{summary['mean_token_reduction_pct']}%`"
+        )
+    if summary.get("live_case_mean_token_reduction_pct") is not None:
+        lines.append(
+            f"- Live-case weighted eligible mean reduction: `{summary['live_case_mean_token_reduction_pct']}%`"
+        )
+    if summary.get("fixture_mean_token_reduction_pct") is not None:
+        lines.append(
+            f"- Fixture weighted eligible mean reduction: `{summary['fixture_mean_token_reduction_pct']}%`"
+        )
+    lines.append(
+        f"- Live benchmark integrity: `{summary['successful_live_case_count']}/{summary['expected_live_case_count']} successful`"
+    )
+    if summary.get("compact_path_coverage_pct") is not None:
+        lines.append(
+            f"- Compact-path coverage across successful cases: `{summary['compact_path_coverage_pct']}%`"
         )
     lines.extend(
         [
@@ -399,6 +463,11 @@ def main() -> int:
         action="store_true",
         help="Use the git origin remote as the gh repo benchmark target",
     )
+    parser.add_argument(
+        "--shell",
+        default=None,
+        help="Shell binary used for live hook benchmark execution",
+    )
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -418,7 +487,7 @@ def main() -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     results = [
-        run_case(root, artifact_dir, name, argv)
+        run_case(root, artifact_dir, name, argv, args.shell)
         for name, argv in default_cases(gh_repo, gh_pr_number, gh_run_id)
     ]
     results.extend(run_fixture_case(root, artifact_dir, case) for case in fixture_cases(root))

@@ -115,10 +115,17 @@ fn summarize_go_test(output: &str, failed: bool) -> String {
         .filter(|line| line.trim_start().starts_with("--- FAIL:"))
         .count();
     if failed || failed_pkgs > 0 {
+        let first_failed_test = extract_first_failed_go_test(output);
         if failed_tests > 0 {
-            format!(
-                "go test: {passed} pkgs passed, {failed_pkgs} failed; {failed_tests} tests failed"
-            )
+            if let Some(first_failed_test) = first_failed_test {
+                format!(
+                    "go test: {failed_pkgs} pkg failed, {failed_tests} tests failed; first {first_failed_test}"
+                )
+            } else {
+                format!(
+                    "go test: {passed} pkgs passed, {failed_pkgs} failed; {failed_tests} tests failed"
+                )
+            }
         } else {
             format!("go test: {passed} pkgs passed, {failed_pkgs} failed")
         }
@@ -139,7 +146,7 @@ fn summarize_go_build_like(
     if failed {
         if diagnostic_count > 0 {
             let lead = diagnostic_paths.first().cloned().unwrap_or_default();
-            format!("{label}: {diagnostic_count} diagnostics in {lead}",)
+            format!("{label}: {diagnostic_count} diagnostics in {lead}")
         } else {
             first_nonempty_line(output).unwrap_or_else(|| format!("{label} failed"))
         }
@@ -198,6 +205,15 @@ fn extract_go_diagnostics(output: &str) -> (usize, Vec<String>) {
         }
     }
     (count, paths)
+}
+
+fn extract_first_failed_go_test(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("--- FAIL: ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn merge_paths(base: &[String], extra: &[String]) -> Vec<String> {

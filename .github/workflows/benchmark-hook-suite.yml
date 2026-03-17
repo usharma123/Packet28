@@ -7,6 +7,10 @@ on:
       - "scripts/benchmark_hook_rewrite.py"
       - "scripts/benchmark_hook_suite.py"
       - "scripts/validate_hook_benchmarks.py"
+      - "scripts/benchmark_native_mcp.py"
+      - "scripts/validate_native_benchmarks.py"
+      - "scripts/benchmark_common.py"
+      - "scripts/hook_benchmark_thresholds.py"
       - "crates/packet28-reducer-core/**"
       - "crates/suite-cli/**"
       - "crates/packet28d/**"
@@ -21,6 +25,10 @@ on:
       - "scripts/benchmark_hook_rewrite.py"
       - "scripts/benchmark_hook_suite.py"
       - "scripts/validate_hook_benchmarks.py"
+      - "scripts/benchmark_native_mcp.py"
+      - "scripts/validate_native_benchmarks.py"
+      - "scripts/benchmark_common.py"
+      - "scripts/hook_benchmark_thresholds.py"
       - "crates/packet28-reducer-core/**"
       - "crates/suite-cli/**"
       - "crates/packet28d/**"
@@ -59,20 +67,36 @@ jobs:
             --gh-repo "${{ github.repository }}" \
             --artifact-dir "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-hook-suite"
 
+      - name: Run native MCP benchmark suite
+        run: |
+          python3 scripts/benchmark_native_mcp.py \
+            --root "$GITHUB_WORKSPACE" \
+            --artifact-dir "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-native-suite"
+
       - name: Validate hook benchmark thresholds
         run: |
           python3 scripts/validate_hook_benchmarks.py \
             "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-hook-suite/summary.json" \
             --markdown-path "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-hook-suite/validation.md"
 
+      - name: Validate native MCP benchmark thresholds
+        run: |
+          python3 scripts/validate_native_benchmarks.py \
+            "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-native-suite/summary.json" \
+            --markdown-path "$GITHUB_WORKSPACE/.packet28/benchmarks/ci-native-suite/validation.md"
+
       - name: Publish workflow summary
         run: |
           cat .packet28/benchmarks/ci-hook-suite/summary.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n' >> "$GITHUB_STEP_SUMMARY"
           cat .packet28/benchmarks/ci-hook-suite/validation.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n' >> "$GITHUB_STEP_SUMMARY"
+          cat .packet28/benchmarks/ci-native-suite/summary.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n' >> "$GITHUB_STEP_SUMMARY"
+          cat .packet28/benchmarks/ci-native-suite/validation.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload hook benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: hook-benchmark-suite
-          path: .packet28/benchmarks/ci-hook-suite
+          name: benchmark-suites
+          path: .packet28/benchmarks

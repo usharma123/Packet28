@@ -50,17 +50,10 @@ pub fn reduce_git_command(
     let output = first_nonempty_line(stdout).or_else(|| first_nonempty_line(stderr));
     let summary = match spec.canonical_kind.as_str() {
         "git_status" => {
-            let changed = stdout
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
             if failed {
                 output.unwrap_or_else(|| "git status failed".to_string())
             } else {
-                format!(
-                    "git status reported {changed} changed entr{suffix}",
-                    suffix = if changed == 1 { "y" } else { "ies" }
-                )
+                summarize_git_status(stdout)
             }
         }
         "git_log" => {
@@ -159,4 +152,51 @@ fn looks_like_commit_line(line: &str) -> bool {
         return false;
     };
     (7..=40).contains(&first.len()) && first.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn summarize_git_status(stdout: &str) -> String {
+    if stdout.contains("nothing to commit") {
+        return "git status clean".to_string();
+    }
+    let modified = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with("modified:"))
+        .count();
+    let new_files = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with("new file:"))
+        .count();
+    let deleted = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with("deleted:"))
+        .count();
+    let renamed = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with("renamed:"))
+        .count();
+    let untracked = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with('\t') && !line.contains(':'))
+        .count();
+    let mut parts = Vec::new();
+    if modified > 0 {
+        parts.push(format!("{modified} modified"));
+    }
+    if new_files > 0 {
+        parts.push(format!("{new_files} new"));
+    }
+    if deleted > 0 {
+        parts.push(format!("{deleted} deleted"));
+    }
+    if renamed > 0 {
+        parts.push(format!("{renamed} renamed"));
+    }
+    if untracked > 0 {
+        parts.push(format!("{untracked} untracked"));
+    }
+    if parts.is_empty() {
+        "git status has pending changes".to_string()
+    } else {
+        format!("git status: {}", parts.join(", "))
+    }
 }

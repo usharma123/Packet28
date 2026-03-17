@@ -534,30 +534,43 @@ pub(crate) fn summarize_agent_state_event(
         suite_packet_core::AgentStateEventData::ToolInvocationStarted {
             tool_name,
             sequence,
+            compact_path,
+            passthrough_reason,
             ..
         } => format!(
-            "tool invocation started task={} seq={} tool={}",
-            event.task_id, sequence, tool_name
+            "tool invocation started task={} seq={} tool={} route={} reason={}",
+            event.task_id,
+            sequence,
+            tool_name,
+            compact_path.as_deref().unwrap_or("unknown"),
+            passthrough_reason.as_deref().unwrap_or("n/a")
         ),
         suite_packet_core::AgentStateEventData::ToolInvocationCompleted {
             tool_name,
             sequence,
             operation_kind,
+            compact_path,
             ..
         } => format!(
-            "tool invocation completed task={} seq={} tool={} kind={:?}",
-            event.task_id, sequence, tool_name, operation_kind
+            "tool invocation completed task={} seq={} tool={} kind={:?} route={}",
+            event.task_id,
+            sequence,
+            tool_name,
+            operation_kind,
+            compact_path.as_deref().unwrap_or("unknown")
         ),
         suite_packet_core::AgentStateEventData::ToolInvocationFailed {
             tool_name,
             sequence,
             error_class,
+            compact_path,
             ..
         } => format!(
-            "tool invocation failed task={} seq={} tool={} error={}",
+            "tool invocation failed task={} seq={} tool={} route={} error={}",
             event.task_id,
             sequence,
             tool_name,
+            compact_path.as_deref().unwrap_or("unknown"),
             error_class.as_deref().unwrap_or("unknown")
         ),
         suite_packet_core::AgentStateEventData::FocusInferred { .. } => format!(
@@ -711,9 +724,15 @@ pub(crate) fn derive_agent_snapshot(
                 request_summary,
                 result_summary,
                 request_fingerprint,
+                compact_path,
+                passthrough_reason,
+                raw_est_tokens,
+                reduced_est_tokens,
                 search_query,
                 command,
                 artifact_id,
+                raw_artifact_handle,
+                raw_artifact_available,
                 regions,
                 duration_ms,
             } => {
@@ -775,9 +794,15 @@ pub(crate) fn derive_agent_snapshot(
                     request_summary: request_summary.clone(),
                     result_summary: result_summary.clone(),
                     request_fingerprint: request_fingerprint.clone(),
+                    compact_path: compact_path.clone(),
+                    passthrough_reason: passthrough_reason.clone(),
+                    raw_est_tokens: *raw_est_tokens,
+                    reduced_est_tokens: *reduced_est_tokens,
                     search_query: search_query.clone(),
                     command: command.clone(),
                     artifact_id: artifact_id.clone(),
+                    raw_artifact_handle: raw_artifact_handle.clone(),
+                    raw_artifact_available: *raw_artifact_available,
                     paths: event.paths.clone(),
                     regions: regions.clone(),
                     symbols: event.symbols.clone(),
@@ -803,6 +828,12 @@ pub(crate) fn derive_agent_snapshot(
                 error_class,
                 error_message,
                 request_fingerprint,
+                compact_path,
+                passthrough_reason,
+                raw_est_tokens,
+                reduced_est_tokens,
+                raw_artifact_handle,
+                raw_artifact_available,
                 retryable,
                 duration_ms,
             } => {
@@ -816,6 +847,12 @@ pub(crate) fn derive_agent_snapshot(
                     error_class: error_class.clone(),
                     error_message: error_message.clone(),
                     request_fingerprint: request_fingerprint.clone(),
+                    compact_path: compact_path.clone(),
+                    passthrough_reason: passthrough_reason.clone(),
+                    raw_est_tokens: *raw_est_tokens,
+                    reduced_est_tokens: *reduced_est_tokens,
+                    raw_artifact_handle: raw_artifact_handle.clone(),
+                    raw_artifact_available: *raw_artifact_available,
                     retryable: *retryable,
                     duration_ms: *duration_ms,
                     occurred_at_unix: event.occurred_at_unix,

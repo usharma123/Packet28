@@ -227,22 +227,33 @@ pub fn run_and_reduce(
     Ok(envelope)
 }
 
+pub fn command_supported(argv: &[String]) -> bool {
+    validate_safe_command(argv).is_ok()
+}
+
 fn validate_safe_command(argv: &[String]) -> Result<(), CovyError> {
     let root = argv[0].as_str();
     match root {
-        "ls" | "find" | "grep" => Ok(()),
+        "ls" | "find" | "grep" | "rg" | "cat" | "head" | "tail" | "sed" | "env"
+        | "printenv" | "jq" | "wget" | "curl" | "docker" | "kubectl" | "cargo" | "gh"
+        | "npm" | "pnpm" | "yarn" | "npx" | "tsc" | "eslint" | "vitest" | "prettier"
+        | "next" | "prisma" | "python" | "python3" | "pytest" | "ruff" | "mypy"
+        | "pip" | "pip3" | "go" | "golangci-lint" => Ok(()),
         "git" => {
             if let Some(subcmd) = git_subcommand(argv) {
-                if subcmd == "status" || subcmd == "log" {
+                if matches!(
+                    subcmd.as_str(),
+                    "status" | "log" | "show" | "diff" | "fetch" | "stash" | "worktree"
+                ) {
                     return Ok(());
                 }
             }
             Err(CovyError::Other(
-                "proxy.run only allows: ls, find, grep, git status, git log".to_string(),
+                "proxy.run only allows a Packet28-managed safe command subset".to_string(),
             ))
         }
         _ => Err(CovyError::Other(
-            "proxy.run only allows: ls, find, grep, git status, git log".to_string(),
+            "proxy.run only allows a Packet28-managed safe command subset".to_string(),
         )),
     }
 }

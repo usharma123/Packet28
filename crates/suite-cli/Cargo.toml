@@ -37,6 +37,7 @@ colored.workspace = true
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 libc = "0.2"
 blake3.workspace = true
 shell-words.workspace = true

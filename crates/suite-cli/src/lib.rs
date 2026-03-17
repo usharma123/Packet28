@@ -6,6 +6,7 @@ mod cli_defs;
 mod cli_runtime;
 pub mod cmd_agent_prompt;
 pub mod cmd_build;
+pub mod cmd_compact;
 pub mod cmd_common;
 pub mod cmd_common_machine;
 mod cmd_common_machine_support;
@@ -33,6 +34,7 @@ pub mod cmd_setup;
 pub mod cmd_shard;
 pub mod cmd_stack;
 pub mod packet28_agent;
+pub mod route_registry;
 pub mod task_runtime;
 
 pub use cli_defs::*;

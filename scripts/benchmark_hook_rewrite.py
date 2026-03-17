@@ -3,25 +3,11 @@
 import argparse
 import json
 import shlex
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-
-def estimate_tokens(text: str) -> int:
-    return max(1, (len(text.encode("utf-8")) + 3) // 4) if text else 0
-
-
-def run_capture(cmd: list[str], cwd: Path, stdin_text: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        input=stdin_text,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+from benchmark_common import estimate_tokens, resolve_shell, run_capture
 
 
 def main() -> int:
@@ -37,6 +23,11 @@ def main() -> int:
         default=None,
         help="Optional JSON artifact output path",
     )
+    parser.add_argument(
+        "--shell",
+        default=None,
+        help="Shell binary to use for raw and rewritten command execution",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to benchmark")
     args = parser.parse_args()
 
@@ -49,6 +40,10 @@ def main() -> int:
     command_text = shlex.join(args.command)
     task_id = args.task_id or f"bench-hook-{int(time.time())}"
     session_id = args.session_id or f"bench-session-{int(time.time())}"
+    try:
+        shell_path = resolve_shell(args.shell)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"benchmark shell setup failed: {exc}") from exc
 
     pretool_payload = json.dumps(
         {
@@ -85,20 +80,31 @@ def main() -> int:
         .get("updatedInput", {})
         .get("command")
     )
-    if not rewritten:
-        raise SystemExit("command was not rewritten by Packet28 hook")
-
-    raw = run_capture(["zsh", "-lc", command_text], root)
+    raw = run_capture([shell_path, "-lc", command_text], root)
     raw_visible = raw.stdout + raw.stderr
-
-    reduced = run_capture(["zsh", "-lc", rewritten], root)
-    reduced_visible = reduced.stdout + reduced.stderr
+    if rewritten:
+        reduced = run_capture([shell_path, "-lc", rewritten], root)
+        reduced_visible = reduced.stdout + reduced.stderr
+        reduced_exit_code = reduced.returncode
+        status = "ok"
+        compact_path = "hook_rewrite"
+        raw_output_recoverable = True
+    else:
+        reduced_visible = raw_visible
+        reduced_exit_code = raw.returncode
+        status = "passthrough"
+        compact_path = "passthrough"
+        raw_output_recoverable = False
 
     payload = {
+        "status": status,
         "command": command_text,
         "rewritten_command": rewritten,
+        "chosen_shell": shell_path,
+        "compact_path": compact_path,
+        "raw_output_recoverable": raw_output_recoverable,
         "raw_exit_code": raw.returncode,
-        "reduced_exit_code": reduced.returncode,
+        "reduced_exit_code": reduced_exit_code,
         "raw_bytes": len(raw_visible.encode("utf-8")),
         "raw_est_tokens": estimate_tokens(raw_visible),
         "reduced_bytes": len(reduced_visible.encode("utf-8")),

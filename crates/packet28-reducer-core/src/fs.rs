@@ -87,25 +87,27 @@ pub fn reduce_fs_command(
                 .unwrap_or_else(|| "file".to_string());
             match spec.canonical_kind.as_str() {
                 "fs_head" => format!(
-                    "head returned {lines} line(s) from {target}{}",
+                    "head {target}{}{}",
                     parse_head_count(&spec.argv)
-                        .map(|count| format!(" (requested {count})"))
-                        .unwrap_or_default()
+                        .map(|count| format!(" lines 1-{count}"))
+                        .unwrap_or_default(),
+                    preview_suffix(stdout)
                 ),
                 "fs_tail" => format!(
-                    "tail returned {lines} line(s) from {target}{}",
+                    "tail {target}{}{}",
                     parse_head_count(&spec.argv)
-                        .map(|count| format!(" (requested last {count})"))
-                        .unwrap_or_default()
+                        .map(|count| format!(" last {count} line(s)"))
+                        .unwrap_or_default(),
+                    preview_suffix(stdout)
                 ),
                 "fs_sed" => {
                     if let Some((start, end)) = parse_sed_region(&spec.argv) {
-                        format!("sed printed lines {start}-{end} from {target}")
+                        format!("sed {target} lines {start}-{end}{}", preview_suffix(stdout))
                     } else {
-                        format!("sed returned {lines} line(s) from {target}")
+                        format!("sed {target} returned {lines} line(s){}", preview_suffix(stdout))
                     }
                 }
-                _ => format!("cat returned {lines} line(s) from {target}"),
+                _ => format!("cat {target}{}{}", line_count_suffix(lines), preview_suffix(stdout)),
             }
         }
         "fs_diff" => {
@@ -301,6 +303,16 @@ fn parse_sed_region(argv: &[String]) -> Option<(usize, usize)> {
     Some((line, line))
 }
 
+fn line_count_suffix(lines: usize) -> String {
+    format!(" ({lines} line(s))")
+}
+
+fn preview_suffix(stdout: &str) -> String {
+    first_nonempty_line(stdout)
+        .map(|line| format!(": {}", compact(&line, 60)))
+        .unwrap_or_default()
+}
+
 fn compact(value: &str, limit: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let char_count = compact.chars().count();
@@ -344,7 +356,7 @@ mod tests {
         let reduction = reduce_fs_command(&spec, "a\nb\nc\n", "", 0);
         assert_eq!(
             reduction.summary,
-            "head returned 3 line(s) from README.md (requested 3)"
+            "head README.md lines 1-3: a"
         );
         assert_eq!(reduction.regions, vec!["README.md:1-3".to_string()]);
     }

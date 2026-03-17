@@ -181,8 +181,13 @@ fn summarize_run_view(lines: &[String]) -> String {
 fn summarize_list_entries(label: &str, lines: &[String], noun: &str) -> String {
     let count = lines.len();
     if let Some(first) = lines.first() {
-        let preview = first.split('\t').take(2).collect::<Vec<_>>().join(" ");
+        let fields = first.split('\t').collect::<Vec<_>>();
+        let preview = fields.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+        let state = fields.get(3).copied().filter(|value| !value.is_empty());
         if !preview.is_empty() {
+            if let Some(state) = state {
+                return format!("{label}: {count} {noun}(s); first {preview} [{state}]");
+            }
             return format!("{label}: {count} {noun}(s); first {preview}");
         }
     }
@@ -254,7 +259,7 @@ mod tests {
         let reduction = reduce_github_command(&spec, stdout, "", 0);
         assert_eq!(
             reduction.summary,
-            "gh pr list: 2 PR(s); first 123 Fix reducer path"
+            "gh pr list: 2 PR(s); first 123 Fix reducer path [OPEN]"
         );
     }
 

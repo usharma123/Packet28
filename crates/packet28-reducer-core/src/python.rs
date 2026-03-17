@@ -111,7 +111,12 @@ fn classify_ruff_format_check(argv: &[String]) -> bool {
 fn summarize_pytest(output: &str, failed: bool) -> String {
     if let Some((passed, failed_count)) = parse_pytest_result(output) {
         if failed || failed_count > 0 {
-            return format!("pytest reported {passed} passed and {failed_count} failed");
+            if let Some(failed_test) = extract_pytest_failed_test(output) {
+                return format!(
+                    "pytest: {failed_count} failed, {passed} passed; first {failed_test}"
+                );
+            }
+            return format!("pytest: {failed_count} failed, {passed} passed");
         }
         return format!("pytest passed ({passed} tests)");
     }
@@ -131,9 +136,13 @@ fn summarize_ruff_check(output: &str, failed: bool) -> String {
             .count();
         if diagnostics > 0 {
             if let Some(path) = extract_python_diagnostic_path(output) {
-                format!("ruff check: {diagnostics} diagnostics in {path}")
+                if let Some(code) = extract_python_diagnostic_code(output) {
+                    format!("ruff: {diagnostics} diagnostics in {path} ({code})")
+                } else {
+                    format!("ruff: {diagnostics} diagnostics in {path}")
+                }
             } else {
-                format!("ruff check reported {diagnostics} diagnostic line(s)")
+                format!("ruff: {diagnostics} diagnostic line(s)")
             }
         } else {
             first_nonempty_line(output).unwrap_or_else(|| "ruff check failed".to_string())
@@ -241,6 +250,38 @@ fn extract_python_diagnostic_path(output: &str) -> Option<String> {
     })
 }
 
+fn extract_pytest_failed_test(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("FAILED ")
+            .and_then(|rest| rest.split(" - ").next())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn extract_python_diagnostic_code(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut parts = line.split(':');
+        let path = parts.next()?;
+        if !path.ends_with(".py") && !path.ends_with(".pyi") {
+            return None;
+        }
+        let line_no = parts.next()?;
+        let col_no = parts.next()?;
+        if !line_no.chars().all(|ch| ch.is_ascii_digit())
+            || !col_no.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return None;
+        }
+        parts
+            .next()?
+            .split_whitespace()
+            .next()
+            .map(ToOwned::to_owned)
+    })
+}
+
 fn fingerprint(family: &str, kind: &str, argv: &[String]) -> String {
     format!("{family}:{kind}:{}", argv.join("\u{1f}"))
 }
@@ -281,7 +322,7 @@ mod tests {
             "",
             1,
         );
-        assert_eq!(reduction.summary, "pytest reported 4 passed and 1 failed");
+        assert_eq!(reduction.summary, "pytest: 1 failed, 4 passed");
     }
 
     #[test]
@@ -318,7 +359,7 @@ mod tests {
         );
         assert_eq!(
             reduction.summary,
-            "ruff check: 2 diagnostics in src/demo.py"
+            "ruff: 2 diagnostics in src/demo.py (F841)"
         );
     }
 }

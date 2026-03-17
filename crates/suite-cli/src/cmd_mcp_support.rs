@@ -244,6 +244,33 @@ pub(crate) fn load_tool_result_artifact(
     Ok((selected_artifact_id, value))
 }
 
+pub(crate) fn load_raw_output_artifact(
+    root: &Path,
+    task_id: &str,
+    handle: &str,
+) -> Result<(String, String)> {
+    let trimmed = handle.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("packet28.fetch_raw_output requires handle"));
+    }
+    let direct = PathBuf::from(trimmed);
+    let task_root = task_artifact_dir(root, task_id);
+    let candidates = [
+        direct.clone(),
+        task_root.join(trimmed),
+        task_root.join("hook-spool").join(trimmed),
+        task_root.join("hook-artifacts").join(trimmed),
+        task_root.join("tool-evidence").join(trimmed),
+    ];
+    let path = candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| anyhow!("failed to resolve raw artifact handle '{trimmed}'"))?;
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read raw artifact '{}'", path.display()))?;
+    Ok((path.display().to_string(), text))
+}
+
 pub(crate) fn track_task(
     session: &Arc<Mutex<McpSessionState>>,
     root: &Path,

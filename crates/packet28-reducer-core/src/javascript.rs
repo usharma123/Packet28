@@ -138,7 +138,12 @@ fn classify_vitest(argv: &[String]) -> bool {
 fn summarize_js_tests(output: &str, failed: bool) -> String {
     if let Some((passed, failed_count)) = parse_test_result(output) {
         if failed || failed_count > 0 {
-            return format!("javascript tests reported {passed} passed and {failed_count} failed");
+            if let Some(failing_file) = extract_vitest_failure(output) {
+                return format!(
+                    "vitest: {failed_count} failed, {passed} passed; {failing_file}"
+                );
+            }
+            return format!("vitest: {failed_count} failed, {passed} passed");
         }
         return format!("javascript tests passed ({passed} tests)");
     }
@@ -159,9 +164,13 @@ fn summarize_js_lint(output: &str, failed: bool) -> String {
     if failed {
         if diagnostics > 0 {
             if let Some(path) = extract_js_diagnostic_path(output) {
-                format!("javascript lint: {diagnostics} diagnostics in {path}")
+                if let Some(rule) = extract_eslint_rule(output) {
+                    format!("eslint: {diagnostics} diagnostics in {path} ({rule})")
+                } else {
+                    format!("eslint: {diagnostics} diagnostics in {path}")
+                }
             } else {
-                format!("javascript lint reported {diagnostics} diagnostic line(s)")
+                format!("eslint: {diagnostics} diagnostic line(s)")
             }
         } else {
             first_nonempty_line(output).unwrap_or_else(|| "javascript lint failed".to_string())
@@ -177,7 +186,11 @@ fn summarize_tsc(output: &str, failed: bool) -> String {
         .filter(|line| line.contains("error TS") || line.trim_start().starts_with("error "))
         .count();
     if failed {
-        format!("tsc reported {errors} error(s)")
+        if let Some((path, code)) = extract_tsc_error(output) {
+            format!("tsc: {errors} errors in {path} ({code})")
+        } else {
+            format!("tsc: {errors} error(s)")
+        }
     } else {
         "tsc passed".to_string()
     }
@@ -291,6 +304,43 @@ fn extract_js_diagnostic_path(output: &str) -> Option<String> {
     })
 }
 
+fn extract_eslint_rule(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if !trimmed
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit())
+        {
+            return None;
+        }
+        trimmed.split_whitespace().last().map(ToOwned::to_owned)
+    })
+}
+
+fn extract_tsc_error(output: &str) -> Option<(String, String)> {
+    output.lines().find_map(|line| {
+        let (path, rest) = line.split_once(":")?;
+        if !path.ends_with(".ts") && !path.ends_with(".tsx") && !path.ends_with(".js") {
+            return None;
+        }
+        let code = rest
+            .split_whitespace()
+            .find(|token| token.starts_with("TS"))
+            .map(|token| token.trim_end_matches(':').to_string())?;
+        Some((path.to_string(), code))
+    })
+}
+
+fn extract_vitest_failure(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("FAIL  ")
+            .and_then(|value| value.split(" > ").next())
+            .map(ToOwned::to_owned)
+    })
+}
+
 fn fingerprint(family: &str, kind: &str, argv: &[String]) -> String {
     format!("{family}:{kind}:{}", argv.join("\u{1f}"))
 }
@@ -337,10 +387,7 @@ mod tests {
             "",
             1,
         );
-        assert_eq!(
-            reduction.summary,
-            "javascript tests reported 7 passed and 1 failed"
-        );
+        assert_eq!(reduction.summary, "vitest: 1 failed, 7 passed");
     }
 
     #[test]
@@ -356,7 +403,7 @@ mod tests {
             "src/index.ts:4:1 - error TS2322: Type 'string' is not assignable\n",
             2,
         );
-        assert_eq!(reduction.summary, "tsc reported 1 error(s)");
+        assert_eq!(reduction.summary, "tsc: 1 errors in src/index.ts (TS2322)");
     }
 
     #[test]
@@ -374,7 +421,7 @@ mod tests {
         );
         assert_eq!(
             reduction.summary,
-            "javascript lint: 2 diagnostics in /workspace/src/app.ts"
+            "eslint: 2 diagnostics in /workspace/src/app.ts (bad)"
         );
     }
 }

@@ -5,7 +5,15 @@ import json
 import sys
 from pathlib import Path
 
-from hook_benchmark_thresholds import DEFAULT_THRESHOLDS
+
+DEFAULT_THRESHOLDS = {
+    "mean_token_reduction_pct": 75.0,
+    "cases": {
+        "native_search": {"min_reduction_pct": 80.0},
+        "native_read_regions": {"min_reduction_pct": 60.0},
+        "native_glob": {"min_reduction_pct": 80.0},
+    },
+}
 
 
 def load_summary(path: Path) -> dict:
@@ -26,39 +34,25 @@ def validate(summary: dict) -> tuple[list[str], list[str]]:
     else:
         notes.append(f"mean token reduction {mean}% passed")
 
-    if not summary.get("live_case_integrity_ok", False):
-        failures = summary.get("live_case_failures", [])
-        if failures:
-            errors.append(
-                "live benchmark integrity failed: "
-                + ", ".join(failures)
-            )
-        else:
-            errors.append("live benchmark integrity failed")
+    if summary.get("artifact_fetch_success_count") != summary.get("case_count"):
+        errors.append(
+            "artifact fetch coverage failed: "
+            f"{summary.get('artifact_fetch_success_count', 0)}/{summary.get('case_count', 0)}"
+        )
     else:
         notes.append(
-            "live benchmark integrity passed "
-            f"({summary.get('successful_live_case_count', 0)}/"
-            f"{summary.get('expected_live_case_count', 0)} successful)"
+            "artifact fetch coverage passed "
+            f"({summary.get('artifact_fetch_success_count', 0)}/{summary.get('case_count', 0)})"
         )
 
     by_case = {result.get("case"): result for result in summary.get("results", [])}
     for case, config in DEFAULT_THRESHOLDS["cases"].items():
         result = by_case.get(case)
         if result is None:
-            notes.append(f"{case}: skipped (case not present)")
+            errors.append(f"{case}: benchmark result missing")
             continue
         if result.get("status") != "ok":
-            if result.get("status") == "passthrough":
-                errors.append(f"{case}: command was not compacted by the hook")
-            else:
-                errors.append(f"{case}: benchmark execution failed")
-            continue
-        raw_tokens = result.get("raw_est_tokens", 0)
-        if raw_tokens < config["min_raw_tokens"]:
-            notes.append(
-                f"{case}: skipped threshold check (raw tokens {raw_tokens} < {config['min_raw_tokens']})"
-            )
+            errors.append(f"{case}: benchmark execution failed")
             continue
         reduction = result.get("token_reduction_pct")
         if reduction is None:
@@ -76,7 +70,7 @@ def validate(summary: dict) -> tuple[list[str], list[str]]:
 
 def render_markdown(summary: dict, errors: list[str], notes: list[str]) -> str:
     lines = [
-        "# Hook Benchmark Validation",
+        "# Native MCP Benchmark Validation",
         "",
         f"- Summary: `{summary.get('artifact_dir', '<unknown>')}/summary.json`",
         f"- Status: `{'failed' if errors else 'passed'}`",
@@ -99,12 +93,9 @@ def render_markdown(summary: dict, errors: list[str], notes: list[str]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate Packet28 hook benchmark artifacts against regression thresholds."
+        description="Validate Packet28 native MCP benchmark artifacts against regression thresholds."
     )
-    parser.add_argument(
-        "summary_path",
-        help="Path to hook benchmark summary.json",
-    )
+    parser.add_argument("summary_path", help="Path to native MCP benchmark summary.json")
     parser.add_argument(
         "--markdown-path",
         default=None,
@@ -112,8 +103,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    summary_path = Path(args.summary_path).resolve()
-    summary = load_summary(summary_path)
+    summary = load_summary(Path(args.summary_path).resolve())
     errors, notes = validate(summary)
     markdown = render_markdown(summary, errors, notes)
 

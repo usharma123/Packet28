@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::{Args, ValueEnum};
+use packet28_daemon_core::{resolve_workspace_root, BrokerWriteOp, BrokerWriteStateRequest};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,10 @@ pub enum ProxyCommands {
 
 #[derive(Args)]
 pub struct RunArgs {
+    /// Optional Packet28 task to attribute proxy usage to
+    #[arg(long)]
+    pub task_id: Option<String>,
+
     /// Emit JSON output
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "compact")]
     pub json: Option<crate::cmd_common::JsonProfileArg>,
@@ -152,6 +157,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         } else {
             print_text_summary(&envelope);
         }
+        record_proxy_result(&caller_cwd, args.task_id.as_deref(), &args.command_argv, &envelope)?;
         return Ok(if envelope.payload.exit_code == 0 {
             0
         } else {
@@ -198,7 +204,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         None
     };
 
-    handle_kernel_response(&args, &persist_root, response, governed_response)
+    handle_kernel_response(&args, &persist_root, &caller_cwd, response, governed_response)
 }
 
 pub fn run_remote(args: RunArgs, daemon_root: &Path) -> Result<i32> {
@@ -267,12 +273,13 @@ pub fn run_remote(args: RunArgs, daemon_root: &Path) -> Result<i32> {
     } else {
         None
     };
-    handle_kernel_response(&args, &persist_root, response, governed_response)
+    handle_kernel_response(&args, &persist_root, &caller_cwd, response, governed_response)
 }
 
 fn handle_kernel_response(
     args: &RunArgs,
     persist_root: &Path,
+    caller_cwd: &Path,
     response: context_kernel_core::KernelResponse,
     governed_response: Option<context_kernel_core::KernelResponse>,
 ) -> Result<i32> {
@@ -390,6 +397,7 @@ fn handle_kernel_response(
             )?;
         }
 
+        record_proxy_result(caller_cwd, args.task_id.as_deref(), &args.command_argv, &envelope)?;
         return Ok(if envelope.payload.exit_code == 0 {
             0
         } else {
@@ -439,11 +447,44 @@ fn handle_kernel_response(
         );
     }
 
+    record_proxy_result(caller_cwd, args.task_id.as_deref(), &args.command_argv, &envelope)?;
     Ok(if envelope.payload.exit_code == 0 {
         0
     } else {
         1
     })
+}
+
+fn record_proxy_result(
+    caller_cwd: &Path,
+    task_id: Option<&str>,
+    argv: &[String],
+    envelope: &suite_packet_core::EnvelopeV1<suite_proxy_core::CommandSummaryPayload>,
+) -> Result<()> {
+    let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    let root = resolve_workspace_root(caller_cwd);
+    crate::broker_client::ensure_daemon(&root)?;
+    crate::broker_client::write_state(
+        &root,
+        BrokerWriteStateRequest {
+            task_id: task_id.to_string(),
+            op: Some(BrokerWriteOp::ToolResult),
+            tool_name: Some("packet28.proxy.run".to_string()),
+            operation_kind: Some(suite_packet_core::ToolOperationKind::Generic),
+            request_summary: Some(argv.join(" ")),
+            result_summary: Some(envelope.summary.clone()),
+            compact_path: Some("proxy_passthrough".to_string()),
+            raw_est_tokens: Some(((envelope.payload.bytes_in as f64) / 4.0).ceil() as u64),
+            reduced_est_tokens: Some(((envelope.payload.bytes_out as f64) / 4.0).ceil() as u64),
+            paths: envelope.files.iter().map(|file| file.path.clone()).collect(),
+            raw_artifact_available: Some(false),
+            refresh_context: Some(false),
+            ..BrokerWriteStateRequest::default()
+        },
+    )?;
+    Ok(())
 }
 
 fn print_text_summary(

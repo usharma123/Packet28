@@ -14,25 +14,12 @@ Usage:
 
 import argparse
 import json
-import os
-import subprocess
 import shlex
 import sys
 import time
 from pathlib import Path
 
-CHARS_PER_TOKEN = 4
-
-
-def estimate_tokens(text: str) -> int:
-    return max(1, (len(text.encode("utf-8")) + 3) // 4) if text else 0
-
-
-def run(cmd: list[str], cwd: Path, stdin: str | None = None, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd, cwd=str(cwd), input=stdin,
-        text=True, capture_output=True, check=False, timeout=timeout,
-    )
+from benchmark_common import estimate_tokens, resolve_shell, run_capture as run
 
 
 # ---------------------------------------------------------------------------
@@ -50,10 +37,10 @@ HOOK_CASES = [
 ]
 
 
-def run_hook_case(root: Path, case_name: str, command: str) -> dict:
+def run_hook_case(root: Path, case_name: str, command: str, shell_path: str) -> dict:
     """Run a command raw and through the hook reducer, compare tokens."""
     # Raw execution
-    raw = run(["zsh", "-lc", command], root)
+    raw = run([shell_path, "-lc", command], root)
     raw_output = raw.stdout + raw.stderr
     raw_tokens = estimate_tokens(raw_output)
 
@@ -99,7 +86,7 @@ def run_hook_case(root: Path, case_name: str, command: str) -> dict:
             "reduction_pct": 0.0,
         }
 
-    reduced = run(["zsh", "-lc", rewritten_cmd], root)
+    reduced = run([shell_path, "-lc", rewritten_cmd], root)
     reduced_output = reduced.stdout + reduced.stderr
     reduced_tokens = estimate_tokens(reduced_output)
     reduction_pct = (
@@ -110,6 +97,8 @@ def run_hook_case(root: Path, case_name: str, command: str) -> dict:
     return {
         "case": case_name, "command": command, "status": "ok",
         "rewritten": rewritten_cmd,
+        "compact_path": "hook_rewrite",
+        "raw_output_recoverable": True,
         "raw_tokens": raw_tokens, "reduced_tokens": reduced_tokens,
         "reduction_pct": reduction_pct,
     }
@@ -335,13 +324,14 @@ def main():
 
     root = args.root.resolve()
     all_results = []
+    shell_path = resolve_shell()
 
     # Layer 1: Hook reducer comparison (live commands)
     if not args.skip_hooks:
         print("=== Layer 1: Hook Reducer (raw vs reduced) ===")
         for case_name, command in HOOK_CASES:
             print(f"  Running {case_name}...", end=" ", flush=True)
-            result = run_hook_case(root, case_name, command)
+            result = run_hook_case(root, case_name, command, shell_path)
             all_results.append(result)
             if result["status"] == "ok":
                 print(f"{result['raw_tokens']}t -> {result['reduced_tokens']}t (-{result['reduction_pct']}%)")
@@ -378,6 +368,17 @@ def main():
         report = {
             "measured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "root": str(root),
+            "hook_shell": shell_path,
+            "compact_path_coverage_pct": (
+                round(
+                    100.0
+                    * sum(1 for r in all_results if r.get("compact_path"))
+                    / len(all_results),
+                    1,
+                )
+                if all_results
+                else None
+            ),
             "results": all_results,
         }
         artifact_path = args.artifact_dir / f"token-usage-{int(time.time())}.json"

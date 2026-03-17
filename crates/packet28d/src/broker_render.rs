@@ -455,6 +455,30 @@ pub(crate) fn build_broker_sections(
         });
     }
 
+    let missed_savings = render_missed_savings_lines(snapshot);
+    if !missed_savings.is_empty() {
+        sections.push(BrokerSection {
+            id: "savings_opportunities".to_string(),
+            title: "Savings Opportunities".to_string(),
+            body: truncate_lines(
+                missed_savings,
+                section_item_limit(&effective_limits, "savings_opportunities"),
+            ),
+            priority: if matches!(
+                action,
+                BrokerAction::Inspect
+                    | BrokerAction::ChooseTool
+                    | BrokerAction::Edit
+                    | BrokerAction::Summarize
+            ) {
+                1
+            } else {
+                2
+            },
+            source_kind: BrokerSourceKind::Derived,
+        });
+    }
+
     if !snapshot.tool_failures.is_empty() {
         let lines = snapshot
             .tool_failures

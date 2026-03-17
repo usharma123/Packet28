@@ -67,6 +67,10 @@ pub struct HookReducerPacket {
     pub summary: String,
     pub command: Option<String>,
     pub search_query: Option<String>,
+    pub compact_path: Option<String>,
+    pub passthrough_reason: Option<String>,
+    pub raw_est_tokens: Option<u64>,
+    pub reduced_est_tokens: Option<u64>,
     pub paths: Vec<String>,
     pub regions: Vec<String>,
     pub symbols: Vec<String>,
@@ -83,6 +87,7 @@ pub struct HookReducerPacket {
     pub cacheable: Option<bool>,
     pub mutation: Option<bool>,
     pub raw_artifact_handle: Option<String>,
+    pub raw_artifact_available: bool,
     pub artifact: Option<Value>,
 }
 

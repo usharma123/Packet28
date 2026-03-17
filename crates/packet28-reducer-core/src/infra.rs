@@ -206,13 +206,19 @@ fn summarize_kubectl_get(spec: &CommandReducerSpec, lines: &[String]) -> String 
     if lines.is_empty() || rows == 0 {
         return format!("kubectl get {resource} returned 0 row(s)");
     }
-    let pending = lines
+    let pending_rows = lines
         .iter()
         .skip(1)
-        .filter(|line| line.contains(" Pending ") || line.ends_with(" Pending"))
-        .count();
-    if pending > 0 {
-        format!("kubectl get {resource} returned {rows} row(s), {pending} pending")
+        .filter_map(|line| {
+            (line.contains(" Pending ") || line.ends_with(" Pending"))
+                .then(|| line.split_whitespace().next().unwrap_or_default().to_string())
+        })
+        .collect::<Vec<_>>();
+    if let Some(first_pending) = pending_rows.first() {
+        format!(
+            "kubectl get {resource}: {rows} row(s), {} pending; first {first_pending}",
+            pending_rows.len()
+        )
     } else {
         format!("kubectl get {resource} returned {rows} row(s)")
     }
@@ -278,7 +284,7 @@ mod tests {
         let reduction = reduce_infra_command(&spec, output, "", 0);
         assert_eq!(
             reduction.summary,
-            "kubectl get pods returned 2 row(s), 1 pending"
+            "kubectl get pods: 2 row(s), 1 pending; first cron"
         );
     }
 

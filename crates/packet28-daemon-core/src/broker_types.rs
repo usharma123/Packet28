@@ -406,6 +406,10 @@ pub struct BrokerWriteStateRequest {
     pub request_summary: Option<String>,
     pub result_summary: Option<String>,
     pub request_fingerprint: Option<String>,
+    pub compact_path: Option<String>,
+    pub passthrough_reason: Option<String>,
+    pub raw_est_tokens: Option<u64>,
+    pub reduced_est_tokens: Option<u64>,
     pub search_query: Option<String>,
     pub command: Option<String>,
     pub sequence: Option<u64>,
@@ -414,6 +418,8 @@ pub struct BrokerWriteStateRequest {
     pub error_message: Option<String>,
     pub retryable: Option<bool>,
     pub artifact_id: Option<String>,
+    pub raw_artifact_handle: Option<String>,
+    pub raw_artifact_available: Option<bool>,
     pub refresh_context: Option<bool>,
 }
 

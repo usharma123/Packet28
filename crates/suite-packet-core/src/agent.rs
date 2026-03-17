@@ -36,6 +36,18 @@ pub struct ToolInvocationSummary {
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passthrough_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_est_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduced_est_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_artifact_handle: Option<String>,
+    #[serde(default)]
+    pub raw_artifact_available: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -64,6 +76,18 @@ pub struct ToolFailureSummary {
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passthrough_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_est_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduced_est_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_artifact_handle: Option<String>,
+    #[serde(default)]
+    pub raw_artifact_available: bool,
     pub retryable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -191,6 +215,10 @@ pub enum AgentStateEventData {
         request_summary: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         request_fingerprint: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compact_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        passthrough_reason: Option<String>,
     },
     ToolInvocationCompleted {
         invocation_id: String,
@@ -211,6 +239,18 @@ pub enum AgentStateEventData {
         command: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         artifact_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compact_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        passthrough_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw_est_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reduced_est_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw_artifact_handle: Option<String>,
+        #[serde(default)]
+        raw_artifact_available: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         regions: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -231,6 +271,18 @@ pub enum AgentStateEventData {
         error_message: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         request_fingerprint: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compact_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        passthrough_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw_est_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reduced_est_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw_artifact_handle: Option<String>,
+        #[serde(default)]
+        raw_artifact_available: bool,
         #[serde(default)]
         retryable: bool,
         #[serde(skip_serializing_if = "Option::is_none")]

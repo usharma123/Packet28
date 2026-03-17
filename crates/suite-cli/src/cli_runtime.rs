@@ -5,7 +5,7 @@ use clap::Parser;
 use serde_json::{json, Value};
 
 use crate::{
-    cmd_agent_prompt, cmd_build, cmd_common, cmd_context, cmd_cover, cmd_daemon, cmd_diff,
+    cmd_agent_prompt, cmd_build, cmd_common, cmd_compact, cmd_context, cmd_cover, cmd_daemon, cmd_diff,
     cmd_doctor, cmd_guard, cmd_hook, cmd_impact, cmd_map, cmd_map_repo, cmd_mcp, cmd_packet,
     cmd_proxy, cmd_setup, cmd_shard, cmd_stack, BuildCommands, Cli, Commands, ContextCommands,
     CoverCommands, DiffCommands, GuardCommands, MapCommands, StackCommands, TestCommands,
@@ -90,6 +90,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         Commands::Proxy(proxy) => match proxy.command {
             cmd_proxy::ProxyCommands::Run(args) => cmd_proxy::run(args),
         },
+        Commands::Compact(args) => cmd_compact::run(args),
         Commands::Packet(packet) => match packet.command {
             cmd_packet::PacketCommands::Fetch(args) => cmd_packet::run_fetch(args),
         },
@@ -333,6 +334,7 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
                 _ => None,
             }
         }
+        Commands::Compact(_) => None,
         Commands::Daemon(_)
         | Commands::Guard(_)
         | Commands::AgentPrompt(_)
