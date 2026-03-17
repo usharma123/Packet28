@@ -1,6 +1,6 @@
 {
   "name": "packet28",
-  "version": "0.2.25",
+  "version": "0.2.26",
   "description": "Context broker for AI coding agents — manages your agent's context window so it conserves tokens",
   "license": "MIT",
   "repository": {
