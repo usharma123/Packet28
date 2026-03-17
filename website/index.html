@@ -5,17 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Packet28 — Context Broker for AI Coding Agents</title>
 <meta name="description" content="Packet28 manages your agent's context window so it conserves tokens. 164x fewer tokens on large codebases.">
-<!-- Open Graph -->
 <meta property="og:title" content="Packet28 — Context Broker for AI Coding Agents">
 <meta property="og:description" content="Hook reducers keep your agent's turns slim. Handoff packets compress cross-turn memory. 164x fewer tokens on large codebases.">
 <meta property="og:image" content="og-image.png">
 <meta property="og:type" content="website">
-<!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Packet28 — Context Broker for AI Coding Agents">
 <meta name="twitter:description" content="Hook reducers keep your agent's turns slim. Handoff packets compress cross-turn memory. 164x fewer tokens on large codebases.">
 <meta name="twitter:image" content="og-image.png">
-<!-- Favicon -->
 <link rel="icon" type="image/svg+xml" href="logo.svg">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap');
@@ -24,13 +21,14 @@
 
 :root {
   --bg: #000000;
+  --bg-raised: #060606;
   --fg: #e0e0e0;
   --dim: #8a8a8a;
   --muted: #555555;
-  --border: #2a2a2a;
+  --border: #333333;
+  --border-hi: #444444;
   --highlight: #ffffff;
   --font: 'IBM Plex Mono', monospace;
-  --cell: 20px;
 }
 
 html { scroll-behavior: smooth; }
@@ -46,11 +44,11 @@ body {
 }
 
 ::selection {
-  background: var(--fg);
+  background: var(--highlight);
   color: var(--bg);
 }
 
-/* ═══ SCANLINE OVERLAY ═══ */
+/* ═══ SCANLINES ═══ */
 body::after {
   content: '';
   position: fixed;
@@ -58,42 +56,30 @@ body::after {
   z-index: 9999;
   pointer-events: none;
   background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 3px,
-    rgba(0, 0, 0, 0.03) 3px,
-    rgba(0, 0, 0, 0.03) 4px
+    0deg, transparent, transparent 2px,
+    rgba(0, 0, 0, 0.05) 2px, rgba(0, 0, 0, 0.05) 4px
   );
-  transform: translateZ(0);
+}
+
+/* ═══ CRT VIGNETTE ═══ */
+.crt-vignette {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse at center,
+    transparent 50%,
+    rgba(0, 0, 0, 0.5) 100%
+  );
 }
 
 /* ═══ CONTAINER ═══ */
 .container {
-  max-width: 960px;
+  max-width: 920px;
   margin: 0 auto;
-  padding: 0 24px;
+  padding: 0 32px;
 }
-
-/* ═══ TUI BOX DRAWING ═══ */
-.tui-box {
-  border: 1px solid var(--border);
-  position: relative;
-}
-
-.tui-box::before {
-  content: attr(data-title);
-  position: absolute;
-  top: -1px;
-  left: 16px;
-  transform: translateY(-50%);
-  background: var(--bg);
-  padding: 0 8px;
-  font-size: 11px;
-  color: var(--dim);
-  letter-spacing: 1px;
-  text-transform: uppercase;
-}
-
 
 /* ═══ HERO ═══ */
 .hero {
@@ -101,40 +87,40 @@ body::after {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 80px 24px 80px;
+  padding: 80px 32px;
   position: relative;
+  text-align: center;
 }
 
 .hero-content {
-  max-width: 720px;
+  max-width: 740px;
   width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
 .hero-ascii {
-  font-size: clamp(6px, 1.4vw, 12px);
+  font-size: clamp(6px, 1.3vw, 11px);
   line-height: 1.15;
   color: var(--highlight);
   margin-bottom: 48px;
   white-space: pre;
   overflow: hidden;
-  text-shadow: 0 0 20px rgba(255,255,255,0.15), 0 0 60px rgba(255,255,255,0.05);
+  text-shadow:
+    0 0 30px rgba(255, 255, 255, 0.15),
+    0 0 80px rgba(255, 255, 255, 0.04);
   letter-spacing: 1px;
-  animation: asciiFade 0.8s ease-out 0.2s both;
+  animation: asciiFade 1s ease-out 0.3s both;
 }
 
 @keyframes asciiFade {
-  from {
-    opacity: 0;
-    transform: translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(16px); filter: blur(2px); }
+  to   { opacity: 1; transform: translateY(0);    filter: blur(0); }
 }
 
 .hero h1 {
-  font-size: clamp(32px, 5.5vw, 56px);
+  font-size: clamp(26px, 5vw, 48px);
   font-weight: 700;
   line-height: 1.1;
   letter-spacing: -2px;
@@ -143,11 +129,11 @@ body::after {
 }
 
 .hero-sub {
-  font-size: 15px;
+  font-size: 14px;
   color: var(--dim);
-  max-width: 480px;
+  max-width: 520px;
   margin-bottom: 40px;
-  line-height: 1.7;
+  line-height: 1.8;
   font-weight: 300;
 }
 
@@ -156,69 +142,110 @@ body::after {
   font-weight: 600;
 }
 
+.cursor-blink {
+  display: inline-block;
+  width: 0.5em;
+  height: 1.1em;
+  background: var(--dim);
+  vertical-align: text-bottom;
+  animation: cursorBlink 1s step-end infinite;
+  margin-left: 2px;
+}
+
+@keyframes cursorBlink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
 .install-row {
   display: flex;
   align-items: stretch;
   gap: 0;
-  margin-bottom: 32px;
-  max-width: 480px;
+  margin-bottom: 28px;
+  width: 100%;
+  max-width: 460px;
 }
 
 .install-cmd {
   flex: 1;
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 10px;
-  padding: 12px 16px;
-  background: transparent;
+  padding: 14px 16px;
+  background: var(--bg-raised);
   border: 1px solid var(--border);
   font-family: var(--font);
   font-size: 14px;
   cursor: pointer;
-  transition: border-color 0.2s;
-  position: relative;
+  transition: border-color 0.15s, background 0.15s;
 }
-.install-cmd:hover { border-color: var(--dim); }
-.install-cmd .prompt { color: var(--dim); }
+
+.install-cmd:hover {
+  border-color: var(--border-hi);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.install-cmd .prompt { color: var(--muted); }
 .install-cmd .cmd { color: var(--fg); }
 
 .install-copy {
-  padding: 12px 16px;
-  background: transparent;
+  padding: 14px 20px;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-left: none;
   color: var(--dim);
   font-family: var(--font);
-  font-size: 11px;
+  font-size: 10px;
   cursor: pointer;
-  letter-spacing: 0.5px;
-  transition: all 0.15s;
+  letter-spacing: 1.5px;
+  font-weight: 600;
+  transition: all 0.1s;
 }
+
 .install-copy:hover {
-  color: var(--highlight);
-  background: rgba(255,255,255,0.03);
+  color: var(--bg);
+  background: var(--fg);
+}
+
+.install-copy.copied {
+  color: var(--bg);
+  background: var(--dim);
 }
 
 .hero-links {
   display: flex;
-  gap: 24px;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: center;
 }
+
 .hero-links a {
   color: var(--dim);
   text-decoration: none;
-  font-size: 13px;
-  transition: color 0.15s;
+  font-size: 12px;
+  transition: all 0.1s;
+  padding: 5px 16px;
+  border: 1px solid var(--border);
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
-.hero-links a:hover { color: var(--highlight); }
-.hero-links a::before {
-  content: '>';
+
+.hero-links a:hover {
+  color: var(--bg);
+  background: var(--fg);
+  border-color: var(--fg);
+}
+
+.hero-links .link-key {
+  font-size: 10px;
+  font-weight: 600;
   color: var(--muted);
 }
 
-/* ═══ MATRIX RAIN (hero bg) ═══ */
+.hero-links a:hover .link-key { color: var(--bg); }
+
 #matrix {
   position: absolute;
   inset: 0;
@@ -227,38 +254,18 @@ body::after {
   opacity: 0.04;
 }
 
-/* ═══ SECTION DIVIDER ═══ */
-.divider {
-  border: none;
-  border-top: 1px solid var(--border);
-  margin: 0;
-  position: relative;
-}
-
-/* ═══ SECTION STYLES ═══ */
+/* ═══ SECTION ═══ */
 .section {
   padding: 80px 0;
-  position: relative;
 }
 
 .section-header {
+  text-align: center;
   margin-bottom: 48px;
 }
 
-.section-label {
-  font-size: 11px;
-  color: var(--muted);
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  margin-bottom: 12px;
-}
-.section-label::before {
-  content: '// ';
-  color: var(--muted);
-}
-
 .section-title {
-  font-size: clamp(22px, 3.5vw, 32px);
+  font-size: clamp(22px, 3.5vw, 30px);
   font-weight: 700;
   letter-spacing: -1px;
   color: var(--highlight);
@@ -266,95 +273,145 @@ body::after {
 
 .section-desc {
   color: var(--dim);
-  font-size: 14px;
-  max-width: 480px;
-  margin-top: 8px;
+  font-size: 13px;
+  max-width: 460px;
+  margin: 10px auto 0;
+  line-height: 1.7;
+}
+
+/* ═══ SECTION DIVIDER ═══ */
+.section-rule {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 0 32px;
+}
+
+.section-rule-inner {
+  border-top: 1px solid var(--border);
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+
+.section-rule-label {
+  position: absolute;
+  top: 0;
+  transform: translateY(-50%);
+  background: var(--bg);
+  padding: 0 18px;
+  font-size: 9px;
+  color: var(--muted);
+  letter-spacing: 3.5px;
+  text-transform: uppercase;
+  font-weight: 400;
 }
 
 /* ═══ TOOLS ═══ */
-.tools-list {
+.tools-grid {
   display: flex;
+  justify-content: center;
   flex-wrap: wrap;
   gap: 0;
 }
 
 .tool-item {
-  padding: 14px 20px;
+  padding: 14px 24px;
   border: 1px solid var(--border);
   margin-right: -1px;
   margin-bottom: -1px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  transition: background 0.15s;
-  min-width: 180px;
+  gap: 12px;
+  transition: all 0.1s;
+  cursor: default;
 }
+
 .tool-item:hover {
-  background: rgba(255,255,255,0.02);
+  background: rgba(255, 255, 255, 0.025);
+  border-color: var(--border-hi);
+  z-index: 1;
 }
 
-.tool-dot {
-  width: 6px;
-  height: 6px;
-  border: 1px solid var(--dim);
-}
+.tool-check { font-size: 12px; color: var(--dim); flex-shrink: 0; }
+.tool-name  { font-size: 13px; color: var(--fg); }
+.tool-item:hover .tool-check { color: var(--highlight); }
+.tool-item:hover .tool-name  { color: var(--highlight); }
 
-.tool-name {
-  font-size: 13px;
-  color: var(--fg);
-}
-
-/* ═══ HOW IT WORKS — PIPELINE ═══ */
+/* ═══ PIPELINE ═══ */
 .pipeline {
   display: grid;
   grid-template-columns: 1fr auto 1fr auto 1fr;
-  align-items: start;
+  align-items: stretch;
   gap: 0;
-  margin-top: 48px;
 }
 
 .pipe-step {
   border: 1px solid var(--border);
-  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.pipe-step-header {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .pipe-num {
-  font-size: 11px;
-  color: var(--muted);
-  margin-bottom: 12px;
+  font-size: 10px;
+  color: var(--bg);
+  background: var(--dim);
+  padding: 0 6px;
+  font-weight: 700;
   letter-spacing: 1px;
 }
 
-.pipe-title {
-  font-size: 15px;
+.pipe-step-title {
+  font-size: 12px;
   font-weight: 600;
   color: var(--highlight);
-  margin-bottom: 8px;
+  letter-spacing: 0.3px;
+}
+
+.pipe-step-body {
+  padding: 20px 16px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .pipe-desc {
   font-size: 12px;
   color: var(--dim);
-  line-height: 1.6;
-  margin-bottom: 12px;
+  line-height: 1.7;
+  margin-bottom: 16px;
+  flex: 1;
+  min-height: 0;
 }
 
 .pipe-code {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--fg);
   padding: 8px 12px;
-  background: rgba(255,255,255,0.02);
   border: 1px solid var(--border);
+  background: var(--bg);
+  margin-top: auto;
+  flex-shrink: 0;
 }
 
 .pipe-arrow {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px 8px;
+  padding: 0 12px;
   color: var(--muted);
-  font-size: 16px;
+  font-size: 13px;
   align-self: center;
+  white-space: nowrap;
 }
 
 /* ═══ FEATURES ═══ */
@@ -366,170 +423,201 @@ body::after {
 
 .feature-item {
   border: 1px solid var(--border);
-  padding: 28px 24px;
   margin-right: -1px;
   margin-bottom: -1px;
-  transition: background 0.2s;
+  transition: all 0.15s;
 }
+
 .feature-item:hover {
-  background: rgba(255,255,255,0.015);
+  background: rgba(255, 255, 255, 0.015);
+  border-color: var(--border-hi);
+  z-index: 1;
+}
+
+.feature-head {
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-raised);
 }
 
 .feature-tag {
-  font-size: 11px;
-  color: var(--muted);
+  font-size: 9px;
+  color: var(--bg);
+  background: var(--dim);
+  padding: 1px 7px;
   letter-spacing: 1px;
-  text-transform: uppercase;
-  margin-bottom: 10px;
+  font-weight: 700;
 }
 
 .feature-title {
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--highlight);
-  margin-bottom: 8px;
-  letter-spacing: -0.3px;
+}
+
+.feature-body {
+  padding: 16px 20px;
 }
 
 .feature-desc {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--dim);
-  line-height: 1.6;
+  line-height: 1.7;
 }
 
 .feature-desc code {
   font-family: var(--font);
-  font-size: 12px;
+  font-size: 11px;
   color: var(--fg);
-  background: rgba(255,255,255,0.04);
+  background: rgba(255, 255, 255, 0.04);
   padding: 1px 5px;
   border: 1px solid var(--border);
 }
 
 /* ═══ BENCHMARK ═══ */
-.bench-display {
-  margin-top: 48px;
-}
+.bench-display { margin-top: 0; }
 
 .bench-row {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   gap: 0;
-  margin-bottom: 2px;
+  margin-bottom: -1px;
 }
 
 .bench-label {
   width: 200px;
   flex-shrink: 0;
-  padding: 14px 16px;
-  font-size: 12px;
+  padding: 16px 18px;
+  font-size: 11px;
   color: var(--dim);
   border: 1px solid var(--border);
-  letter-spacing: 0.3px;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  font-weight: 500;
 }
 
 .bench-bar-track {
   flex: 1;
-  height: 50px;
+  min-height: 52px;
   border: 1px solid var(--border);
   border-left: none;
   position: relative;
   overflow: hidden;
+  background: var(--bg-raised);
 }
 
 .bench-bar {
   height: 100%;
   display: flex;
   align-items: center;
-  padding-left: 16px;
-  font-size: 13px;
+  padding: 0 16px;
+  font-size: 12px;
   font-weight: 600;
   transition: width 2s cubic-bezier(0.16, 1, 0.3, 1);
-  position: relative;
+  white-space: nowrap;
 }
 
 .bench-bar--naive {
   width: 0;
   background: repeating-linear-gradient(
     90deg,
-    rgba(255,255,255,0.04) 0px,
-    rgba(255,255,255,0.04) 2px,
-    transparent 2px,
-    transparent 4px
+    rgba(255, 255, 255, 0.06) 0px,
+    rgba(255, 255, 255, 0.06) 3px,
+    rgba(255, 255, 255, 0.02) 3px,
+    rgba(255, 255, 255, 0.02) 6px
   );
   color: var(--fg);
 }
+
 .bench-bar--naive.animated { width: 100%; }
 
 .bench-bar--p28 {
   width: 0;
   background: var(--highlight);
   color: var(--bg);
-  transition: width 1.2s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: width 1.4s cubic-bezier(0.16, 1, 0.3, 1) 0.4s;
+  font-weight: 700;
 }
+
 .bench-bar--p28.animated { width: 12%; min-width: 120px; }
 
 .bench-stat {
-  margin-top: 32px;
-  display: flex;
-  align-items: baseline;
-  gap: 16px;
+  margin-top: 40px;
+  text-align: center;
 }
 
 .bench-number {
-  font-size: clamp(48px, 8vw, 80px);
+  font-size: clamp(60px, 12vw, 110px);
   font-weight: 700;
   color: var(--highlight);
-  letter-spacing: -4px;
+  letter-spacing: -6px;
   line-height: 1;
+  text-shadow: 0 0 50px rgba(255, 255, 255, 0.06);
 }
 
 .bench-unit {
-  font-size: 16px;
+  font-size: 14px;
   color: var(--dim);
   font-weight: 300;
+  margin-top: 8px;
+  display: block;
 }
 
 .bench-footnote {
-  margin-top: 16px;
-  font-size: 12px;
+  margin-top: 28px;
+  font-size: 11px;
   color: var(--muted);
-  line-height: 1.7;
-  padding: 16px;
+  line-height: 1.8;
+  padding: 14px 18px;
   border: 1px solid var(--border);
+  text-align: left;
 }
 
-/* ═══ QUICK START — TERMINAL ═══ */
+/* ═══ TERMINAL ═══ */
 .term {
-  margin-top: 48px;
   max-width: 640px;
+  margin: 0 auto;
   border: 1px solid var(--border);
+  background: var(--bg-raised);
 }
 
 .term-bar {
   display: flex;
   align-items: center;
-  padding: 10px 16px;
+  padding: 6px 14px;
   border-bottom: 1px solid var(--border);
-  gap: 12px;
-}
-
-.term-bar-title {
-  font-size: 11px;
-  color: var(--muted);
-  letter-spacing: 0.5px;
+  gap: 10px;
+  background: var(--bg);
 }
 
 .term-bar-dots {
-  margin-left: auto;
   display: flex;
   gap: 6px;
 }
 
 .term-bar-dot {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
   border: 1px solid var(--muted);
+  font-size: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  line-height: 1;
+}
+
+.term-bar-title {
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 1.5px;
+  flex: 1;
+  text-align: center;
+  text-transform: uppercase;
 }
 
 .term-body {
@@ -540,67 +628,215 @@ body::after {
 
 .term-line {
   opacity: 0;
-  transform: translateX(-8px);
-  animation: termSlide 0.3s ease-out forwards;
+  transform: translateX(-6px);
 }
-.term-line:nth-child(1) { animation-delay: 0.2s; }
-.term-line:nth-child(2) { animation-delay: 0.5s; }
-.term-line:nth-child(3) { animation-delay: 0.8s; }
-.term-line:nth-child(4) { animation-delay: 1.1s; }
-.term-line:nth-child(5) { animation-delay: 1.4s; }
-.term-line:nth-child(6) { animation-delay: 1.7s; }
-.term-line:nth-child(7) { animation-delay: 2.0s; }
-.term-line:nth-child(8) { animation-delay: 2.3s; }
-.term-line:nth-child(9) { animation-delay: 2.6s; }
-.term-line:nth-child(10) { animation-delay: 2.9s; }
-.term-line:nth-child(11) { animation-delay: 3.2s; }
+
+.term-line.typed {
+  animation: termSlide 0.2s ease-out forwards;
+}
 
 @keyframes termSlide {
   to { opacity: 1; transform: translateX(0); }
 }
 
-.t-prompt { color: var(--dim); }
-.t-cmd { color: var(--fg); }
-.t-comment { color: var(--muted); }
-.t-output { color: var(--highlight); }
-.t-flag { color: var(--dim); font-style: italic; }
+.t-prompt  { color: var(--muted); }
+.t-cmd     { color: var(--fg); }
+.t-comment { color: var(--muted); font-style: italic; }
+.t-output  { color: var(--highlight); }
+.t-flag    { color: var(--dim); }
+.t-success { color: var(--fg); }
 
-/* ═══ ARCHITECTURE — ASCII DIAGRAM ═══ */
-.arch-ascii {
-  margin-top: 48px;
-  font-size: 13px;
-  line-height: 1.5;
-  white-space: pre;
+/* ═══ ARCHITECTURE DIAGRAM (CSS) ═══ */
+.diagram {
+  display: grid;
+  grid-template-columns: 1fr auto 1.3fr auto 1fr;
+  align-items: stretch;
+  gap: 0;
+}
+
+.diagram-node {
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+
+.diagram-node--primary {
+  border-color: var(--border-hi);
+}
+
+.diagram-node-header {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--highlight);
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.diagram-node--primary .diagram-node-header {
+  background: var(--highlight);
+  color: var(--bg);
+  border-color: var(--border-hi);
+}
+
+.diagram-node-body {
+  padding: 16px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.diagram-item {
+  font-size: 12px;
   color: var(--dim);
-  overflow-x: auto;
-  padding: 24px;
+  padding: 2px 0;
+}
+
+.diagram-item::before {
+  content: '·';
+  color: var(--muted);
+  margin-right: 8px;
+}
+
+.diagram-sub {
+  margin-top: 12px;
   border: 1px solid var(--border);
 }
 
-.arch-ascii .highlight { color: var(--highlight); }
-.arch-ascii .label { color: var(--fg); }
-
-/* ═══ FOOTER ═══ */
-footer {
-  padding: 40px 0;
-  border-top: 1px solid var(--border);
+.diagram-sub-header {
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  color: var(--dim);
+  text-transform: uppercase;
+  background: var(--bg);
 }
 
-.footer-inner {
+.diagram-sub-body {
+  padding: 10px 12px;
   display: flex;
-  justify-content: space-between;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.diagram-sub-body .diagram-item {
+  font-size: 11px;
+}
+
+.diagram-arrows {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 14px;
+  padding: 20px 0;
+  min-width: 70px;
+}
+
+.diagram-arrow {
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 16px;
+  gap: 3px;
+}
+
+.diagram-arrow-label {
+  font-size: 9px;
+  color: var(--muted);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+.diagram-arrow-line {
+  width: 100%;
+  height: 1px;
+  position: relative;
+  overflow: visible;
+}
+
+.diagram-arrow-line-inner {
+  width: 100%;
+  height: 1px;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--muted) 0, var(--muted) 3px,
+    transparent 3px, transparent 7px
+  );
+  background-size: 7px 1px;
+  animation: dashFlow 0.6s linear infinite;
+}
+
+.diagram-arrow--reverse .diagram-arrow-line-inner {
+  animation: dashFlowReverse 0.6s linear infinite;
+}
+
+@keyframes dashFlow {
+  from { background-position: 0 0; }
+  to   { background-position: 7px 0; }
+}
+
+@keyframes dashFlowReverse {
+  from { background-position: 7px 0; }
+  to   { background-position: 0 0; }
+}
+
+.diagram-arrow-line::after {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 8px;
+  color: var(--muted);
+}
+
+.diagram-arrow:not(.diagram-arrow--reverse) .diagram-arrow-line::after {
+  content: '▶';
+  right: -2px;
+}
+
+.diagram-arrow--reverse .diagram-arrow-line::after {
+  content: '◀';
+  left: -2px;
+}
+
+.diagram-arrow-sublabel {
+  font-size: 8px;
+  color: var(--border-hi);
+  letter-spacing: 0.5px;
+}
+
+.diagram-stats {
+  margin-top: 24px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--dim);
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  letter-spacing: 0.5px;
+}
+
+.diagram-stats strong {
+  color: var(--highlight);
+  font-weight: 600;
 }
 
 /* ═══ FOUNDER ═══ */
 .founder-card {
   border: 1px solid var(--border);
-  padding: 24px;
-  display: inline-flex;
-  align-items: center;
-  gap: 20px;
+  padding: 28px 32px;
+  display: inline-block;
+  text-align: left;
+  transition: border-color 0.15s;
+}
+
+.founder-card:hover {
+  border-color: var(--border-hi);
 }
 
 .founder-name {
@@ -613,221 +849,250 @@ footer {
 .founder-role {
   font-size: 12px;
   color: var(--dim);
-  margin-bottom: 10px;
+  margin-bottom: 14px;
 }
 
 .founder-link {
   font-size: 12px;
   color: var(--dim);
   text-decoration: none;
-  transition: color 0.15s;
+  transition: all 0.1s;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  display: inline-block;
 }
-.founder-link:hover { color: var(--highlight); }
 
-.footer-left {
+.founder-link:hover {
+  color: var(--bg);
+  background: var(--fg);
+  border-color: var(--fg);
+}
+
+/* ═══ FOOTER ═══ */
+.site-footer {
+  padding: 40px 0;
+  text-align: center;
+}
+
+.footer-inner {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 24px;
+  flex-wrap: wrap;
   font-size: 12px;
   color: var(--muted);
 }
 
-.footer-links {
-  display: flex;
-  gap: 20px;
-  list-style: none;
-}
-
-.footer-links a {
+.footer-inner a {
   color: var(--dim);
   text-decoration: none;
-  font-size: 12px;
-  transition: color 0.15s;
+  transition: color 0.1s;
 }
-.footer-links a:hover { color: var(--highlight); }
 
-/* ═══ REVEAL ANIMATIONS ═══ */
+.footer-inner a:hover { color: var(--highlight); }
+.footer-sep { color: var(--border); }
+
+/* ═══ REVEAL ═══ */
 .reveal {
   opacity: 0;
-  transform: translateY(16px);
-  transition: opacity 0.5s ease-out, transform 0.5s ease-out;
+  transform: translateY(10px);
+  transition: opacity 0.4s ease-out, transform 0.4s ease-out;
   will-change: opacity, transform;
 }
+
 .reveal.visible {
   opacity: 1;
   transform: translateY(0);
 }
 
+.reveal-stagger > .reveal {
+  transition-delay: calc(var(--i, 0) * 60ms);
+}
+
 /* ═══ RESPONSIVE ═══ */
 @media (max-width: 768px) {
-  .pipeline {
-    grid-template-columns: 1fr;
-  }
-  .pipe-arrow {
-    transform: rotate(90deg);
-    padding: 12px;
-  }
+  .container { padding: 0 20px; }
+
+  .pipeline { grid-template-columns: 1fr; }
+  .pipe-arrow { transform: rotate(90deg); padding: 8px; }
+
   .features-grid { grid-template-columns: 1fr; }
+
+  .diagram {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  .diagram-arrows {
+    flex-direction: row;
+    justify-content: center;
+    min-width: auto;
+    padding: 12px 0;
+  }
+  .diagram-arrow-line { width: 40px; }
+
   .bench-row { flex-direction: column; }
   .bench-label { width: 100%; }
-  .bench-bar-track { width: 100%; }
-  .hero-ascii { font-size: 7px; }
-  .install-row { flex-direction: column; }
+  .bench-bar-track { width: 100%; min-height: 44px; border-left: 1px solid var(--border); }
+
+  .hero-ascii { font-size: 6px; }
+
+  .install-row { flex-direction: column; max-width: 100%; }
   .install-copy { border-left: 1px solid var(--border); border-top: none; }
-  .arch-ascii { font-size: 11px; }
-  .footer-inner { flex-direction: column; text-align: center; }
+
+  .section { padding: 56px 0; }
+  .section-header { margin-bottom: 36px; }
+
+  .section-rule { padding: 0 20px; }
+}
+
+@media (max-width: 480px) {
+  .hero h1 { letter-spacing: -1px; }
+  .bench-number { letter-spacing: -3px; }
+  .hero-ascii { font-size: 5px; margin-bottom: 28px; }
 }
 </style>
 </head>
 <body>
 
+<div class="crt-vignette"></div>
+
 <!-- ═══ HERO ═══ -->
-<section class="hero">
+<section class="hero" id="hero">
   <canvas id="matrix"></canvas>
   <div class="hero-content">
     <div class="hero-ascii" id="ascii-art"></div>
     <h1>Context broker for<br>AI coding agents</h1>
     <p class="hero-sub">
       Hook reducers keep your agent's turns slim. Handoff packets compress cross-turn memory.
-      <strong>164x fewer tokens</strong> on large codebases.
+      <strong>164x fewer tokens</strong> on large codebases.<span class="cursor-blink"></span>
     </p>
     <div class="install-row">
-      <div class="install-cmd" id="install-box">
+      <div class="install-cmd" id="install-box" onclick="copyCmd()">
         <span class="prompt">$</span>
         <span class="cmd">npm install -g packet28</span>
       </div>
-      <button class="install-copy" onclick="copyCmd()">COPY</button>
+      <button class="install-copy" id="copy-btn" onclick="copyCmd()">COPY</button>
     </div>
     <div class="hero-links">
-      <a href="#quickstart">Get started</a>
-      <a href="https://github.com/usharma123/Packet28" target="_blank">View source</a>
-      <a href="https://www.npmjs.com/package/packet28" target="_blank">npm</a>
+      <a href="#quickstart"><span class="link-key">1</span> get started</a>
+      <a href="https://github.com/usharma123/Packet28" target="_blank"><span class="link-key">2</span> source</a>
+      <a href="https://www.npmjs.com/package/packet28" target="_blank"><span class="link-key">3</span> npm</a>
+      <a href="https://deepwiki.com/usharma123/Packet28" target="_blank"><span class="link-key">4</span> docs</a>
     </div>
   </div>
 </section>
 
-<hr class="divider">
-
-<!-- ═══ SUPPORTED TOOLS ═══ -->
+<!-- ═══ INTEGRATIONS ═══ -->
+<div class="section-rule"><div class="section-rule-inner"><span class="section-rule-label">integrations</span></div></div>
 <section class="section" id="tools">
   <div class="container">
     <div class="section-header reveal">
-      <div class="section-label">integrations</div>
       <h2 class="section-title">Works with your tools</h2>
       <p class="section-desc">Auto-detects your runtime. One command to configure MCP servers.</p>
     </div>
-    <div class="tools-list reveal">
-      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">Claude Code</span></div>
-      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">Cursor</span></div>
-      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">Codex</span></div>
-      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">GitHub Copilot</span></div>
-      <div class="tool-item"><div class="tool-dot"></div><span class="tool-name">Windsurf</span></div>
+    <div class="tools-grid reveal">
+      <div class="tool-item"><span class="tool-check">[■]</span><span class="tool-name">Claude Code</span></div>
+      <div class="tool-item"><span class="tool-check">[■]</span><span class="tool-name">Cursor</span></div>
+      <div class="tool-item"><span class="tool-check">[■]</span><span class="tool-name">Codex</span></div>
+      <div class="tool-item"><span class="tool-check">[■]</span><span class="tool-name">GitHub Copilot</span></div>
+      <div class="tool-item"><span class="tool-check">[■]</span><span class="tool-name">Windsurf</span></div>
     </div>
   </div>
 </section>
 
-<hr class="divider">
-
-<!-- ═══ HOW IT WORKS ═══ -->
+<!-- ═══ PIPELINE ═══ -->
+<div class="section-rule"><div class="section-rule-inner"><span class="section-rule-label">pipeline</span></div></div>
 <section class="section" id="how">
   <div class="container">
     <div class="section-header reveal">
-      <div class="section-label">pipeline</div>
       <h2 class="section-title">Three steps to focused context</h2>
     </div>
     <div class="pipeline reveal">
       <div class="pipe-step">
-        <div class="pipe-num">01</div>
-        <h3 class="pipe-title">Setup + Hooks</h3>
-        <p class="pipe-desc">Auto-detects runtimes, installs Claude hooks, configures MCP servers, starts the daemon.</p>
-        <div class="pipe-code">$ packet28 setup --root .</div>
+        <div class="pipe-step-header"><span class="pipe-num">01</span><span class="pipe-step-title">Setup + Hooks</span></div>
+        <div class="pipe-step-body">
+          <p class="pipe-desc">Auto-detects runtimes, installs Claude hooks, configures MCP servers, starts the daemon.</p>
+          <div class="pipe-code">$ packet28 setup --root .</div>
+        </div>
       </div>
-      <div class="pipe-arrow">&rarr;</div>
+      <div class="pipe-arrow">───▶</div>
       <div class="pipe-step">
-        <div class="pipe-num">02</div>
-        <h3 class="pipe-title">Hooks reduce, MCP controls</h3>
-        <p class="pipe-desc">PreToolUse hooks rewrite commands through reducers. MCP handles intent, handoff, and context inspection only.</p>
-        <div class="pipe-code">hooks &rarr; reducers | MCP &rarr; write_intention</div>
+        <div class="pipe-step-header"><span class="pipe-num">02</span><span class="pipe-step-title">Hooks reduce, MCP controls</span></div>
+        <div class="pipe-step-body">
+          <p class="pipe-desc">PreToolUse hooks rewrite commands through reducers. MCP handles intent, handoff, and context inspection.</p>
+          <div class="pipe-code">hooks → reducers | MCP → write_intention</div>
+        </div>
       </div>
-      <div class="pipe-arrow">&rarr;</div>
+      <div class="pipe-arrow">───▶</div>
       <div class="pipe-step">
-        <div class="pipe-num">03</div>
-        <h3 class="pipe-title">Handoff &amp; relaunch</h3>
-        <p class="pipe-desc">Daemon assembles a denoised handoff packet. Fresh worker relaunches from compressed context.</p>
-        <div class="pipe-code">~849 tokens (not ~139,000)</div>
+        <div class="pipe-step-header"><span class="pipe-num">03</span><span class="pipe-step-title">Handoff &amp; relaunch</span></div>
+        <div class="pipe-step-body">
+          <p class="pipe-desc">Daemon assembles a denoised handoff packet. Fresh worker relaunches from compressed context.</p>
+          <div class="pipe-code">~849 tokens (not ~139,000)</div>
+        </div>
       </div>
     </div>
   </div>
 </section>
 
-<hr class="divider">
-
 <!-- ═══ FEATURES ═══ -->
+<div class="section-rule"><div class="section-rule-inner"><span class="section-rule-label">capabilities</span></div></div>
 <section class="section" id="features">
   <div class="container">
     <div class="section-header reveal">
-      <div class="section-label">capabilities</div>
       <h2 class="section-title">Everything your agent needs</h2>
     </div>
-    <div class="features-grid reveal">
-      <div class="feature-item">
-        <div class="feature-tag">01 MAP</div>
-        <h3 class="feature-title">Repo Mapping</h3>
-        <p class="feature-desc">Builds a structural map of your codebase &mdash; files, symbols, dependencies &mdash; so the agent navigates directly to what matters.</p>
+    <div class="features-grid reveal-stagger">
+      <div class="feature-item reveal" style="--i:0">
+        <div class="feature-head"><span class="feature-tag">MAP</span><span class="feature-title">Repo Mapping</span></div>
+        <div class="feature-body"><p class="feature-desc">Builds a structural map of your codebase &mdash; files, symbols, dependencies &mdash; so the agent navigates directly to what matters.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">02 COV</div>
-        <h3 class="feature-title">Coverage-Aware</h3>
-        <p class="feature-desc">Ingests test coverage data to show which lines are tested vs untested. Agents know exactly where to add tests.</p>
+      <div class="feature-item reveal" style="--i:1">
+        <div class="feature-head"><span class="feature-tag">COV</span><span class="feature-title">Coverage-Aware</span></div>
+        <div class="feature-body"><p class="feature-desc">Ingests test coverage data to show which lines are tested vs untested. Agents know exactly where to add tests.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">03 BUD</div>
-        <h3 class="feature-title">Token Budgeting</h3>
-        <p class="feature-desc">Each response stays within a configurable token budget. No more blowing through context windows on a single file read.</p>
+      <div class="feature-item reveal" style="--i:2">
+        <div class="feature-head"><span class="feature-tag">BUD</span><span class="feature-title">Token Budgeting</span></div>
+        <div class="feature-body"><p class="feature-desc">Each response stays within a configurable token budget. No more blowing through context windows on a single file read.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">04 HOK</div>
-        <h3 class="feature-title">Hook Reducers</h3>
-        <p class="feature-desc">Claude PreToolUse hooks rewrite commands through reducers automatically. Reducer traffic stays out of the MCP loop &mdash; zero agent overhead.</p>
+      <div class="feature-item reveal" style="--i:3">
+        <div class="feature-head"><span class="feature-tag">HOK</span><span class="feature-title">Hook Reducers</span></div>
+        <div class="feature-body"><p class="feature-desc">Claude PreToolUse hooks rewrite commands through reducers automatically. Reducer traffic stays out of the MCP loop.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">05 DIS</div>
-        <h3 class="feature-title">Discover &amp; Learn</h3>
-        <p class="feature-desc">Scans session history for command patterns and savings opportunities. Learns error&rarr;correction patterns to auto-generate agent rules.</p>
+      <div class="feature-item reveal" style="--i:4">
+        <div class="feature-head"><span class="feature-tag">DIS</span><span class="feature-title">Discover &amp; Learn</span></div>
+        <div class="feature-body"><p class="feature-desc">Scans session history for command patterns and savings opportunities. Learns error→correction patterns to auto-generate rules.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">06 FOC</div>
-        <h3 class="feature-title">Focus Sets</h3>
-        <p class="feature-desc">Agents mark files and symbols as "in focus." Packet28 tracks what the agent cares about across tool calls.</p>
+      <div class="feature-item reveal" style="--i:5">
+        <div class="feature-head"><span class="feature-tag">FOC</span><span class="feature-title">Focus Sets</span></div>
+        <div class="feature-body"><p class="feature-desc">Agents mark files and symbols as "in focus." Packet28 tracks what the agent cares about across tool calls.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">07 DMN</div>
-        <h3 class="feature-title">Daemon State</h3>
-        <p class="feature-desc">The packet28d daemon persists state across agent sessions. Start, stop, resume &mdash; your context survives restarts.</p>
+      <div class="feature-item reveal" style="--i:6">
+        <div class="feature-head"><span class="feature-tag">DMN</span><span class="feature-title">Daemon State</span></div>
+        <div class="feature-body"><p class="feature-desc">The packet28d daemon persists state across agent sessions. Start, stop, resume &mdash; your context survives restarts.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">08 DOC</div>
-        <h3 class="feature-title">Doctor</h3>
-        <p class="feature-desc">Verifies daemon, index, MCP servers, notifications, and broker round-trip health in a single command. Diagnoses issues before they hit your agent.</p>
+      <div class="feature-item reveal" style="--i:7">
+        <div class="feature-head"><span class="feature-tag">DOC</span><span class="feature-title">Doctor</span></div>
+        <div class="feature-body"><p class="feature-desc">Verifies daemon, index, MCP servers, notifications, and broker round-trip health in a single command.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">09 MRT</div>
-        <h3 class="feature-title">Multi-Runtime</h3>
-        <p class="feature-desc">One setup command detects Claude Code, Cursor, Codex, and more. Configures MCP servers for each automatically.</p>
+      <div class="feature-item reveal" style="--i:8">
+        <div class="feature-head"><span class="feature-tag">MRT</span><span class="feature-title">Multi-Runtime</span></div>
+        <div class="feature-body"><p class="feature-desc">One setup command detects Claude Code, Cursor, Codex, and more. Configures MCP servers for each automatically.</p></div>
       </div>
-      <div class="feature-item">
-        <div class="feature-tag">10 GLB</div>
-        <h3 class="feature-title">Path Glob Routing</h3>
-        <p class="feature-desc">Glob expansion and cwd-aware routing lets agents target files with patterns like <code>src/**/*.rs</code> instead of listing every path.</p>
+      <div class="feature-item reveal" style="--i:9">
+        <div class="feature-head"><span class="feature-tag">GLB</span><span class="feature-title">Path Glob Routing</span></div>
+        <div class="feature-body"><p class="feature-desc">Glob expansion and cwd-aware routing lets agents target files with patterns like <code>src/**/*.rs</code> instead of listing every path.</p></div>
       </div>
     </div>
   </div>
 </section>
 
-<hr class="divider">
-
 <!-- ═══ BENCHMARK ═══ -->
+<div class="section-rule"><div class="section-rule-inner"><span class="section-rule-label">benchmark</span></div></div>
 <section class="section" id="benchmark">
   <div class="container">
     <div class="section-header reveal">
-      <div class="section-label">benchmark</div>
       <h2 class="section-title">The numbers</h2>
       <p class="section-desc">Tested on Apache Commons Lang &mdash; 534 Java files, 12MB.</p>
     </div>
@@ -846,7 +1111,7 @@ footer {
       </div>
       <div class="bench-stat">
         <div class="bench-number">164x</div>
-        <div class="bench-unit">fewer tokens consumed</div>
+        <span class="bench-unit">fewer tokens consumed</span>
       </div>
       <div class="bench-footnote">
         Task: "Understand StringUtils.wrap and fix null delimiter handling"<br>
@@ -856,210 +1121,253 @@ footer {
   </div>
 </section>
 
-<hr class="divider">
-
 <!-- ═══ QUICK START ═══ -->
+<div class="section-rule"><div class="section-rule-inner"><span class="section-rule-label">quick start</span></div></div>
 <section class="section" id="quickstart">
   <div class="container">
     <div class="section-header reveal">
-      <div class="section-label">quick start</div>
       <h2 class="section-title">Up and running in 30 seconds</h2>
     </div>
-    <div class="term reveal">
+    <div class="term reveal" id="terminal">
       <div class="term-bar">
-        <span class="term-bar-title">TERMINAL</span>
         <div class="term-bar-dots">
-          <div class="term-bar-dot"></div>
-          <div class="term-bar-dot"></div>
-          <div class="term-bar-dot"></div>
+          <div class="term-bar-dot">─</div>
+          <div class="term-bar-dot">□</div>
+          <div class="term-bar-dot">×</div>
         </div>
+        <span class="term-bar-title">terminal</span>
+        <div style="width:42px"></div>
       </div>
       <div class="term-body">
         <div class="term-line"><span class="t-comment"># install globally</span></div>
         <div class="term-line"><span class="t-prompt">$</span> <span class="t-cmd">npm install <span class="t-flag">-g</span> packet28</span></div>
-        <div class="term-line"></div>
+        <div class="term-line">&nbsp;</div>
         <div class="term-line"><span class="t-comment"># set up hooks + MCP in your project</span></div>
         <div class="term-line"><span class="t-prompt">$</span> <span class="t-cmd">packet28 setup <span class="t-flag">--root</span> .</span></div>
-        <div class="term-line"><span class="t-output">  Detected runtimes: Claude Code, Cursor</span></div>
-        <div class="term-line"><span class="t-output">  Hooks installed. MCP servers configured.</span></div>
-        <div class="term-line"></div>
+        <div class="term-line"><span class="t-output">  ✓ Detected runtimes: Claude Code, Cursor</span></div>
+        <div class="term-line"><span class="t-output">  ✓ Hooks installed. MCP servers configured.</span></div>
+        <div class="term-line">&nbsp;</div>
         <div class="term-line"><span class="t-comment"># verify everything works</span></div>
         <div class="term-line"><span class="t-prompt">$</span> <span class="t-cmd">packet28 doctor <span class="t-flag">--root</span> .</span></div>
-        <div class="term-line"><span class="t-output">  All checks passed.</span></div>
+        <div class="term-line"><span class="t-success">  ✓ All checks passed.</span><span class="cursor-blink"></span></div>
       </div>
     </div>
   </div>
 </section>
 
-<hr class="divider">
-
 <!-- ═══ ARCHITECTURE ═══ -->
+<div class="section-rule"><div class="section-rule-inner"><span class="section-rule-label">architecture</span></div></div>
 <section class="section" id="architecture">
   <div class="container">
     <div class="section-header reveal">
-      <div class="section-label">architecture</div>
       <h2 class="section-title">How the pieces fit</h2>
     </div>
-    <div class="arch-ascii reveal" id="arch-diagram"></div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<!-- ═══ FOUNDER ═══ -->
-<section class="section" id="founder">
-  <div class="container">
-    <div class="section-header reveal">
-      <div class="section-label">founder</div>
-      <h2 class="section-title">Built by</h2>
-    </div>
-    <div class="founder-card reveal">
-      <div class="founder-info">
-        <div class="founder-name">Utsav Sharma</div>
-        <div class="founder-role">Founder</div>
-        <a href="https://www.linkedin.com/in/usharma124" target="_blank" class="founder-link">linkedin &rarr;</a>
+    <div class="reveal">
+      <div class="diagram">
+        <div class="diagram-node">
+          <div class="diagram-node-header">AI Agent</div>
+          <div class="diagram-node-body">
+            <div class="diagram-item">Claude Code</div>
+            <div class="diagram-item">Cursor</div>
+            <div class="diagram-item">Codex</div>
+            <div class="diagram-item">GitHub Copilot</div>
+            <div class="diagram-item">Windsurf</div>
+          </div>
+        </div>
+        <div class="diagram-arrows">
+          <div class="diagram-arrow">
+            <span class="diagram-arrow-label">hooks</span>
+            <div class="diagram-arrow-line"><div class="diagram-arrow-line-inner"></div></div>
+            <span class="diagram-arrow-sublabel">PreToolUse</span>
+          </div>
+          <div class="diagram-arrow">
+            <span class="diagram-arrow-label">mcp</span>
+            <div class="diagram-arrow-line"><div class="diagram-arrow-line-inner"></div></div>
+            <span class="diagram-arrow-sublabel">stdio</span>
+          </div>
+          <div class="diagram-arrow diagram-arrow--reverse">
+            <span class="diagram-arrow-label">context</span>
+            <div class="diagram-arrow-line"><div class="diagram-arrow-line-inner"></div></div>
+          </div>
+        </div>
+        <div class="diagram-node diagram-node--primary">
+          <div class="diagram-node-header">Packet28 Broker</div>
+          <div class="diagram-node-body">
+            <div class="diagram-item">diffy · mapy</div>
+            <div class="diagram-item">stacky · buildy</div>
+            <div class="diagram-item">testy · proxy</div>
+            <div class="diagram-sub">
+              <div class="diagram-sub-header">MCP Surface</div>
+              <div class="diagram-sub-body">
+                <div class="diagram-item">intent · handoff</div>
+                <div class="diagram-item">search · inspect</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="diagram-arrows">
+          <div class="diagram-arrow">
+            <span class="diagram-arrow-label">daemon</span>
+            <div class="diagram-arrow-line"><div class="diagram-arrow-line-inner"></div></div>
+            <span class="diagram-arrow-sublabel">packet28d</span>
+          </div>
+          <div class="diagram-arrow diagram-arrow--reverse">
+            <span class="diagram-arrow-label">maps</span>
+            <div class="diagram-arrow-line"><div class="diagram-arrow-line-inner"></div></div>
+          </div>
+        </div>
+        <div class="diagram-node">
+          <div class="diagram-node-header">Codebase</div>
+          <div class="diagram-node-body">
+            <div class="diagram-item">repo + coverage</div>
+            <div class="diagram-item">file system</div>
+            <div class="diagram-item">test results</div>
+          </div>
+        </div>
+      </div>
+      <div class="diagram-stats">
+        <strong>25</strong> crates &nbsp;·&nbsp; <strong>7</strong> reducers &nbsp;·&nbsp; hooks + MCP &nbsp;·&nbsp; daemon persistence &nbsp;·&nbsp; handoff relaunch
       </div>
     </div>
   </div>
 </section>
 
-<hr class="divider">
+<!-- ═══ FOUNDER ═══ -->
+<div class="section-rule"><div class="section-rule-inner"><span class="section-rule-label">founder</span></div></div>
+<section class="section" id="founder">
+  <div class="container">
+    <div class="section-header reveal">
+      <h2 class="section-title">Built by</h2>
+    </div>
+    <div style="text-align:center" class="reveal">
+      <div class="founder-card">
+        <div class="founder-name">Utsav Sharma</div>
+        <div class="founder-role">Founder</div>
+        <a href="https://www.linkedin.com/in/usharma124" target="_blank" class="founder-link">linkedin →</a>
+      </div>
+    </div>
+  </div>
+</section>
 
 <!-- ═══ FOOTER ═══ -->
-<footer>
+<div class="section-rule"><div class="section-rule-inner"><span class="section-rule-label">·</span></div></div>
+<footer class="site-footer">
   <div class="container">
     <div class="footer-inner">
-      <div class="footer-left">packet28 &mdash; MIT License &mdash; 2026</div>
-      <ul class="footer-links">
-        <li><a href="https://github.com/usharma123/Packet28" target="_blank">github</a></li>
-        <li><a href="https://www.npmjs.com/package/packet28" target="_blank">npm</a></li>
-        <li><a href="https://deepwiki.com/usharma123/Packet28" target="_blank">docs</a></li>
-      </ul>
+      <span>packet28</span>
+      <span class="footer-sep">·</span>
+      <span>MIT License</span>
+      <span class="footer-sep">·</span>
+      <span>2026</span>
+      <span class="footer-sep">│</span>
+      <a href="https://github.com/usharma123/Packet28" target="_blank">github</a>
+      <span class="footer-sep">·</span>
+      <a href="https://www.npmjs.com/package/packet28" target="_blank">npm</a>
+      <span class="footer-sep">·</span>
+      <a href="https://deepwiki.com/usharma123/Packet28" target="_blank">docs</a>
     </div>
   </div>
 </footer>
 
 <script>
-// ═══ COPY COMMAND ═══
-function copyCmd() {
-  navigator.clipboard.writeText('npm install -g packet28');
-  const btn = document.querySelector('.install-copy');
-  btn.textContent = 'COPIED';
-  setTimeout(() => btn.textContent = 'COPY', 1500);
-}
-
-// ═══ ASCII ART — STATIC, CSS ANIMATED ═══
-document.getElementById('ascii-art').textContent = [
-  ' ██████╗  █████╗  ██████╗██╗  ██╗███████╗████████╗██████╗  █████╗ ',
-  ' ██╔══██╗██╔══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝╚════██╗██╔══██╗',
-  ' ██████╔╝███████║██║     █████╔╝ █████╗     ██║    █████╔╝╚█████╔╝',
-  ' ██╔═══╝ ██╔══██║██║     ██╔═██╗ ██╔══╝     ██║   ██╔═══╝ ██╔══██╗',
-  ' ██║     ██║  ██║╚██████╗██║  ██╗███████╗   ██║   ███████╗╚█████╔╝',
-  ' ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝ ╚════╝',
-].join('\n');
-
-// ═══ MATRIX RAIN (throttled to ~20fps) ═══
 (function() {
-  const canvas = document.getElementById('matrix');
-  const ctx = canvas.getContext('2d');
-  let columns, drops;
-  const chars = '01';
-  const fontSize = 18;
-  let last = 0;
-  const interval = 50; // ~20fps
+  'use strict';
 
-  function resize() {
-    const hero = canvas.parentElement;
-    canvas.width = hero.offsetWidth;
-    canvas.height = hero.offsetHeight;
-    columns = Math.floor(canvas.width / fontSize);
-    drops = Array(columns).fill(0).map(() => Math.floor(Math.random() * canvas.height / fontSize));
-  }
+  window.copyCmd = function() {
+    navigator.clipboard.writeText('npm install -g packet28');
+    var btn = document.getElementById('copy-btn');
+    btn.textContent = 'COPIED';
+    btn.classList.add('copied');
+    setTimeout(function() { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 1500);
+  };
 
-  function draw(ts) {
-    requestAnimationFrame(draw);
-    if (ts - last < interval) return;
-    last = ts;
+  document.getElementById('ascii-art').textContent = [
+    ' ██████╗  █████╗  ██████╗██╗  ██╗███████╗████████╗██████╗  █████╗ ',
+    ' ██╔══██╗██╔══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝╚════██╗██╔══██╗',
+    ' ██████╔╝███████║██║     █████╔╝ █████╗     ██║    █████╔╝╚█████╔╝',
+    ' ██╔═══╝ ██╔══██║██║     ██╔═██╗ ██╔══╝     ██║   ██╔═══╝ ██╔══██╗',
+    ' ██║     ██║  ██║╚██████╗██║  ██╗███████╗   ██║   ███████╗╚█████╔╝',
+    ' ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝ ╚════╝',
+  ].join('\n');
 
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#ffffff';
-    ctx.font = fontSize + 'px monospace';
+  // Matrix rain
+  (function() {
+    var canvas = document.getElementById('matrix');
+    var ctx = canvas.getContext('2d');
+    var columns, drops;
+    var fontSize = 16;
+    var last = 0;
+    var interval = 55;
 
-    for (let i = 0; i < drops.length; i++) {
-      const char = chars[Math.floor(Math.random() * 2)];
-      ctx.fillText(char, i * fontSize, drops[i] * fontSize);
-      if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) {
-        drops[i] = 0;
+    function resize() {
+      var hero = canvas.parentElement;
+      canvas.width = hero.offsetWidth;
+      canvas.height = hero.offsetHeight;
+      columns = Math.floor(canvas.width / fontSize);
+      drops = Array(columns).fill(0).map(function() {
+        return Math.floor(Math.random() * canvas.height / fontSize);
+      });
+    }
+
+    function draw(ts) {
+      requestAnimationFrame(draw);
+      if (ts - last < interval) return;
+      last = ts;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = fontSize + 'px monospace';
+      for (var i = 0; i < drops.length; i++) {
+        ctx.fillText(Math.random() > 0.5 ? '0' : '1', i * fontSize, drops[i] * fontSize);
+        if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) drops[i] = 0;
+        drops[i]++;
       }
-      drops[i]++;
     }
-  }
 
-  resize();
-  requestAnimationFrame(draw);
-  window.addEventListener('resize', resize);
-})();
+    resize();
+    requestAnimationFrame(draw);
+    window.addEventListener('resize', resize);
+  })();
 
-// ═══ INTERSECTION OBSERVER ═══
-const observer = new IntersectionObserver((entries) => {
-  entries.forEach(e => {
-    if (e.isIntersecting) e.target.classList.add('visible');
-  });
-}, { threshold: 0.1, rootMargin: '0px 0px -30px 0px' });
-
-document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
-
-// ═══ BENCHMARK BARS ═══
-const benchObs = new IntersectionObserver((entries) => {
-  entries.forEach(e => {
-    if (e.isIntersecting) {
-      document.getElementById('bar-naive').classList.add('animated');
-      document.getElementById('bar-p28').classList.add('animated');
-    }
-  });
-}, { threshold: 0.3 });
-
-const benchEl = document.querySelector('.bench-display');
-if (benchEl) benchObs.observe(benchEl);
-
-// ═══ ARCHITECTURE ASCII DIAGRAM ═══
-(function() {
-  const el = document.getElementById('arch-diagram');
-  if (!el) return;
-  // Build diagram as plain text, then highlight keywords
-  const lines = [
-    '┌───────────────────┐           ┌───────────────────┐           ┌───────────────────┐',
-    '│                   │   hooks   │                   │   daemon  │                   │',
-    '│    AI  Agent      │ ────────> │   Hook Reducers   │ ────────> │    Codebase       │',
-    '│                   │ PreToolUse│                   │ packet28d │                   │',
-    '│  Claude Code      │           │  diffy · mapy     │           │  repo + coverage  │',
-    '│  Cursor           │           │  stacky · buildy  │           │  file system      │',
-    '│  Codex            │    MCP    │  testy · proxy    │           │  test results     │',
-    '│                   │ ────────> │                   │ <──────── │                   │',
-    '│                   │   stdio   │    MCP Surface    │   maps    │                   │',
-    '│                   │ <──────── │  intent · handoff │           │                   │',
-    '│                   │  context  │  search · inspect │           │                   │',
-    '└───────────────────┘           └───────────────────┘           └───────────────────┘',
-    '',
-    '25 crates  ·  7 reducers  ·  hooks + MCP  ·  daemon persistence  ·  handoff relaunch',
-  ];
-  const highlights = ['AI  Agent', 'Hook Reducers', 'MCP Surface', 'Codebase', '25 crates', '7 reducers', 'hooks + MCP', 'daemon persistence', 'handoff relaunch'];
-
-  function escHtml(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-
-  const html = lines.map(line => {
-    let escaped = escHtml(line);
-    highlights.forEach(kw => {
-      const ekw = escHtml(kw);
-      escaped = escaped.replaceAll(ekw, `<span class="highlight">${ekw}</span>`);
+  // Reveal observer
+  var revealObs = new IntersectionObserver(function(entries) {
+    entries.forEach(function(e) {
+      if (e.isIntersecting) e.target.classList.add('visible');
     });
-    return escaped;
-  }).join('\n');
+  }, { threshold: 0.08, rootMargin: '0px 0px -20px 0px' });
 
-  el.innerHTML = html;
+  document.querySelectorAll('.reveal').forEach(function(el) {
+    revealObs.observe(el);
+  });
+
+  // Benchmark bars
+  var benchObs = new IntersectionObserver(function(entries) {
+    entries.forEach(function(e) {
+      if (e.isIntersecting) {
+        document.getElementById('bar-naive').classList.add('animated');
+        document.getElementById('bar-p28').classList.add('animated');
+      }
+    });
+  }, { threshold: 0.3 });
+  var benchEl = document.querySelector('.bench-display');
+  if (benchEl) benchObs.observe(benchEl);
+
+  // Terminal typing
+  var termTyped = false;
+  var termObs = new IntersectionObserver(function(entries) {
+    entries.forEach(function(e) {
+      if (e.isIntersecting && !termTyped) {
+        termTyped = true;
+        var lines = document.querySelectorAll('#terminal .term-line');
+        lines.forEach(function(line, i) {
+          setTimeout(function() { line.classList.add('typed'); }, i * 180);
+        });
+      }
+    });
+  }, { threshold: 0.3 });
+  var termEl = document.getElementById('terminal');
+  if (termEl) termObs.observe(termEl);
+
 })();
 </script>
 
