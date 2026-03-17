@@ -130,7 +130,7 @@ const INDEX_BATCH_DEBOUNCE_MS: u64 = 150;
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("error: {err}");
+        eprintln!("error: {err:#}");
         std::process::exit(2);
     }
 }
@@ -274,20 +274,28 @@ fn bind_listener(socket: &Path) -> Result<UnixListener> {
                     socket.display()
                 );
             }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::ConnectionRefused | ErrorKind::NotFound
-                ) =>
-            {
+            Err(err) if matches!(err.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+                daemon_log(&format!(
+                    "removing stale socket '{}' after probe failure: {}",
+                    socket.display(),
+                    err
+                ));
                 fs::remove_file(socket).with_context(|| {
                     format!("failed to remove stale socket '{}'", socket.display())
                 })?;
             }
             Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to probe existing socket '{}'", socket.display())
-                });
+                daemon_log(&format!(
+                    "removing unreachable socket '{}' after probe failure: {}",
+                    socket.display(),
+                    err
+                ));
+                fs::remove_file(socket).with_context(|| {
+                    format!(
+                        "failed to remove unreachable socket '{}' after probe failure",
+                        socket.display()
+                    )
+                })?;
             }
         }
     }

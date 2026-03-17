@@ -10,6 +10,7 @@ pub(crate) struct UpstreamClient {
     pub(crate) responses: Receiver<Value>,
     pub(crate) request_timeout: Duration,
     pub(crate) command_preview: String,
+    pub(crate) compact_tools: Vec<String>,
 }
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 30_000;
@@ -63,6 +64,7 @@ pub(crate) fn spawn_upstream_clients(
                 responses: rx,
                 request_timeout: timeout,
                 command_preview,
+                compact_tools: server.compact_tools.clone(),
             },
         );
     }

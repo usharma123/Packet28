@@ -226,13 +226,21 @@ pub(crate) fn load_tool_result_artifact(
             ));
         }
     };
-    let path = task_artifact_dir(root, task_id)
+    let tool_path = task_artifact_dir(root, task_id)
         .join("tool-evidence")
         .join(&selected_artifact_id);
+    let hook_path = task_artifact_dir(root, task_id)
+        .join("hook-artifacts")
+        .join(format!("{selected_artifact_id}.json"));
+    let path = if tool_path.exists() {
+        tool_path
+    } else {
+        hook_path
+    };
     let text = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read tool evidence '{}'", path.display()))?;
+        .with_context(|| format!("failed to read stored artifact '{}'", path.display()))?;
     let value = serde_json::from_str(&text)
-        .with_context(|| format!("invalid tool evidence JSON '{}'", path.display()))?;
+        .with_context(|| format!("invalid artifact JSON '{}'", path.display()))?;
     Ok((selected_artifact_id, value))
 }
 

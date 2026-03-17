@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use packet28_daemon_core::{
-    hook_runtime_config_path, now_unix, task_artifact_dir, ActiveTaskRecord, HookBoundaryKind,
-    HookEventKind, HookIngestRequest, HookLifecycleEvent, HookLifecycleKind, HookReducerPacket,
-    HookRuntimeConfig,
+    hook_runtime_config_path, load_task_registry, now_unix, task_artifact_dir, ActiveTaskRecord,
+    HookBoundaryKind, HookEventKind, HookIngestRequest, HookLifecycleEvent, HookLifecycleKind,
+    HookReducerCacheEntry, HookReducerPacket, HookRuntimeConfig, TaskRecord,
 };
-use packet28_reducer_core::{classify_command, classify_command_argv, reduce_command_output};
+use packet28_reducer_core::{
+    classify_command, classify_command_argv, reduce_command_output, CommandReducerSpec,
+};
 use serde_json::{json, Value};
 
 #[derive(Args)]
@@ -170,6 +172,37 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
         || spec.cache_fingerprint != args.fingerprint
     {
         return Err(anyhow!("reducer-runner classification mismatch"));
+    }
+
+    if let Some((cached_packet, exit_code)) =
+        cached_reducer_packet(&root, &task_id, &spec, &command_text)
+    {
+        let command_id = format!("runner-cache-{}", now_unix_millis());
+        let _ = crate::broker_client::hook_ingest(
+            &root,
+            HookIngestRequest {
+                task_id,
+                session_id: args.session_id,
+                event_kind: HookEventKind::CommandFinished,
+                matcher: None,
+                source: Some("packet28-reducer-runner-cache".to_string()),
+                boundary_kind: HookBoundaryKind::None,
+                lifecycle_event: Some(HookLifecycleEvent {
+                    kind: HookLifecycleKind::CommandFinished,
+                    command_id: Some(command_id),
+                    reducer_family: cached_packet.reducer_family.clone(),
+                    canonical_command_kind: cached_packet.canonical_command_kind.clone(),
+                    cache_fingerprint: cached_packet.cache_fingerprint.clone(),
+                    elapsed_ms: Some(0),
+                    exit_code: cached_packet.exit_code,
+                    ..HookLifecycleEvent::default()
+                }),
+                reducer_packet: Some(cached_packet.clone()),
+                host_context_budget_tokens: None,
+            },
+        )?;
+        println!("{}", cached_packet.summary);
+        return Ok(exit_code);
     }
 
     let command_id = format!("runner-{}", now_unix_millis());
@@ -383,6 +416,74 @@ fn run_reduce_fixture(args: ReduceFixtureArgs) -> Result<i32> {
         );
     }
     Ok(0)
+}
+
+fn cached_reducer_packet(
+    root: &Path,
+    task_id: &str,
+    spec: &CommandReducerSpec,
+    command_text: &str,
+) -> Option<(HookReducerPacket, i32)> {
+    let registry = load_task_registry(root).ok()?;
+    let task = registry.tasks.get(task_id)?;
+    let entry = task.hook_reducer_cache.get(&spec.cache_fingerprint)?;
+    if !cache_entry_matches(task, entry, spec) {
+        return None;
+    }
+    let est_bytes = entry.summary.len() as u64;
+    let est_tokens = ((est_bytes as f64) / 4.0).ceil() as u64;
+    let exit_code = entry.exit_code.unwrap_or(if entry.failed { 1 } else { 0 });
+    Some((
+        HookReducerPacket {
+            packet_type: spec.packet_type.clone(),
+            tool_name: "Bash".to_string(),
+            operation_kind: spec.operation_kind,
+            reducer_family: Some(spec.family.clone()),
+            canonical_command_kind: Some(spec.canonical_kind.clone()),
+            summary: entry.summary.clone(),
+            command: Some(command_text.to_string()),
+            search_query: None,
+            paths: entry.paths.clone(),
+            regions: entry.regions.clone(),
+            symbols: entry.symbols.clone(),
+            equivalence_key: spec.equivalence_key.clone(),
+            est_tokens,
+            est_bytes,
+            failed: entry.failed,
+            error_class: entry.failed.then_some("cached_tool_error".to_string()),
+            error_message: entry.error_message.clone(),
+            retryable: entry.failed.then_some(false),
+            duration_ms: Some(0),
+            exit_code: Some(exit_code),
+            cache_fingerprint: Some(spec.cache_fingerprint.clone()),
+            cacheable: Some(spec.cacheable),
+            mutation: Some(spec.mutation),
+            raw_artifact_handle: entry.raw_artifact_handle.clone(),
+            artifact: None,
+        },
+        exit_code,
+    ))
+}
+
+fn cache_entry_matches(
+    task: &TaskRecord,
+    entry: &HookReducerCacheEntry,
+    spec: &CommandReducerSpec,
+) -> bool {
+    if entry.reducer_family != spec.family || entry.canonical_command_kind != spec.canonical_kind {
+        return false;
+    }
+    if entry.git_epoch != task.hook_git_epoch
+        || entry.fs_epoch != task.hook_fs_epoch
+        || entry.rust_epoch != task.hook_rust_epoch
+    {
+        return false;
+    }
+    if entry.reducer_family == "github" {
+        let age = now_unix().saturating_sub(entry.occurred_at_unix);
+        return age <= 300;
+    }
+    true
 }
 
 fn resolve_hook_root(args: &ClaudeHookArgs, payload: &Value) -> PathBuf {
@@ -602,7 +703,7 @@ fn build_bash_packet(input: &Value, response: &Value) -> Option<HookReducerPacke
     let (packet_type, operation_kind, family, canonical_kind, fingerprint, paths, equivalence_key) =
         if let Some(spec) = spec {
             (
-                format!("packet28.hook.{}.v2", spec.family),
+                format!("packet28.hook.fallback.{}.v1", spec.family),
                 spec.operation_kind,
                 Some(spec.family),
                 Some(spec.canonical_kind),
@@ -669,7 +770,7 @@ fn build_read_packet(input: &Value, response: &Value) -> Option<HookReducerPacke
         Some(format!("read:{}:{}:{}", path, line_start, line_end)),
         Some(true),
         response.clone(),
-        false,
+        response_failed(response),
     ))
 }
 
@@ -700,7 +801,7 @@ fn build_grep_packet(input: &Value, response: &Value) -> Option<HookReducerPacke
         Some(format!("grep:{}:{}", query, paths.join(","))),
         Some(true),
         response.clone(),
-        false,
+        response_failed(response),
     ))
 }
 
@@ -731,7 +832,7 @@ fn build_glob_packet(input: &Value, response: &Value) -> Option<HookReducerPacke
         Some(format!("glob:{pattern}")),
         Some(true),
         response.clone(),
-        false,
+        response_failed(response),
     ))
 }
 

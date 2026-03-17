@@ -1,8 +1,9 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -64,7 +65,13 @@ struct McpRoundTripChecks {
 struct McpHarness {
     child: Child,
     stdin: ChildStdin,
-    responses: Receiver<Value>,
+    responses: Receiver<McpHarnessEvent>,
+    stderr: Arc<Mutex<String>>,
+}
+
+enum McpHarnessEvent {
+    Message(Value),
+    StreamError(String),
 }
 
 impl McpHarness {
@@ -78,7 +85,7 @@ impl McpHarness {
             .arg(root.to_str().unwrap_or("."))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context("failed to start Packet28 MCP server for doctor")?;
         let stdin = child
@@ -89,11 +96,17 @@ impl McpHarness {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("failed to capture MCP stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture MCP stderr"))?;
         let responses = spawn_reader(stdout);
+        let stderr = capture_stderr(stderr);
         Ok(Self {
             child,
             stdin,
             responses,
+            stderr,
         })
     }
 
@@ -105,35 +118,80 @@ impl McpHarness {
         Ok(())
     }
 
-    fn read_response(&self, expected_id: u64, timeout: Duration) -> Result<Value> {
+    fn read_response(&mut self, expected_id: u64, timeout: Duration) -> Result<Value> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
-                .ok_or_else(|| anyhow!("timed out waiting for MCP response id={expected_id}"))?;
-            let value = self
+                .ok_or_else(|| self.diagnostic_error(format!(
+                    "timed out waiting for MCP response id={expected_id}"
+                )))?;
+            let event = self
                 .responses
                 .recv_timeout(remaining)
-                .map_err(|_| anyhow!("timed out waiting for MCP response id={expected_id}"))?;
-            if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
-                return Ok(value);
+                .map_err(|_| self.diagnostic_error(format!(
+                    "timed out waiting for MCP response id={expected_id}"
+                )))?;
+            match event {
+                McpHarnessEvent::Message(value) => {
+                    if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
+                        return Ok(value);
+                    }
+                }
+                McpHarnessEvent::StreamError(error) => {
+                    return Err(self.diagnostic_error(format!(
+                        "MCP stream closed before response id={expected_id}: {error}"
+                    )));
+                }
             }
         }
     }
 
-    fn read_notification(&self, method: &str, timeout: Duration) -> Result<Value> {
+    fn read_notification(&mut self, method: &str, timeout: Duration) -> Result<Value> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
-                .ok_or_else(|| anyhow!("timed out waiting for MCP notification {method}"))?;
-            let value = self
+                .ok_or_else(|| self.diagnostic_error(format!(
+                    "timed out waiting for MCP notification {method}"
+                )))?;
+            let event = self
                 .responses
                 .recv_timeout(remaining)
-                .map_err(|_| anyhow!("timed out waiting for MCP notification {method}"))?;
-            if value.get("method").and_then(Value::as_str) == Some(method) {
-                return Ok(value);
+                .map_err(|_| self.diagnostic_error(format!(
+                    "timed out waiting for MCP notification {method}"
+                )))?;
+            match event {
+                McpHarnessEvent::Message(value) => {
+                    if value.get("method").and_then(Value::as_str) == Some(method) {
+                        return Ok(value);
+                    }
+                }
+                McpHarnessEvent::StreamError(error) => {
+                    return Err(self.diagnostic_error(format!(
+                        "MCP stream closed before notification {method}: {error}"
+                    )));
+                }
             }
+        }
+    }
+
+    fn diagnostic_error(&mut self, prefix: String) -> anyhow::Error {
+        let child_state = match self.child.try_wait() {
+            Ok(Some(status)) => format!(" child_exit={:?}", status.code()),
+            Ok(None) => " child_running=true".to_string(),
+            Err(error) => format!(" child_status_error={error}"),
+        };
+        let stderr = self
+            .stderr
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            anyhow!("{prefix}.{child_state}")
+        } else {
+            anyhow!("{prefix}.{child_state} stderr={}", compact_text(stderr, 400))
         }
     }
 }
@@ -383,7 +441,7 @@ fn mcp_config_has_packet28(path: &Path) -> Result<bool> {
 }
 
 fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
-    let timeout = Duration::from_secs(5);
+    let timeout = Duration::from_secs(10);
     let task_id = format!(
         "doctor-smoke-task-{}-{}",
         std::process::id(),
@@ -635,17 +693,52 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
     }
 }
 
-fn spawn_reader(stdout: ChildStdout) -> Receiver<Value> {
+fn spawn_reader(stdout: ChildStdout) -> Receiver<McpHarnessEvent> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        while let Ok(value) = read_mcp_message(&mut reader) {
-            if tx.send(value).is_err() {
-                break;
+        loop {
+            match read_mcp_message(&mut reader) {
+                Ok(value) => {
+                    if tx.send(McpHarnessEvent::Message(value)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(McpHarnessEvent::StreamError(error.to_string()));
+                    break;
+                }
             }
         }
     });
     rx
+}
+
+fn capture_stderr(stderr: ChildStderr) -> Arc<Mutex<String>> {
+    let captured = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&captured);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut buffer = String::new();
+        let _ = reader.read_to_string(&mut buffer);
+        if let Ok(mut guard) = sink.lock() {
+            *guard = buffer;
+        }
+    });
+    captured
+}
+
+fn compact_text(value: &str, limit: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = compact.chars().count();
+    if count <= limit {
+        compact
+    } else if limit <= 3 {
+        "...".to_string()
+    } else {
+        let shortened = compact.chars().take(limit.saturating_sub(3)).collect::<String>();
+        format!("{shortened}...")
+    }
 }
 
 fn read_mcp_message(reader: &mut BufReader<ChildStdout>) -> Result<Value> {

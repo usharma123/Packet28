@@ -286,8 +286,11 @@ impl PersistentDaemonClient {
 #[cfg(unix)]
 pub(crate) fn ensure_daemon(root: &Path) -> Result<()> {
     let root = normalize_daemon_root(root);
-    if socket_path(&root).exists() && UnixStream::connect(socket_path(&root)).is_ok() {
+    if daemon_status_existing(&root).is_ok() {
         return Ok(());
+    }
+    if socket_path(&root).exists() && connect_daemon_socket(&socket_path(&root)).is_err() {
+        cleanup_unreachable_runtime_files(&root)?;
     }
     start_daemon(&root)?;
     wait_for_daemon(&root, Duration::from_secs(10))
@@ -338,10 +341,7 @@ fn start_daemon(root: &Path) -> Result<()> {
 fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if ready_path(root).exists()
-            && socket_path(root).exists()
-            && UnixStream::connect(socket_path(root)).is_ok()
-        {
+        if daemon_status_existing(root).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(10));
@@ -362,6 +362,7 @@ pub(crate) fn restart_daemon(root: &Path) -> Result<()> {
     let root = normalize_daemon_root(root);
     stop_daemon_if_running(&root)?;
     wait_for_daemon_shutdown(&root, Duration::from_secs(5))?;
+    cleanup_unreachable_runtime_files(&root)?;
     start_daemon(&root)?;
     wait_for_daemon(&root, Duration::from_secs(10))
 }
@@ -389,6 +390,16 @@ fn send_request_existing_daemon(root: &Path, request: &DaemonRequest) -> Result<
     let mut reader = BufReader::new(reader_stream);
     write_socket_message(&mut writer, request)?;
     read_socket_message(&mut reader)
+}
+
+#[cfg(unix)]
+fn daemon_status_existing(root: &Path) -> Result<packet28_daemon_core::DaemonStatus> {
+    match send_request_existing_daemon(root, &DaemonRequest::Status) {
+        Ok(DaemonResponse::Status { status }) => Ok(status),
+        Ok(DaemonResponse::Error { message }) => Err(anyhow!(message)),
+        Ok(other) => Err(anyhow!("unexpected daemon status response: {other:?}")),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(unix)]
@@ -430,6 +441,17 @@ fn stop_daemon_if_running(root: &Path) -> Result<()> {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn cleanup_unreachable_runtime_files(root: &Path) -> Result<()> {
+    for path in [socket_path(root), ready_path(root)] {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove stale runtime file '{}'", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

@@ -36,8 +36,10 @@ mod support;
 mod transport;
 
 use crate::cmd_mcp::native_tools::{
-    handle_packet28_fetch_context, handle_packet28_prepare_handoff,
-    handle_packet28_write_intention, Packet28FetchContextArgs, Packet28PrepareHandoffArgs,
+    handle_packet28_fetch_context, handle_packet28_fetch_tool_result, handle_packet28_glob,
+    handle_packet28_prepare_handoff, handle_packet28_read_regions, handle_packet28_search,
+    handle_packet28_write_intention, Packet28FetchContextArgs, Packet28FetchToolResultArgs,
+    Packet28GlobArgs, Packet28PrepareHandoffArgs, Packet28ReadRegionsArgs, Packet28SearchArgs,
     Packet28WriteIntentionArgs,
 };
 use crate::cmd_mcp::prompt_resource::{
@@ -155,6 +157,7 @@ struct McpProxyServerConfig {
     env: BTreeMap<String, String>,
     cwd: Option<String>,
     timeout_ms: Option<u64>,
+    compact_tools: Vec<String>,
 }
 
 pub fn run(args: McpArgs) -> Result<i32> {
@@ -353,6 +356,69 @@ fn handle_method(
         "tools/list" => Ok(json!({
             "tools": [
                 {
+                    "name": "packet28.search",
+                    "description": "Run compact code/text search and return a slim preview plus a fetchable full artifact.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "query": {"type":"string"},
+                            "paths": {"type":"array","items":{"type":"string"}},
+                            "fixed_string": {"type":"boolean"},
+                            "case_sensitive": {"type":"boolean"},
+                            "whole_word": {"type":"boolean"},
+                            "context_lines": {"type":"integer","minimum":0},
+                            "max_matches_per_file": {"type":"integer","minimum":1},
+                            "max_total_matches": {"type":"integer","minimum":1},
+                            "response_mode": {"type":"string","enum":["slim","full"]}
+                        }
+                    }
+                },
+                {
+                    "name": "packet28.read_regions",
+                    "description": "Read targeted file regions and return a slim preview plus a fetchable full artifact.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "path": {"type":"string"},
+                            "regions": {"type":"array","items":{"type":"string"}},
+                            "line_start": {"type":"integer","minimum":1},
+                            "line_end": {"type":"integer","minimum":1},
+                            "response_mode": {"type":"string","enum":["slim","full"]}
+                        }
+                    }
+                },
+                {
+                    "name": "packet28.glob",
+                    "description": "Resolve a glob pattern into compact path matches with a fetchable full artifact.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["pattern"],
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "pattern": {"type":"string"},
+                            "paths": {"type":"array","items":{"type":"string"}},
+                            "max_results": {"type":"integer","minimum":1},
+                            "response_mode": {"type":"string","enum":["slim","full"]}
+                        }
+                    }
+                },
+                {
+                    "name": "packet28.fetch_tool_result",
+                    "description": "Fetch a previously stored full artifact for packet28.search, packet28.read_regions, packet28.glob, or hook-captured tool output.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type":"string"},
+                            "artifact_id": {"type":"string"},
+                            "invocation_id": {"type":"string"}
+                        }
+                    }
+                },
+                {
                     "name": "packet28.fetch_context",
                     "description": "Fetch a stored Packet28 broker context by context_version or artifact_id. Use response_mode='slim' to omit heavy sections.",
                     "inputSchema": {
@@ -460,6 +526,54 @@ fn handle_tool_call(
         .ok_or_else(|| anyhow!("missing tool name"))?;
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     let payload = match name {
+        "packet28.search" => {
+            let mut request: Packet28SearchArgs = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                Some(request.query.as_str()),
+                "packet28.search",
+            )?;
+            track_task(session, root, &request.task_id)?;
+            handle_packet28_search(root, session, request)?
+        }
+        "packet28.read_regions" => {
+            let mut request: Packet28ReadRegionsArgs = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                Some(request.path.as_str()),
+                "packet28.read_regions",
+            )?;
+            track_task(session, root, &request.task_id)?;
+            handle_packet28_read_regions(root, session, request)?
+        }
+        "packet28.glob" => {
+            let mut request: Packet28GlobArgs = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                Some(request.pattern.as_str()),
+                "packet28.glob",
+            )?;
+            track_task(session, root, &request.task_id)?;
+            handle_packet28_glob(root, session, request)?
+        }
+        "packet28.fetch_tool_result" => {
+            let mut request: Packet28FetchToolResultArgs = serde_json::from_value(arguments)?;
+            request.task_id = resolve_session_task_id(
+                session,
+                root,
+                &request.task_id,
+                None,
+                "packet28.fetch_tool_result",
+            )?;
+            track_task(session, root, &request.task_id)?;
+            handle_packet28_fetch_tool_result(root, request)?
+        }
         "packet28.fetch_context" => {
             let mut request: Packet28FetchContextArgs = serde_json::from_value(arguments)?;
             request.task_id = resolve_session_task_id(
@@ -549,6 +663,18 @@ fn capabilities_payload() -> Value {
 
 fn summarize_tool_payload(name: &str, payload: &Value) -> String {
     match name {
+        "packet28.search" | "packet28.read_regions" | "packet28.glob" => payload
+            .get("compact_preview")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "Packet28 compact tool result.".to_string()),
+        "packet28.fetch_tool_result" => {
+            let artifact_id = payload
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!("Packet28 fetched tool artifact {artifact_id}.")
+        }
         "packet28.fetch_context" => {
             let artifact_id = payload
                 .get("artifact_id")

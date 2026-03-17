@@ -417,14 +417,24 @@ fn handle_proxy_tool_call(
     }
 
     let result = response.get("result").cloned().unwrap_or(Value::Null);
-    let result_summary = summarize_json_value(&result, 200);
-    let artifact_id = maybe_store_result_artifact(
-        root,
-        &task_id,
-        &invocation_id,
-        &result,
-        !paths.is_empty() || !symbols.is_empty(),
-    )?;
+    let rewrite_response =
+        should_compact_proxy_tool(upstream, name, operation_kind) && response.get("result").is_some();
+    let artifact_id = if rewrite_response {
+        Some(store_tool_artifact(root, &task_id, &invocation_id, "result", &result)?)
+    } else {
+        maybe_store_result_artifact(
+            root,
+            &task_id,
+            &invocation_id,
+            &result,
+            !paths.is_empty() || !symbols.is_empty(),
+        )?
+    };
+    let result_summary = if rewrite_response {
+        summarize_json_value(&result, 280)
+    } else {
+        summarize_json_value(&result, 200)
+    };
 
     write_auto_capture_state(
         root,
@@ -436,7 +446,7 @@ fn handle_proxy_tool_call(
             server_name: Some(owner.clone()),
             operation_kind: Some(operation_kind),
             request_summary: Some(request_summary),
-            result_summary: Some(result_summary),
+            result_summary: Some(result_summary.clone()),
             request_fingerprint: Some(request_fingerprint),
             search_query,
             command,
@@ -461,6 +471,7 @@ fn handle_proxy_tool_call(
             },
         )?;
     }
+    let response_artifact_id = artifact_id.clone();
     if let Some(artifact_id) = artifact_id {
         write_auto_capture_state(
             root,
@@ -474,7 +485,41 @@ fn handle_proxy_tool_call(
         )?;
     }
 
+    if rewrite_response {
+        let compact_preview = result_summary.clone();
+        return Ok(json!({
+            "jsonrpc":"2.0",
+            "id": id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": compact_preview
+                    }
+                ],
+                "structuredContent": {
+                    "original_tool": name,
+                    "upstream": owner,
+                    "artifact_id": response_artifact_id,
+                    "compact_preview": result_summary,
+                    "response_mode": "slim"
+                }
+            }
+        }));
+    }
+
     Ok(response)
+}
+
+fn should_compact_proxy_tool(
+    upstream: &UpstreamClient,
+    tool_name: &str,
+    operation_kind: suite_packet_core::ToolOperationKind,
+) -> bool {
+    matches!(
+        operation_kind,
+        suite_packet_core::ToolOperationKind::Read | suite_packet_core::ToolOperationKind::Search
+    ) && upstream.compact_tools.iter().any(|entry| entry == tool_name)
 }
 
 fn write_auto_capture_state(root: &Path, request: BrokerWriteStateRequest) -> Result<()> {

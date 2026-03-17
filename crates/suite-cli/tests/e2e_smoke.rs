@@ -3,6 +3,8 @@ use predicates::prelude::*;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::OnceLock;
@@ -3563,6 +3565,281 @@ fn test_packet28_mcp_native_read_auto_captures_regions() {
 
 #[test]
 #[cfg(unix)]
+fn test_packet28_mcp_native_tools_return_slim_results_and_fetch_full_artifacts() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let (mut child, mut stdin, mut stdout) = start_mcp_server(dir.path());
+    initialize_mcp_session(&mut stdin, &mut stdout);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.search",
+                "arguments":{
+                    "task_id":"task-native-tools",
+                    "query":"Alpha",
+                    "response_mode":"slim"
+                }
+            }
+        }),
+    );
+    let search = read_mcp_message_for_id(&mut stdout, 2);
+    let search_payload = &search["result"]["structuredContent"];
+    assert_eq!(search_payload["response_mode"], "slim");
+    assert!(search_payload["artifact_id"].as_str().is_some());
+    assert!(search_payload["match_count"].as_u64().unwrap() >= 1);
+    let search_artifact = search_payload["artifact_id"].as_str().unwrap().to_string();
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.fetch_tool_result",
+                "arguments":{
+                    "task_id":"task-native-tools",
+                    "artifact_id": search_artifact
+                }
+            }
+        }),
+    );
+    let search_full = read_mcp_message_for_id(&mut stdout, 3);
+    let search_full_payload = &search_full["result"]["structuredContent"];
+    assert_eq!(search_full_payload["response_mode"], "full");
+    assert_eq!(search_full_payload["query"], "Alpha");
+    assert!(search_full_payload["groups"].as_array().unwrap().len() >= 1);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.read_regions",
+                "arguments":{
+                    "task_id":"task-native-tools",
+                    "path":"src/alpha.rs",
+                    "line_start":1,
+                    "line_end":2,
+                    "response_mode":"slim"
+                }
+            }
+        }),
+    );
+    let read_regions = read_mcp_message_for_id(&mut stdout, 4);
+    let read_payload = &read_regions["result"]["structuredContent"];
+    assert_eq!(read_payload["response_mode"], "slim");
+    assert!(read_payload["artifact_id"].as_str().is_some());
+    let read_artifact = read_payload["artifact_id"].as_str().unwrap().to_string();
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":5,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.fetch_tool_result",
+                "arguments":{
+                    "task_id":"task-native-tools",
+                    "artifact_id": read_artifact
+                }
+            }
+        }),
+    );
+    let read_full = read_mcp_message_for_id(&mut stdout, 5);
+    let read_full_payload = &read_full["result"]["structuredContent"];
+    assert_eq!(read_full_payload["response_mode"], "full");
+    assert_eq!(read_full_payload["path"], "src/alpha.rs");
+    assert_eq!(read_full_payload["lines"].as_array().unwrap().len(), 2);
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":6,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.glob",
+                "arguments":{
+                    "task_id":"task-native-tools",
+                    "pattern":"src/*.rs",
+                    "response_mode":"slim"
+                }
+            }
+        }),
+    );
+    let glob = read_mcp_message_for_id(&mut stdout, 6);
+    let glob_payload = &glob["result"]["structuredContent"];
+    assert_eq!(glob_payload["response_mode"], "slim");
+    assert!(glob_payload["artifact_id"].as_str().is_some());
+    let glob_artifact = glob_payload["artifact_id"].as_str().unwrap().to_string();
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":7,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.fetch_tool_result",
+                "arguments":{
+                    "task_id":"task-native-tools",
+                    "artifact_id": glob_artifact
+                }
+            }
+        }),
+    );
+    let glob_full = read_mcp_message_for_id(&mut stdout, 7);
+    let glob_full_payload = &glob_full["result"]["structuredContent"];
+    assert_eq!(glob_full_payload["response_mode"], "full");
+    assert_eq!(glob_full_payload["pattern"], "src/*.rs");
+    assert!(glob_full_payload["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path == "src/alpha.rs"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_doctor_reports_healthy_runtime() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let output = suite_cmd()
+        .args(["doctor", "--root", dir.path().to_str().unwrap(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["daemon"]["ok"], true);
+    assert_eq!(report["handshake"]["ok"], true);
+    assert_eq!(report["reducer_round_trip"]["ok"], true);
+    assert_eq!(report["handoff_round_trip"]["ok"], true);
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_packet28_hook_reducer_runner_reuses_cached_summary_without_rerunning_command() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    fs::write(dir.path().join("sample.txt"), "Alpha\nBeta\n").unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let counter_path = dir.path().join("cat-count.txt");
+    fs::write(&counter_path, "0\n").unwrap();
+    let script_path = bin_dir.join("cat");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\ncount=$(/bin/cat \"{count}\" 2>/dev/null || echo 0)\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"{count}\"\nexec /bin/cat \"$@\"\n",
+            count = counter_path.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&script_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).unwrap();
+
+    let spec = packet28_reducer_core::classify_command("cat sample.txt").unwrap();
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut first = std::process::Command::new(env!("CARGO_BIN_EXE_Packet28"));
+    first
+        .current_dir(dir.path())
+        .env("PATH", &path_env)
+        .args([
+            "hook",
+            "reducer-runner",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-runner-cache",
+            "--family",
+            &spec.family,
+            "--kind",
+            &spec.canonical_kind,
+            "--fingerprint",
+            &spec.cache_fingerprint,
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--",
+            "cat",
+            "sample.txt",
+        ]);
+    let first = first.output().unwrap();
+    assert!(first.status.success());
+
+    let mut second = std::process::Command::new(env!("CARGO_BIN_EXE_Packet28"));
+    second
+        .current_dir(dir.path())
+        .env("PATH", &path_env)
+        .args([
+            "hook",
+            "reducer-runner",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--task-id",
+            "task-runner-cache",
+            "--family",
+            &spec.family,
+            "--kind",
+            &spec.canonical_kind,
+            "--fingerprint",
+            &spec.cache_fingerprint,
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--",
+            "cat",
+            "sample.txt",
+        ]);
+    let second = second.output().unwrap();
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(fs::read_to_string(&counter_path).unwrap().trim(), "1");
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
 fn test_packet28_hook_pretool_rewrites_supported_git_command() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
@@ -3802,11 +4079,26 @@ fn test_packet28_mcp_accepts_newline_json_stdio() {
         .unwrap()
         .iter()
         .any(|tool| tool["name"] == "packet28.write_intention"));
-    assert!(!tools["result"]["tools"]
+    assert!(tools["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .any(|tool| tool["name"] == "packet28.search"));
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.read_regions"));
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.glob"));
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "packet28.fetch_tool_result"));
     assert!(!tools["result"]["tools"]
         .as_array()
         .unwrap()
@@ -4149,6 +4441,146 @@ while True:
 
 #[test]
 #[cfg(unix)]
+fn test_packet28_mcp_proxy_compacts_allowlisted_read_tool_results() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+
+    let script_path = dir.path().join("compact_mcp.py");
+    fs::write(
+        &script_path,
+        r#"import json, sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("utf-8").split(":", 1)
+        headers[name.lower().strip()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def write_message(value):
+    body = json.dumps(value).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    msg_id = message.get("id")
+    if msg_id is None:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "compact", "version": "1"}}})
+    elif method == "tools/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "compact.read", "description": "compact test tool", "inputSchema": {"type": "object", "properties": {}}}]}})
+    elif method == "resources/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resources": []}})
+    elif method == "resources/templates/list":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": []}})
+    elif method == "tools/call":
+        write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": "Alpha content line 1\nAlpha content line 2"}], "structuredContent": {"path": "src/alpha.rs", "lines": ["pub struct Alpha;", "impl Alpha {}"], "notes": "verbose upstream payload"}}})
+    else:
+        write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown method"}})
+"#,
+    )
+    .unwrap();
+
+    let config_path = dir.path().join(".mcp.proxy.json");
+    fs::write(
+        &config_path,
+        json!({
+            "mcpServers": {
+                "compact": {
+                    "command": "python3",
+                    "args": ["-u", script_path.to_str().unwrap()],
+                    "compact_tools": ["compact.read"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (mut child, mut stdin, mut stdout, tools) = start_mcp_proxy_server_with_tool(
+        dir.path(),
+        &config_path,
+        "task-proxy-compact",
+        "compact.read",
+    );
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "compact.read"));
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{
+                "name":"compact.read",
+                "arguments":{}
+            }
+        }),
+    );
+    let compact = read_mcp_message_for_id(&mut stdout, 2);
+    let compact_payload = &compact["result"]["structuredContent"];
+    assert_eq!(compact_payload["response_mode"], "slim");
+    assert_eq!(compact_payload["original_tool"], "compact.read");
+    assert!(compact_payload["artifact_id"].as_str().is_some());
+    let artifact_id = compact_payload["artifact_id"].as_str().unwrap().to_string();
+
+    write_mcp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.fetch_tool_result",
+                "arguments":{
+                    "task_id":"task-proxy-compact",
+                    "artifact_id": artifact_id
+                }
+            }
+        }),
+    );
+    let fetched = read_mcp_message_for_id(&mut stdout, 3);
+    let fetched_payload = &fetched["result"]["structuredContent"];
+    assert_eq!(
+        fetched_payload["structuredContent"]["path"],
+        "src/alpha.rs"
+    );
+    assert!(fetched_payload["structuredContent"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| line == "pub struct Alpha;"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
 fn test_suite_agent_prompt_outputs_all_supported_fragments() {
     for format in ["claude", "agents", "cursor"] {
         let output = suite_cmd()
@@ -4162,9 +4594,9 @@ fn test_suite_agent_prompt_outputs_all_supported_fragments() {
         assert!(!rendered.trim().is_empty());
         assert!(rendered.contains("Packet28 mcp serve"));
         assert!(rendered.contains("packet28.write_intention"));
+        assert!(rendered.contains("packet28.search"));
+        assert!(rendered.contains("packet28.read_regions"));
         assert!(rendered.to_ascii_lowercase().contains("handoff"));
-        assert!(!rendered.contains("packet28.search"));
-        assert!(!rendered.contains("packet28.read_regions"));
         assert!(rendered
             .to_ascii_lowercase()
             .contains("fall back to direct file reads"));

@@ -12,7 +12,8 @@ use crate::types::{CommandReducerFamily, CommandReducerSpec, CommandReduction};
 
 pub fn classify_command(command: &str) -> Option<CommandReducerSpec> {
     let trimmed = command.trim();
-    if trimmed.is_empty() || contains_shell_composition(trimmed) {
+    if trimmed.is_empty() || contains_shell_composition(trimmed) || contains_shell_expansion(trimmed)
+    {
         return None;
     }
     let argv = shell_words::split(trimmed).ok()?;
@@ -111,6 +112,48 @@ fn contains_shell_composition(command: &str) -> bool {
     false
 }
 
+fn contains_shell_expansion(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let ch = bytes[idx] as char;
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => {
+                escaped = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            '$' if !in_single => {
+                return true;
+            }
+            '~' if !in_single && !in_double && idx == 0 => {
+                return true;
+            }
+            '*' | '?' if !in_single && !in_double => {
+                return true;
+            }
+            '[' | '{' if !in_single && !in_double => {
+                return true;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +162,12 @@ mod tests {
     fn declines_shell_composition() {
         assert!(classify_command("cargo test 2>&1 | grep FAIL").is_none());
         assert!(classify_command("FOO=1 cargo test").is_none());
+    }
+
+    #[test]
+    fn declines_shell_expansion() {
+        assert!(classify_command("git diff src/*.rs").is_none());
+        assert!(classify_command("cargo test $CRATE").is_none());
+        assert!(classify_command("~/bin/tool").is_none());
     }
 }
