@@ -3779,54 +3779,48 @@ fn test_packet28_hook_reducer_runner_reuses_cached_summary_without_rerunning_com
         std::env::var("PATH").unwrap_or_default()
     );
     let mut first = std::process::Command::new(env!("CARGO_BIN_EXE_Packet28"));
-    first
-        .current_dir(dir.path())
-        .env("PATH", &path_env)
-        .args([
-            "hook",
-            "reducer-runner",
-            "--root",
-            dir.path().to_str().unwrap(),
-            "--task-id",
-            "task-runner-cache",
-            "--family",
-            &spec.family,
-            "--kind",
-            &spec.canonical_kind,
-            "--fingerprint",
-            &spec.cache_fingerprint,
-            "--cwd",
-            dir.path().to_str().unwrap(),
-            "--",
-            "cat",
-            "sample.txt",
-        ]);
+    first.current_dir(dir.path()).env("PATH", &path_env).args([
+        "hook",
+        "reducer-runner",
+        "--root",
+        dir.path().to_str().unwrap(),
+        "--task-id",
+        "task-runner-cache",
+        "--family",
+        &spec.family,
+        "--kind",
+        &spec.canonical_kind,
+        "--fingerprint",
+        &spec.cache_fingerprint,
+        "--cwd",
+        dir.path().to_str().unwrap(),
+        "--",
+        "cat",
+        "sample.txt",
+    ]);
     let first = first.output().unwrap();
     assert!(first.status.success());
 
     let mut second = std::process::Command::new(env!("CARGO_BIN_EXE_Packet28"));
-    second
-        .current_dir(dir.path())
-        .env("PATH", &path_env)
-        .args([
-            "hook",
-            "reducer-runner",
-            "--root",
-            dir.path().to_str().unwrap(),
-            "--task-id",
-            "task-runner-cache",
-            "--family",
-            &spec.family,
-            "--kind",
-            &spec.canonical_kind,
-            "--fingerprint",
-            &spec.cache_fingerprint,
-            "--cwd",
-            dir.path().to_str().unwrap(),
-            "--",
-            "cat",
-            "sample.txt",
-        ]);
+    second.current_dir(dir.path()).env("PATH", &path_env).args([
+        "hook",
+        "reducer-runner",
+        "--root",
+        dir.path().to_str().unwrap(),
+        "--task-id",
+        "task-runner-cache",
+        "--family",
+        &spec.family,
+        "--kind",
+        &spec.canonical_kind,
+        "--fingerprint",
+        &spec.cache_fingerprint,
+        "--cwd",
+        dir.path().to_str().unwrap(),
+        "--",
+        "cat",
+        "sample.txt",
+    ]);
     let second = second.output().unwrap();
     assert!(second.status.success());
     assert_eq!(first.stdout, second.stdout);
@@ -4560,10 +4554,7 @@ while True:
     );
     let fetched = read_mcp_message_for_id(&mut stdout, 3);
     let fetched_payload = &fetched["result"]["structuredContent"];
-    assert_eq!(
-        fetched_payload["structuredContent"]["path"],
-        "src/alpha.rs"
-    );
+    assert_eq!(fetched_payload["structuredContent"]["path"], "src/alpha.rs");
     assert!(fetched_payload["structuredContent"]["lines"]
         .as_array()
         .unwrap()
