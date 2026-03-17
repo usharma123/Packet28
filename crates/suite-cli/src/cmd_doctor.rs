@@ -474,7 +474,7 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                 "name":"packet28.write_intention",
                 "arguments":{
                     "task_id":task_id,
-                    "text":"Doctor handoff probe",
+                    "text": format!("Doctor handoff probe {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()),
                     "step_id":"hooks-first"
                 }
             }

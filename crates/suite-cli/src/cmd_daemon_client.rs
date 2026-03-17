@@ -215,8 +215,14 @@ pub fn execute_context_recall(
 
 #[cfg(unix)]
 pub fn send_request(root: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
-    let mut client = PersistentDaemonClient::connect(root)?;
-    client.send_request(request)
+    let root = normalize_daemon_root(root);
+    ensure_daemon(&root)?;
+    let response = send_request_existing_daemon(&root, request)?;
+    if daemon_response_indicates_protocol_mismatch(&response) {
+        restart_daemon(&root)?;
+        return send_request_existing_daemon(&root, request);
+    }
+    Ok(response)
 }
 
 #[cfg(unix)]
@@ -258,41 +264,8 @@ impl PersistentDaemonClient {
         let root = normalize_daemon_root(root);
         ensure_daemon(&root)?;
         let socket = socket_path(&root);
-        let stream = UnixStream::connect(&socket)
-            .with_context(|| format!("failed to connect to '{}'", socket.display()))?;
-        stream
-            .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
-            .with_context(|| {
-                format!(
-                    "failed to configure read timeout for '{}'",
-                    socket.display()
-                )
-            })?;
-        stream
-            .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
-            .with_context(|| {
-                format!(
-                    "failed to configure write timeout for '{}'",
-                    socket.display()
-                )
-            })?;
+        let stream = connect_daemon_socket(&socket)?;
         let reader_stream = stream.try_clone()?;
-        reader_stream
-            .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
-            .with_context(|| {
-                format!(
-                    "failed to configure cloned read timeout for '{}'",
-                    socket.display()
-                )
-            })?;
-        reader_stream
-            .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
-            .with_context(|| {
-                format!(
-                    "failed to configure cloned write timeout for '{}'",
-                    socket.display()
-                )
-            })?;
         Ok(Self {
             root,
             reader: BufReader::new(reader_stream),
@@ -385,6 +358,97 @@ fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
 }
 
 #[cfg(unix)]
+pub(crate) fn restart_daemon(root: &Path) -> Result<()> {
+    let root = normalize_daemon_root(root);
+    stop_daemon_if_running(&root)?;
+    wait_for_daemon_shutdown(&root, Duration::from_secs(5))?;
+    start_daemon(&root)?;
+    wait_for_daemon(&root, Duration::from_secs(10))
+}
+
+#[cfg(unix)]
+fn daemon_response_indicates_protocol_mismatch(response: &DaemonResponse) -> bool {
+    matches!(
+        response,
+        DaemonResponse::Error { message } if daemon_error_indicates_protocol_mismatch(message)
+    )
+}
+
+#[cfg(unix)]
+fn daemon_error_indicates_protocol_mismatch(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unknown variant") && lower.contains("expected one of")
+}
+
+#[cfg(unix)]
+fn send_request_existing_daemon(root: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
+    let socket = socket_path(root);
+    let stream = connect_daemon_socket(&socket)?;
+    let reader_stream = stream.try_clone()?;
+    let mut writer = BufWriter::new(stream);
+    let mut reader = BufReader::new(reader_stream);
+    write_socket_message(&mut writer, request)?;
+    read_socket_message(&mut reader)
+}
+
+#[cfg(unix)]
+fn connect_daemon_socket(socket: &Path) -> Result<UnixStream> {
+    let stream = UnixStream::connect(socket)
+        .with_context(|| format!("failed to connect to '{}'", socket.display()))?;
+    stream
+        .set_read_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+        .with_context(|| {
+            format!(
+                "failed to configure read timeout for '{}'",
+                socket.display()
+            )
+        })?;
+    stream
+        .set_write_timeout(Some(DAEMON_SOCKET_TIMEOUT))
+        .with_context(|| {
+            format!(
+                "failed to configure write timeout for '{}'",
+                socket.display()
+            )
+        })?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
+fn stop_daemon_if_running(root: &Path) -> Result<()> {
+    let socket = socket_path(root);
+    if !socket.exists() {
+        return Ok(());
+    }
+    match send_request_existing_daemon(root, &DaemonRequest::Stop) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if socket.exists() && UnixStream::connect(&socket).is_ok() {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_daemon_shutdown(root: &Path, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let socket = socket_path(root);
+        if !socket.exists() || UnixStream::connect(&socket).is_err() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(anyhow!(
+        "packet28d did not stop; socket still reachable at '{}'",
+        socket_path(root).display()
+    ))
+}
+
+#[cfg(unix)]
 fn packet28d_binary() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_packet28d") {
         return Ok(PathBuf::from(path));
@@ -401,4 +465,24 @@ fn packet28d_binary() -> Result<PathBuf> {
         "could not locate packet28d next to '{}'",
         current.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_mismatch_errors_are_detected() {
+        assert!(daemon_error_indicates_protocol_mismatch(
+            "unknown variant `hook_ingest`, expected one of `execute`, `status` at line 1 column 21"
+        ));
+    }
+
+    #[test]
+    fn normal_daemon_errors_do_not_trigger_protocol_restart() {
+        let response = DaemonResponse::Error {
+            message: "prepare_handoff did not return a ready handoff".to_string(),
+        };
+        assert!(!daemon_response_indicates_protocol_mismatch(&response));
+    }
 }

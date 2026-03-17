@@ -7,6 +7,7 @@ use clap::Args;
 use colored::Colorize;
 use packet28_daemon_core::{
     DaemonIndexRebuildRequest, DaemonIndexStatusRequest, DaemonRequest, DaemonResponse,
+    RelaunchPreference,
 };
 use serde_json::{json, Value};
 
@@ -181,6 +182,23 @@ pub fn run(args: SetupArgs) -> Result<i32> {
                     .to_string()
                     .dimmed()
             );
+        }
+        if any_hooks_configured {
+            match crate::cmd_daemon::restart_daemon(&root) {
+                Ok(_) => {
+                    println!(
+                        "    {} restarted packet28d for hook compatibility",
+                        "✓".green().bold()
+                    );
+                }
+                Err(err) => {
+                    println!(
+                        "    {} could not restart packet28d automatically: {}",
+                        "·".dimmed(),
+                        err
+                    );
+                }
+            }
         }
         println!();
     }
@@ -613,25 +631,24 @@ fn write_hook_runtime_config(root: &Path, any_hooks_configured: bool) -> Result<
         return Ok(McpConfigStatus::Declined);
     }
     let path = packet28_daemon_core::hook_runtime_config_path(root);
-    if path.exists() {
+    let existed = path.exists();
+    let mut config = if existed {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        serde_json::from_str::<packet28_daemon_core::HookRuntimeConfig>(&content).with_context(
+            || format!("refusing to overwrite invalid JSON in '{}'", path.display()),
+        )?
+    } else {
+        packet28_daemon_core::HookRuntimeConfig::default()
+    };
+    let changed =
+        apply_generated_relaunch_command(&mut config, root, resolve_packet28_agent_command());
+    if existed && !changed {
         return Ok(McpConfigStatus::AlreadyConfigured);
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut config = packet28_daemon_core::HookRuntimeConfig::default();
-    // Populate relaunch_command so the daemon can auto-restart the agent
-    // from a handoff packet when the context threshold is reached.
-    let packet28_agent = resolve_packet28_agent_command();
-    config.relaunch_command = vec![
-        packet28_agent,
-        "--wait-for-handoff".to_string(),
-        "--root".to_string(),
-        root.display().to_string(),
-        "--".to_string(),
-        "claude".to_string(),
-        "--continue".to_string(),
-    ];
     fs::write(
         path,
         format!("{}\n", serde_json::to_string_pretty(&config)?),
@@ -639,7 +656,80 @@ fn write_hook_runtime_config(root: &Path, any_hooks_configured: bool) -> Result<
     Ok(McpConfigStatus::Written)
 }
 
-fn resolve_packet28_agent_command() -> String {
+fn apply_generated_relaunch_command(
+    config: &mut packet28_daemon_core::HookRuntimeConfig,
+    root: &Path,
+    packet28_agent: Option<String>,
+) -> bool {
+    let should_manage_existing = config.relaunch_command.is_empty()
+        || is_generated_relaunch_command(&config.relaunch_command);
+    if !should_manage_existing {
+        return false;
+    }
+    match packet28_agent {
+        Some(packet28_agent) => {
+            let desired_command = generated_relaunch_command(&packet28_agent, root);
+            if config.relaunch_preference == RelaunchPreference::DaemonManaged
+                && config.relaunch_command == desired_command
+            {
+                return false;
+            }
+            config.relaunch_preference = RelaunchPreference::DaemonManaged;
+            config.relaunch_command = desired_command;
+            true
+        }
+        None => {
+            if config.relaunch_preference == RelaunchPreference::HostManaged
+                && config.relaunch_command.is_empty()
+            {
+                return false;
+            }
+            config.relaunch_preference = RelaunchPreference::HostManaged;
+            config.relaunch_command.clear();
+            true
+        }
+    }
+}
+
+fn generated_relaunch_command(packet28_agent: &str, root: &Path) -> Vec<String> {
+    vec![
+        packet28_agent.to_string(),
+        "--wait-for-handoff".to_string(),
+        "--root".to_string(),
+        root.display().to_string(),
+        "--".to_string(),
+        "claude".to_string(),
+        "--continue".to_string(),
+    ]
+}
+
+fn is_generated_relaunch_command(command: &[String]) -> bool {
+    command
+        .first()
+        .map(|value| {
+            Path::new(value)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(value)
+                == "packet28-agent"
+        })
+        .unwrap_or(false)
+}
+
+fn resolve_packet28_agent_command() -> Option<String> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_packet28-agent") {
+        if !path.trim().is_empty() {
+            return Some(path);
+        }
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent() {
+            let sibling = parent.join("packet28-agent");
+            if sibling.exists() {
+                return Some(sibling.display().to_string());
+            }
+        }
+    }
     let output = std::process::Command::new("which")
         .arg("packet28-agent")
         .output();
@@ -647,11 +737,11 @@ fn resolve_packet28_agent_command() -> String {
         if output.status.success() {
             let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !command.is_empty() {
-                return command;
+                return Some(command);
             }
         }
     }
-    "packet28-agent".to_string()
+    None
 }
 
 fn shell_escape(value: String) -> String {
@@ -778,5 +868,50 @@ mod tests {
         assert!(value["hooks"]["SessionStart"].is_array());
         assert!(value["hooks"]["PostToolUse"].is_array());
         assert!(value["hooks"].get("packet28").is_none());
+    }
+
+    #[test]
+    fn generated_relaunch_is_disabled_when_packet28_agent_is_missing() {
+        let mut config = packet28_daemon_core::HookRuntimeConfig {
+            relaunch_preference: RelaunchPreference::DaemonManaged,
+            relaunch_command: vec![
+                "packet28-agent".to_string(),
+                "--wait-for-handoff".to_string(),
+            ],
+            ..packet28_daemon_core::HookRuntimeConfig::default()
+        };
+        let changed = apply_generated_relaunch_command(&mut config, Path::new("/tmp/repo"), None);
+        assert!(changed);
+        assert_eq!(config.relaunch_preference, RelaunchPreference::HostManaged);
+        assert!(config.relaunch_command.is_empty());
+    }
+
+    #[test]
+    fn generated_relaunch_preserves_custom_commands() {
+        let original = vec!["custom-agent-runner".to_string(), "--resume".to_string()];
+        let mut config = packet28_daemon_core::HookRuntimeConfig {
+            relaunch_preference: RelaunchPreference::DaemonManaged,
+            relaunch_command: original.clone(),
+            ..packet28_daemon_core::HookRuntimeConfig::default()
+        };
+        let changed = apply_generated_relaunch_command(&mut config, Path::new("/tmp/repo"), None);
+        assert!(!changed);
+        assert_eq!(config.relaunch_command, original);
+    }
+
+    #[test]
+    fn generated_relaunch_uses_packet28_agent_when_available() {
+        let mut config = packet28_daemon_core::HookRuntimeConfig::default();
+        let changed = apply_generated_relaunch_command(
+            &mut config,
+            Path::new("/tmp/repo"),
+            Some("/usr/local/bin/packet28-agent".to_string()),
+        );
+        assert!(changed);
+        assert_eq!(config.relaunch_preference, RelaunchPreference::DaemonManaged);
+        assert_eq!(
+            config.relaunch_command,
+            generated_relaunch_command("/usr/local/bin/packet28-agent", Path::new("/tmp/repo"))
+        );
     }
 }
