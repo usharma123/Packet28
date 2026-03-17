@@ -157,27 +157,6 @@ struct McpProxyServerConfig {
     timeout_ms: Option<u64>,
 }
 
-const BROKER_SECTION_IDS: &[&str] = &[
-    "task_objective",
-    "budget_notes",
-    "task_memory",
-    "agent_intention",
-    "checkpoint_context",
-    "active_decisions",
-    "open_questions",
-    "resolved_questions",
-    "current_focus",
-    "discovered_scope",
-    "recent_tool_activity",
-    "tool_failures",
-    "evidence_cache",
-    "checkpoint_deltas",
-    "search_evidence",
-    "code_evidence",
-    "relevant_context",
-    "recommended_actions",
-    "progress",
-];
 pub fn run(args: McpArgs) -> Result<i32> {
     match args.command {
         McpCommands::Serve(args) => run_serve(args),
@@ -375,13 +354,14 @@ fn handle_method(
             "tools": [
                 {
                     "name": "packet28.fetch_context",
-                    "description": "Fetch a previously stored full Packet28 broker context by context_version or artifact_id.",
+                    "description": "Fetch a stored Packet28 broker context by context_version or artifact_id. Use response_mode='slim' to omit heavy sections.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "task_id": {"type":"string"},
                             "artifact_id": {"type":"string"},
-                            "context_version": {"type":"string"}
+                            "context_version": {"type":"string"},
+                            "response_mode": {"type":"string","enum":["slim","full"]}
                         }
                     }
                 },
@@ -553,68 +533,17 @@ fn handle_tool_call(
 }
 
 fn capabilities_payload() -> Value {
+    // Keep this payload minimal — it is injected into every MCP init and
+    // counts against the agent's context budget.  Only include fields the
+    // agent needs to *decide what to call*; omit anything derivable from
+    // tool schemas or MCP protocol defaults.
     json!({
-        "section_ids": BROKER_SECTION_IDS,
-        "verbosity_modes": ["compact", "standard", "rich"],
         "response_modes": ["slim", "full"],
-        "tools": ["packet28.fetch_context", "packet28.prepare_handoff", "packet28.write_intention", "packet28.task_status", "packet28.capabilities"],
-        "prompts": ["packet28.start_task", "packet28.continue_task", "packet28.summarize_current_context"],
-        "tool_result_kinds": ["build", "stack", "test", "diff", "generic"],
-        "push_notifications": {
-            "supported": true,
-            "method": "notifications/packet28.context_updated"
-        },
-        "resources": {
-            "current_aliases": ["packet28://current/task", "packet28://current/brief", "packet28://current/events", "packet28://current/state"]
-        },
-        "filters": {
-            "include_sections": true,
-            "exclude_sections": true,
-            "include_self_context_default": false
-        },
-        "session": {
-            "current_task_default": true,
-            "task_id_optional_after_first_task": true
-        },
-        "context": {
-            "response_modes": ["full"],
-            "default_response_mode": "full",
-            "detail_fetch_tool": "packet28.fetch_context",
-            "use_case": "artifact_inspection_only"
-        },
-        "hooks": {
-            "primary_runtime": "claude",
-            "reducers_visible_via_mcp": false,
-            "ingest_path": "daemon_hook_ingest"
-        },
-        "handoff": {
-            "tool": "packet28.prepare_handoff",
-            "default_response_mode": "slim",
-            "checkpoint_required": false,
-            "detail_fetch_tool": "packet28.fetch_context"
-        },
-        "section_limits": {
-            "explicit_limits_supported": true,
-            "deprecated_verbosity_alias": true
-        },
-        "relaunch": {
-            "daemon_managed": true,
-            "fresh_worker_recommended": true
-        },
-        "supersession": {
-            "supported": true,
-            "mode": "replace",
-            "brief_header": true
-        },
-        "adapter_contract": {
-            "window_mode": "replace",
-            "local_section_cache": true,
-            "delta_patch": true
-        },
-        "polling_fallback": {
-            "supported": true,
-            "field": "since_version"
-        }
+        "hooks_first": true,
+        "push_notification": "notifications/packet28.context_updated",
+        "task_id_optional_after_first": true,
+        "relaunch": "daemon_managed",
+        "supersession": "replace"
     })
 }
 

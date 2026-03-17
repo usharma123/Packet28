@@ -84,32 +84,19 @@ Use Packet28 as the primary context broker for this task.\n\
                 prompt_argument(&arguments, "task_id").as_deref(),
             )?;
             let status = broker_task_status_via_session(root, session, &task_id)?;
-            let brief_excerpt = read_brief_excerpt(root, &task_id)
-                .unwrap_or_else(|| "No persisted brief is available yet.".to_string());
+            // Return a lean pointer to the brief resource instead of embedding
+            // up to 4KB of brief excerpt directly into the prompt. The agent
+            // reads the resource only when it needs the full context.
             let prompt = format!(
                 "Continue Packet28 task `{task_id}`.\n\n\
-Latest known status:\n\
-- context version: {}\n\
-- reason: {}\n\
-- supports push notifications: {}\n\n\
-Recommended flow:\n\
-- Read `packet28://current/brief` or `packet28://task/{task_id}/brief` to review the latest rendered brief.\n\
-- Let Claude hooks rewrite supported shell commands and persist reducer activity automatically inside the active turn.\n\
-- Use `packet28.write_intention` only for semantic objective changes and fetch full artifacts only when you need detail.\n\
-- If you are about to hand work to a fresh worker, write the latest intention and call `packet28.prepare_handoff` only for explicit bootstrap or inspection.\n\
-- Use `packet28.fetch_context` only to inspect a stored handoff/context artifact.\n\
-- If you use Packet28 proxy mode, prefer proxied upstream tools so tool activity is captured automatically.\n\n\
-Latest brief excerpt:\n{}",
+Status: version={}, handoff_ready={}, push={}\n\n\
+Read `packet28://task/{task_id}/brief` for full context. Let hooks handle reducer capture. Use `packet28.write_intention` for objective changes.",
                 status
                     .latest_context_version
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                status
-                    .latest_context_reason
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
+                status.handoff_ready,
                 status.supports_push,
-                brief_excerpt,
             );
             Ok(prompt_response(
                 "Continue the current Packet28 task.",
@@ -122,13 +109,9 @@ Latest brief excerpt:\n{}",
                 session,
                 prompt_argument(&arguments, "task_id").as_deref(),
             )?;
-            let brief = read_brief_excerpt(root, &task_id).unwrap_or_else(|| {
-                "No persisted brief is available yet. Produce reducer activity or prepare a handoff first."
-                    .to_string()
-            });
             let prompt = format!(
                 "Summarize the current Packet28 context for task `{task_id}`. Focus on active decisions, discovered scope, recent tool activity, and the next recommended actions.\n\n\
-Current brief:\n{brief}"
+Read `packet28://task/{task_id}/brief` for the full brief."
             );
             Ok(prompt_response(
                 "Summarize the latest Packet28 context.",
@@ -219,19 +202,6 @@ fn task_recency_key(task: &TaskRecord) -> (u8, u64, u64, u64, u64, u64) {
     )
 }
 
-fn read_brief_excerpt(root: &Path, task_id: &str) -> Option<String> {
-    let path = task_brief_markdown_path(root, task_id);
-    let text = fs::read_to_string(path).ok()?;
-    Some(truncate_for_prompt(&text, 4_000))
-}
-
-fn truncate_for_prompt(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        text.to_string()
-    } else {
-        format!("{}...", &text[..limit])
-    }
-}
 
 pub(crate) fn handle_resources_list(
     root: &Path,
@@ -244,7 +214,8 @@ pub(crate) fn handle_resources_list(
         .ok()
         .and_then(|guard| guard.current_task_id.clone())
         .or_else(|| select_current_task(&status.tasks).map(|task| task.task_id.clone()));
-    if let Some(current_task_id) = current_task_id {
+    let current_task_id_str = current_task_id.clone().unwrap_or_default();
+    if let Some(ref current_task_id) = current_task_id {
         if let Ok(mut guard) = session.lock() {
             guard.current_task_id = Some(current_task_id.clone());
         }
@@ -260,37 +231,22 @@ pub(crate) fn handle_resources_list(
             "description": format!("Latest broker brief for {}", current_task_id),
             "mimeType": "text/markdown"
         }));
-        resources.push(json!({
-            "uri": "packet28://current/events",
-            "name": "Packet28 current events",
-            "description": format!("Task event replay for {}", current_task_id),
-            "mimeType": "application/json"
-        }));
-        resources.push(json!({
-            "uri": "packet28://current/state",
-            "name": "Packet28 current state",
-            "description": format!("Task broker metadata for {}", current_task_id),
-            "mimeType": "application/json"
-        }));
     }
-    for task in status.tasks {
+    // Limit resource enumeration to the 5 most recent tasks to prevent
+    // linear resource list growth from bloating context on every MCP init.
+    // Only expose brief resources for non-current tasks (events/state on demand).
+    let mut tasks_by_recency = status.tasks.clone();
+    tasks_by_recency.sort_by(|a, b| task_recency_key(b).cmp(&task_recency_key(a)));
+    for task in tasks_by_recency
+        .iter()
+        .filter(|t| t.task_id != current_task_id_str)
+        .take(5)
+    {
         resources.push(json!({
             "uri": format!("packet28://task/{}/brief", task.task_id),
             "name": format!("Packet28 brief {}", task.task_id),
             "description": "Latest broker brief",
             "mimeType": "text/markdown"
-        }));
-        resources.push(json!({
-            "uri": format!("packet28://task/{}/events", task.task_id),
-            "name": format!("Packet28 events {}", task.task_id),
-            "description": "Task event replay",
-            "mimeType": "application/json"
-        }));
-        resources.push(json!({
-            "uri": format!("packet28://task/{}/state", task.task_id),
-            "name": format!("Packet28 state {}", task.task_id),
-            "description": "Task broker metadata",
-            "mimeType": "application/json"
         }));
     }
     Ok(json!({ "resources": resources }))

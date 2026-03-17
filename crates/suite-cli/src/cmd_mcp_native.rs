@@ -51,6 +51,7 @@ pub(crate) struct Packet28FetchContextArgs {
     pub(crate) task_id: String,
     pub(crate) artifact_id: Option<String>,
     pub(crate) context_version: Option<String>,
+    pub(crate) response_mode: Option<BrokerResponseMode>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -392,7 +393,18 @@ pub(crate) fn handle_packet28_fetch_context(
     if payload.get("artifact_id").is_none() {
         payload["artifact_id"] = json!(artifact_id.clone());
     }
-    if payload.get("response_mode").is_none() {
+    // Honour response_mode: when slim is requested, strip heavy section
+    // data and keep only the metadata the agent needs to decide next steps.
+    if matches!(args.response_mode, Some(BrokerResponseMode::Slim)) {
+        payload.as_object_mut().map(|obj| {
+            obj.remove("sections");
+            obj.remove("delta");
+            obj.remove("evidence_cache");
+            obj.remove("search_evidence");
+            obj.remove("code_evidence");
+        });
+        payload["response_mode"] = json!("slim");
+    } else if payload.get("response_mode").is_none() {
         payload["response_mode"] = json!("full");
     }
     Ok(payload)
