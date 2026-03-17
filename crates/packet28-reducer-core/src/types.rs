@@ -126,6 +126,8 @@ pub struct CommandReduction {
     pub packet_type: String,
     pub operation_kind: suite_packet_core::ToolOperationKind,
     pub summary: String,
+    /// Condensed readable preview (e.g. RTK-style compact diff) for agent context.
+    pub compact_preview: String,
     pub paths: Vec<String>,
     pub regions: Vec<String>,
     pub symbols: Vec<String>,

@@ -1,6 +1,6 @@
 mod command;
 mod fs;
-mod git;
+pub(crate) mod git;
 mod github;
 mod go;
 mod infra;
@@ -11,9 +11,13 @@ mod rust;
 mod search;
 #[cfg(test)]
 mod tests;
+pub mod parser;
+pub mod filter;
+pub mod tee;
 mod types;
 
 pub use command::{classify_command, classify_command_argv, reduce_command_output};
+pub use git::compact_diff_public;
 pub use read::read_regions;
 pub use search::{
     format_region, infer_symbols_from_lines, infer_symbols_from_pattern, normalize_capture_path,
