@@ -65,6 +65,8 @@ pub struct HookReducerPacket {
     pub reducer_family: Option<String>,
     pub canonical_command_kind: Option<String>,
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_preview: Option<String>,
     pub command: Option<String>,
     pub search_query: Option<String>,
     pub compact_path: Option<String>,
@@ -190,6 +192,18 @@ pub struct HookRuntimeConfig {
     /// Command the daemon will use to auto-relaunch the agent.
     /// Example: `["claude", "--task-id", "{{task_id}}", "--resume"]`
     pub relaunch_command: Vec<String>,
+    /// Tee mode for raw output capture: "never", "failures", or "always".
+    #[serde(default)]
+    pub tee_mode: Option<String>,
+    /// Directory for tee output files.
+    #[serde(default)]
+    pub tee_directory: Option<String>,
+    /// Default filter level for read operations: "none", "minimal", or "aggressive".
+    #[serde(default)]
+    pub filter_level: Option<String>,
+    /// Whether to run integrity checks on hooks.
+    #[serde(default)]
+    pub integrity_check: Option<bool>,
     pub reducer_allowlist: Vec<String>,
 }
 
@@ -248,8 +262,7 @@ impl HookRuntimeConfig {
     /// Determine the current threshold level for a given token count.
     pub fn compute_threshold_level(&self, tokens: u64, budget: u64) -> ThresholdLevel {
         let force = self.threshold_tokens_for_level_with_budget(ThresholdLevel::Force, budget);
-        let prepare =
-            self.threshold_tokens_for_level_with_budget(ThresholdLevel::Prepare, budget);
+        let prepare = self.threshold_tokens_for_level_with_budget(ThresholdLevel::Prepare, budget);
         let warn = self.threshold_tokens_for_level_with_budget(ThresholdLevel::Warn, budget);
         if tokens >= force {
             ThresholdLevel::Force
@@ -287,6 +300,10 @@ impl Default for HookRuntimeConfig {
                 "go".to_string(),
                 "infra".to_string(),
             ],
+            tee_mode: None,
+            tee_directory: None,
+            filter_level: None,
+            integrity_check: None,
         }
     }
 }
@@ -306,6 +323,8 @@ pub struct HookReducerCacheEntry {
     pub canonical_command_kind: String,
     pub cache_fingerprint: String,
     pub summary: String,
+    #[serde(default)]
+    pub compact_preview: Option<String>,
     pub paths: Vec<String>,
     pub regions: Vec<String>,
     pub symbols: Vec<String>,

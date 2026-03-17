@@ -19,9 +19,11 @@ mod context_store_types;
 mod daemon_protocol;
 mod hook_types;
 mod index_types;
+pub mod integrity;
 mod paths;
 mod storage;
 mod task_types;
+pub mod trust;
 
 pub use broker_types::*;
 pub use context_store_types::*;
