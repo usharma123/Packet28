@@ -506,10 +506,11 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         }))?;
         let task_status = harness.read_response(4, timeout)?;
         let task_status_payload = &task_status["result"]["structuredContent"];
-        let hook_tokens = task_status_payload["hook_window_est_tokens"]
+        let task_record = &task_status_payload["task"];
+        let hook_tokens = task_record["hook_window_est_tokens"]
             .as_u64()
             .unwrap_or(0);
-        let hook_kind = task_status_payload["latest_hook_command_kind"]
+        let hook_kind = task_record["latest_hook_command_kind"]
             .as_str()
             .unwrap_or_default();
         let reducer_ok = hook_status == 0 && hook_tokens > 0 && !hook_kind.is_empty();

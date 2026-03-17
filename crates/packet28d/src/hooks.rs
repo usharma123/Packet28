@@ -453,6 +453,9 @@ pub(crate) fn hook_ingest(
                 update_cache_for_packet(task, packet, artifact_id.clone());
             }
             invalidate_epochs_for_packet(task, packet);
+            if let Some(kind) = packet_kind(packet) {
+                task.latest_hook_command_kind = Some(kind.to_string());
+            }
             persist_state(&guard)?;
         }
 

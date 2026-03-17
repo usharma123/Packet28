@@ -565,10 +565,38 @@ fn write_claude_hook_config(path: &Path, root: &Path, auto_yes: bool) -> Result<
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    if hooks.get("packet28") == Some(&packet28_hooks) {
+    // Claude Code expects hook event names (PreToolUse, Stop, etc.) as
+    // direct keys under `hooks`. Merge our entries into each event key
+    // rather than nesting under a "packet28" grouping key.
+    let packet28_events = packet28_hooks.as_object().cloned().unwrap_or_default();
+    let mut already_configured = true;
+    for (event_name, entries) in &packet28_events {
+        let existing = hooks
+            .get(event_name)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let new_entries = entries.as_array().cloned().unwrap_or_default();
+        // Check if our hook command is already present in this event.
+        let hook_present = new_entries.iter().all(|new_entry| {
+            existing.iter().any(|ex| ex == new_entry)
+        });
+        if !hook_present {
+            already_configured = false;
+            // Append our entries (don't overwrite user's existing hooks).
+            let mut merged = existing;
+            merged.extend(new_entries);
+            hooks.insert(event_name.clone(), Value::Array(merged));
+        }
+    }
+    // Remove legacy "packet28" grouping key if present.
+    if hooks.contains_key("packet28") {
+        hooks.remove("packet28");
+        already_configured = false;
+    }
+    if already_configured {
         return Ok(McpConfigStatus::AlreadyConfigured);
     }
-    hooks.insert("packet28".to_string(), packet28_hooks);
     config.insert("hooks".to_string(), Value::Object(hooks));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -746,7 +774,9 @@ mod tests {
         let status = write_claude_hook_config(&path, dir.path(), true).unwrap();
         assert!(matches!(status, McpConfigStatus::Written));
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(value["hooks"]["packet28"]["SessionStart"].is_array());
-        assert!(value["hooks"]["packet28"]["PostToolUse"].is_array());
+        // Hooks should be at top-level event keys, not nested under "packet28".
+        assert!(value["hooks"]["SessionStart"].is_array());
+        assert!(value["hooks"]["PostToolUse"].is_array());
+        assert!(value["hooks"].get("packet28").is_none());
     }
 }
