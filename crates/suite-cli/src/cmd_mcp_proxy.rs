@@ -417,10 +417,16 @@ fn handle_proxy_tool_call(
     }
 
     let result = response.get("result").cloned().unwrap_or(Value::Null);
-    let rewrite_response =
-        should_compact_proxy_tool(upstream, name, operation_kind) && response.get("result").is_some();
+    let rewrite_response = should_compact_proxy_tool(upstream, name, operation_kind)
+        && response.get("result").is_some();
     let artifact_id = if rewrite_response {
-        Some(store_tool_artifact(root, &task_id, &invocation_id, "result", &result)?)
+        Some(store_tool_artifact(
+            root,
+            &task_id,
+            &invocation_id,
+            "result",
+            &result,
+        )?)
     } else {
         maybe_store_result_artifact(
             root,
@@ -519,7 +525,10 @@ fn should_compact_proxy_tool(
     matches!(
         operation_kind,
         suite_packet_core::ToolOperationKind::Read | suite_packet_core::ToolOperationKind::Search
-    ) && upstream.compact_tools.iter().any(|entry| entry == tool_name)
+    ) && upstream
+        .compact_tools
+        .iter()
+        .any(|entry| entry == tool_name)
 }
 
 fn write_auto_capture_state(root: &Path, request: BrokerWriteStateRequest) -> Result<()> {

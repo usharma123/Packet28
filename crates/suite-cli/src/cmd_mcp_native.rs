@@ -1,7 +1,7 @@
 use super::*;
 use crate::cmd_mcp::support::{
-    load_raw_output_artifact, load_tool_result_artifact, next_task_invocation, store_result_artifact,
-    write_auto_capture_state_batch_via_session,
+    load_raw_output_artifact, load_tool_result_artifact, next_task_invocation,
+    store_result_artifact, write_auto_capture_state_batch_via_session,
 };
 use glob::Pattern;
 
@@ -138,7 +138,10 @@ fn read_regions_request_summary(args: &Packet28ReadRegionsArgs, path: &str) -> S
 
 fn glob_request_summary(args: &Packet28GlobArgs) -> String {
     if args.paths.is_empty() {
-        format!("glob '{}' across repo ({:?})", args.pattern, args.response_mode)
+        format!(
+            "glob '{}' across repo ({:?})",
+            args.pattern, args.response_mode
+        )
     } else {
         format!(
             "glob '{}' in {} path(s) ({:?})",
@@ -644,9 +647,13 @@ pub(crate) fn handle_packet28_read_regions(
     Ok(payload)
 }
 
-fn collect_glob_matches(root: &Path, pattern: &str, requested_paths: &[String]) -> Result<(Vec<String>, Vec<String>)> {
-    let compiled = Pattern::new(pattern)
-        .with_context(|| format!("invalid glob pattern '{pattern}'"))?;
+fn collect_glob_matches(
+    root: &Path,
+    pattern: &str,
+    requested_paths: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let compiled =
+        Pattern::new(pattern).with_context(|| format!("invalid glob pattern '{pattern}'"))?;
     let mut stack = Vec::<std::path::PathBuf>::new();
     let mut resolved_paths = Vec::<String>::new();
     if requested_paths.is_empty() {
@@ -672,7 +679,10 @@ fn collect_glob_matches(root: &Path, pattern: &str, requested_paths: &[String]) 
             {
                 let entry = entry?;
                 let child = entry.path();
-                let relative = packet28_reducer_core::normalize_capture_path(root, &child.display().to_string());
+                let relative = packet28_reducer_core::normalize_capture_path(
+                    root,
+                    &child.display().to_string(),
+                );
                 if relative.starts_with(".git/") || relative.starts_with(".packet28/") {
                     continue;
                 }
@@ -685,7 +695,8 @@ fn collect_glob_matches(root: &Path, pattern: &str, requested_paths: &[String]) 
                 }
             }
         } else {
-            let relative = packet28_reducer_core::normalize_capture_path(root, &path.display().to_string());
+            let relative =
+                packet28_reducer_core::normalize_capture_path(root, &path.display().to_string());
             if !relative.is_empty() && compiled.matches(&relative) {
                 matches.push(relative);
             }
@@ -699,7 +710,11 @@ fn collect_glob_matches(root: &Path, pattern: &str, requested_paths: &[String]) 
 }
 
 fn render_glob_compact_preview(pattern: &str, matches: &[String]) -> String {
-    let mut rendered = vec![format!("Glob matched {} path(s) for '{}'.", matches.len(), pattern)];
+    let mut rendered = vec![format!(
+        "Glob matched {} path(s) for '{}'.",
+        matches.len(),
+        pattern
+    )];
     for path in matches.iter().take(12) {
         rendered.push(path.clone());
     }

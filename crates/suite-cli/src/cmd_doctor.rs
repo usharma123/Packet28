@@ -123,15 +123,16 @@ impl McpHarness {
         loop {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
-                .ok_or_else(|| self.diagnostic_error(format!(
+                .ok_or_else(|| {
+                    self.diagnostic_error(format!(
+                        "timed out waiting for MCP response id={expected_id}"
+                    ))
+                })?;
+            let event = self.responses.recv_timeout(remaining).map_err(|_| {
+                self.diagnostic_error(format!(
                     "timed out waiting for MCP response id={expected_id}"
-                )))?;
-            let event = self
-                .responses
-                .recv_timeout(remaining)
-                .map_err(|_| self.diagnostic_error(format!(
-                    "timed out waiting for MCP response id={expected_id}"
-                )))?;
+                ))
+            })?;
             match event {
                 McpHarnessEvent::Message(value) => {
                     if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
@@ -152,15 +153,14 @@ impl McpHarness {
         loop {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
-                .ok_or_else(|| self.diagnostic_error(format!(
-                    "timed out waiting for MCP notification {method}"
-                )))?;
-            let event = self
-                .responses
-                .recv_timeout(remaining)
-                .map_err(|_| self.diagnostic_error(format!(
-                    "timed out waiting for MCP notification {method}"
-                )))?;
+                .ok_or_else(|| {
+                    self.diagnostic_error(format!(
+                        "timed out waiting for MCP notification {method}"
+                    ))
+                })?;
+            let event = self.responses.recv_timeout(remaining).map_err(|_| {
+                self.diagnostic_error(format!("timed out waiting for MCP notification {method}"))
+            })?;
             match event {
                 McpHarnessEvent::Message(value) => {
                     if value.get("method").and_then(Value::as_str) == Some(method) {
@@ -191,7 +191,10 @@ impl McpHarness {
         if stderr.is_empty() {
             anyhow!("{prefix}.{child_state}")
         } else {
-            anyhow!("{prefix}.{child_state} stderr={}", compact_text(stderr, 400))
+            anyhow!(
+                "{prefix}.{child_state} stderr={}",
+                compact_text(stderr, 400)
+            )
         }
     }
 }
@@ -736,7 +739,10 @@ fn compact_text(value: &str, limit: usize) -> String {
     } else if limit <= 3 {
         "...".to_string()
     } else {
-        let shortened = compact.chars().take(limit.saturating_sub(3)).collect::<String>();
+        let shortened = compact
+            .chars()
+            .take(limit.saturating_sub(3))
+            .collect::<String>();
         format!("{shortened}...")
     }
 }

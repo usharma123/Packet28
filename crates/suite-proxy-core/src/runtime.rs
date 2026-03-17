@@ -234,11 +234,11 @@ pub fn command_supported(argv: &[String]) -> bool {
 fn validate_safe_command(argv: &[String]) -> Result<(), CovyError> {
     let root = argv[0].as_str();
     match root {
-        "ls" | "find" | "grep" | "rg" | "cat" | "head" | "tail" | "sed" | "env"
-        | "printenv" | "jq" | "wget" | "curl" | "docker" | "kubectl" | "cargo" | "gh"
-        | "npm" | "pnpm" | "yarn" | "npx" | "tsc" | "eslint" | "vitest" | "prettier"
-        | "next" | "prisma" | "python" | "python3" | "pytest" | "ruff" | "mypy"
-        | "pip" | "pip3" | "go" | "golangci-lint" => Ok(()),
+        "ls" | "find" | "grep" | "rg" | "cat" | "head" | "tail" | "sed" | "env" | "printenv"
+        | "jq" | "wget" | "curl" | "docker" | "kubectl" | "cargo" | "gh" | "npm" | "pnpm"
+        | "yarn" | "npx" | "tsc" | "eslint" | "vitest" | "prettier" | "next" | "prisma"
+        | "python" | "python3" | "pytest" | "ruff" | "mypy" | "pip" | "pip3" | "go"
+        | "golangci-lint" => Ok(()),
         "git" => {
             if let Some(subcmd) = git_subcommand(argv) {
                 if matches!(

@@ -447,8 +447,9 @@ fn stop_daemon_if_running(root: &Path) -> Result<()> {
 fn cleanup_unreachable_runtime_files(root: &Path) -> Result<()> {
     for path in [socket_path(root), ready_path(root)] {
         if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("failed to remove stale runtime file '{}'", path.display()))?;
+            std::fs::remove_file(&path).with_context(|| {
+                format!("failed to remove stale runtime file '{}'", path.display())
+            })?;
         }
     }
     Ok(())

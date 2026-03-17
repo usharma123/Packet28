@@ -596,9 +596,9 @@ fn write_claude_hook_config(path: &Path, root: &Path, auto_yes: bool) -> Result<
             .unwrap_or_default();
         let new_entries = entries.as_array().cloned().unwrap_or_default();
         // Check if our hook command is already present in this event.
-        let hook_present = new_entries.iter().all(|new_entry| {
-            existing.iter().any(|ex| ex == new_entry)
-        });
+        let hook_present = new_entries
+            .iter()
+            .all(|new_entry| existing.iter().any(|ex| ex == new_entry));
         if !hook_present {
             already_configured = false;
             // Append our entries (don't overwrite user's existing hooks).
@@ -908,7 +908,10 @@ mod tests {
             Some("/usr/local/bin/packet28-agent".to_string()),
         );
         assert!(changed);
-        assert_eq!(config.relaunch_preference, RelaunchPreference::DaemonManaged);
+        assert_eq!(
+            config.relaunch_preference,
+            RelaunchPreference::DaemonManaged
+        );
         assert_eq!(
             config.relaunch_command,
             generated_relaunch_command("/usr/local/bin/packet28-agent", Path::new("/tmp/repo"))

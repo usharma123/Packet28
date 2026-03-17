@@ -248,7 +248,8 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .envs(args.env.iter().filter_map(|entry| {
-            entry.split_once('=')
+            entry
+                .split_once('=')
                 .map(|(key, value)| (key.to_string(), value.to_string()))
         }))
         .spawn()
@@ -355,6 +356,8 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
                 reducer_family: Some(reduced.family),
                 canonical_command_kind: Some(reduced.canonical_kind),
                 summary: reduced.summary.clone(),
+                compact_preview: (!reduced.compact_preview.is_empty())
+                    .then_some(reduced.compact_preview.clone()),
                 command: Some(command_text),
                 search_query: None,
                 compact_path: Some("reducer_rewrite".to_string()),
@@ -452,6 +455,7 @@ fn cached_reducer_packet(
             reducer_family: Some(spec.family.clone()),
             canonical_command_kind: Some(spec.canonical_kind.clone()),
             summary: entry.summary.clone(),
+            compact_preview: entry.compact_preview.clone(),
             command: Some(command_text.to_string()),
             search_query: None,
             compact_path: Some("reducer_rewrite".to_string()),
@@ -649,19 +653,49 @@ fn build_pretool_rewrite(
     let Some(command) = json_string(tool_input, "command") else {
         return Ok(None);
     };
-    let decision = crate::route_registry::decide_command_route(&command);
-    if matches!(
-        decision.kind,
-        crate::route_registry::RouteKind::ReducerRewrite
-    ) && !decision
-        .reducer_spec
-        .as_ref()
-        .is_some_and(|spec| runtime_config.reducer_allowlist.iter().any(|entry| entry == &spec.family))
-    {
+    let hook_cwd = json_string(payload, "cwd").unwrap_or_else(|| root.display().to_string());
+    let hook_cwd_path = std::path::Path::new(&hook_cwd);
+    let mut decision =
+        crate::route_registry::decide_command_route_with_cwd(&command, hook_cwd_path);
+
+    // In hook context, promote NativeTool → ReducerRewrite when the reducer-core
+    // also classifies the command (e.g. head/cat/sed → fs family).
+    if matches!(decision.kind, crate::route_registry::RouteKind::NativeTool) {
+        if let Some(spec) =
+            packet28_reducer_core::classify_command_argv(&command, &decision.argv)
+        {
+            decision = crate::route_registry::RouteDecision {
+                kind: crate::route_registry::RouteKind::ReducerRewrite,
+                reason: None,
+                argv: decision.argv,
+                env_assignments: decision.env_assignments,
+                reducer_spec: Some(spec),
+                native_tool: None,
+                original_argv: decision.original_argv,
+            };
+        }
+    }
+
+    // Only allow ReducerRewrite (when family is in allowlist) and NativeTool
+    // through hook rewrites. ProxyPassthrough and RawPassthrough are not
+    // rewritten in the hook path.
+    let proceed = match &decision.kind {
+        crate::route_registry::RouteKind::ReducerRewrite => {
+            decision.reducer_spec.as_ref().is_some_and(|spec| {
+                runtime_config
+                    .reducer_allowlist
+                    .iter()
+                    .any(|entry| entry == &spec.family)
+            })
+        }
+        crate::route_registry::RouteKind::NativeTool => true,
+        _ => false,
+    };
+    if !proceed {
         return Ok(None);
     }
+
     let mut updated_input = tool_input.clone();
-    let hook_cwd = json_string(payload, "cwd").unwrap_or_else(|| root.display().to_string());
     let Some(rewritten) =
         crate::route_registry::build_route_rewrite(root, task_id, session_id, &hook_cwd, &decision)
     else {
@@ -941,6 +975,7 @@ fn packet_from_parts(
         reducer_family,
         canonical_command_kind,
         summary,
+        compact_preview: None,
         command,
         search_query,
         compact_path,

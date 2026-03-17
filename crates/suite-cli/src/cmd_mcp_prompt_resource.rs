@@ -202,7 +202,6 @@ fn task_recency_key(task: &TaskRecord) -> (u8, u64, u64, u64, u64, u64) {
     )
 }
 
-
 pub(crate) fn handle_resources_list(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
