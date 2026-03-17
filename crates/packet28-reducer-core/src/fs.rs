@@ -104,10 +104,17 @@ pub fn reduce_fs_command(
                     if let Some((start, end)) = parse_sed_region(&spec.argv) {
                         format!("sed {target} lines {start}-{end}{}", preview_suffix(stdout))
                     } else {
-                        format!("sed {target} returned {lines} line(s){}", preview_suffix(stdout))
+                        format!(
+                            "sed {target} returned {lines} line(s){}",
+                            preview_suffix(stdout)
+                        )
                     }
                 }
-                _ => format!("cat {target}{}{}", line_count_suffix(lines), preview_suffix(stdout)),
+                _ => format!(
+                    "cat {target}{}{}",
+                    line_count_suffix(lines),
+                    preview_suffix(stdout)
+                ),
             }
         }
         "fs_diff" => {
@@ -163,6 +170,7 @@ pub fn reduce_fs_command(
         } else {
             summary
         },
+        compact_preview: String::new(),
         paths: spec.paths.clone(),
         regions,
         symbols: Vec::new(),
@@ -354,10 +362,7 @@ mod tests {
             .collect::<Vec<_>>();
         let spec = classify_fs_command("head -n 3 README.md", &argv).unwrap();
         let reduction = reduce_fs_command(&spec, "a\nb\nc\n", "", 0);
-        assert_eq!(
-            reduction.summary,
-            "head README.md lines 1-3: a"
-        );
+        assert_eq!(reduction.summary, "head README.md lines 1-3: a");
         assert_eq!(reduction.regions, vec!["README.md:1-3".to_string()]);
     }
 }

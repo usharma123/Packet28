@@ -9,13 +9,11 @@ pub fn classify_rust_command(command: &str, argv: &[String]) -> Option<CommandRe
         "check" => "rust_check",
         "build" => "rust_build",
         "test" => "rust_test",
+        "nextest" if argv.get(2).is_some_and(|arg| arg == "run") => "rust_test",
         "clippy" => "rust_clippy",
         _ => return None,
     };
-    if contains_any(
-        argv,
-        &["--message-format", "--timings", "--quiet", "-q", "--json"],
-    ) {
+    if contains_any(argv, &["--message-format", "--timings", "--json"]) {
         return None;
     }
     let operation_kind = if canonical_kind == "rust_test" {
@@ -46,6 +44,7 @@ pub fn reduce_rust_command(
 ) -> CommandReduction {
     let failed = exit_code != 0;
     let combined = format!("{stdout}\n{stderr}");
+    let canonical_kind_str = spec.canonical_kind.as_str();
     let diagnostics = parse_rust_diagnostics(&combined);
     let summary = match spec.canonical_kind.as_str() {
         "rust_test" => {
@@ -89,6 +88,13 @@ pub fn reduce_rust_command(
         packet_type: spec.packet_type.clone(),
         operation_kind: spec.operation_kind,
         summary,
+        compact_preview: if canonical_kind_str == "rust_test" && failed {
+            compact_cargo_test_failures(&combined)
+        } else if canonical_kind_str == "rust_clippy" {
+            compact_clippy_output(&combined)
+        } else {
+            String::new()
+        },
         paths: diagnostics.paths,
         regions: diagnostics.regions,
         symbols: Vec::new(),
@@ -228,6 +234,95 @@ fn extract_result_count(line: &str, label: &str) -> Option<usize> {
         .find_map(|segment| segment.strip_suffix(label))
         .and_then(|prefix| prefix.split_whitespace().last())
         .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn compact_cargo_test_failures(output: &str) -> String {
+    let mut failures = Vec::new();
+    let mut in_failure = false;
+    let mut current_test = String::new();
+    let mut current_output = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("---- ") && trimmed.ends_with(" stdout ----") {
+            in_failure = true;
+            current_test = trimmed
+                .trim_start_matches("---- ")
+                .trim_end_matches(" stdout ----")
+                .to_string();
+            current_output.clear();
+            continue;
+        }
+        if in_failure {
+            if trimmed.starts_with("---- ")
+                || trimmed == "failures:"
+                || (trimmed.is_empty() && current_output.len() > 5)
+            {
+                if !current_test.is_empty() {
+                    let preview = current_output
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    failures.push(format!("FAIL {current_test}\n{preview}"));
+                }
+                in_failure = false;
+                current_test.clear();
+                current_output.clear();
+            } else {
+                current_output.push(trimmed.to_string());
+            }
+        }
+    }
+    if !current_test.is_empty() && !current_output.is_empty() {
+        let preview = current_output
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        failures.push(format!("FAIL {current_test}\n{preview}"));
+    }
+
+    failures.join("\n\n")
+}
+
+fn compact_clippy_output(output: &str) -> String {
+    let mut by_rule: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut first_example: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("warning: ") {
+            if let Some(rule) = extract_clippy_rule(trimmed) {
+                *by_rule.entry(rule.clone()).or_insert(0) += 1;
+                first_example
+                    .entry(rule)
+                    .or_insert_with(|| rest.to_string());
+            }
+        }
+    }
+
+    if by_rule.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::new();
+    for (rule, count) in &by_rule {
+        let example = first_example.get(rule).map(String::as_str).unwrap_or("");
+        lines.push(format!("{rule}: {count}x — {example}"));
+    }
+    lines.join("\n")
+}
+
+fn extract_clippy_rule(line: &str) -> Option<String> {
+    // warning: ... #[warn(clippy::rule_name)] ...
+    let start = line.find("#[warn(")? + 7;
+    let end = line[start..].find(")]")? + start;
+    Some(line[start..end].to_string())
 }
 
 #[cfg(test)]

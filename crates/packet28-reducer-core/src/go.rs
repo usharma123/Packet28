@@ -86,6 +86,11 @@ pub fn reduce_go_command(
         packet_type: spec.packet_type.clone(),
         operation_kind: spec.operation_kind,
         summary,
+        compact_preview: match spec.canonical_kind.as_str() {
+            "go_test" if failed => compact_go_test_failures(&combined),
+            "golangci_lint" if failed => compact_golangci_output(&combined),
+            _ => String::new(),
+        },
         paths: merge_paths(&spec.paths, &diagnostic_paths),
         regions: Vec::new(),
         symbols: Vec::new(),
@@ -228,6 +233,89 @@ fn merge_paths(base: &[String], extra: &[String]) -> Vec<String> {
 
 fn fingerprint(family: &str, kind: &str, argv: &[String]) -> String {
     format!("{family}:{kind}:{}", argv.join("\u{1f}"))
+}
+
+fn compact_go_test_failures(output: &str) -> String {
+    let mut failures = Vec::new();
+    let mut current_test = String::new();
+    let mut current_lines = Vec::new();
+    let mut in_failure = false;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("--- FAIL: ") {
+            if !current_test.is_empty() && !current_lines.is_empty() {
+                let preview = current_lines
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                failures.push(format!("FAIL {current_test}\n{preview}"));
+            }
+            current_test = rest.split_whitespace().next().unwrap_or(rest).to_string();
+            current_lines.clear();
+            in_failure = true;
+        } else if in_failure {
+            if trimmed.starts_with("--- ")
+                || trimmed.starts_with("FAIL\t")
+                || trimmed.starts_with("ok\t")
+            {
+                if !current_test.is_empty() && !current_lines.is_empty() {
+                    let preview = current_lines
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    failures.push(format!("FAIL {current_test}\n{preview}"));
+                }
+                in_failure = false;
+                current_test.clear();
+                current_lines.clear();
+            } else if !trimmed.is_empty() {
+                current_lines.push(trimmed.to_string());
+            }
+        }
+    }
+    if !current_test.is_empty() && !current_lines.is_empty() {
+        let preview = current_lines
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        failures.push(format!("FAIL {current_test}\n{preview}"));
+    }
+
+    failures.join("\n\n")
+}
+
+fn compact_golangci_output(output: &str) -> String {
+    let mut by_linter: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        // file.go:line:col: message (linter)
+        if let Some(paren_start) = trimmed.rfind('(') {
+            if let Some(linter) = trimmed[paren_start + 1..].strip_suffix(')') {
+                let location = trimmed[..paren_start].trim();
+                by_linter
+                    .entry(linter.to_string())
+                    .or_default()
+                    .push(location.to_string());
+            }
+        }
+    }
+    if by_linter.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    for (linter, locations) in &by_linter {
+        let first = locations.first().map(String::as_str).unwrap_or("");
+        lines.push(format!("{linter}: {}x (first: {first})", locations.len()));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]

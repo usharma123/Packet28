@@ -1,4 +1,5 @@
 use crate::types::{CommandReducerSpec, CommandReduction};
+use serde_json::Value;
 
 pub fn classify_github_command(command: &str, argv: &[String]) -> Option<CommandReducerSpec> {
     if argv.first()?.as_str() != "gh" {
@@ -24,10 +25,12 @@ pub fn classify_github_command(command: &str, argv: &[String]) -> Option<Command
         ("pr", "list") => "gh_pr_list",
         ("pr", "view") => "gh_pr_view",
         ("pr", "diff") => "gh_pr_diff",
+        ("pr", "checks") => "gh_pr_checks",
         ("issue", "list") => "gh_issue_list",
         ("issue", "view") => "gh_issue_view",
         ("run", "list") => "gh_run_list",
         ("run", "view") => "gh_run_view",
+        ("api", _) if argv.get(1).is_some_and(|value| value == "api") => "gh_api",
         _ => return None,
     };
     Some(CommandReducerSpec {
@@ -55,7 +58,7 @@ pub fn reduce_github_command(
     let lines = nonempty_lines(stdout);
     let line_count = lines.len();
     let command_name = spec.argv[0..3.min(spec.argv.len())].join(" ");
-    let summary = if failed {
+    let summary = if failed && spec.canonical_kind != "gh_pr_checks" {
         first_nonempty_line(stderr)
             .or_else(|| first_nonempty_line(stdout))
             .map(|line| format!("{command_name} failed: {line}"))
@@ -65,6 +68,7 @@ pub fn reduce_github_command(
             "gh_pr_list" => summarize_list_entries("gh pr list", &lines, "PR"),
             "gh_pr_view" => summarize_pr_view(&lines),
             "gh_pr_diff" => format!("gh pr diff returned {line_count} diff line(s)"),
+            "gh_pr_checks" => summarize_pr_checks(&lines),
             "gh_issue_list" => summarize_list_entries("gh issue list", &lines, "issue"),
             "gh_issue_view" => lines
                 .first()
@@ -72,6 +76,7 @@ pub fn reduce_github_command(
                 .unwrap_or_else(|| "gh issue view completed".to_string()),
             "gh_run_list" => summarize_list_entries("gh run list", &lines, "run"),
             "gh_run_view" => summarize_run_view(&lines),
+            "gh_api" => summarize_api(stdout),
             _ => format!("{command_name} returned {line_count} line(s)"),
         }
     };
@@ -81,6 +86,13 @@ pub fn reduce_github_command(
         packet_type: spec.packet_type.clone(),
         operation_kind: spec.operation_kind,
         summary,
+        compact_preview: match spec.canonical_kind.as_str() {
+            "gh_pr_view" => compact_pr_view_preview(stdout),
+            "gh_pr_checks" => compact_pr_checks_preview(&lines),
+            "gh_run_view" => compact_run_view_preview(&lines),
+            "gh_pr_diff" => crate::git::compact_diff_public(stdout, 500),
+            _ => String::new(),
+        },
         paths: spec.paths.clone(),
         regions: Vec::new(),
         symbols: Vec::new(),
@@ -194,6 +206,93 @@ fn summarize_list_entries(label: &str, lines: &[String], noun: &str) -> String {
     format!("{label} returned {count} {noun}(s)")
 }
 
+fn summarize_pr_checks(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return "gh pr checks returned 0 checks".to_string();
+    }
+    let mut passing = 0usize;
+    let mut failing = 0usize;
+    let mut pending = 0usize;
+    let mut first_failing = None::<String>;
+    for line in lines {
+        let fields = line
+            .split('\t')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let name = fields.first().copied().unwrap_or_default();
+        let status = fields
+            .iter()
+            .find(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "pass" | "fail" | "pending" | "cancel" | "skipping" | "skip"
+                )
+            })
+            .map(|value| value.to_ascii_lowercase());
+        match status.as_deref() {
+            Some("pass") => passing += 1,
+            Some("fail") | Some("cancel") => {
+                failing += 1;
+                if first_failing.is_none() && !name.is_empty() {
+                    first_failing = Some(name.to_string());
+                }
+            }
+            Some("pending") | Some("skip") | Some("skipping") => pending += 1,
+            _ => pending += 1,
+        }
+    }
+    if let Some(name) = first_failing {
+        format!(
+            "gh pr checks: {passing} pass, {failing} fail, {pending} pending; first failing {name}"
+        )
+    } else {
+        format!("gh pr checks: {passing} pass, {failing} fail, {pending} pending")
+    }
+}
+
+fn summarize_api(stdout: &str) -> String {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return "gh api returned empty payload".to_string();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        let lines = nonempty_lines(stdout);
+        return format!("gh api returned {} line(s)", lines.len());
+    };
+    match value {
+        Value::Array(items) => {
+            if let Some(first) = items.first() {
+                if let Some(label) = json_label(first) {
+                    format!("gh api returned {} item(s); first {label}", items.len())
+                } else {
+                    format!("gh api returned {} item(s)", items.len())
+                }
+            } else {
+                "gh api returned 0 item(s)".to_string()
+            }
+        }
+        Value::Object(map) => {
+            if let Some(label) = json_label(&Value::Object(map.clone())) {
+                format!("gh api returned object; {label}")
+            } else {
+                format!("gh api returned object with {} key(s)", map.len())
+            }
+        }
+        _ => "gh api returned scalar payload".to_string(),
+    }
+}
+
+fn json_label(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    for key in ["full_name", "name", "title", "status", "conclusion"] {
+        if let Some(label) = object.get(key).and_then(Value::as_str) {
+            return Some(format!("{key}={label}"));
+        }
+    }
+    Some(format!("{} key(s)", object.len()))
+}
+
 fn extract_tab_field(lines: &[String], key: &str) -> Option<String> {
     let prefix = format!("{key}:\t");
     lines
@@ -227,6 +326,67 @@ fn extract_section_count(lines: &[String], heading: &str) -> usize {
         }
     }
     count
+}
+
+fn compact_pr_view_preview(stdout: &str) -> String {
+    let mut parts = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        // Skip markdown images, badges, HTML comments
+        if trimmed.starts_with("![")
+            || trimmed.starts_with("<!--")
+            || trimmed.starts_with("<img")
+            || trimmed.starts_with("[![")
+        {
+            continue;
+        }
+        parts.push(trimmed.to_string());
+    }
+    // Limit to 30 lines
+    parts.truncate(30);
+    parts.join("\n")
+}
+
+fn compact_pr_checks_preview(lines: &[String]) -> String {
+    let mut result = Vec::new();
+    for line in lines {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() >= 2 {
+            let name = fields[0].trim();
+            let status = fields
+                .iter()
+                .find(|f| {
+                    matches!(
+                        f.trim().to_ascii_lowercase().as_str(),
+                        "pass" | "fail" | "pending" | "cancel" | "skip"
+                    )
+                })
+                .map(|s| s.trim())
+                .unwrap_or("?");
+            result.push(format!("{status} {name}"));
+        }
+    }
+    result.join("\n")
+}
+
+fn compact_run_view_preview(lines: &[String]) -> String {
+    let mut result = Vec::new();
+    let mut in_jobs = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "JOBS" {
+            in_jobs = true;
+            continue;
+        }
+        if trimmed == "ANNOTATIONS" {
+            in_jobs = false;
+            continue;
+        }
+        if in_jobs && !trimmed.is_empty() {
+            result.push(trimmed.to_string());
+        }
+    }
+    result.join("\n")
 }
 
 #[cfg(test)]
@@ -290,6 +450,36 @@ mod tests {
         assert_eq!(
             reduction.summary,
             "gh run view: v0.2.24 Release (2 jobs, 2 annotations)"
+        );
+    }
+
+    #[test]
+    fn reduce_github_pr_checks_summarizes_status_counts() {
+        let argv = vec!["gh", "pr", "checks", "12"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let spec = classify_github_command("gh pr checks 12", &argv).unwrap();
+        let stdout = "build\tpass\t14s\ntest\tfail\t22s\nlint\tpending\t-\n";
+        let reduction = reduce_github_command(&spec, stdout, "", 1);
+        assert_eq!(
+            reduction.summary,
+            "gh pr checks: 1 pass, 1 fail, 1 pending; first failing test"
+        );
+    }
+
+    #[test]
+    fn reduce_github_api_summarizes_json_payload() {
+        let argv = vec!["gh", "api", "repos/packet28/coverage/pulls"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let spec = classify_github_command("gh api repos/packet28/coverage/pulls", &argv).unwrap();
+        let stdout = r#"[{"title":"Add compact parity"},{"title":"Trim reducers"}]"#;
+        let reduction = reduce_github_command(&spec, stdout, "", 0);
+        assert_eq!(
+            reduction.summary,
+            "gh api returned 2 item(s); first title=Add compact parity"
         );
     }
 }
