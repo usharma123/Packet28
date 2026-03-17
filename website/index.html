@@ -5,6 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Packet28 — Context Broker for AI Coding Agents</title>
 <meta name="description" content="Packet28 manages your agent's context window so it conserves tokens. 164x fewer tokens on large codebases.">
+<!-- Open Graph -->
+<meta property="og:title" content="Packet28 — Context Broker for AI Coding Agents">
+<meta property="og:description" content="Hook reducers keep your agent's turns slim. Handoff packets compress cross-turn memory. 164x fewer tokens on large codebases.">
+<meta property="og:image" content="og-image.png">
+<meta property="og:type" content="website">
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Packet28 — Context Broker for AI Coding Agents">
+<meta name="twitter:description" content="Hook reducers keep your agent's turns slim. Handoff packets compress cross-turn memory. 164x fewer tokens on large codebases.">
+<meta name="twitter:image" content="og-image.png">
+<!-- Favicon -->
+<link rel="icon" type="image/svg+xml" href="logo.svg">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap');
 
@@ -385,6 +397,15 @@ body::after {
   line-height: 1.6;
 }
 
+.feature-desc code {
+  font-family: var(--font);
+  font-size: 12px;
+  color: var(--fg);
+  background: rgba(255,255,255,0.04);
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+}
+
 /* ═══ BENCHMARK ═══ */
 .bench-display {
   margin-top: 48px;
@@ -529,6 +550,10 @@ body::after {
 .term-line:nth-child(5) { animation-delay: 1.4s; }
 .term-line:nth-child(6) { animation-delay: 1.7s; }
 .term-line:nth-child(7) { animation-delay: 2.0s; }
+.term-line:nth-child(8) { animation-delay: 2.3s; }
+.term-line:nth-child(9) { animation-delay: 2.6s; }
+.term-line:nth-child(10) { animation-delay: 2.9s; }
+.term-line:nth-child(11) { animation-delay: 3.2s; }
 
 @keyframes termSlide {
   to { opacity: 1; transform: translateX(0); }
@@ -660,7 +685,7 @@ footer {
     <div class="hero-ascii" id="ascii-art"></div>
     <h1>Context broker for<br>AI coding agents</h1>
     <p class="hero-sub">
-      Manages your agent's context window so it reads only what matters.
+      Hook reducers keep your agent's turns slim. Handoff packets compress cross-turn memory.
       <strong>164x fewer tokens</strong> on large codebases.
     </p>
     <div class="install-row">
@@ -710,22 +735,22 @@ footer {
     <div class="pipeline reveal">
       <div class="pipe-step">
         <div class="pipe-num">01</div>
-        <h3 class="pipe-title">Setup</h3>
-        <p class="pipe-desc">Auto-detects runtimes, configures MCP servers, starts the daemon.</p>
+        <h3 class="pipe-title">Setup + Hooks</h3>
+        <p class="pipe-desc">Auto-detects runtimes, installs Claude hooks, configures MCP servers, starts the daemon.</p>
         <div class="pipe-code">$ packet28 setup --root .</div>
       </div>
       <div class="pipe-arrow">&rarr;</div>
       <div class="pipe-step">
         <div class="pipe-num">02</div>
-        <h3 class="pipe-title">Agent calls MCP</h3>
-        <p class="pipe-desc">Your AI agent stays on slim reducers during the turn, then assembles handoff context outside the loop.</p>
-        <div class="pipe-code">search() -> write_state() -> prepare_handoff()</div>
+        <h3 class="pipe-title">Hooks reduce, MCP controls</h3>
+        <p class="pipe-desc">PreToolUse hooks rewrite commands through reducers. MCP handles intent, handoff, and context inspection only.</p>
+        <div class="pipe-code">hooks &rarr; reducers | MCP &rarr; write_intention</div>
       </div>
       <div class="pipe-arrow">&rarr;</div>
       <div class="pipe-step">
         <div class="pipe-num">03</div>
-        <h3 class="pipe-title">Focused context</h3>
-        <p class="pipe-desc">Returns only what matters &mdash; repo anchors, focus sets, coverage data.</p>
+        <h3 class="pipe-title">Handoff &amp; relaunch</h3>
+        <p class="pipe-desc">Daemon assembles a denoised handoff packet. Fresh worker relaunches from compressed context.</p>
         <div class="pipe-code">~849 tokens (not ~139,000)</div>
       </div>
     </div>
@@ -758,19 +783,39 @@ footer {
         <p class="feature-desc">Each response stays within a configurable token budget. No more blowing through context windows on a single file read.</p>
       </div>
       <div class="feature-item">
-        <div class="feature-tag">04 FOC</div>
+        <div class="feature-tag">04 HOK</div>
+        <h3 class="feature-title">Hook Reducers</h3>
+        <p class="feature-desc">Claude PreToolUse hooks rewrite commands through reducers automatically. Reducer traffic stays out of the MCP loop &mdash; zero agent overhead.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">05 DIS</div>
+        <h3 class="feature-title">Discover &amp; Learn</h3>
+        <p class="feature-desc">Scans session history for command patterns and savings opportunities. Learns error&rarr;correction patterns to auto-generate agent rules.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">06 FOC</div>
         <h3 class="feature-title">Focus Sets</h3>
         <p class="feature-desc">Agents mark files and symbols as "in focus." Packet28 tracks what the agent cares about across tool calls.</p>
       </div>
       <div class="feature-item">
-        <div class="feature-tag">05 DMN</div>
+        <div class="feature-tag">07 DMN</div>
         <h3 class="feature-title">Daemon State</h3>
         <p class="feature-desc">The packet28d daemon persists state across agent sessions. Start, stop, resume &mdash; your context survives restarts.</p>
       </div>
       <div class="feature-item">
-        <div class="feature-tag">06 MRT</div>
+        <div class="feature-tag">08 DOC</div>
+        <h3 class="feature-title">Doctor</h3>
+        <p class="feature-desc">Verifies daemon, index, MCP servers, notifications, and broker round-trip health in a single command. Diagnoses issues before they hit your agent.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">09 MRT</div>
         <h3 class="feature-title">Multi-Runtime</h3>
         <p class="feature-desc">One setup command detects Claude Code, Cursor, Codex, and more. Configures MCP servers for each automatically.</p>
+      </div>
+      <div class="feature-item">
+        <div class="feature-tag">10 GLB</div>
+        <h3 class="feature-title">Path Glob Routing</h3>
+        <p class="feature-desc">Glob expansion and cwd-aware routing lets agents target files with patterns like <code>src/**/*.rs</code> instead of listing every path.</p>
       </div>
     </div>
   </div>
@@ -833,10 +878,14 @@ footer {
         <div class="term-line"><span class="t-comment"># install globally</span></div>
         <div class="term-line"><span class="t-prompt">$</span> <span class="t-cmd">npm install <span class="t-flag">-g</span> packet28</span></div>
         <div class="term-line"></div>
-        <div class="term-line"><span class="t-comment"># set up in your project</span></div>
+        <div class="term-line"><span class="t-comment"># set up hooks + MCP in your project</span></div>
         <div class="term-line"><span class="t-prompt">$</span> <span class="t-cmd">packet28 setup <span class="t-flag">--root</span> .</span></div>
         <div class="term-line"><span class="t-output">  Detected runtimes: Claude Code, Cursor</span></div>
-        <div class="term-line"><span class="t-output">  Setup complete. MCP servers configured.</span></div>
+        <div class="term-line"><span class="t-output">  Hooks installed. MCP servers configured.</span></div>
+        <div class="term-line"></div>
+        <div class="term-line"><span class="t-comment"># verify everything works</span></div>
+        <div class="term-line"><span class="t-prompt">$</span> <span class="t-cmd">packet28 doctor <span class="t-flag">--root</span> .</span></div>
+        <div class="term-line"><span class="t-output">  All checks passed.</span></div>
       </div>
     </div>
   </div>
@@ -880,7 +929,7 @@ footer {
 <footer>
   <div class="container">
     <div class="footer-inner">
-      <div class="footer-left">packet28 &mdash; MIT License &mdash; 2024</div>
+      <div class="footer-left">packet28 &mdash; MIT License &mdash; 2026</div>
       <ul class="footer-links">
         <li><a href="https://github.com/usharma123/Packet28" target="_blank">github</a></li>
         <li><a href="https://www.npmjs.com/package/packet28" target="_blank">npm</a></li>
@@ -981,18 +1030,21 @@ if (benchEl) benchObs.observe(benchEl);
   // Build diagram as plain text, then highlight keywords
   const lines = [
     '┌───────────────────┐           ┌───────────────────┐           ┌───────────────────┐',
-    '│                   │    MCP    │                   │   daemon  │                   │',
-    '│    AI  Agent      │ ────────> │    Packet28       │ ────────> │    Codebase       │',
-    '│                   │   stdio   │                   │ packet28d │                   │',
-    '│  Claude Code      │           │  context broker   │           │  repo + coverage  │',
-    '│  Cursor           │ <──────── │  token budget     │ <──────── │  file system      │',
-    '│  Codex            │  focused  │  focus sets       │   maps    │  test results     │',
-    '│                   │  context  │  repo map         │           │                   │',
+    '│                   │   hooks   │                   │   daemon  │                   │',
+    '│    AI  Agent      │ ────────> │   Hook Reducers   │ ────────> │    Codebase       │',
+    '│                   │ PreToolUse│                   │ packet28d │                   │',
+    '│  Claude Code      │           │  diffy · mapy     │           │  repo + coverage  │',
+    '│  Cursor           │           │  stacky · buildy  │           │  file system      │',
+    '│  Codex            │    MCP    │  testy · proxy    │           │  test results     │',
+    '│                   │ ────────> │                   │ <──────── │                   │',
+    '│                   │   stdio   │    MCP Surface    │   maps    │                   │',
+    '│                   │ <──────── │  intent · handoff │           │                   │',
+    '│                   │  context  │  search · inspect │           │                   │',
     '└───────────────────┘           └───────────────────┘           └───────────────────┘',
     '',
-    'actions:  plan  |  inspect  |  choose_tool  |  interpret  |  edit  |  summarize',
+    '25 crates  ·  7 reducers  ·  hooks + MCP  ·  daemon persistence  ·  handoff relaunch',
   ];
-  const highlights = ['AI  Agent', 'Packet28', 'Codebase', 'plan', 'inspect', 'choose_tool', 'interpret', 'edit', 'summarize'];
+  const highlights = ['AI  Agent', 'Hook Reducers', 'MCP Surface', 'Codebase', '25 crates', '7 reducers', 'hooks + MCP', 'daemon persistence', 'handoff relaunch'];
 
   function escHtml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
