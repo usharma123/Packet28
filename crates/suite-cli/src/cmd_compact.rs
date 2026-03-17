@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
-use packet28_daemon_core::{load_task_registry, task_state_json_path, BrokerGetContextResponse, BrokerWriteOp, BrokerWriteStateRequest};
+use packet28_daemon_core::{
+    load_task_registry, task_state_json_path, BrokerGetContextResponse, BrokerWriteOp,
+    BrokerWriteStateRequest,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::route_registry::{build_route_rewrite, decide_command_route, NativeToolKind, RouteKind};
+use crate::route_registry::{build_route_rewrite, decide_command_route_with_cwd, NativeToolKind, RouteKind};
 
 #[derive(Args)]
 pub struct CompactArgs {
@@ -305,17 +308,18 @@ fn run_tree(args: TreeArgs) -> Result<i32> {
     let mut rendered = Vec::<String>::new();
     let mut paths = Vec::<String>::new();
     for raw_path in &args.paths {
-        let resolved = resolve_repo_path(&root, &cwd, raw_path);
-        walk_tree(
-            &root,
-            &resolved,
-            0,
-            args.max_depth,
-            args.max_entries,
-            args.hidden,
-            &mut rendered,
-            &mut paths,
-        )?;
+        for resolved in expand_repo_paths(&root, &cwd, raw_path)? {
+            walk_tree(
+                &root,
+                &resolved,
+                0,
+                args.max_depth,
+                args.max_entries,
+                args.hidden,
+                &mut rendered,
+                &mut paths,
+            )?;
+        }
     }
     paths.sort();
     paths.dedup();
@@ -345,11 +349,13 @@ fn run_read(args: ReadArgs) -> Result<i32> {
     let root = resolve_root(&args.root)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let resolved_path = resolve_repo_path(&root, &cwd, &args.path);
-    let relative = packet28_reducer_core::normalize_capture_path(&root, &resolved_path.display().to_string());
+    let relative =
+        packet28_reducer_core::normalize_capture_path(&root, &resolved_path.display().to_string());
     let text = fs::read_to_string(&resolved_path)
         .with_context(|| format!("failed to read '{}'", resolved_path.display()))?;
     let lines = text.lines().collect::<Vec<_>>();
-    let (start, end, rendered_lines) = select_read_lines(&lines, args.line_start, args.line_end, args.last);
+    let (start, end, rendered_lines) =
+        select_read_lines(&lines, args.line_start, args.line_end, args.last);
     let preview = rendered_lines
         .iter()
         .enumerate()
@@ -382,12 +388,17 @@ fn run_read(args: ReadArgs) -> Result<i32> {
 fn run_grep(args: GrepArgs) -> Result<i32> {
     let root = resolve_root(&args.root)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
-    let requested_paths = args
-        .paths
-        .iter()
-        .map(|path| resolve_repo_path(&root, &cwd, path))
-        .map(|path| packet28_reducer_core::normalize_capture_path(&root, &path.display().to_string()))
-        .collect::<Vec<_>>();
+    let mut requested_paths = Vec::<String>::new();
+    for raw_path in &args.paths {
+        for path in expand_repo_paths(&root, &cwd, raw_path)? {
+            requested_paths.push(packet28_reducer_core::normalize_capture_path(
+                &root,
+                &path.display().to_string(),
+            ));
+        }
+    }
+    requested_paths.sort();
+    requested_paths.dedup();
     let result = packet28_reducer_core::search(
         &root,
         &packet28_reducer_core::SearchRequest {
@@ -430,8 +441,10 @@ fn run_json(args: JsonArgs) -> Result<i32> {
     let root = resolve_root(&args.root)?;
     let cwd = crate::cmd_common::caller_cwd()?;
     let path = PathBuf::from(crate::cmd_common::resolve_path_from_cwd(&args.path, &cwd));
-    let relative = packet28_reducer_core::normalize_capture_path(&root, &path.display().to_string());
-    let raw = fs::read_to_string(&path).with_context(|| format!("failed to read '{}'", path.display()))?;
+    let relative =
+        packet28_reducer_core::normalize_capture_path(&root, &path.display().to_string());
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
     let value: Value = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse JSON '{}'", path.display()))?;
     let mut lines = vec![format!("JSON {}", relative)];
@@ -486,7 +499,11 @@ fn run_env(args: EnvArgs) -> Result<i32> {
         args.task_id.as_deref(),
         "packet28.compact.env",
         "native_tool",
-        if prefix.is_empty() { "env".to_string() } else { format!("env prefix={prefix}") },
+        if prefix.is_empty() {
+            "env".to_string()
+        } else {
+            format!("env prefix={prefix}")
+        },
         preview.clone(),
         None,
         Some(estimate_tokens_str(&preview)),
@@ -525,7 +542,9 @@ fn run_deps(args: DepsArgs) -> Result<i32> {
         Some(estimate_tokens_str(&preview)),
         manifests
             .iter()
-            .map(|path| packet28_reducer_core::normalize_capture_path(&root, &path.display().to_string()))
+            .map(|path| {
+                packet28_reducer_core::normalize_capture_path(&root, &path.display().to_string())
+            })
             .collect(),
         Vec::new(),
     )?;
@@ -536,8 +555,10 @@ fn run_log(args: LogArgs) -> Result<i32> {
     let root = resolve_root(&args.root)?;
     let cwd = crate::cmd_common::caller_cwd()?;
     let path = PathBuf::from(crate::cmd_common::resolve_path_from_cwd(&args.path, &cwd));
-    let relative = packet28_reducer_core::normalize_capture_path(&root, &path.display().to_string());
-    let raw = fs::read_to_string(&path).with_context(|| format!("failed to read '{}'", path.display()))?;
+    let relative =
+        packet28_reducer_core::normalize_capture_path(&root, &path.display().to_string());
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
     let lines = raw.lines().rev().take(args.max_lines).collect::<Vec<_>>();
     let mut grouped = Vec::<(String, usize)>::new();
     for line in lines.into_iter().rev() {
@@ -618,7 +639,11 @@ fn run_summary(args: SummaryArgs, label: &str) -> Result<i32> {
                     .collect(),
                 Vec::new(),
             )?;
-            Ok(if envelope.payload.exit_code == 0 { 0 } else { 1 })
+            Ok(if envelope.payload.exit_code == 0 {
+                0
+            } else {
+                1
+            })
         }
         Err(error) => {
             record_tool_failure(
@@ -637,7 +662,8 @@ fn run_summary(args: SummaryArgs, label: &str) -> Result<i32> {
 fn run_rewrite(args: RewriteArgs) -> Result<i32> {
     let root = resolve_root(&args.root)?;
     let command = args.command_argv.join(" ");
-    let decision = decide_command_route(&command);
+    let cwd_path = std::path::Path::new(&args.cwd);
+    let decision = decide_command_route_with_cwd(&command, cwd_path);
     let rewritten = build_route_rewrite(
         &root,
         &args.task_id,
@@ -809,7 +835,9 @@ fn run_session(args: SessionArgs) -> Result<i32> {
                 session.running,
                 session.recent_invocation_count,
                 session.changed_paths_since_checkpoint,
-                session.latest_hook_command_kind.unwrap_or_else(|| "n/a".to_string())
+                session
+                    .latest_hook_command_kind
+                    .unwrap_or_else(|| "n/a".to_string())
             );
         }
     }
@@ -826,7 +854,10 @@ fn run_fetch_raw(args: FetchRawArgs) -> Result<i32> {
         if candidate.exists() {
             candidate
         } else {
-            task_state_json_path(&root, &args.task_id).parent().unwrap_or(&root).join(&args.handle)
+            task_state_json_path(&root, &args.task_id)
+                .parent()
+                .unwrap_or(&root)
+                .join(&args.handle)
         }
     };
     let text = fs::read_to_string(&path)
@@ -858,7 +889,9 @@ fn emit_or_print(payload: &Value, preview: &str, json: bool, pretty: bool) -> Re
 
 fn resolve_root(root: &str) -> Result<PathBuf> {
     let cwd = crate::cmd_common::caller_cwd()?;
-    Ok(PathBuf::from(crate::cmd_common::resolve_path_from_cwd(root, &cwd)))
+    Ok(PathBuf::from(crate::cmd_common::resolve_path_from_cwd(
+        root, &cwd,
+    )))
 }
 
 fn resolve_cwd(cwd: Option<&str>) -> Result<PathBuf> {
@@ -871,8 +904,38 @@ fn resolve_cwd(cwd: Option<&str>) -> Result<PathBuf> {
 
 fn resolve_repo_path(_root: &Path, cwd: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
-    let absolute = if path.is_absolute() { path } else { cwd.join(path) };
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
     absolute.canonicalize().unwrap_or(absolute)
+}
+
+fn expand_repo_paths(root: &Path, cwd: &Path, value: &str) -> Result<Vec<PathBuf>> {
+    if !looks_like_glob_pattern(value) {
+        return Ok(vec![resolve_repo_path(root, cwd, value)]);
+    }
+    let pattern = if Path::new(value).is_absolute() {
+        value.to_string()
+    } else {
+        cwd.join(value).display().to_string()
+    };
+    let mut matches = glob::glob(&pattern)
+        .with_context(|| format!("invalid glob pattern '{value}'"))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    if matches.is_empty() {
+        Ok(vec![resolve_repo_path(root, cwd, value)])
+    } else {
+        Ok(matches)
+    }
+}
+
+fn looks_like_glob_pattern(value: &str) -> bool {
+    value.contains('*') || value.contains('?') || value.contains('[')
 }
 
 fn walk_tree(
@@ -890,7 +953,11 @@ fn walk_tree(
     }
     let relative = packet28_reducer_core::normalize_capture_path(root, &path.display().to_string());
     if !relative.is_empty() {
-        let name = if depth == 0 { relative.clone() } else { format!("{}{}", "  ".repeat(depth), relative) };
+        let name = if depth == 0 {
+            relative.clone()
+        } else {
+            format!("{}{}", "  ".repeat(depth), relative)
+        };
         rendered.push(name);
         paths.push(relative.clone());
     }
@@ -904,11 +971,23 @@ fn walk_tree(
         .collect::<Vec<_>>();
     children.sort();
     for child in children {
-        let name = child.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let name = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
         if (!hidden && name.starts_with('.')) || name == ".git" || name == ".packet28" {
             continue;
         }
-        walk_tree(root, &child, depth + 1, max_depth, max_entries, hidden, rendered, paths)?;
+        walk_tree(
+            root,
+            &child,
+            depth + 1,
+            max_depth,
+            max_entries,
+            hidden,
+            rendered,
+            paths,
+        )?;
         if rendered.len() >= max_entries {
             break;
         }
@@ -966,20 +1045,33 @@ fn collect_dependency_manifests(start: &Path) -> Result<Vec<PathBuf>> {
     Ok(manifests)
 }
 
-fn walk_manifests(path: &Path, depth: usize, max_depth: usize, manifests: &mut Vec<PathBuf>) -> Result<()> {
+fn walk_manifests(
+    path: &Path,
+    depth: usize,
+    max_depth: usize,
+    manifests: &mut Vec<PathBuf>,
+) -> Result<()> {
     if depth > max_depth {
         return Ok(());
     }
     if path.is_file() {
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
         if matches!(name, "Cargo.toml" | "package.json" | "pyproject.toml") {
             manifests.push(path.to_path_buf());
         }
         return Ok(());
     }
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read '{}'", path.display()))? {
+    for entry in
+        fs::read_dir(path).with_context(|| format!("failed to read '{}'", path.display()))?
+    {
         let child = entry?.path();
-        let name = child.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let name = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
         if matches!(name, ".git" | ".packet28" | "node_modules" | "target") {
             continue;
         }
@@ -989,8 +1081,12 @@ fn walk_manifests(path: &Path, depth: usize, max_depth: usize, manifests: &mut V
 }
 
 fn render_manifest_dependencies(path: &Path) -> Result<Vec<String>> {
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-    let raw = fs::read_to_string(path).with_context(|| format!("failed to read '{}'", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read '{}'", path.display()))?;
     let mut lines = vec![format!("manifest {}", path.display())];
     match name {
         "package.json" => {
@@ -1000,7 +1096,9 @@ fn render_manifest_dependencies(path: &Path) -> Result<Vec<String>> {
                     let deps = map
                         .iter()
                         .take(12)
-                        .map(|(key, value)| format!("- {section}: {key}@{}", value.as_str().unwrap_or("?")))
+                        .map(|(key, value)| {
+                            format!("- {section}: {key}@{}", value.as_str().unwrap_or("?"))
+                        })
                         .collect::<Vec<_>>();
                     lines.extend(deps);
                 }
@@ -1008,7 +1106,12 @@ fn render_manifest_dependencies(path: &Path) -> Result<Vec<String>> {
         }
         "Cargo.toml" | "pyproject.toml" => {
             let value: toml::Value = toml::from_str(&raw)?;
-            for section in ["dependencies", "dev-dependencies", "build-dependencies", "project"] {
+            for section in [
+                "dependencies",
+                "dev-dependencies",
+                "build-dependencies",
+                "project",
+            ] {
                 if let Some(table) = value.get(section).and_then(toml::Value::as_table) {
                     for (key, value) in table.iter().take(12) {
                         lines.push(format!("- {section}: {key}={}", render_toml_value(value)));
