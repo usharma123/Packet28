@@ -120,6 +120,9 @@ fn run_claude(args: ClaudeHookArgs) -> Result<i32> {
             boundary_kind: boundary_for_event(event_kind),
             lifecycle_event: None,
             reducer_packet,
+            host_context_budget_tokens: std::env::var("PACKET28_HOST_CONTEXT_BUDGET_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         },
     )?;
 
@@ -199,6 +202,7 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
                 ..HookLifecycleEvent::default()
             }),
             reducer_packet: None,
+            host_context_budget_tokens: None,
         },
     )?;
 
@@ -249,6 +253,7 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
                         ..HookLifecycleEvent::default()
                     }),
                     reducer_packet: None,
+                    host_context_budget_tokens: None,
                 },
             );
         }
@@ -331,6 +336,7 @@ fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
                 raw_artifact_handle: Some(stdout_path.display().to_string()),
                 artifact: Some(artifact),
             }),
+            host_context_budget_tokens: None,
         },
     )?;
     let _ = response;
@@ -481,7 +487,17 @@ fn emit_hook_output(
             }
         }
         HookEventKind::Stop | HookEventKind::SubagentStop => {
-            if response.block_stop {
+            if response.relaunch_requested {
+                // Daemon is handling relaunch — allow the stop to proceed.
+                // The next session will bootstrap from the handoff artifact.
+                eprintln!(
+                    "packet28: context threshold reached, daemon relaunch queued (artifact={})",
+                    response
+                        .latest_handoff_artifact_id
+                        .as_deref()
+                        .unwrap_or("pending")
+                );
+            } else if response.block_stop {
                 println!(
                     "{}",
                     serde_json::to_string(&json!({

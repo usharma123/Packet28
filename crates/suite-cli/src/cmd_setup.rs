@@ -591,12 +591,39 @@ fn write_hook_runtime_config(root: &Path, any_hooks_configured: bool) -> Result<
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let config = packet28_daemon_core::HookRuntimeConfig::default();
+    let mut config = packet28_daemon_core::HookRuntimeConfig::default();
+    // Populate relaunch_command so the daemon can auto-restart the agent
+    // from a handoff packet when the context threshold is reached.
+    let packet28_agent = resolve_packet28_agent_command();
+    config.relaunch_command = vec![
+        packet28_agent,
+        "--wait-for-handoff".to_string(),
+        "--root".to_string(),
+        root.display().to_string(),
+        "--".to_string(),
+        "claude".to_string(),
+        "--continue".to_string(),
+    ];
     fs::write(
         path,
         format!("{}\n", serde_json::to_string_pretty(&config)?),
     )?;
     Ok(McpConfigStatus::Written)
+}
+
+fn resolve_packet28_agent_command() -> String {
+    let output = std::process::Command::new("which")
+        .arg("packet28-agent")
+        .output();
+    if let Ok(output) = output {
+        if output.status.success() {
+            let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !command.is_empty() {
+                return command;
+            }
+        }
+    }
+    "packet28-agent".to_string()
 }
 
 fn shell_escape(value: String) -> String {

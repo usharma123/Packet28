@@ -33,9 +33,27 @@ pub enum HookBoundaryKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RelaunchPreference {
+    /// Daemon will auto-relaunch the agent when handoff is ready at a stop boundary.
     #[default]
-    ClearOrNewSession,
-    NewSessionOnly,
+    DaemonManaged,
+    /// Disable auto-relaunch; the host is responsible for restarting.
+    HostManaged,
+}
+
+/// Graduated context pressure level. The daemon computes this from the
+/// accumulated hook-window tokens relative to the configured budget.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdLevel {
+    /// Below warn threshold — no action needed.
+    #[default]
+    Normal,
+    /// Warn threshold crossed — agent should start recording intent.
+    Warn,
+    /// Prepare threshold crossed — handoff will be assembled at next boundary.
+    Prepare,
+    /// Force threshold crossed — handoff assembled and relaunch requested.
+    Force,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -104,6 +122,10 @@ pub struct HookIngestRequest {
     pub boundary_kind: HookBoundaryKind,
     pub lifecycle_event: Option<HookLifecycleEvent>,
     pub reducer_packet: Option<HookReducerPacket>,
+    /// Host-provided context budget in tokens. When set, overrides the
+    /// daemon's `context_budget_tokens` for threshold calculations, allowing
+    /// the budget to track the actual model context window.
+    pub host_context_budget_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -119,6 +141,13 @@ pub struct HookIngestResponse {
     pub block_stop: bool,
     pub stop_reason: Option<String>,
     pub cache_hit: bool,
+    /// Current graduated context pressure level.
+    pub threshold_level: ThresholdLevel,
+    /// When true, the daemon has queued an auto-relaunch of the agent from the
+    /// prepared handoff. The host should allow the stop to proceed.
+    pub relaunch_requested: bool,
+    /// Which relaunch preference was applied.
+    pub relaunch_preference: RelaunchPreference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,11 +156,46 @@ pub struct HookRuntimeConfig {
     pub hooks_enabled: bool,
     pub rewrite_enabled: bool,
     pub fallback_post_tool_capture: bool,
+    /// Base context budget in tokens. Overridden at runtime when the host
+    /// passes `host_context_budget_tokens` in the ingest request.
     pub context_budget_tokens: u64,
+    /// Legacy single-threshold fraction (kept for backwards compatibility).
+    /// Mapped to `warn_threshold_fraction` when graduated fractions are unset.
     #[serde(deserialize_with = "deserialize_soft_threshold_fraction")]
     pub soft_threshold_fraction: f64,
+    /// Graduated threshold: agent should start recording intent.
+    #[serde(
+        default = "default_warn_fraction",
+        deserialize_with = "deserialize_opt_fraction"
+    )]
+    pub warn_threshold_fraction: f64,
+    /// Graduated threshold: handoff will be assembled at next boundary.
+    #[serde(
+        default = "default_prepare_fraction",
+        deserialize_with = "deserialize_opt_fraction"
+    )]
+    pub prepare_threshold_fraction: f64,
+    /// Graduated threshold: handoff assembled and relaunch requested.
+    #[serde(
+        default = "default_force_fraction",
+        deserialize_with = "deserialize_opt_fraction"
+    )]
+    pub force_threshold_fraction: f64,
     pub relaunch_preference: RelaunchPreference,
+    /// Command the daemon will use to auto-relaunch the agent.
+    /// Example: `["claude", "--task-id", "{{task_id}}", "--resume"]`
+    pub relaunch_command: Vec<String>,
     pub reducer_allowlist: Vec<String>,
+}
+
+fn default_warn_fraction() -> f64 {
+    0.6
+}
+fn default_prepare_fraction() -> f64 {
+    0.75
+}
+fn default_force_fraction() -> f64 {
+    0.9
 }
 
 impl HookRuntimeConfig {
@@ -141,9 +205,56 @@ impl HookRuntimeConfig {
             .unwrap_or(0.5)
     }
 
+    /// Legacy soft threshold (backward compat). Prefer `threshold_tokens_for_level`.
     pub fn soft_threshold_tokens(&self) -> u64 {
-        let budget = self.context_budget_tokens.max(1);
-        ((budget as f64) * self.soft_threshold_fraction_value()).round() as u64
+        self.threshold_tokens_for_level(ThresholdLevel::Prepare)
+    }
+
+    /// Effective budget, optionally overridden by the host at runtime.
+    pub fn effective_budget(&self, host_override: Option<u64>) -> u64 {
+        host_override
+            .filter(|v| *v > 0)
+            .unwrap_or(self.context_budget_tokens)
+            .max(1)
+    }
+
+    /// Compute the token threshold for a given graduated level.
+    pub fn threshold_tokens_for_level(&self, level: ThresholdLevel) -> u64 {
+        self.threshold_tokens_for_level_with_budget(level, self.context_budget_tokens)
+    }
+
+    /// Compute the token threshold for a given level using a specific budget.
+    pub fn threshold_tokens_for_level_with_budget(
+        &self,
+        level: ThresholdLevel,
+        budget: u64,
+    ) -> u64 {
+        let budget = budget.max(1);
+        let fraction = match level {
+            ThresholdLevel::Normal => return 0,
+            ThresholdLevel::Warn => self.warn_threshold_fraction,
+            ThresholdLevel::Prepare => self.prepare_threshold_fraction,
+            ThresholdLevel::Force => self.force_threshold_fraction,
+        };
+        let fraction = if fraction > 0.0 { fraction } else { 0.5 };
+        ((budget as f64) * fraction).round() as u64
+    }
+
+    /// Determine the current threshold level for a given token count.
+    pub fn compute_threshold_level(&self, tokens: u64, budget: u64) -> ThresholdLevel {
+        let force = self.threshold_tokens_for_level_with_budget(ThresholdLevel::Force, budget);
+        let prepare =
+            self.threshold_tokens_for_level_with_budget(ThresholdLevel::Prepare, budget);
+        let warn = self.threshold_tokens_for_level_with_budget(ThresholdLevel::Warn, budget);
+        if tokens >= force {
+            ThresholdLevel::Force
+        } else if tokens >= prepare {
+            ThresholdLevel::Prepare
+        } else if tokens >= warn {
+            ThresholdLevel::Warn
+        } else {
+            ThresholdLevel::Normal
+        }
     }
 }
 
@@ -153,9 +264,13 @@ impl Default for HookRuntimeConfig {
             hooks_enabled: true,
             rewrite_enabled: true,
             fallback_post_tool_capture: true,
-            context_budget_tokens: 10_000,
+            context_budget_tokens: 200_000,
             soft_threshold_fraction: 0.5,
-            relaunch_preference: RelaunchPreference::ClearOrNewSession,
+            warn_threshold_fraction: default_warn_fraction(),
+            prepare_threshold_fraction: default_prepare_fraction(),
+            force_threshold_fraction: default_force_fraction(),
+            relaunch_preference: RelaunchPreference::DaemonManaged,
+            relaunch_command: Vec::new(),
             reducer_allowlist: vec![
                 "claude_native".to_string(),
                 "git".to_string(),
@@ -203,18 +318,40 @@ where
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum SoftThresholdFraction {
+    enum FractionValue {
         Number(f64),
         String(String),
     }
 
-    match Option::<SoftThresholdFraction>::deserialize(deserializer)? {
-        Some(SoftThresholdFraction::Number(value)) if value > 0.0 => Ok(value),
-        Some(SoftThresholdFraction::String(value)) => value
+    match Option::<FractionValue>::deserialize(deserializer)? {
+        Some(FractionValue::Number(value)) if value > 0.0 => Ok(value),
+        Some(FractionValue::String(value)) => value
             .parse::<f64>()
             .ok()
             .filter(|parsed| *parsed > 0.0)
             .ok_or_else(|| serde::de::Error::custom("soft_threshold_fraction must be > 0")),
         _ => Ok(0.5),
+    }
+}
+
+fn deserialize_opt_fraction<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FractionValue {
+        Number(f64),
+        String(String),
+    }
+
+    match Option::<FractionValue>::deserialize(deserializer)? {
+        Some(FractionValue::Number(value)) if value > 0.0 => Ok(value),
+        Some(FractionValue::String(value)) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|parsed| *parsed > 0.0)
+            .ok_or_else(|| serde::de::Error::custom("threshold fraction must be > 0")),
+        _ => Ok(0.0), // 0.0 signals "use default" to callers
     }
 }

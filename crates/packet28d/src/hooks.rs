@@ -1,7 +1,8 @@
 use super::*;
 use packet28_daemon_core::{
     hook_runtime_config_path, HookBoundaryKind, HookEventKind, HookIngestRequest,
-    HookIngestResponse, HookReducerCacheEntry, HookRuntimeConfig,
+    HookIngestResponse, HookReducerCacheEntry, HookRuntimeConfig, RelaunchPreference,
+    ThresholdLevel,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -77,17 +78,20 @@ fn maybe_prepare_handoff_from_hooks(
     state: Arc<Mutex<DaemonState>>,
     task_id: &str,
     boundary_kind: HookBoundaryKind,
+    host_budget: Option<u64>,
 ) -> Result<HookIngestResponse> {
     let config = {
         let root = state.lock().map_err(lock_err)?.root.clone();
         load_hook_runtime_config(&root)
     };
+    let effective_budget = config.effective_budget(host_budget);
     if boundary_kind != HookBoundaryKind::None {
         let mut guard = state.lock().map_err(lock_err)?;
         let task = ensure_task_record_mut(&mut guard.tasks, task_id);
         task.latest_hook_boundary_at_unix = Some(now_unix());
         task.latest_hook_boundary_kind = Some(format!("{boundary_kind:?}").to_ascii_lowercase());
-        task.hook_soft_threshold_tokens = config.soft_threshold_tokens();
+        task.hook_soft_threshold_tokens =
+            config.threshold_tokens_for_level_with_budget(ThresholdLevel::Prepare, effective_budget);
         persist_state(&guard)?;
     }
     let status = broker_task_status(
@@ -98,10 +102,22 @@ fn maybe_prepare_handoff_from_hooks(
     )?;
     let snapshot = load_agent_snapshot_for_task(&state, task_id)?;
     let task = load_task_record(&state, task_id);
-    let threshold_reason = task
-        .as_ref()
-        .filter(|task| task.hook_threshold_exceeded)
-        .map(|_| "soft context threshold reached");
+
+    // Compute graduated threshold level from accumulated tokens.
+    let window_tokens = task.as_ref().map_or(0, |t| t.hook_window_est_tokens);
+    let threshold_level = config.compute_threshold_level(window_tokens, effective_budget);
+    let threshold_exceeded = matches!(
+        threshold_level,
+        ThresholdLevel::Prepare | ThresholdLevel::Force
+    );
+    let threshold_reason = if threshold_exceeded {
+        Some(match threshold_level {
+            ThresholdLevel::Force => "force context threshold reached",
+            _ => "prepare context threshold reached",
+        })
+    } else {
+        None
+    };
     let boundary_reason = boundary_reason(boundary_kind);
     let should_prepare = snapshot.latest_intention.is_some()
         && (threshold_reason.is_some() || boundary_reason.is_some());
@@ -117,6 +133,9 @@ fn maybe_prepare_handoff_from_hooks(
         block_stop: false,
         stop_reason: None,
         cache_hit: false,
+        threshold_level,
+        relaunch_requested: false,
+        relaunch_preference: config.relaunch_preference,
     };
 
     if should_prepare {
@@ -144,14 +163,69 @@ fn maybe_prepare_handoff_from_hooks(
             task.hook_window_est_tokens = 0;
             task.hook_window_est_bytes = 0;
             persist_state(&guard)?;
+
+            // Auto-relaunch: when daemon-managed and at a stop boundary with
+            // handoff ready, queue a fresh worker launch.
+            let is_stop_boundary = matches!(
+                boundary_kind,
+                HookBoundaryKind::Stop
+                    | HookBoundaryKind::SubagentStop
+                    | HookBoundaryKind::SessionEnd
+            );
+            if is_stop_boundary
+                && matches!(config.relaunch_preference, RelaunchPreference::DaemonManaged)
+                && !config.relaunch_command.is_empty()
+            {
+                response.relaunch_requested = true;
+                let relaunch_task_id = task_id.to_string();
+                let relaunch_command = config.relaunch_command.clone();
+                let relaunch_state = state.clone();
+                thread::spawn(move || {
+                    // Brief delay to let the current session complete its stop.
+                    thread::sleep(Duration::from_millis(500));
+                    let result = task_launch_agent(
+                        relaunch_state,
+                        TaskLaunchAgentRequest {
+                            task_id: relaunch_task_id.clone(),
+                            task: None,
+                            wait_for_handoff: false,
+                            handoff_timeout_ms: None,
+                            handoff_poll_ms: None,
+                            command: relaunch_command,
+                        },
+                    );
+                    match result {
+                        Ok(launched) => {
+                            eprintln!(
+                                "packet28: auto-relaunched agent pid={} task={}",
+                                launched.pid, relaunch_task_id
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "packet28: auto-relaunch failed for task {}: {err:#}",
+                                relaunch_task_id
+                            );
+                        }
+                    }
+                });
+            }
         }
-    } else if threshold_reason.is_some() && snapshot.latest_intention.is_none() {
+    } else if threshold_exceeded && snapshot.latest_intention.is_none() {
         response.block_stop = matches!(
             boundary_kind,
             HookBoundaryKind::Stop | HookBoundaryKind::SubagentStop
         );
         response.stop_reason = Some(
             "Packet28 threshold reached. Record the current task objective with packet28.write_intention before stopping."
+                .to_string(),
+        );
+    } else if matches!(threshold_level, ThresholdLevel::Warn)
+        && snapshot.latest_intention.is_none()
+    {
+        // At warn level, nudge the agent to record intent but don't block.
+        response.stop_reason = Some(
+            "Packet28 context usage at warn level. Consider recording intent with packet28.write_intention."
                 .to_string(),
         );
     }
@@ -330,17 +404,23 @@ pub(crate) fn hook_ingest(
         });
     }
 
+    let effective_budget = config.effective_budget(request.host_context_budget_tokens);
+    let prepare_threshold =
+        config.threshold_tokens_for_level_with_budget(ThresholdLevel::Prepare, effective_budget);
+
     {
         let mut guard = state.lock().map_err(lock_err)?;
         let task = ensure_task_record_mut(&mut guard.tasks, task_id);
         task.latest_hook_session_id = request.session_id.clone();
         task.latest_hook_event_at_unix = Some(now_unix());
-        task.hook_soft_threshold_tokens = config.soft_threshold_tokens();
+        task.hook_soft_threshold_tokens = prepare_threshold;
         if let Some(lifecycle) = request.lifecycle_event.as_ref() {
             apply_lifecycle_event(task, lifecycle);
         }
         persist_state(&guard)?;
     }
+
+    let host_budget = request.host_context_budget_tokens;
 
     if matches!(request.event_kind, HookEventKind::SessionStart) {
         let additional_context =
@@ -349,7 +429,12 @@ pub(crate) fn hook_ingest(
             task_id: task_id.to_string(),
             accepted: true,
             additional_context,
-            ..maybe_prepare_handoff_from_hooks(state, task_id, HookBoundaryKind::None)?
+            ..maybe_prepare_handoff_from_hooks(
+                state,
+                task_id,
+                HookBoundaryKind::None,
+                host_budget,
+            )?
         });
     }
 
@@ -439,14 +524,15 @@ pub(crate) fn hook_ingest(
                     .saturating_add(packet.est_tokens);
                 task.hook_window_est_bytes =
                     task.hook_window_est_bytes.saturating_add(packet.est_bytes);
-                task.hook_threshold_exceeded =
-                    task.hook_window_est_tokens >= config.soft_threshold_tokens();
+                // Use graduated threshold: exceeded at Prepare level or above.
+                task.hook_threshold_exceeded = task.hook_window_est_tokens >= prepare_threshold;
                 persist_state(&guard)?;
             }
         }
     }
 
-    let mut response = maybe_prepare_handoff_from_hooks(state, task_id, request.boundary_kind)?;
+    let mut response =
+        maybe_prepare_handoff_from_hooks(state, task_id, request.boundary_kind, host_budget)?;
     response.cache_hit = cache_hit;
     Ok(response)
 }
@@ -748,6 +834,7 @@ mod tests {
             state.clone(),
             "task-handoff-reset",
             HookBoundaryKind::Stop,
+            None,
         )
         .unwrap();
 
@@ -756,5 +843,457 @@ mod tests {
         assert_eq!(task.hook_window_est_tokens, 0);
         assert_eq!(task.hook_window_est_bytes, 0);
         assert!(!task.hook_threshold_exceeded);
+    }
+
+    #[test]
+    fn graduated_threshold_levels_are_computed_correctly() {
+        let config = HookRuntimeConfig {
+            context_budget_tokens: 1000,
+            warn_threshold_fraction: 0.6,
+            prepare_threshold_fraction: 0.75,
+            force_threshold_fraction: 0.9,
+            ..HookRuntimeConfig::default()
+        };
+        assert_eq!(
+            config.compute_threshold_level(0, 1000),
+            ThresholdLevel::Normal
+        );
+        assert_eq!(
+            config.compute_threshold_level(599, 1000),
+            ThresholdLevel::Normal
+        );
+        assert_eq!(
+            config.compute_threshold_level(600, 1000),
+            ThresholdLevel::Warn
+        );
+        assert_eq!(
+            config.compute_threshold_level(749, 1000),
+            ThresholdLevel::Warn
+        );
+        assert_eq!(
+            config.compute_threshold_level(750, 1000),
+            ThresholdLevel::Prepare
+        );
+        assert_eq!(
+            config.compute_threshold_level(899, 1000),
+            ThresholdLevel::Prepare
+        );
+        assert_eq!(
+            config.compute_threshold_level(900, 1000),
+            ThresholdLevel::Force
+        );
+        assert_eq!(
+            config.compute_threshold_level(1500, 1000),
+            ThresholdLevel::Force
+        );
+    }
+
+    #[test]
+    fn host_budget_override_changes_effective_budget() {
+        let config = HookRuntimeConfig {
+            context_budget_tokens: 1000,
+            ..HookRuntimeConfig::default()
+        };
+        assert_eq!(config.effective_budget(None), 1000);
+        assert_eq!(config.effective_budget(Some(5000)), 5000);
+        // Zero is ignored (falls back to config).
+        assert_eq!(config.effective_budget(Some(0)), 1000);
+    }
+
+    #[test]
+    fn threshold_accumulation_triggers_exceeded_without_stop_boundary() {
+        let state = test_state();
+        // Write a hook runtime config with small budget so threshold fires.
+        let root = state.lock().unwrap().root.clone();
+        let config = HookRuntimeConfig {
+            context_budget_tokens: 100,
+            warn_threshold_fraction: 0.6,
+            prepare_threshold_fraction: 0.75,
+            force_threshold_fraction: 0.9,
+            ..HookRuntimeConfig::default()
+        };
+        let config_path = packet28_daemon_core::hook_runtime_config_path(&root);
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        // Ingest packets totaling 80 tokens (above prepare=75 threshold).
+        for i in 0..8 {
+            let mut pkt = packet(&format!("read {i}"));
+            pkt.est_tokens = 10;
+            pkt.cache_fingerprint = Some(format!("unique-fp-{i}"));
+            let _ = hook_ingest(
+                state.clone(),
+                HookIngestRequest {
+                    task_id: "task-threshold".to_string(),
+                    reducer_packet: Some(pkt),
+                    ..HookIngestRequest::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let task = load_task_record(&state, "task-threshold").unwrap();
+        assert_eq!(task.hook_window_est_tokens, 80);
+        assert!(task.hook_threshold_exceeded);
+
+        // Without intention, stop should be blocked.
+        let response = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            "task-threshold",
+            HookBoundaryKind::Stop,
+            None,
+        )
+        .unwrap();
+        assert!(response.block_stop);
+        assert!(!response.handoff_ready);
+
+        // Write intention, then handoff should fire without a boundary.
+        let _ = broker_write_state(
+            state.clone(),
+            BrokerWriteStateRequest {
+                task_id: "task-threshold".to_string(),
+                op: Some(BrokerWriteOp::Intention),
+                text: Some("Continue investigating".to_string()),
+                refresh_context: Some(false),
+                ..BrokerWriteStateRequest::default()
+            },
+        )
+        .unwrap();
+
+        // Now at Stop boundary with intention → handoff should be ready.
+        let response = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            "task-threshold",
+            HookBoundaryKind::Stop,
+            None,
+        )
+        .unwrap();
+        assert!(response.handoff_ready);
+        assert!(matches!(
+            response.threshold_level,
+            ThresholdLevel::Prepare | ThresholdLevel::Force
+        ));
+
+        // Window should be cleared after successful handoff.
+        let task = load_task_record(&state, "task-threshold").unwrap();
+        assert_eq!(task.hook_window_est_tokens, 0);
+        assert!(!task.hook_threshold_exceeded);
+    }
+
+    #[test]
+    fn threshold_level_returned_in_response() {
+        let state = test_state();
+        let root = state.lock().unwrap().root.clone();
+        let config = HookRuntimeConfig {
+            context_budget_tokens: 100,
+            warn_threshold_fraction: 0.6,
+            prepare_threshold_fraction: 0.75,
+            force_threshold_fraction: 0.9,
+            ..HookRuntimeConfig::default()
+        };
+        let config_path = packet28_daemon_core::hook_runtime_config_path(&root);
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        // Under warn threshold.
+        let mut pkt = packet("small read");
+        pkt.est_tokens = 50;
+        pkt.cache_fingerprint = Some("unique-level-1".to_string());
+        let response = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: "task-level".to_string(),
+                reducer_packet: Some(pkt),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.threshold_level, ThresholdLevel::Normal);
+
+        // Push past warn (60 = 0.6 * 100) → total 65 tokens.
+        let mut pkt2 = packet("more read");
+        pkt2.est_tokens = 15;
+        pkt2.cache_fingerprint = Some("unique-level-2".to_string());
+        let response = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: "task-level".to_string(),
+                reducer_packet: Some(pkt2),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.threshold_level, ThresholdLevel::Warn);
+
+        // Push past force (90 = 0.9 * 100) → total 95 tokens.
+        let mut pkt3 = packet("big read");
+        pkt3.est_tokens = 30;
+        pkt3.cache_fingerprint = Some("unique-level-3".to_string());
+        let response = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: "task-level".to_string(),
+                reducer_packet: Some(pkt3),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.threshold_level, ThresholdLevel::Force);
+    }
+
+    #[test]
+    fn host_budget_override_affects_threshold_calculation() {
+        let state = test_state();
+        // Default config has budget=200_000 so threshold is very high.
+        // But host override sets budget=100 → threshold fires at 75 tokens.
+        let mut pkt = packet("big read");
+        pkt.est_tokens = 80;
+        pkt.cache_fingerprint = Some("unique-host-1".to_string());
+        let response = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: "task-host-budget".to_string(),
+                reducer_packet: Some(pkt),
+                host_context_budget_tokens: Some(100),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+        // 80 >= 75 (0.75 * 100), so threshold is exceeded at Prepare level.
+        assert!(matches!(
+            response.threshold_level,
+            ThresholdLevel::Prepare | ThresholdLevel::Force
+        ));
+
+        let task = load_task_record(&state, "task-host-budget").unwrap();
+        assert!(task.hook_threshold_exceeded);
+    }
+
+    #[test]
+    fn relaunch_preference_daemon_managed_is_default() {
+        let config = HookRuntimeConfig::default();
+        assert_eq!(config.relaunch_preference, RelaunchPreference::DaemonManaged);
+    }
+
+    #[test]
+    fn relaunch_requested_when_daemon_managed_with_command() {
+        let state = test_state();
+        let root = state.lock().unwrap().root.clone();
+        let config = HookRuntimeConfig {
+            context_budget_tokens: 100,
+            relaunch_preference: RelaunchPreference::DaemonManaged,
+            // Use a harmless command that will fail quickly (fine for test).
+            relaunch_command: vec!["true".to_string()],
+            ..HookRuntimeConfig::default()
+        };
+        let config_path = packet28_daemon_core::hook_runtime_config_path(&root);
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        // Ingest enough to exceed threshold.
+        let mut pkt = packet("big read");
+        pkt.est_tokens = 80;
+        pkt.cache_fingerprint = Some("unique-relaunch-1".to_string());
+        let _ = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: "task-relaunch".to_string(),
+                reducer_packet: Some(pkt),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+
+        // Write intention so handoff can proceed.
+        let _ = broker_write_state(
+            state.clone(),
+            BrokerWriteStateRequest {
+                task_id: "task-relaunch".to_string(),
+                op: Some(BrokerWriteOp::Intention),
+                text: Some("Continue work".to_string()),
+                refresh_context: Some(false),
+                ..BrokerWriteStateRequest::default()
+            },
+        )
+        .unwrap();
+
+        // Stop boundary should trigger handoff + relaunch.
+        let response = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            "task-relaunch",
+            HookBoundaryKind::Stop,
+            None,
+        )
+        .unwrap();
+        assert!(response.handoff_ready);
+        assert!(response.relaunch_requested);
+        assert_eq!(response.relaunch_preference, RelaunchPreference::DaemonManaged);
+    }
+
+    /// End-to-end test: hook ingest → graduated thresholds → intention write
+    /// → stop boundary handoff → window reset → brief artifact persisted.
+    #[test]
+    fn e2e_hook_threshold_handoff_cycle() {
+        let state = test_state();
+        let root = state.lock().unwrap().root.clone();
+        let config = HookRuntimeConfig {
+            context_budget_tokens: 100,
+            warn_threshold_fraction: 0.6,
+            prepare_threshold_fraction: 0.75,
+            force_threshold_fraction: 0.9,
+            relaunch_preference: RelaunchPreference::DaemonManaged,
+            relaunch_command: vec!["true".to_string()],
+            ..HookRuntimeConfig::default()
+        };
+        let config_path = packet28_daemon_core::hook_runtime_config_path(&root);
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let task_id = "task-e2e-cycle";
+
+        // Phase 1: Ingest hooks, observe graduated threshold levels.
+        // 30 tokens → Normal.
+        let mut pkt1 = packet("read file A");
+        pkt1.est_tokens = 30;
+        pkt1.cache_fingerprint = Some("e2e-fp-1".to_string());
+        let r1 = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: task_id.to_string(),
+                reducer_packet: Some(pkt1),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r1.threshold_level, ThresholdLevel::Normal);
+        assert!(!r1.handoff_ready);
+
+        // 65 tokens total → Warn.
+        let mut pkt2 = packet("read file B");
+        pkt2.est_tokens = 35;
+        pkt2.cache_fingerprint = Some("e2e-fp-2".to_string());
+        let r2 = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: task_id.to_string(),
+                reducer_packet: Some(pkt2),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r2.threshold_level, ThresholdLevel::Warn);
+
+        // 95 tokens total → Force.
+        let mut pkt3 = packet("read file C");
+        pkt3.est_tokens = 30;
+        pkt3.cache_fingerprint = Some("e2e-fp-3".to_string());
+        let r3 = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: task_id.to_string(),
+                reducer_packet: Some(pkt3),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r3.threshold_level, ThresholdLevel::Force);
+
+        // Phase 2: Stop without intention → blocked.
+        let blocked = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            task_id,
+            HookBoundaryKind::Stop,
+            None,
+        )
+        .unwrap();
+        assert!(blocked.block_stop);
+        assert!(!blocked.handoff_ready);
+
+        // Phase 3: Write intention.
+        let _ = broker_write_state(
+            state.clone(),
+            BrokerWriteStateRequest {
+                task_id: task_id.to_string(),
+                op: Some(BrokerWriteOp::Intention),
+                text: Some("Refactor auth middleware for compliance".to_string()),
+                refresh_context: Some(false),
+                ..BrokerWriteStateRequest::default()
+            },
+        )
+        .unwrap();
+
+        // Phase 4: Stop with intention → handoff fires, relaunch queued.
+        let handoff = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            task_id,
+            HookBoundaryKind::Stop,
+            None,
+        )
+        .unwrap();
+        assert!(handoff.handoff_ready);
+        assert!(handoff.relaunch_requested);
+        assert_eq!(handoff.relaunch_preference, RelaunchPreference::DaemonManaged);
+        assert!(matches!(
+            handoff.threshold_level,
+            ThresholdLevel::Force
+        ));
+
+        // Phase 5: Verify window reset.
+        let task = load_task_record(&state, task_id).unwrap();
+        assert_eq!(task.hook_window_est_tokens, 0);
+        assert_eq!(task.hook_window_est_bytes, 0);
+        assert!(!task.hook_threshold_exceeded);
+
+        // Phase 6: Verify brief artifact was persisted.
+        let brief_path = crate::task_brief_markdown_path(&root, task_id);
+        assert!(brief_path.exists(), "brief.md should be written after handoff");
+        let brief_content = std::fs::read_to_string(&brief_path).unwrap();
+        assert!(!brief_content.is_empty(), "brief should not be empty");
+    }
+
+    #[test]
+    fn relaunch_not_requested_when_host_managed() {
+        let state = test_state();
+        let root = state.lock().unwrap().root.clone();
+        let config = HookRuntimeConfig {
+            context_budget_tokens: 100,
+            relaunch_preference: RelaunchPreference::HostManaged,
+            relaunch_command: vec!["true".to_string()],
+            ..HookRuntimeConfig::default()
+        };
+        let config_path = packet28_daemon_core::hook_runtime_config_path(&root);
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let mut pkt = packet("big read");
+        pkt.est_tokens = 80;
+        pkt.cache_fingerprint = Some("unique-host-managed-1".to_string());
+        let _ = hook_ingest(
+            state.clone(),
+            HookIngestRequest {
+                task_id: "task-host-managed".to_string(),
+                reducer_packet: Some(pkt),
+                ..HookIngestRequest::default()
+            },
+        )
+        .unwrap();
+
+        let _ = broker_write_state(
+            state.clone(),
+            BrokerWriteStateRequest {
+                task_id: "task-host-managed".to_string(),
+                op: Some(BrokerWriteOp::Intention),
+                text: Some("Continue work".to_string()),
+                refresh_context: Some(false),
+                ..BrokerWriteStateRequest::default()
+            },
+        )
+        .unwrap();
+
+        let response = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            "task-host-managed",
+            HookBoundaryKind::Stop,
+            None,
+        )
+        .unwrap();
+        assert!(response.handoff_ready);
+        assert!(!response.relaunch_requested);
+        assert_eq!(response.relaunch_preference, RelaunchPreference::HostManaged);
     }
 }
