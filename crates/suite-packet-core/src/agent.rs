@@ -29,6 +29,8 @@ pub struct ToolInvocationSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_query: Option<String>,
@@ -231,6 +233,8 @@ pub enum AgentStateEventData {
         request_summary: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         result_summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compact_preview: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         request_fingerprint: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

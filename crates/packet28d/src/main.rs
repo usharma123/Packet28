@@ -274,7 +274,12 @@ fn bind_listener(socket: &Path) -> Result<UnixListener> {
                     socket.display()
                 );
             }
-            Err(err) if matches!(err.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                ) =>
+            {
                 daemon_log(&format!(
                     "removing stale socket '{}' after probe failure: {}",
                     socket.display(),

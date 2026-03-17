@@ -405,6 +405,8 @@ pub struct BrokerWriteStateRequest {
     pub operation_kind: Option<suite_packet_core::ToolOperationKind>,
     pub request_summary: Option<String>,
     pub result_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_preview: Option<String>,
     pub request_fingerprint: Option<String>,
     pub compact_path: Option<String>,
     pub passthrough_reason: Option<String>,

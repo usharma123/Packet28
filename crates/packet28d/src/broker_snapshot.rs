@@ -13,76 +13,86 @@ pub(crate) fn render_recent_tool_activity_lines(
     compact: bool,
 ) -> Vec<String> {
     let invocations = dedup_recent_invocations(&snapshot.recent_tool_invocations);
-    invocations
-        .iter()
-        .rev()
-        .map(|invocation| {
-            let request = invocation
-                .request_summary
+    let mut lines = Vec::new();
+    for invocation in invocations.iter().rev() {
+        let request = invocation
+            .request_summary
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("no request summary");
+        let operation_kind = serde_json::to_string(&invocation.operation_kind)
+            .unwrap_or_else(|_| "\"generic\"".to_string())
+            .trim_matches('"')
+            .to_string();
+        let route = invocation.compact_path.as_deref().unwrap_or("unknown");
+        let savings = invocation_savings_label(invocation);
+        let header = if compact {
+            let mut metadata = vec![
+                format!("paths={}", invocation.paths.len()),
+                format!("symbols={}", invocation.symbols.len()),
+                format!("route={route}"),
+            ];
+            if !invocation.regions.is_empty() {
+                metadata.push(format!("regions={}", invocation.regions.len()));
+            }
+            if let Some(duration_ms) = invocation.duration_ms {
+                metadata.push(format!("duration={}ms", duration_ms));
+            }
+            if let Some(savings) = savings.as_deref() {
+                metadata.push(savings.to_string());
+            }
+            format!(
+                "- #{} {} [{}] {} ({})",
+                invocation.sequence,
+                invocation.tool_name,
+                operation_kind,
+                request,
+                metadata.join(", ")
+            )
+        } else {
+            let result = invocation
+                .result_summary
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or("no request summary");
-            let operation_kind = serde_json::to_string(&invocation.operation_kind)
-                .unwrap_or_else(|_| "\"generic\"".to_string())
-                .trim_matches('"')
-                .to_string();
-            let route = invocation
-                .compact_path
+                .unwrap_or("no result summary");
+            let mut tail = vec![format!("route={route}")];
+            if let Some(reason) = invocation
+                .passthrough_reason
                 .as_deref()
-                .unwrap_or("unknown");
-            let savings = invocation_savings_label(invocation);
-            if compact {
-                let mut metadata = vec![
-                    format!("paths={}", invocation.paths.len()),
-                    format!("symbols={}", invocation.symbols.len()),
-                    format!("route={route}"),
-                ];
-                if !invocation.regions.is_empty() {
-                    metadata.push(format!("regions={}", invocation.regions.len()));
-                }
-                if let Some(duration_ms) = invocation.duration_ms {
-                    metadata.push(format!("duration={}ms", duration_ms));
-                }
-                if let Some(savings) = savings.as_deref() {
-                    metadata.push(savings.to_string());
-                }
-                format!(
-                    "- #{} {} [{}] {} ({})",
-                    invocation.sequence,
-                    invocation.tool_name,
-                    operation_kind,
-                    request,
-                    metadata.join(", ")
-                )
-            } else {
-                let result = invocation
-                    .result_summary
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("no result summary");
-                let mut tail = vec![format!("route={route}")];
-                if let Some(reason) = invocation
-                    .passthrough_reason
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    tail.push(format!("reason={reason}"));
-                }
-                if let Some(savings) = savings.as_deref() {
-                    tail.push(savings.to_string());
-                }
-                format!(
-                    "- #{} {} [{}] {} -> {} ({})",
-                    invocation.sequence,
-                    invocation.tool_name,
-                    operation_kind,
-                    request,
-                    result,
-                    tail.join(", ")
-                )
+                .filter(|value| !value.trim().is_empty())
+            {
+                tail.push(format!("reason={reason}"));
             }
-        })
-        .collect()
+            if let Some(savings) = savings.as_deref() {
+                tail.push(savings.to_string());
+            }
+            format!(
+                "- #{} {} [{}] {} -> {} ({})",
+                invocation.sequence,
+                invocation.tool_name,
+                operation_kind,
+                request,
+                result,
+                tail.join(", ")
+            )
+        };
+        lines.push(header);
+        if !compact {
+            if let Some(preview) = invocation
+                .compact_preview
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+            {
+                for preview_line in preview.lines().take(25) {
+                    lines.push(format!("    {preview_line}"));
+                }
+                if preview.lines().count() > 25 {
+                    lines.push("    ... (truncated)".to_string());
+                }
+            }
+        }
+    }
+    lines
 }
 
 pub(crate) fn render_missed_savings_lines(
@@ -178,7 +188,9 @@ fn invocation_richness(invocation: &suite_packet_core::ToolInvocationSummary) ->
     invocation.paths.len() + invocation.regions.len() * 3 + invocation.symbols.len() * 2
 }
 
-fn invocation_savings_label(invocation: &suite_packet_core::ToolInvocationSummary) -> Option<String> {
+fn invocation_savings_label(
+    invocation: &suite_packet_core::ToolInvocationSummary,
+) -> Option<String> {
     let raw = invocation.raw_est_tokens?;
     if raw == 0 {
         return None;
@@ -472,6 +484,7 @@ fn apply_agent_snapshot_event(
             operation_kind,
             request_summary,
             result_summary,
+            compact_preview,
             request_fingerprint,
             compact_path,
             passthrough_reason,
@@ -554,6 +567,7 @@ fn apply_agent_snapshot_event(
                     operation_kind: *operation_kind,
                     request_summary: request_summary.clone(),
                     result_summary: result_summary.clone(),
+                    compact_preview: compact_preview.clone(),
                     request_fingerprint: request_fingerprint.clone(),
                     compact_path: compact_path.clone(),
                     passthrough_reason: passthrough_reason.clone(),
