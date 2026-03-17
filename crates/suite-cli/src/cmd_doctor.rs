@@ -384,7 +384,15 @@ fn mcp_config_has_packet28(path: &Path) -> Result<bool> {
 
 fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
     let timeout = Duration::from_secs(5);
-    let task_id = "doctor-smoke-task";
+    let task_id = format!(
+        "doctor-smoke-task-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let session_id = format!("{task_id}-session");
     let mut handshake = DoctorCheck {
         name: "handshake",
         ok: false,
@@ -488,7 +496,7 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             &json!({
                 "hook_event_name":"PostToolUse",
                 "task_id": task_id,
-                "session_id":"doctor-session",
+                "session_id": session_id,
                 "cwd": root.display().to_string(),
                 "tool_name":"Bash",
                 "tool_input":{"command":"git status --short src/lib.rs"},
@@ -507,9 +515,7 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         let task_status = harness.read_response(4, timeout)?;
         let task_status_payload = &task_status["result"]["structuredContent"];
         let task_record = &task_status_payload["task"];
-        let hook_tokens = task_record["hook_window_est_tokens"]
-            .as_u64()
-            .unwrap_or(0);
+        let hook_tokens = task_record["hook_window_est_tokens"].as_u64().unwrap_or(0);
         let hook_kind = task_record["latest_hook_command_kind"]
             .as_str()
             .unwrap_or_default();
@@ -571,7 +577,7 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             &json!({
                 "hook_event_name":"Stop",
                 "task_id":task_id,
-                "session_id":"doctor-session",
+                "session_id":session_id,
                 "cwd": root.display().to_string()
             }),
         )?;

@@ -88,10 +88,10 @@ fn maybe_prepare_handoff_from_hooks(
     if boundary_kind != HookBoundaryKind::None {
         let mut guard = state.lock().map_err(lock_err)?;
         let task = ensure_task_record_mut(&mut guard.tasks, task_id);
-        task.latest_hook_boundary_at_unix = Some(now_unix());
+        task.latest_hook_boundary_at_unix = Some(now_unix_millis());
         task.latest_hook_boundary_kind = Some(format!("{boundary_kind:?}").to_ascii_lowercase());
-        task.hook_soft_threshold_tokens =
-            config.threshold_tokens_for_level_with_budget(ThresholdLevel::Prepare, effective_budget);
+        task.hook_soft_threshold_tokens = config
+            .threshold_tokens_for_level_with_budget(ThresholdLevel::Prepare, effective_budget);
         persist_state(&guard)?;
     }
     let status = broker_task_status(
@@ -173,7 +173,10 @@ fn maybe_prepare_handoff_from_hooks(
                     | HookBoundaryKind::SessionEnd
             );
             if is_stop_boundary
-                && matches!(config.relaunch_preference, RelaunchPreference::DaemonManaged)
+                && matches!(
+                    config.relaunch_preference,
+                    RelaunchPreference::DaemonManaged
+                )
                 && !config.relaunch_command.is_empty()
             {
                 response.relaunch_requested = true;
@@ -220,8 +223,7 @@ fn maybe_prepare_handoff_from_hooks(
             "Packet28 threshold reached. Record the current task objective with packet28.write_intention before stopping."
                 .to_string(),
         );
-    } else if matches!(threshold_level, ThresholdLevel::Warn)
-        && snapshot.latest_intention.is_none()
+    } else if matches!(threshold_level, ThresholdLevel::Warn) && snapshot.latest_intention.is_none()
     {
         // At warn level, nudge the agent to record intent but don't block.
         response.stop_reason = Some(
@@ -429,12 +431,7 @@ pub(crate) fn hook_ingest(
             task_id: task_id.to_string(),
             accepted: true,
             additional_context,
-            ..maybe_prepare_handoff_from_hooks(
-                state,
-                task_id,
-                HookBoundaryKind::None,
-                host_budget,
-            )?
+            ..maybe_prepare_handoff_from_hooks(state, task_id, HookBoundaryKind::None, host_budget)?
         });
     }
 
@@ -1073,7 +1070,10 @@ mod tests {
     #[test]
     fn relaunch_preference_daemon_managed_is_default() {
         let config = HookRuntimeConfig::default();
-        assert_eq!(config.relaunch_preference, RelaunchPreference::DaemonManaged);
+        assert_eq!(
+            config.relaunch_preference,
+            RelaunchPreference::DaemonManaged
+        );
     }
 
     #[test]
@@ -1127,7 +1127,10 @@ mod tests {
         .unwrap();
         assert!(response.handoff_ready);
         assert!(response.relaunch_requested);
-        assert_eq!(response.relaunch_preference, RelaunchPreference::DaemonManaged);
+        assert_eq!(
+            response.relaunch_preference,
+            RelaunchPreference::DaemonManaged
+        );
     }
 
     /// End-to-end test: hook ingest → graduated thresholds → intention write
@@ -1198,13 +1201,9 @@ mod tests {
         assert_eq!(r3.threshold_level, ThresholdLevel::Force);
 
         // Phase 2: Stop without intention → blocked.
-        let blocked = maybe_prepare_handoff_from_hooks(
-            state.clone(),
-            task_id,
-            HookBoundaryKind::Stop,
-            None,
-        )
-        .unwrap();
+        let blocked =
+            maybe_prepare_handoff_from_hooks(state.clone(), task_id, HookBoundaryKind::Stop, None)
+                .unwrap();
         assert!(blocked.block_stop);
         assert!(!blocked.handoff_ready);
 
@@ -1222,20 +1221,16 @@ mod tests {
         .unwrap();
 
         // Phase 4: Stop with intention → handoff fires, relaunch queued.
-        let handoff = maybe_prepare_handoff_from_hooks(
-            state.clone(),
-            task_id,
-            HookBoundaryKind::Stop,
-            None,
-        )
-        .unwrap();
+        let handoff =
+            maybe_prepare_handoff_from_hooks(state.clone(), task_id, HookBoundaryKind::Stop, None)
+                .unwrap();
         assert!(handoff.handoff_ready);
         assert!(handoff.relaunch_requested);
-        assert_eq!(handoff.relaunch_preference, RelaunchPreference::DaemonManaged);
-        assert!(matches!(
-            handoff.threshold_level,
-            ThresholdLevel::Force
-        ));
+        assert_eq!(
+            handoff.relaunch_preference,
+            RelaunchPreference::DaemonManaged
+        );
+        assert!(matches!(handoff.threshold_level, ThresholdLevel::Force));
 
         // Phase 5: Verify window reset.
         let task = load_task_record(&state, task_id).unwrap();
@@ -1245,7 +1240,10 @@ mod tests {
 
         // Phase 6: Verify brief artifact was persisted.
         let brief_path = crate::task_brief_markdown_path(&root, task_id);
-        assert!(brief_path.exists(), "brief.md should be written after handoff");
+        assert!(
+            brief_path.exists(),
+            "brief.md should be written after handoff"
+        );
         let brief_content = std::fs::read_to_string(&brief_path).unwrap();
         assert!(!brief_content.is_empty(), "brief should not be empty");
     }
@@ -1297,6 +1295,9 @@ mod tests {
         .unwrap();
         assert!(response.handoff_ready);
         assert!(!response.relaunch_requested);
-        assert_eq!(response.relaunch_preference, RelaunchPreference::HostManaged);
+        assert_eq!(
+            response.relaunch_preference,
+            RelaunchPreference::HostManaged
+        );
     }
 }

@@ -24,12 +24,27 @@ pub(crate) fn next_action_summary(
         })
 }
 
+fn normalize_timestamp_millis(value: u64) -> u64 {
+    // Older hook fields were persisted in unix seconds while handoff timestamps
+    // are stored in unix milliseconds. Normalize both so repeated handoffs and
+    // resumed tasks can compare boundaries safely.
+    if value < 100_000_000_000 {
+        value.saturating_mul(1_000)
+    } else {
+        value
+    }
+}
+
 pub(crate) fn compute_handoff_state(
     task: Option<&TaskRecord>,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
 ) -> (bool, String) {
-    let latest_handoff_at = task.and_then(|task| task.latest_handoff_generated_at_unix);
-    let latest_hook_boundary_at = task.and_then(|task| task.latest_hook_boundary_at_unix);
+    let latest_handoff_at = task
+        .and_then(|task| task.latest_handoff_generated_at_unix)
+        .map(normalize_timestamp_millis);
+    let latest_hook_boundary_at = task
+        .and_then(|task| task.latest_hook_boundary_at_unix)
+        .map(normalize_timestamp_millis);
     let latest_hook_boundary_kind = task.and_then(|task| task.latest_hook_boundary_kind.as_deref());
     let threshold_exceeded = task.is_some_and(|task| task.hook_threshold_exceeded);
     if snapshot.latest_checkpoint_id.is_none() {
@@ -63,7 +78,8 @@ pub(crate) fn compute_handoff_state(
     let latest_handoff_checkpoint_id =
         task.and_then(|task| task.latest_handoff_checkpoint_id.as_ref());
     let has_newer_intention = snapshot.latest_intention.as_ref().is_some_and(|intention| {
-        latest_handoff_at.is_none_or(|handoff_at| intention.occurred_at_unix > handoff_at)
+        let intention_at = normalize_timestamp_millis(intention.occurred_at_unix);
+        latest_handoff_at.is_none_or(|handoff_at| intention_at > handoff_at)
     });
     let has_state_delta = !snapshot.changed_paths_since_checkpoint.is_empty()
         || !snapshot.changed_symbols_since_checkpoint.is_empty()

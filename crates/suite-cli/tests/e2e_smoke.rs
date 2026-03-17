@@ -3230,26 +3230,28 @@ fn test_packet28_doctor_reports_healthy_stack() {
     )
     .unwrap();
 
-    let output = suite_cmd()
-        .current_dir(dir.path())
-        .args(["doctor", "--root", dir.path().to_str().unwrap(), "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["daemon"]["ok"], true);
-    assert_eq!(payload["index"]["ok"], true);
-    assert!(payload["mcp_config"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["packet28_configured"] == true));
-    assert_eq!(payload["handshake"]["ok"], true);
-    assert_eq!(payload["reducer_round_trip"]["ok"], true);
-    assert!(payload.get("push_notifications").is_some());
-    assert_eq!(payload["handoff_round_trip"]["ok"], true);
+    for _ in 0..2 {
+        let output = suite_cmd()
+            .current_dir(dir.path())
+            .args(["doctor", "--root", dir.path().to_str().unwrap(), "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let payload: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(payload["daemon"]["ok"], true);
+        assert_eq!(payload["index"]["ok"], true);
+        assert!(payload["mcp_config"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["packet28_configured"] == true));
+        assert_eq!(payload["handshake"]["ok"], true);
+        assert_eq!(payload["reducer_round_trip"]["ok"], true);
+        assert!(payload.get("push_notifications").is_some());
+        assert_eq!(payload["handoff_round_trip"]["ok"], true);
+    }
 
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])

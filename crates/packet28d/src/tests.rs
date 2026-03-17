@@ -971,6 +971,30 @@ fn compute_handoff_state_requires_checkpoint_and_tracks_newer_intentions() {
 }
 
 #[test]
+fn compute_handoff_state_accepts_newer_hook_boundaries_with_legacy_second_timestamps() {
+    let snapshot = suite_packet_core::AgentSnapshotPayload {
+        latest_intention: Some(suite_packet_core::AgentIntention {
+            text: "Resume editing beta".to_string(),
+            occurred_at_unix: 1_700_000_001_500,
+            ..suite_packet_core::AgentIntention::default()
+        }),
+        ..suite_packet_core::AgentSnapshotPayload::default()
+    };
+    let task = TaskRecord {
+        task_id: "task-legacy-boundary".to_string(),
+        latest_handoff_generated_at_unix: Some(1_700_000_000_250),
+        latest_hook_boundary_at_unix: Some(1_700_000_001),
+        latest_hook_boundary_kind: Some("stop".to_string()),
+        ..TaskRecord::default()
+    };
+
+    let (ready, reason) = compute_handoff_state(Some(&task), &snapshot);
+
+    assert!(ready);
+    assert!(reason.contains("stop"));
+}
+
+#[test]
 fn checkpoint_context_lines_surface_saved_focus() {
     let snapshot = suite_packet_core::AgentSnapshotPayload {
         latest_checkpoint_id: Some("cp-42".to_string()),
