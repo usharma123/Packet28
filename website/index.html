@@ -15,7 +15,7 @@
 <meta name="twitter:image" content="og-image.png">
 <link rel="icon" type="image/svg+xml" href="logo.svg">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Space+Mono:wght@400;700&display=swap');
 
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -100,23 +100,56 @@ body::after {
   align-items: center;
 }
 
-.hero-ascii {
-  font-size: clamp(6px, 1.3vw, 11px);
-  line-height: 1.15;
-  color: var(--highlight);
-  margin-bottom: 48px;
-  white-space: pre;
-  overflow: hidden;
-  text-shadow:
-    0 0 30px rgba(255, 255, 255, 0.15),
-    0 0 80px rgba(255, 255, 255, 0.04);
-  letter-spacing: 1px;
-  animation: asciiFade 1s ease-out 0.3s both;
+.hero-logo {
+  margin-bottom: 52px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0;
 }
 
-@keyframes asciiFade {
-  from { opacity: 0; transform: translateY(16px); filter: blur(2px); }
-  to   { opacity: 1; transform: translateY(0);    filter: blur(0); }
+.hero-logo-char {
+  font-family: 'Space Mono', monospace;
+  font-size: clamp(46px, 9vw, 96px);
+  font-weight: 700;
+  line-height: 1;
+  display: inline-block;
+  width: 0.62em;
+  text-align: center;
+  color: var(--highlight);
+  position: relative;
+  visibility: hidden;
+}
+
+/* revealed — character visible behind the block */
+.hero-logo-char.revealed {
+  visibility: visible;
+}
+
+/* solid block overlay that sits on top of the char cell */
+.hero-logo-char .block {
+  position: absolute;
+  inset: 0;
+  background: var(--highlight);
+  z-index: 1;
+}
+
+/* "28" — hollow outlined */
+.hero-logo-char.num {
+  font-weight: 700;
+  color: transparent;
+  -webkit-text-stroke: 1.5px var(--dim);
+}
+
+/* settled glow on packet portion */
+.hero-logo.settled .hero-logo-char:not(.num) {
+  text-shadow: 0 0 50px rgba(255, 255, 255, 0.10);
+  transition: text-shadow 0.6s ease-out;
+}
+
+.hero-logo.settled .hero-logo-char.num {
+  -webkit-text-stroke-color: var(--highlight);
+  transition: -webkit-text-stroke-color 0.6s ease-out;
 }
 
 .hero h1 {
@@ -950,7 +983,7 @@ body::after {
   .bench-label { width: 100%; }
   .bench-bar-track { width: 100%; min-height: 44px; border-left: 1px solid var(--border); }
 
-  .hero-ascii { font-size: 6px; }
+  .hero-logo-char { font-size: clamp(32px, 7vw, 56px); }
 
   .install-row { flex-direction: column; max-width: 100%; }
   .install-copy { border-left: 1px solid var(--border); border-top: none; }
@@ -964,7 +997,8 @@ body::after {
 @media (max-width: 480px) {
   .hero h1 { letter-spacing: -1px; }
   .bench-number { letter-spacing: -3px; }
-  .hero-ascii { font-size: 5px; margin-bottom: 28px; }
+  .hero-logo { margin-bottom: 28px; }
+  .hero-logo-char { font-size: clamp(24px, 10vw, 36px); }
 }
 </style>
 </head>
@@ -976,7 +1010,9 @@ body::after {
 <section class="hero" id="hero">
   <canvas id="matrix"></canvas>
   <div class="hero-content">
-    <div class="hero-ascii" id="ascii-art"></div>
+    <div class="hero-logo" id="hero-logo">
+      <span class="hero-logo-char">p<span class="block"></span></span><span class="hero-logo-char">a<span class="block"></span></span><span class="hero-logo-char">c<span class="block"></span></span><span class="hero-logo-char">k<span class="block"></span></span><span class="hero-logo-char">e<span class="block"></span></span><span class="hero-logo-char">t<span class="block"></span></span><span class="hero-logo-char num">2<span class="block"></span></span><span class="hero-logo-char num">8<span class="block"></span></span>
+    </div>
     <h1>Context broker for<br>AI coding agents</h1>
     <p class="hero-sub">
       Hook reducers keep your agent's turns slim. Handoff packets compress cross-turn memory.
@@ -1299,14 +1335,38 @@ body::after {
     setTimeout(function() { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 1500);
   };
 
-  document.getElementById('ascii-art').textContent = [
-    ' ██████╗  █████╗  ██████╗██╗  ██╗███████╗████████╗██████╗  █████╗ ',
-    ' ██╔══██╗██╔══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝╚════██╗██╔══██╗',
-    ' ██████╔╝███████║██║     █████╔╝ █████╗     ██║    █████╔╝╚█████╔╝',
-    ' ██╔═══╝ ██╔══██║██║     ██╔═██╗ ██╔══╝     ██║   ██╔═══╝ ██╔══██╗',
-    ' ██║     ██║  ██║╚██████╗██║  ██╗███████╗   ██║   ███████╗╚█████╔╝',
-    ' ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝ ╚════╝',
-  ].join('\n');
+  // Logo scan — solid block slides left-to-right, revealing each char as it passes
+  (function() {
+    var chars = document.querySelectorAll('.hero-logo-char');
+    var blocks = document.querySelectorAll('.hero-logo-char .block');
+    var logo = document.getElementById('hero-logo');
+    var startDelay = 400;
+    var step = 80;
+
+    // all blocks start hidden, we show one at a time
+    blocks.forEach(function(b) { b.style.display = 'none'; });
+
+    chars.forEach(function(ch, i) {
+      setTimeout(function() {
+        // show this char's cell (still hidden behind block)
+        ch.classList.add('revealed');
+
+        // show block on this cell
+        blocks[i].style.display = 'block';
+
+        // hide block on previous cell (revealing the letter)
+        if (i > 0) blocks[i - 1].style.display = 'none';
+
+        // last char — remove final block after a beat
+        if (i === chars.length - 1) {
+          setTimeout(function() {
+            blocks[i].style.display = 'none';
+            logo.classList.add('settled');
+          }, step);
+        }
+      }, startDelay + i * step);
+    });
+  })();
 
   // Matrix rain
   (function() {
