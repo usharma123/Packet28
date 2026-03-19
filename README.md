@@ -31,7 +31,7 @@ This keeps Packet28 useful as both a context broker and a reducer layer: small i
 
 ## Architecture
 
-Packet28 is a Rust workspace of 24 crates organized into four layers:
+Packet28 is a Rust workspace of 25 crates organized into four layers:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -434,7 +434,7 @@ Operationally:
 | Reducers | `covy-ingest`, `diffy-core`, `testy-core`, `stacky-core`, `buildy-core`, `mapy-core`, `suite-proxy-core`, `suite-ingest` |
 | Context runtime | `context-kernel-core`, `context-memory-core`, `context-scheduler-core`, `contextq-core` |
 | Governance | `guardy-core`, `suite-policy-core` |
-| CLI + daemon | `suite-cli`, `packet28-daemon-core`, `packet28d` |
+| CLI + daemon | `suite-cli`, `packet28-daemon-core`, `packet28d`, `packet28-reducer-core` |
 | Legacy CLIs | `covy-cli`, `diffy-cli`, `testy-cli`, `testy-cli-common` |
 
 ```mermaid
@@ -709,7 +709,7 @@ Repository-local MCP config example: `.mcp.json`.
 
 ## Project Stats
 
-- ~58K lines of Rust across 119 source files
-- ~8K lines of Rust tests across 12 test files
-- 24 crates in the workspace
+- ~83K lines of Rust across 247 source files
+- ~9K lines of Rust tests across 12 test files
+- 25 crates in the workspace
 - 6 binaries (Packet28, packet28-agent, packet28d, covy, diffy, testy)
