@@ -215,7 +215,7 @@ pub(crate) fn run_sequence_for_task(
         }
 
         match result {
-            Ok(response) if rerun => {
+            Ok(_) if rerun => {
                 continue;
             }
             Ok(response) => {
