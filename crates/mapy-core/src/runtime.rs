@@ -658,8 +658,21 @@ pub(crate) fn file_focus_match(
             || normalized_path.starts_with(&candidate)
             || candidate.starts_with(&normalized_path)
     });
+    // Directory sibling: file shares a parent directory with a focus path
+    let dir_sibling = if !explicit_path_match {
+        focus_paths.iter().any(|p| {
+            let candidate = normalize_path(p).to_ascii_lowercase();
+            let candidate_dir = candidate.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            let path_dir = normalized_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            !candidate_dir.is_empty() && candidate_dir == path_dir
+        })
+    } else {
+        false
+    };
     let path_match = if explicit_path_match {
         1.0
+    } else if dir_sibling {
+        0.5
     } else {
         focus_symbols
             .iter()
