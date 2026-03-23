@@ -168,7 +168,7 @@ import static com.example.Util.parse;
 "#;
     let (_, java_imports) = extract_metadata_ast_with_lines(SourceLanguage::Java, java).unwrap();
     let java_imports = java_imports.into_iter().collect::<BTreeSet<_>>();
-    assert!(java_imports.contains("Util"));
+    assert!(java_imports.contains("com.example.Util"));
     assert!(!java_imports.contains("parse"));
 
     let regex_imports = crate::scan::extract_imports(
@@ -180,9 +180,9 @@ import static com.example.Util.parse;
     )
     .into_iter()
     .collect::<BTreeSet<_>>();
-    assert!(regex_imports.contains("util"));
-    assert!(regex_imports.contains("bar"));
-    assert!(regex_imports.contains("Util"));
+    assert!(regex_imports.contains("./util"));
+    assert!(regex_imports.contains("foo/bar"));
+    assert!(regex_imports.contains("com.example.Util"));
 }
 
 #[test]
@@ -208,6 +208,17 @@ fn classifies_top_level_and_windows_test_paths() {
     assert!(crate::scan::is_test_path("test/helpers.py"));
     assert!(crate::scan::is_test_path(r"tests\foo.rs"));
     assert!(!crate::scan::is_test_path("src/tests_support.rs"));
+}
+
+#[test]
+fn excludes_hidden_tmp_paths_from_scan() {
+    assert!(crate::scan::is_generated_or_vendor_path(
+        ".tmp-rtk-reference/src/lib.rs"
+    ));
+    assert!(crate::scan::is_generated_or_vendor_path("foo/.tmp/bar.rs"));
+    assert!(!crate::scan::is_generated_or_vendor_path(
+        "src/tmp_helper.rs"
+    ));
 }
 
 #[test]
@@ -307,6 +318,115 @@ fn focus_symbols_boost_matching_crate_paths_and_attach_symbol_files() {
 }
 
 #[test]
+fn resolves_rust_use_edges_with_module_paths() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("crates/sample/src/foo")).unwrap();
+    std::fs::write(root.join("crates/sample/src/lib.rs"), "pub mod foo;\n").unwrap();
+    std::fs::write(root.join("crates/sample/src/foo/mod.rs"), "pub mod util;\n").unwrap();
+    std::fs::write(
+        root.join("crates/sample/src/foo/util.rs"),
+        "pub fn helper() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("crates/sample/src/foo/worker.rs"),
+        "use super::util::helper;\npub fn run() { helper(); }\n",
+    )
+    .unwrap();
+
+    let env = build_repo_map(RepoMapRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        ..RepoMapRequest::default()
+    })
+    .unwrap();
+
+    assert!(env.payload.edges.iter().any(|edge| {
+        let from = env
+            .files
+            .get(edge.from_file_idx)
+            .map(|file| file.path.as_str())
+            .unwrap_or("");
+        let to = env
+            .files
+            .get(edge.to_file_idx)
+            .map(|file| file.path.as_str())
+            .unwrap_or("");
+        from.ends_with("worker.rs") && to.ends_with("util.rs")
+    }));
+}
+
+#[test]
+fn resolves_relative_typescript_imports_to_local_modules() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/widgets")).unwrap();
+    std::fs::write(
+        root.join("src/widgets/util.ts"),
+        "export const helper = () => 1;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/widgets/index.ts"),
+        "import { helper } from \"./util\";\nexport const run = () => helper();\n",
+    )
+    .unwrap();
+
+    let env = build_repo_map(RepoMapRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        ..RepoMapRequest::default()
+    })
+    .unwrap();
+
+    assert!(env.payload.edges.iter().any(|edge| {
+        let from = env
+            .files
+            .get(edge.from_file_idx)
+            .map(|file| file.path.as_str())
+            .unwrap_or("");
+        let to = env
+            .files
+            .get(edge.to_file_idx)
+            .map(|file| file.path.as_str())
+            .unwrap_or("");
+        from.ends_with("index.ts") && to.ends_with("util.ts")
+    }));
+}
+
+#[test]
+fn extracts_callable_variable_symbols_for_js_and_ts() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/app.ts"),
+        "export const boot = () => 1;\nconst Widget = class Widget {};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app.js"),
+        "const handle = function () { return 1; };\nconst Service = class Service {};\n",
+    )
+    .unwrap();
+
+    let env = build_repo_map(RepoMapRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        ..RepoMapRequest::default()
+    })
+    .unwrap();
+
+    let names = env
+        .symbols
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(names.contains("boot"));
+    assert!(names.contains("Widget"));
+    assert!(names.contains("handle"));
+    assert!(names.contains("Service"));
+}
+
+#[test]
 fn build_repo_index_captures_symbol_lines_and_token_regions() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
@@ -324,6 +444,130 @@ fn build_repo_index_captures_symbol_lines_and_token_regions() {
         .iter()
         .any(|symbol| { symbol.name == "isBlank" && symbol.kind == "method" && symbol.line == 2 }));
     assert_eq!(file.token_lines.get("isblank").cloned(), Some(vec![2, 3]));
+}
+
+#[test]
+fn repo_query_exact_symbol_returns_single_match() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn build_repo_map() {}\n").unwrap();
+    std::fs::write(root.join("src/other.rs"), "pub fn build_repo_mapper() {}\n").unwrap();
+
+    let envelope = build_repo_query(RepoQueryRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        symbol_query: "build_repo_map".to_string(),
+        exact: true,
+        max_results: 5,
+        ..RepoQueryRequest::default()
+    })
+    .unwrap();
+
+    let rich = expand_repo_query_payload(&envelope);
+    assert_eq!(rich.matches.len(), 1);
+    assert_eq!(rich.matches[0].file, "src/lib.rs");
+    assert_eq!(rich.matches[0].symbol, "build_repo_map");
+    assert_eq!(rich.matches[0].line, 1);
+}
+
+#[test]
+fn repo_query_files_only_dedupes_multiple_symbol_hits_per_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn build_repo_map() {}\npub fn build_repo_map_extra() {}\n",
+    )
+    .unwrap();
+
+    let envelope = build_repo_query(RepoQueryRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        symbol_query: "build_repo_map".to_string(),
+        files_only: true,
+        max_results: 5,
+        ..RepoQueryRequest::default()
+    })
+    .unwrap();
+
+    assert_eq!(envelope.payload.matches.len(), 1);
+    assert_eq!(envelope.files.len(), 1);
+    assert_eq!(envelope.files[0].path, "src/lib.rs");
+}
+
+#[test]
+fn repo_query_uses_cache_for_warm_symbol_lookup() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn should_tee() {}\n").unwrap();
+
+    build_repo_map(RepoMapRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        ..RepoMapRequest::default()
+    })
+    .unwrap();
+
+    let envelope = build_repo_query(RepoQueryRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        symbol_query: "should_tee".to_string(),
+        exact: true,
+        max_results: 5,
+        ..RepoQueryRequest::default()
+    })
+    .unwrap();
+
+    assert_eq!(envelope.files[0].path, "src/lib.rs");
+}
+
+#[test]
+fn repo_query_pattern_matches_rust_function_definition() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn should_tee(value: bool) -> bool {\n    value\n}\n",
+    )
+    .unwrap();
+
+    let envelope = build_repo_query(RepoQueryRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        pattern_query: "fn should_tee($$$)".to_string(),
+        language: "rust".to_string(),
+        max_results: 5,
+        ..RepoQueryRequest::default()
+    })
+    .unwrap();
+
+    let rich = expand_repo_query_payload(&envelope);
+    assert_eq!(rich.matches.len(), 1);
+    assert_eq!(rich.matches[0].file, "src/lib.rs");
+    assert_eq!(rich.matches[0].symbol, "should_tee");
+    assert_eq!(rich.matches[0].line, 1);
+}
+
+#[test]
+fn repo_query_pattern_files_only_dedupes_matches_per_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+
+    let envelope = build_repo_query(RepoQueryRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        pattern_query: "fn $NAME($$$)".to_string(),
+        language: "rust".to_string(),
+        selector: "function_item".to_string(),
+        files_only: true,
+        max_results: 5,
+        ..RepoQueryRequest::default()
+    })
+    .unwrap();
+
+    assert_eq!(envelope.payload.matches.len(), 1);
+    assert_eq!(envelope.files.len(), 1);
+    assert_eq!(envelope.files[0].path, "src/lib.rs");
 }
 
 #[test]

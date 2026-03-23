@@ -235,6 +235,18 @@ pub(crate) fn extract_packet_summary(body: &Value) -> Option<String> {
                 .map(|items| items.len())
                 .unwrap_or_default()
         )),
+        ("mapy", "repo_query") => Some(format!(
+            "repo query matches={} query={}",
+            payload
+                .get("matches")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or_default(),
+            payload
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        )),
         ("diffy", "diff_analyze") => Some(format!(
             "diff touched files={}",
             payload

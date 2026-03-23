@@ -18,6 +18,13 @@ pub(crate) enum SourceLanguage {
     Cpp,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SyntaxCandidate {
+    pub kind: String,
+    pub line: usize,
+    pub text: String,
+}
+
 pub(crate) fn detect_source_language(path: &str) -> Option<SourceLanguage> {
     if path.ends_with(".java") {
         return Some(SourceLanguage::Java);
@@ -51,6 +58,20 @@ pub(crate) fn detect_source_language(path: &str) -> Option<SourceLanguage> {
         return Some(SourceLanguage::Cpp);
     }
     None
+}
+
+pub(crate) fn parse_source_language_name(raw: &str) -> Option<SourceLanguage> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "java" => Some(SourceLanguage::Java),
+        "rust" | "rs" => Some(SourceLanguage::Rust),
+        "python" | "py" => Some(SourceLanguage::Python),
+        "typescript" | "ts" => Some(SourceLanguage::TypeScript),
+        "tsx" => Some(SourceLanguage::TypeScriptJsx),
+        "javascript" | "js" | "jsx" => Some(SourceLanguage::JavaScript),
+        "go" | "golang" => Some(SourceLanguage::Go),
+        "cpp" | "c++" | "cc" | "cxx" | "c" | "hpp" | "h" => Some(SourceLanguage::Cpp),
+        _ => None,
+    }
 }
 
 pub(crate) fn symbol_re() -> &'static Regex {
@@ -179,6 +200,42 @@ pub(crate) fn extract_metadata_ast_with_lines(
     }
 }
 
+pub(crate) fn collect_syntax_candidates(
+    language: SourceLanguage,
+    content: &str,
+    selectors: &[String],
+) -> Vec<SyntaxCandidate> {
+    let selectors = selectors
+        .iter()
+        .map(|selector| selector.trim().to_string())
+        .filter(|selector| !selector.is_empty())
+        .collect::<BTreeSet<_>>();
+    match language {
+        SourceLanguage::Java => {
+            JAVA_PARSER.with(|cell| collect_candidates(cell, content, &selectors))
+        }
+        SourceLanguage::Rust => {
+            RUST_PARSER.with(|cell| collect_candidates(cell, content, &selectors))
+        }
+        SourceLanguage::Python => {
+            PYTHON_PARSER.with(|cell| collect_candidates(cell, content, &selectors))
+        }
+        SourceLanguage::TypeScript => {
+            TYPESCRIPT_PARSER.with(|cell| collect_candidates(cell, content, &selectors))
+        }
+        SourceLanguage::TypeScriptJsx => {
+            TSX_PARSER.with(|cell| collect_candidates(cell, content, &selectors))
+        }
+        SourceLanguage::JavaScript => {
+            JAVASCRIPT_PARSER.with(|cell| collect_candidates(cell, content, &selectors))
+        }
+        SourceLanguage::Go => GO_PARSER.with(|cell| collect_candidates(cell, content, &selectors)),
+        SourceLanguage::Cpp => {
+            CPP_PARSER.with(|cell| collect_candidates(cell, content, &selectors))
+        }
+    }
+}
+
 fn extract_java_metadata_ast(content: &str) -> Option<(Vec<IndexedSymbolDef>, Vec<String>)> {
     JAVA_PARSER.with(|cell| {
         let mut parser = cell.borrow_mut();
@@ -244,6 +301,51 @@ fn extract_with_walker(
     Some((symbols.into_iter().collect(), imports.into_iter().collect()))
 }
 
+fn collect_candidates(
+    cell: &RefCell<Option<Parser>>,
+    content: &str,
+    selectors: &BTreeSet<String>,
+) -> Vec<SyntaxCandidate> {
+    let mut parser = cell.borrow_mut();
+    let Some(parser) = parser.as_mut() else {
+        return Vec::new();
+    };
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_candidates_from_node(tree.root_node(), content.as_bytes(), selectors, &mut out);
+    out
+}
+
+fn collect_candidates_from_node(
+    node: Node<'_>,
+    src: &[u8],
+    selectors: &BTreeSet<String>,
+    out: &mut Vec<SyntaxCandidate>,
+) {
+    if node.is_named()
+        && !node.has_error()
+        && (selectors.is_empty() || selectors.contains(node.kind()))
+    {
+        if let Ok(text) = node.utf8_text(src) {
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push(SyntaxCandidate {
+                    kind: node.kind().to_string(),
+                    line: node.start_position().row + 1,
+                    text: text.to_string(),
+                });
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_candidates_from_node(child, src, selectors, out);
+    }
+}
+
 fn walk_java_ast(
     node: Node<'_>,
     src: &[u8],
@@ -279,6 +381,9 @@ fn walk_rust_ast(
         "enum_item" => insert_name_or_identifier(node, src, "enum", symbols),
         "trait_item" => insert_name_or_identifier(node, src, "trait", symbols),
         "type_item" => insert_name_or_identifier(node, src, "type", symbols),
+        "const_item" => insert_name_or_identifier(node, src, "const", symbols),
+        "static_item" => insert_name_or_identifier(node, src, "static", symbols),
+        "mod_item" => insert_name_or_identifier(node, src, "module", symbols),
         "use_declaration" => insert_import_leaf(node, src, imports),
         _ => {}
     }
@@ -293,7 +398,9 @@ fn walk_python_ast(
     imports: &mut BTreeSet<String>,
 ) {
     match node.kind() {
-        "function_definition" => insert_name_or_identifier(node, src, "function", symbols),
+        "function_definition" | "async_function_definition" => {
+            insert_name_or_identifier(node, src, "function", symbols)
+        }
         "class_definition" => insert_name_or_identifier(node, src, "class", symbols),
         "import_statement" | "import_from_statement" => insert_import_leaf(node, src, imports),
         _ => {}
@@ -315,6 +422,9 @@ fn walk_typescript_ast(
         "type_alias_declaration" => insert_name_or_identifier(node, src, "type", symbols),
         "enum_declaration" => insert_name_or_identifier(node, src, "enum", symbols),
         "method_definition" => insert_name_or_identifier(node, src, "method", symbols),
+        "lexical_declaration" | "variable_declarator" => {
+            insert_callable_variable(node, src, symbols)
+        }
         "import_statement" => insert_import_leaf(node, src, imports),
         _ => {}
     }
@@ -332,6 +442,9 @@ fn walk_javascript_ast(
         "function_declaration" => insert_name_or_identifier(node, src, "function", symbols),
         "class_declaration" => insert_name_or_identifier(node, src, "class", symbols),
         "method_definition" => insert_name_or_identifier(node, src, "method", symbols),
+        "lexical_declaration" | "variable_declarator" => {
+            insert_callable_variable(node, src, symbols)
+        }
         "import_statement" => insert_import_leaf(node, src, imports),
         _ => {}
     }
@@ -440,6 +553,33 @@ fn insert_name_or_identifier(
     }
 }
 
+fn insert_callable_variable(node: Node<'_>, src: &[u8], out: &mut BTreeSet<IndexedSymbolDef>) {
+    let Some(kind) = callable_value_kind(node) else {
+        return;
+    };
+    insert_name_or_identifier(node, src, kind, out);
+}
+
+fn callable_value_kind(node: Node<'_>) -> Option<&'static str> {
+    let value = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("initializer"))?;
+    if matches!(
+        value.kind(),
+        "arrow_function"
+            | "function"
+            | "function_expression"
+            | "generator_function"
+            | "generator_function_declaration"
+    ) {
+        return Some("function");
+    }
+    if matches!(value.kind(), "class" | "class_expression") {
+        return Some("class");
+    }
+    None
+}
+
 fn insert_java_import(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
     let Ok(import_text) = node.utf8_text(src) else {
         return;
@@ -452,8 +592,8 @@ fn insert_java_import(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
     let is_static = normalized.starts_with("static ");
     let candidate = normalized.strip_prefix("static ").unwrap_or(&normalized);
 
-    if let Some(leaf) = resolve_java_import_leaf(candidate, is_static) {
-        out.insert(leaf);
+    if let Some(reference) = resolve_java_import_reference(candidate, is_static) {
+        out.insert(reference);
     }
 }
 
@@ -461,8 +601,8 @@ fn insert_import_leaf(node: Node<'_>, src: &[u8], out: &mut BTreeSet<String>) {
     let Some(raw) = find_import_candidate(node, src) else {
         return;
     };
-    if let Some(leaf) = resolve_import_leaf(&raw) {
-        out.insert(leaf);
+    if let Some(reference) = normalize_import_reference(&raw) {
+        out.insert(reference);
     }
 }
 
@@ -477,8 +617,8 @@ pub(crate) fn normalize_import_candidate(raw: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn resolve_java_import_leaf(raw: &str, is_static: bool) -> Option<String> {
-    let normalized = normalize_import_candidate(raw);
+pub(crate) fn resolve_java_import_reference(raw: &str, is_static: bool) -> Option<String> {
+    let normalized = normalize_import_reference(raw)?;
     let trimmed = normalized.trim_end_matches(".*").trim();
     if trimmed.is_empty() {
         return None;
@@ -490,56 +630,81 @@ pub(crate) fn resolve_java_import_leaf(raw: &str, is_static: bool) -> Option<Str
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     let leaf = if is_static {
-        segments.iter().rev().nth(1).copied()
+        Some(segments[..segments.len().saturating_sub(1)].join("."))
     } else {
-        segments.last().copied()
+        Some(segments.join("."))
     }?;
 
-    if is_reserved_word(leaf) {
+    if leaf.is_empty() || is_reserved_word(&leaf) {
         None
     } else {
-        Some(leaf.to_string())
+        Some(leaf)
     }
 }
 
-pub(crate) fn resolve_import_leaf(raw: &str) -> Option<String> {
+pub(crate) fn normalize_import_reference(raw: &str) -> Option<String> {
     let normalized = normalize_import_candidate(raw);
     let trimmed = normalized.trim_end_matches(".*").trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let leaf = if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains(':') {
-        trimmed
-            .rsplit(['/', '\\', ':'])
-            .next()
-            .unwrap_or(trimmed)
-            .trim()
-    } else {
-        trimmed.rsplit('.').next().unwrap_or(trimmed).trim()
-    };
-    if leaf.is_empty() {
-        return None;
-    }
-
-    let stem = leaf
-        .rsplit_once('.')
-        .map(|(base, ext)| {
-            if !base.is_empty()
-                && !ext.is_empty()
-                && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
-            {
-                base
-            } else {
-                leaf
-            }
-        })
-        .unwrap_or(leaf)
-        .trim();
+    let stem = trim_known_import_extension(trimmed).trim();
     if stem.is_empty() || is_reserved_word(stem) {
         None
     } else {
         Some(stem.to_string())
+    }
+}
+
+pub(crate) fn resolve_import_leaf(raw: &str) -> Option<String> {
+    let normalized = normalize_import_reference(raw)?;
+    let leaf = if normalized.contains('/') || normalized.contains('\\') || normalized.contains(':')
+    {
+        normalized
+            .rsplit(['/', '\\', ':'])
+            .next()
+            .unwrap_or(&normalized)
+            .trim()
+    } else {
+        normalized.rsplit('.').next().unwrap_or(&normalized).trim()
+    };
+    if leaf.is_empty() {
+        None
+    } else {
+        Some(leaf.to_string())
+    }
+}
+
+fn trim_known_import_extension(raw: &str) -> &str {
+    let Some((base, ext)) = raw.rsplit_once('.') else {
+        return raw;
+    };
+    if base.is_empty() || ext.is_empty() {
+        return raw;
+    }
+    if matches!(
+        ext,
+        "ts" | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "py"
+            | "rs"
+            | "go"
+            | "java"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "h"
+            | "hh"
+            | "hpp"
+    ) {
+        base
+    } else {
+        raw
     }
 }
 

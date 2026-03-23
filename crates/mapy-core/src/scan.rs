@@ -195,6 +195,12 @@ pub(crate) fn is_source_file(path: &Path) -> bool {
 
 pub(crate) fn is_generated_or_vendor_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
+    if lower
+        .split('/')
+        .any(|segment| segment == ".tmp" || segment == ".temp" || segment.starts_with(".tmp-"))
+    {
+        return true;
+    }
     lower.starts_with(".git/")
         || lower.contains("/.git/")
         || lower.starts_with("target/")
@@ -234,9 +240,9 @@ pub(crate) fn extract_imports(content: &str) -> Vec<String> {
         }
         let matched_line = cap.get(0).map(|m| m.as_str()).unwrap_or("");
         let resolved = if matched_line.trim_start().starts_with("import static ") {
-            resolve_java_import_leaf(target, true)
+            resolve_java_import_reference(target, true)
         } else {
-            resolve_import_leaf(target)
+            normalize_import_reference(target)
         };
         if let Some(normalized) = resolved {
             out.insert(normalized);

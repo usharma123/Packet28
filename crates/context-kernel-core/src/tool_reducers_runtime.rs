@@ -541,3 +541,50 @@ pub(crate) fn run_mapy_repo(
         }),
     })
 }
+
+pub(crate) fn run_mapy_query(
+    ctx: &mut ExecutionContext,
+    _input_packets: &[KernelPacket],
+) -> Result<ReducerResult, KernelError> {
+    let input: mapy_core::RepoQueryRequest = serde_json::from_value(ctx.reducer_input.clone())
+        .map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: format!("invalid reducer input: {source}"),
+        })?;
+
+    let envelope =
+        mapy_core::build_repo_query(input).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?;
+
+    let kernel_packet = KernelPacket {
+        packet_id: Some(format!(
+            "mapy-{}",
+            envelope.hash.chars().take(12).collect::<String>()
+        )),
+        format: default_packet_format(),
+        body: serde_json::to_value(&envelope).map_err(|source| KernelError::ReducerFailed {
+            target: ctx.target.clone(),
+            detail: source.to_string(),
+        })?,
+        token_usage: Some(envelope.budget_cost.est_tokens),
+        runtime_ms: Some(envelope.budget_cost.runtime_ms),
+        metadata: json!({
+            "tool": "mapy",
+            "reducer": "query",
+            "kind": envelope.kind,
+            "hash": envelope.hash,
+            "matches": envelope.payload.matches.len(),
+            "query": envelope.payload.query,
+        }),
+    };
+
+    Ok(ReducerResult {
+        output_packets: vec![kernel_packet],
+        metadata: json!({
+            "reducer": "mapy.query",
+            "kind": "repo_query",
+        }),
+    })
+}

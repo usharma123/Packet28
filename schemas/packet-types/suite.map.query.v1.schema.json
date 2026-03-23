@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite.map.query.v1.schema.json",
+  "title": "Packet Type Contract: suite.map.query.v1",
+  "type": "object",
+  "required": ["schema_version", "packet_type", "packet"],
+  "properties": {
+    "schema_version": {
+      "const": "suite.packet.v1"
+    },
+    "packet_type": {
+      "const": "suite.map.query.v1"
+    },
+    "packet": {
+      "type": "object",
+      "required": ["version", "tool", "kind", "hash", "summary", "budget_cost", "provenance", "payload"],
+      "properties": {
+        "payload": {
+          "type": "object",
+          "required": ["query", "matches", "truncation"],
+          "properties": {
+            "debug": {},
+            "truncated": {},
+            "returned_count": {},
+            "total_count": {},
+            "artifact_handle": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-required_payload_fields": ["query", "matches", "truncation"],
+  "x-optional_payload_fields": ["debug", "artifact_handle"],
+  "x-boundedness_rules": ["match arrays bounded by request limits", "files-with-matches mode can emit file-path-only text output"],
+  "x-compatibility_notes": ["v1 exact symbol query contract"]
+}

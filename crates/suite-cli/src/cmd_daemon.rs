@@ -287,6 +287,7 @@ pub fn run_via_daemon(cli: crate::Cli, _raw_args: &[String]) -> Result<i32> {
         },
         crate::Commands::Map(map) => match map.command {
             crate::MapCommands::Repo(args) => crate::cmd_map_repo::run_remote(args, &daemon_root),
+            crate::MapCommands::Query(args) => crate::cmd_map_query::run_remote(args, &daemon_root),
         },
         crate::Commands::Proxy(proxy) => match proxy.command {
             crate::cmd_proxy::ProxyCommands::Run(args) => {

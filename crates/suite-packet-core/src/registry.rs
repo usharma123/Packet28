@@ -11,6 +11,7 @@ pub const PACKET_TYPE_CONTEXT_MANAGE: &str = "suite.context.manage.v1";
 pub const PACKET_TYPE_STACK_SLICE: &str = "suite.stack.slice.v1";
 pub const PACKET_TYPE_BUILD_REDUCE: &str = "suite.build.reduce.v1";
 pub const PACKET_TYPE_MAP_REPO: &str = "suite.map.repo.v1";
+pub const PACKET_TYPE_MAP_QUERY: &str = "suite.map.query.v1";
 pub const PACKET_TYPE_PROXY_RUN: &str = "suite.proxy.run.v1";
 pub const PACKET_TYPE_CONTEXT_ASSEMBLE: &str = "suite.context.assemble.v1";
 pub const PACKET_TYPE_GUARD_CHECK: &str = "suite.guard.check.v1";
@@ -172,6 +173,16 @@ static CONTRACTS: &[PacketTypeContract] = &[
             "compact mode keeps bounded payload",
         ],
         compatibility_notes: &["legacy packet-detail rich path supported for one release"],
+    },
+    PacketTypeContract {
+        packet_type: PACKET_TYPE_MAP_QUERY,
+        required_payload_fields: &["query", "matches", "truncation"],
+        optional_payload_fields: &["debug", "artifact_handle"],
+        boundedness_rules: &[
+            "match arrays bounded by request limits",
+            "files-with-matches mode can emit file-path-only text output",
+        ],
+        compatibility_notes: &["v1 exact symbol query contract"],
     },
     PacketTypeContract {
         packet_type: PACKET_TYPE_PROXY_RUN,

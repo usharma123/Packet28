@@ -7,9 +7,9 @@ use serde_json::{json, Value};
 use crate::{
     cmd_agent_prompt, cmd_build, cmd_common, cmd_compact, cmd_context, cmd_cover, cmd_daemon,
     cmd_diff, cmd_discover, cmd_doctor, cmd_guard, cmd_hook, cmd_impact, cmd_learn, cmd_map,
-    cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy, cmd_setup, cmd_shard, cmd_stack, BuildCommands,
-    Cli, Commands, ContextCommands, CoverCommands, DiffCommands, GuardCommands, MapCommands,
-    StackCommands, TestCommands,
+    cmd_map_query, cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy, cmd_setup, cmd_shard, cmd_stack,
+    BuildCommands, Cli, Commands, ContextCommands, CoverCommands, DiffCommands, GuardCommands,
+    MapCommands, StackCommands, TestCommands,
 };
 
 pub fn main_entry() {
@@ -87,6 +87,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         },
         Commands::Map(map) => match map.command {
             MapCommands::Repo(args) => cmd_map_repo::run(args),
+            MapCommands::Query(args) => cmd_map_query::run(args),
         },
         Commands::Proxy(proxy) => match proxy.command {
             cmd_proxy::ProxyCommands::Run(args) => cmd_proxy::run(args),
@@ -311,6 +312,14 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
                         args.context_config.is_some(),
                         "Packet28 map repo --context-config <context.yaml>",
                     ),
+                })
+            }
+            MapCommands::Query(args) if args.json.is_some() || args.legacy_json => {
+                Some(MachineErrorContext {
+                    command: "Packet28 map query".to_string(),
+                    pretty: args.pretty,
+                    target: Some("mapy.query".to_string()),
+                    retry_hint: None,
                 })
             }
             _ => None,

@@ -106,6 +106,55 @@ pub struct RepoMapPayloadRich {
     pub truncation: TruncationSummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RepoQueryRequest {
+    pub repo_root: String,
+    pub symbol_query: String,
+    pub pattern_query: String,
+    pub language: String,
+    pub selector: String,
+    pub max_results: usize,
+    pub include_tests: bool,
+    pub exact: bool,
+    pub files_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RepoQueryMatch {
+    pub file_idx: usize,
+    pub symbol_idx: usize,
+    pub line: usize,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RepoQueryPayload {
+    pub query: String,
+    pub matches: Vec<RepoQueryMatch>,
+    pub truncation: TruncationSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RepoQueryMatchRich {
+    pub file: String,
+    pub symbol: String,
+    pub kind: String,
+    pub line: usize,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RepoQueryPayloadRich {
+    pub query: String,
+    pub matches: Vec<RepoQueryMatchRich>,
+    pub truncation: TruncationSummary,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(default)]
 pub struct IndexedSymbolDef {

@@ -39,4 +39,5 @@ pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("buildy.reduce", run_buildy_reduce);
     kernel.register_reducer("proxy.run", run_proxy_run);
     kernel.register_reducer("mapy.repo", run_mapy_repo);
+    kernel.register_reducer("mapy.query", run_mapy_query);
 }

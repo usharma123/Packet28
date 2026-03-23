@@ -102,6 +102,7 @@ pub(crate) fn compact_packet_payload(packet_type: &str, packet: &mut Value) {
     let mut stats = CompactStats::default();
     match packet_type {
         suite_packet_core::PACKET_TYPE_MAP_REPO => compact_map_repo_packet(packet, &mut stats),
+        suite_packet_core::PACKET_TYPE_MAP_QUERY => compact_map_query_packet(packet, &mut stats),
         _ => {
             let Some(payload) = packet.get_mut("payload") else {
                 return;
@@ -175,11 +176,13 @@ fn compact_packet_envelope(packet_type: &str, packet: &mut Value, stats: &mut Co
         suite_packet_core::PACKET_TYPE_STACK_SLICE
         | suite_packet_core::PACKET_TYPE_BUILD_REDUCE
         | suite_packet_core::PACKET_TYPE_MAP_REPO
+        | suite_packet_core::PACKET_TYPE_MAP_QUERY
         | suite_packet_core::PACKET_TYPE_TEST_IMPACT
         | suite_packet_core::PACKET_TYPE_DIFF_ANALYZE => {
             if let Some(Value::Array(files)) = map.get_mut("files") {
                 let limit = match packet_type {
                     suite_packet_core::PACKET_TYPE_MAP_REPO => 3,
+                    suite_packet_core::PACKET_TYPE_MAP_QUERY => 4,
                     suite_packet_core::PACKET_TYPE_STACK_SLICE
                     | suite_packet_core::PACKET_TYPE_BUILD_REDUCE => 2,
                     _ => 8,
@@ -189,6 +192,7 @@ fn compact_packet_envelope(packet_type: &str, packet: &mut Value, stats: &mut Co
             if let Some(Value::Array(symbols)) = map.get_mut("symbols") {
                 let limit = match packet_type {
                     suite_packet_core::PACKET_TYPE_MAP_REPO => 4,
+                    suite_packet_core::PACKET_TYPE_MAP_QUERY => 4,
                     suite_packet_core::PACKET_TYPE_STACK_SLICE
                     | suite_packet_core::PACKET_TYPE_BUILD_REDUCE => 2,
                     _ => 8,
@@ -261,6 +265,21 @@ fn compact_context_assemble_payload(payload: &mut Value, stats: &mut CompactStat
             stats.truncated = true;
             stats.total_count += 1;
         }
+    }
+}
+
+fn compact_map_query_packet(packet: &mut Value, stats: &mut CompactStats) {
+    let Some(payload) = packet.get_mut("payload") else {
+        return;
+    };
+    let Some(map) = payload.as_object_mut() else {
+        compact_value(payload, 16, stats);
+        return;
+    };
+
+    remove_field(map, "debug", stats);
+    if let Some(Value::Array(matches)) = map.get_mut("matches") {
+        cap_array(matches, 8, stats);
     }
 }
 

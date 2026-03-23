@@ -253,6 +253,7 @@ fn packet_type_for(tool: &str, kind: &str) -> String {
         ("stacky", "stack_slice") => suite_packet_core::PACKET_TYPE_STACK_SLICE.to_string(),
         ("buildy", "build_reduce") => suite_packet_core::PACKET_TYPE_BUILD_REDUCE.to_string(),
         ("mapy", "repo_map") => suite_packet_core::PACKET_TYPE_MAP_REPO.to_string(),
+        ("mapy", "repo_query") => suite_packet_core::PACKET_TYPE_MAP_QUERY.to_string(),
         ("agenty", "agent_snapshot") => suite_packet_core::PACKET_TYPE_AGENT_SNAPSHOT.to_string(),
         ("agenty", "agent_state") => suite_packet_core::PACKET_TYPE_AGENT_STATE.to_string(),
         ("contextq", "context_correlate") => {
