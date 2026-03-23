@@ -310,6 +310,7 @@ mod tests {
             PACKET_TYPE_STACK_SLICE,
             PACKET_TYPE_BUILD_REDUCE,
             PACKET_TYPE_MAP_REPO,
+            PACKET_TYPE_MAP_QUERY,
             PACKET_TYPE_PROXY_RUN,
             PACKET_TYPE_CONTEXT_ASSEMBLE,
             PACKET_TYPE_GUARD_CHECK,
