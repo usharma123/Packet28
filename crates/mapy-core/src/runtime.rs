@@ -1809,6 +1809,10 @@ pub(crate) fn focus_term_match_score(candidate: &str, focus_term: &str) -> f64 {
     if candidate.contains(&focus_term) || focus_term.contains(&candidate) {
         return 0.6;
     }
+    if candidate.len() >= 6 && focus_term.len() >= 6 && shared_prefix_len(&candidate, &focus_term) >= 5
+    {
+        return 0.45;
+    }
     0.0
 }
 
@@ -1824,6 +1828,10 @@ fn common_prefix_segments(a: &str, b: &str) -> usize {
         }
     }
     count
+}
+
+fn shared_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(left, right)| left == right).count()
 }
 
 pub(crate) fn normalize_path(path: &str) -> String {
