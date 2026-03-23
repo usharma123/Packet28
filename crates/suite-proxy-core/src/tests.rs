@@ -3,14 +3,14 @@ use crate::{run_and_reduce, ProxyRunRequest};
 #[test]
 fn rejects_unsafe_commands() {
     let err = run_and_reduce(ProxyRunRequest {
-        argv: vec!["cat".to_string(), "/etc/passwd".to_string()],
+        argv: vec!["rm".to_string(), "-rf".to_string(), "/tmp/example".to_string()],
         ..ProxyRunRequest::default()
     })
     .unwrap_err();
 
     assert!(err
         .to_string()
-        .contains("proxy.run only allows: ls, find, grep, git status, git log"));
+        .contains("proxy.run only allows a Packet28-managed safe command subset"));
 }
 
 #[test]
