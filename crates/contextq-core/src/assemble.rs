@@ -179,10 +179,18 @@ pub fn assemble_packets(
         let section_tokens = estimate_section_tokens(&section);
         let section_bytes = estimate_json_bytes(&section);
 
-        if exceeds_budget(used_tokens, section_tokens, options.budget_tokens)
-            || exceeds_budget_usize(used_bytes, section_bytes, options.budget_bytes)
-        {
-            continue;
+        // Small-section exception: sections under 50 tokens always fit if we've
+        // used less than 90% of the budget.  This prevents high-relevance small
+        // sections from being dropped because a single large section consumed
+        // most of the budget.
+        let small_section = section_tokens < 50;
+        let budget_headroom = used_tokens < (options.budget_tokens as f64 * 0.9) as u64;
+        if !small_section || !budget_headroom {
+            if exceeds_budget(used_tokens, section_tokens, options.budget_tokens)
+                || exceeds_budget_usize(used_bytes, section_bytes, options.budget_bytes)
+            {
+                continue;
+            }
         }
 
         used_tokens = used_tokens.saturating_add(section_tokens);
