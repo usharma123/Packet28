@@ -626,3 +626,33 @@ fn file_focus_match_prefers_exact_symbol_matches_over_path_only_matches() {
     assert_eq!(direct, 1.0);
     assert_eq!(indirect, 0.0);
 }
+
+#[test]
+fn file_focus_match_rewards_multiple_path_term_hits() {
+    let focus_paths = Vec::new();
+    let focus_symbols = BTreeSet::from(["assemble".to_string(), "contextq".to_string()]);
+
+    let multi = file_focus_match(
+        "crates/contextq-core/src/assemble.rs",
+        &[],
+        &focus_paths,
+        &focus_symbols,
+    );
+    let single_path = file_focus_match(
+        "crates/contextq-core/src/lib.rs",
+        &[],
+        &focus_paths,
+        &focus_symbols,
+    );
+    let single_file = file_focus_match(
+        "crates/suite-packet-core/src/assemble.rs",
+        &[],
+        &focus_paths,
+        &focus_symbols,
+    );
+
+    assert!(multi > single_path);
+    assert!(multi > single_file);
+    assert_eq!(single_path, 0.3);
+    assert_eq!(single_file, 0.3);
+}
