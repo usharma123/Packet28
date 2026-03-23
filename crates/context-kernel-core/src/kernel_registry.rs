@@ -28,6 +28,7 @@ pub fn load_packet_file(path: &Path) -> Result<KernelPacket, KernelError> {
 pub fn register_v1_reducers(kernel: &mut Kernel) {
     kernel.register_reducer("agenty.state.write", run_agenty_state_write);
     kernel.register_reducer("agenty.state.snapshot", run_agenty_state_snapshot);
+    kernel.register_reducer("packet28.broker_memory.write", run_broker_memory_write);
     kernel.register_reducer("contextq.correlate", run_contextq_correlate);
     kernel.register_reducer("contextq.manage", run_contextq_manage);
     kernel.register_reducer("contextq.assemble", run_contextq_assemble);

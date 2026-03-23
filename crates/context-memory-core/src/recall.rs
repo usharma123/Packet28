@@ -316,6 +316,7 @@ impl PacketCache {
         }
 
         let mut hits = Vec::new();
+        let explicit_telemetry_query = query_explicitly_targets_telemetry(query, options);
         for (cache_key, base_score) in candidate_scores {
             let Some(doc) = self.recall_docs.get(&cache_key) else {
                 continue;
@@ -399,6 +400,9 @@ impl PacketCache {
             let matched_packet_type = !packet_type_filters.is_empty();
 
             let mut score = base_score;
+            let task_scoped_match = task_filter
+                .as_ref()
+                .is_some_and(|task_id| doc.task_ids.iter().any(|item| item == task_id));
             if !matched_paths.is_empty() {
                 score += 2.0;
             }
@@ -411,14 +415,19 @@ impl PacketCache {
             if !symbol_filters.is_empty() && matched_symbols.is_empty() {
                 continue;
             }
-            if let Some(task_id) = task_filter.as_ref() {
-                if doc.task_ids.iter().any(|item| item == task_id) {
-                    score += match options.scope {
-                        RecallScope::Global => 0.35,
-                        RecallScope::TaskFirst | RecallScope::TaskOnly => 1.0,
-                    };
-                }
+            if task_scoped_match {
+                score += match options.scope {
+                    RecallScope::Global => 0.35,
+                    RecallScope::TaskFirst | RecallScope::TaskOnly => 1.0,
+                };
             }
+            score += recall_source_tier_score(
+                doc.source_tier,
+                explicit_telemetry_query,
+                !matched_paths.is_empty(),
+                !matched_symbols.is_empty(),
+                task_scoped_match,
+            );
             score += (1.0_f64 / (1.0_f64 + (age_secs as f64 / 86_400.0_f64))).min(1.0_f64) * 0.25;
 
             if score <= 0.0
@@ -453,10 +462,17 @@ impl PacketCache {
             {
                 match_reasons.push("graph_overlap".to_string());
             }
-            if let Some(task_id) = task_filter.as_ref() {
-                if doc.task_ids.iter().any(|item| item == task_id) {
-                    match_reasons.push("task_scope".to_string());
+            if task_scoped_match {
+                match_reasons.push("task_scope".to_string());
+            }
+            match doc.source_tier {
+                RecallSourceTier::CuratedMemory => {
+                    match_reasons.push("curated_memory".to_string());
                 }
+                RecallSourceTier::Telemetry => {
+                    match_reasons.push("telemetry".to_string());
+                }
+                RecallSourceTier::Standard => {}
             }
 
             hits.push(RecallHit {
@@ -474,6 +490,7 @@ impl PacketCache {
                 packet_types: doc.packet_types.clone(),
                 task_ids: doc.task_ids.clone(),
                 budget_estimate: doc.budget_estimate.clone(),
+                source_tier: doc.source_tier,
             });
         }
 
@@ -484,6 +501,58 @@ impl PacketCache {
                 .then_with(|| a.cache_key.cmp(&b.cache_key))
         });
         hits.into_iter().take(options.limit.max(1)).collect()
+    }
+}
+
+fn query_explicitly_targets_telemetry(query: &str, options: &RecallOptions) -> bool {
+    options
+        .target
+        .as_ref()
+        .is_some_and(|target| target.to_ascii_lowercase().contains("agenty.state"))
+        || options
+            .packet_types
+            .iter()
+            .any(|packet_type| packet_type.to_ascii_lowercase().contains("agent_state"))
+        || tokenize(query).iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "agent"
+                    | "state"
+                    | "event"
+                    | "events"
+                    | "tool"
+                    | "tools"
+                    | "invocation"
+                    | "invocations"
+                    | "focus"
+                    | "telemetry"
+            )
+        })
+}
+
+fn recall_source_tier_score(
+    source_tier: RecallSourceTier,
+    explicit_telemetry_query: bool,
+    has_path_match: bool,
+    has_symbol_match: bool,
+    task_scoped_match: bool,
+) -> f64 {
+    match source_tier {
+        RecallSourceTier::CuratedMemory => 3.0,
+        RecallSourceTier::Telemetry => {
+            let mut score = -3.0;
+            if explicit_telemetry_query {
+                score += 2.5;
+            }
+            if has_path_match || has_symbol_match {
+                score += 1.0;
+            }
+            if task_scoped_match {
+                score += 0.5;
+            }
+            score
+        }
+        RecallSourceTier::Standard => 0.0,
     }
 }
 
@@ -600,5 +669,108 @@ mod tests {
             .match_reasons
             .iter()
             .any(|reason| reason == "packet_type_filter"));
+    }
+
+    #[test]
+    fn curated_memory_outranks_telemetry_for_conceptual_queries() {
+        let mut cache = PacketCache::new();
+        let mut hooks = NoopDeltaReuseHooks;
+
+        let telemetry_lookup = cache.lookup_with_hooks(
+            "agenty.state.write",
+            &serde_json::json!({"task_id":"task-conceptual"}),
+            &mut hooks,
+        );
+        cache.put_with_hooks(
+            "agenty.state.write",
+            &telemetry_lookup,
+            vec![CachePacket {
+                body: serde_json::json!({
+                    "packet_type": "suite.agent.state.v1",
+                    "summary": "tool invocation completed task=task-conceptual tool=Read kind=Read broker context lookup",
+                    "task_id": "task-conceptual",
+                }),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        let curated_lookup = cache.lookup_with_hooks(
+            "packet28.broker_memory.write",
+            &serde_json::json!({"task_id":"task-conceptual"}),
+            &mut hooks,
+        );
+        let curated = cache.put_with_hooks(
+            "packet28.broker_memory.write",
+            &curated_lookup,
+            vec![CachePacket {
+                body: serde_json::json!({
+                    "packet_type": "suite.packet28.broker_memory.v1",
+                    "summary": "Checkpoint handoff for task-conceptual: inspect the broker context and resume from the latest brief",
+                    "task_id": "task-conceptual",
+                }),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        let hits = cache.recall(
+            "broker context handoff resume latest brief",
+            &RecallOptions::default(),
+        );
+
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].cache_key, curated.cache_key);
+        assert_eq!(hits[0].source_tier, RecallSourceTier::CuratedMemory);
+        if let Some(telemetry_index) = hits
+            .iter()
+            .position(|hit| hit.source_tier == RecallSourceTier::Telemetry)
+        {
+            assert!(telemetry_index > 0);
+        }
+    }
+
+    #[test]
+    fn telemetry_remains_searchable_for_explicit_task_activity_queries() {
+        let mut cache = PacketCache::new();
+        let mut hooks = NoopDeltaReuseHooks;
+        let lookup = cache.lookup_with_hooks(
+            "agenty.state.write",
+            &serde_json::json!({"task_id":"task-telemetry"}),
+            &mut hooks,
+        );
+        let stored = cache.put_with_hooks(
+            "agenty.state.write",
+            &lookup,
+            vec![CachePacket {
+                body: serde_json::json!({
+                    "packet_type": "suite.agent.state.v1",
+                    "summary": "tool invocation completed task=task-telemetry seq=7 tool=Read kind=Read",
+                    "task_id": "task-telemetry",
+                    "files": [{"path":"src/main.rs"}],
+                    "symbols": [{"name":"parse_input"}]
+                }),
+                ..CachePacket::default()
+            }],
+            Value::Null,
+            &mut hooks,
+        );
+
+        let hits = cache.recall(
+            "task telemetry tool invocation read src/main.rs parse_input",
+            &RecallOptions {
+                task_id: Some("task-telemetry".to_string()),
+                scope: RecallScope::TaskFirst,
+                path_filters: vec!["src/main.rs".to_string()],
+                symbol_filters: vec!["parse_input".to_string()],
+                ..RecallOptions::default()
+            },
+        );
+
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].cache_key, stored.cache_key);
+        assert_eq!(hits[0].source_tier, RecallSourceTier::Telemetry);
     }
 }

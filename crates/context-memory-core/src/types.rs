@@ -151,6 +151,25 @@ pub struct RecallBudgetEstimate {
     pub runtime_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallSourceTier {
+    CuratedMemory,
+    Telemetry,
+    #[default]
+    Standard,
+}
+
+impl RecallSourceTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecallSourceTier::CuratedMemory => "curated_memory",
+            RecallSourceTier::Telemetry => "telemetry",
+            RecallSourceTier::Standard => "standard",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct RecallHit {
@@ -168,6 +187,7 @@ pub struct RecallHit {
     pub packet_types: Vec<String>,
     pub task_ids: Vec<String>,
     pub budget_estimate: RecallBudgetEstimate,
+    pub source_tier: RecallSourceTier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

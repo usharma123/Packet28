@@ -17,12 +17,14 @@ pub(crate) struct RecallDocument {
     pub(crate) terms: HashMap<String, usize>,
     pub(crate) doc_length: usize,
     pub(crate) budget_estimate: RecallBudgetEstimate,
+    pub(crate) source_tier: RecallSourceTier,
 }
 
 pub(crate) fn build_recall_document(
     entry: &PacketCacheEntry,
     workspace_root: Option<&Path>,
 ) -> RecallDocument {
+    let source_tier = classify_recall_source_tier(entry);
     let mut corpus = Vec::new();
     let mut summaries = Vec::new();
     let mut path_terms = Vec::new();
@@ -134,7 +136,38 @@ pub(crate) fn build_recall_document(
         terms,
         doc_length,
         budget_estimate,
+        source_tier,
     }
+}
+
+fn classify_recall_source_tier(entry: &PacketCacheEntry) -> RecallSourceTier {
+    let target = entry.target.to_ascii_lowercase();
+    if target.starts_with("agenty.state.") {
+        return RecallSourceTier::Telemetry;
+    }
+    if target.starts_with("contextq.")
+        || target.starts_with("packet28.broker_memory.")
+        || target.starts_with("packet28.broker.memory.")
+    {
+        return RecallSourceTier::CuratedMemory;
+    }
+    if entry.packets.iter().any(|packet| {
+        packet
+            .body
+            .get("packet_type")
+            .and_then(Value::as_str)
+            .map(|packet_type| {
+                let packet_type = packet_type.to_ascii_lowercase();
+                packet_type.contains("context.manage")
+                    || packet_type.contains("context.correlate")
+                    || packet_type.contains("context.assemble")
+                    || packet_type.contains("broker_memory")
+            })
+            .unwrap_or(false)
+    }) {
+        return RecallSourceTier::CuratedMemory;
+    }
+    RecallSourceTier::Standard
 }
 
 pub(crate) fn extract_budget_estimate(

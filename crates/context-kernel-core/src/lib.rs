@@ -17,6 +17,7 @@ use context_memory_core::{
 pub use context_memory_core::PersistConfig;
 
 mod agenty_runtime;
+mod broker_memory_runtime;
 mod contextq_runtime;
 mod correlation_runtime;
 mod diff_runtime;
@@ -28,6 +29,7 @@ mod reactive_runtime;
 mod tool_reducers_runtime;
 
 pub(crate) use agenty_runtime::*;
+pub(crate) use broker_memory_runtime::*;
 pub(crate) use contextq_runtime::*;
 pub(crate) use correlation_runtime::*;
 pub use diff_runtime::*;

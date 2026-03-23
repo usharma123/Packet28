@@ -50,10 +50,10 @@ fn build_context_manage_packet(
         kind: "context_manage".to_string(),
         hash: String::new(),
         summary: format!(
-            "context manage task={} working_set={} evictions={}",
+            "task memory for {}: {} relevant packet(s), {} recommended action(s)",
             payload.task_id,
             payload.working_set.len(),
-            payload.eviction_candidates.len()
+            payload.recommended_actions.len()
         ),
         files: payload
             .changed_paths_since_checkpoint
@@ -373,6 +373,7 @@ pub(crate) fn run_contextq_manage(
             score: hit.score,
             summary: hit.summary.clone(),
             reason: hit.match_reasons.first().cloned(),
+            source_tier: Some(hit.source_tier.as_str().to_string()),
             packet_types: hit.packet_types.clone(),
             est_tokens: hit.budget_estimate.est_tokens,
             est_bytes: hit.budget_estimate.est_bytes,
@@ -400,6 +401,7 @@ pub(crate) fn run_contextq_manage(
             score: hit.score,
             summary: hit.summary.clone(),
             reason: Some("outside_working_set_budget".to_string()),
+            source_tier: Some(hit.source_tier.as_str().to_string()),
             packet_types: hit.packet_types.clone(),
             est_tokens: hit.budget_estimate.est_tokens,
             est_bytes: hit.budget_estimate.est_bytes,
