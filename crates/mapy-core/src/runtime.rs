@@ -185,13 +185,34 @@ fn build_repo_map_from_scans(
         .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>();
 
+    // When focus_paths is empty but focus_symbols is provided, derive implicit
+    // proximity anchors from files that contain matching symbols.  This prevents
+    // the 25% proximity weight from being wasted (returning 0.0 for every file).
+    let proximity_paths = if normalized_focus_paths.is_empty() && !focus_symbols.is_empty() {
+        let mut implicit = Vec::new();
+        for (path, scan) in &by_file {
+            let has_match = scan.symbols.iter().any(|(_, name)| {
+                let lower = name.trim().to_ascii_lowercase();
+                focus_symbols
+                    .iter()
+                    .any(|fs| lower == *fs || lower.contains(fs.as_str()) || fs.contains(lower.as_str()))
+            });
+            if has_match {
+                implicit.push(normalize_path(path));
+            }
+        }
+        implicit
+    } else {
+        normalized_focus_paths.clone()
+    };
+
     let mut ranked_files_tmp = Vec::<RankedFileTmp>::new();
     let mut ranked_symbols_tmp = Vec::<RankedSymbolTmp>::new();
 
     for (path, scan) in &by_file {
         let focus_match =
             file_focus_match(path, &scan.symbols, &normalized_focus_paths, &focus_symbols);
-        let change_proximity = proximity_score(path, &normalized_focus_paths);
+        let change_proximity = proximity_score(path, &proximity_paths);
         let degree =
             indegree.get(path).copied().unwrap_or(0) + outdegree.get(path).copied().unwrap_or(0);
         let dependency_centrality = degree as f64 / max_degree as f64;
