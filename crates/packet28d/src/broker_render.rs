@@ -4,6 +4,7 @@ fn packet_source_kind(packet: &suite_packet_core::ContextManagePacketRef) -> Bro
     if packet.target.starts_with("agenty.state.") {
         BrokerSourceKind::SelfAuthored
     } else if packet.target.starts_with("contextq.")
+        || packet.target.starts_with("packet28.broker_memory.")
         || packet.target.starts_with("mapy.")
         || packet.target.starts_with("context.")
     {
@@ -11,6 +12,21 @@ fn packet_source_kind(packet: &suite_packet_core::ContextManagePacketRef) -> Bro
     } else {
         BrokerSourceKind::External
     }
+}
+
+fn render_relevant_context_line(packet: &suite_packet_core::ContextManagePacketRef) -> String {
+    let summary = packet
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let rendered = match (packet.source_tier.as_deref(), summary) {
+        (_, Some(summary)) => summary.to_string(),
+        (Some("curated_memory"), None) => "curated task memory".to_string(),
+        (Some("telemetry"), None) => "task telemetry".to_string(),
+        _ => "relevant context".to_string(),
+    };
+    format!("- {rendered}")
 }
 
 pub(crate) fn load_task_record(
@@ -665,10 +681,7 @@ pub(crate) fn build_broker_sections(
                 request.include_self_context
                     || packet_source_kind(packet) != BrokerSourceKind::SelfAuthored
             })
-            .map(|packet| {
-                let summary = packet.summary.as_deref().unwrap_or("no summary");
-                format!("- {} [{}] {}", packet.target, packet.cache_key, summary)
-            })
+            .map(render_relevant_context_line)
             .collect::<Vec<_>>();
         if !visible_packets.is_empty() {
             sections.push(BrokerSection {

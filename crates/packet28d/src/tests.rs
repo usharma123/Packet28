@@ -750,6 +750,71 @@ fn budget_pruning_drops_optional_sections_before_critical_ones() {
 }
 
 #[test]
+fn relevant_context_renders_human_summaries_without_debug_ids() {
+    let request = BrokerGetContextRequest {
+        task_id: "task-summary".to_string(),
+        include_sections: vec!["relevant_context".to_string()],
+        ..BrokerGetContextRequest::default()
+    };
+    let snapshot = suite_packet_core::AgentSnapshotPayload::default();
+    let manage = suite_packet_core::ContextManagePayload {
+        working_set: vec![
+            suite_packet_core::ContextManagePacketRef {
+                cache_key: "cache-1".to_string(),
+                target: "packet28.broker_memory.write".to_string(),
+                score: 9.0,
+                summary: Some(
+                    "Checkpoint handoff for task-summary: inspect Alpha before editing it"
+                        .to_string(),
+                ),
+                reason: Some("curated_memory".to_string()),
+                source_tier: Some("curated_memory".to_string()),
+                packet_types: vec!["suite.packet28.broker_memory.v1".to_string()],
+                est_tokens: 24,
+                est_bytes: 96,
+                runtime_ms: 1,
+            },
+            suite_packet_core::ContextManagePacketRef {
+                cache_key: "cache-2".to_string(),
+                target: "contextq.manage".to_string(),
+                score: 7.0,
+                summary: Some(
+                    "task memory for task-summary: 2 relevant packet(s), 1 recommended action(s)"
+                        .to_string(),
+                ),
+                reason: Some("curated_memory".to_string()),
+                source_tier: Some("curated_memory".to_string()),
+                packet_types: vec!["suite.context.manage.v1".to_string()],
+                est_tokens: 18,
+                est_bytes: 72,
+                runtime_ms: 1,
+            },
+        ],
+        ..suite_packet_core::ContextManagePayload::default()
+    };
+
+    let sections = build_broker_sections(
+        Path::new("."),
+        &daemon_test_state(),
+        &request,
+        &snapshot,
+        Some(&manage),
+        None,
+    );
+    let relevant_context = sections
+        .iter()
+        .find(|section| section.id == "relevant_context")
+        .expect("relevant_context section should exist");
+    assert!(relevant_context
+        .body
+        .contains("Checkpoint handoff for task-summary"));
+    assert!(!relevant_context.body.contains("cache-1"));
+    assert!(!relevant_context
+        .body
+        .contains("packet28.broker_memory.write"));
+}
+
+#[test]
 fn budget_pruning_shrinks_critical_sections_before_dropping_them() {
     let code_evidence_body = (1..=8)
         .map(|idx| format!("- src/alpha.rs:{idx} evidence line {idx}"))

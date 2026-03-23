@@ -153,6 +153,87 @@ pub(crate) fn slim_broker_response(
     }
 }
 
+fn broker_memory_kind_for_task(state: &Arc<Mutex<DaemonState>>, task_id: &str) -> String {
+    state
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .tasks
+                .tasks
+                .get(task_id)
+                .and_then(|task| task.latest_context_reason.clone())
+        })
+        .filter(|reason| reason == "prepare_handoff")
+        .map(|_| "handoff".to_string())
+        .unwrap_or_else(|| "brief".to_string())
+}
+
+fn broker_memory_summary(
+    task_id: &str,
+    memory_kind: &str,
+    response: &BrokerGetContextResponse,
+) -> String {
+    let headline = response
+        .next_action_summary
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            response
+                .latest_intention
+                .as_ref()
+                .map(|intention| intention.text.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "resume the current task".to_string());
+    match memory_kind {
+        "handoff" => format!("Checkpoint handoff for {task_id}: {headline}"),
+        _ => format!("Current task context for {task_id}: {headline}"),
+    }
+}
+
+fn persist_broker_memory_entry(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    response: &BrokerGetContextResponse,
+) -> Result<()> {
+    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    let memory_kind = broker_memory_kind_for_task(state, task_id);
+    let summary = broker_memory_summary(task_id, &memory_kind, response);
+    let latest_intention_text = response
+        .latest_intention
+        .as_ref()
+        .map(|intention| intention.text.clone());
+    let recommended_actions = response
+        .recommended_actions
+        .iter()
+        .map(|action| action.summary.clone())
+        .collect::<Vec<_>>();
+    kernel.execute(KernelRequest {
+        target: "packet28.broker_memory.write".to_string(),
+        reducer_input: json!({
+            "task_id": task_id,
+            "memory_kind": memory_kind,
+            "summary": summary,
+            "brief": response.brief,
+            "context_version": response.context_version,
+            "artifact_id": response.artifact_id,
+            "next_action_summary": response.next_action_summary,
+            "latest_intention_text": latest_intention_text,
+            "recommended_actions": recommended_actions,
+            "evidence_artifact_ids": response.evidence_artifact_ids,
+            "paths": response.discovered_paths,
+            "symbols": response.discovered_symbols,
+        }),
+        policy_context: json!({
+            "task_id": task_id,
+        }),
+        ..KernelRequest::default()
+    })?;
+    Ok(())
+}
+
 pub(crate) fn write_broker_artifacts(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
@@ -215,6 +296,7 @@ pub(crate) fn write_broker_artifacts(
         fs::write(&state_json_path, serde_json::to_vec_pretty(&state_value)?)
             .with_context(|| format!("failed to write '{}'", state_json_path.display()))?;
     }
+    persist_broker_memory_entry(state, task_id, response)?;
     Ok(hash)
 }
 
