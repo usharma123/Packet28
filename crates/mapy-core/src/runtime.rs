@@ -247,11 +247,19 @@ fn build_repo_map_from_scans(
         } else {
             (0.55, 0.10)
         };
-        let score = focus_weight * focus_match
+        // Penalize test files when they don't directly match focus criteria,
+        // so they don't crowd out implementation files in the top results.
+        let test_penalty = if crate::scan::is_test_path(path) && focus_match < 0.5 {
+            0.7 // multiply score by 0.7
+        } else {
+            1.0
+        };
+        let score = (focus_weight * focus_match
             + 0.25 * change_proximity
             + dependency_weight * dependency_centrality
             + 0.10 * recency_hint
-            + importer_affinity;
+            + importer_affinity)
+            * test_penalty;
 
         ranked_files_tmp.push(RankedFileTmp {
             path: path.clone(),

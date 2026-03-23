@@ -1,0 +1,1121 @@
+=== Running workspace tests ===
+    Blocking waiting for file lock on artifact directory
+   Compiling suite-packet-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-packet-core)
+   Compiling context-memory-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/context-memory-core)
+   Compiling context-scheduler-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/context-scheduler-core)
+   Compiling suite-foundation-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-foundation-core)
+   Compiling suite-policy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-policy-core)
+   Compiling buildy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/buildy-core)
+   Compiling stacky-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/stacky-core)
+   Compiling suite-proxy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-proxy-core)
+   Compiling mapy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/mapy-core)
+   Compiling packet28-reducer-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/packet28-reducer-core)
+   Compiling testy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/testy-core)
+   Compiling diffy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/diffy-core)
+   Compiling contextq-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/contextq-core)
+   Compiling guardy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/guardy-core)
+   Compiling covy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/covy-core)
+   Compiling covy-ingest v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/covy-ingest)
+   Compiling testy-cli-common v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/testy-cli-common)
+   Compiling suite-ingest v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-ingest)
+   Compiling diffy-cli v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/diffy-cli)
+   Compiling context-kernel-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/context-kernel-core)
+   Compiling covy-cli v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/covy-cli)
+   Compiling testy-cli v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/testy-cli)
+   Compiling packet28-daemon-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/packet28-daemon-core)
+   Compiling suite-cli v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-cli)
+   Compiling packet28d v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/packet28d)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 37.31s
+     Running unittests src/lib.rs (target/debug/deps/buildy_core-89d103c7f64420e5)
+
+running 3 tests
+test tests::packet_output_is_deterministic ... ok
+test parse::tests::preserves_trailing_rust_header_without_location ... ok
+test tests::parses_and_groups_diagnostics ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/reducer_smoke.rs (target/debug/deps/reducer_smoke-675a09fa67604347)
+
+running 2 tests
+test build_fixture_reduces_and_groups ... ok
+test build_packet_json_is_stable ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/context_kernel_core-485401ab818e3a8c)
+
+running 40 tests
+test reactive_runtime::tests::unchanged_checkpoint_focus_does_not_trigger_focus_rerun ... ok
+test reactive_runtime::tests::invalid_glob_forces_rerun_instead_of_skipping ... ok
+test reactive_runtime::tests::canceled_map_step_does_not_block_focus_followup_append ... ok
+test tests::caches_reducer_packets_by_request_hash ... ok
+test tests::agenty_state_write_rejects_invalid_event_shape ... ok
+test tests::cache_fingerprint_changes_force_cache_miss ... ok
+test reactive_runtime::tests::appended_focus_map_prunes_satisfied_dependencies ... ok
+test tests::enforces_input_token_budget ... ok
+test tests::errors_for_unknown_target ... ok
+test tests::execute_sequence_with_observer_emits_live_step_events_in_order ... ok
+test tests::executes_sequence_in_dependency_order ... ok
+test tests::contextq_assemble_exposes_budget_trim_metadata ... ok
+test tests::contextq_reducer_assembles_packets ... ok
+test tests::governed_cache_hit_rechecks_output_policy_audits ... ok
+test tests::contextq_assemble_uses_task_snapshot_to_compress_read_sections ... ok
+test tests::governed_assemble_surfaces_governance_audit ... ok
+test tests::guardy_reducer_runs_policy_check ... ok
+test tests::loads_packet_file ... ok
+test tests::guardy_reducer_scans_wrapped_packet_payloads ... ok
+test tests::reactive_mutations_can_append_focused_map_followup ... ok
+test tests::governed_cache_misses_when_policy_content_changes ... ok
+test tests::governed_cache_reuses_entries_for_same_policy_content_across_paths ... ok
+test tests::contextq_manage_uses_focus_filters_to_prefer_matching_packets ... ok
+test tests::policy_enforcement_rejects_disallowed_reducer_execution ... ok
+test tests::sequence_rejects_duplicate_resolved_ids ... ok
+test tests::sequence_rejects_empty_targets ... ok
+test tests::sequence_skips_dependent_step_after_failure ... ok
+test tests::reactive_sequence_cancels_completed_steps_and_releases_dependencies ... ok
+test tests::sequence_autofills_missing_step_ids_and_resolves_dependencies ... ok
+test tests::policy_enforcement_rejects_disallowed_packet_before_contextq ... ok
+test tests::contextq_assemble_can_augment_with_task_memory ... ok
+test tests::sequence_respects_scheduler_budget_cutoff ... ok
+test tests::contextq_correlate_uses_unique_basename_fallback ... ok
+test tests::persistent_kernel_reuses_cache_across_instances ... ok
+test tests::contextq_correlate_emits_shared_file_findings_without_diff ... ok
+test tests::contextq_manage_reports_checkpoint_deltas_and_working_set ... ok
+test tests::contextq_assemble_includes_correlation_findings_for_task ... ok
+test tests::agenty_state_snapshot_derives_current_task_state ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpDewLC0/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpzCSZ1S/.git/
+[master (root-commit) 734f2be] init
+ 2 files changed, 2 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+[master (root-commit) 734f2be] init
+ 2 files changed, 2 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+[master 1f40241] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[master 1f40241] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test tests::reactive_sequence_replaces_map_steps_after_focus_update ... ok
+test tests::diffy_analyze_emits_task_state_focus_packets ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running unittests src/lib.rs (target/debug/deps/context_memory_core-f6c7fe0d74a54add)
+
+running 15 tests
+test cache::tests::hooks_receive_hit_and_put_events ... ok
+test cache::tests::evicts_expired_entries ... ok
+test cache::tests::list_get_and_stats_surface_entry_details ... ok
+test cache::tests::tokenize_expands_identifier_fragments ... ok
+test cache::tests::lookup_hits_after_put ... ok
+test cache::tests::stores_and_reads_by_hash ... ok
+test recall::tests::packet_type_only_queries_can_return_hits ... ok
+test cache::tests::basename_aliases_index_each_path_independently ... ok
+test cache::tests::removing_one_entry_keeps_shared_basename_aliases_live ... ok
+test recall::tests::unknown_task_filter_does_not_fall_back_to_global_related_entries ... ok
+test cache::tests::prune_and_recall_produce_expected_outputs ... ok
+test cache::tests::recall_respects_task_scope_and_structured_filters ... ok
+test cache::tests::load_from_disk_ignores_corrupt_file ... ok
+test cache::tests::load_from_v1_rebuilds_indexes_and_migrates_forward ... ok
+test cache::tests::stores_and_loads_from_disk_roundtrip ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/context_scheduler_core-92e75baadd4369db)
+
+running 8 tests
+test tests::apply_mutations_rejects_duplicate_input_ids ... ok
+test tests::apply_mutations_rejects_cycles_introduced_by_mutations ... ok
+test tests::apply_mutations_supports_cancel_replace_and_append ... ok
+test tests::rejects_unknown_dependency ... ok
+test tests::rejects_dependency_cycles ... ok
+test tests::exits_early_when_budget_exhausted ... ok
+test tests::uses_raw_step_ids_consistently_during_validation_and_sorting ... ok
+test tests::schedules_in_dependency_order ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/contextq_core-c3757d327c9740b7)
+
+running 8 tests
+test tests::default_section_body_uses_pretty_json_in_rich_mode ... ok
+test tests::derives_refs_from_envelope_top_level_refs ... ok
+test tests::compact_assembly_drops_duplicate_section_refs_and_text_blobs ... ok
+test tests::assemble_respects_tight_budget ... ok
+test tests::default_section_body_prefers_packet_summary_in_compact_mode ... ok
+test tests::task_aware_assembly_boosts_focus_and_compresses_read_sections ... ok
+test tests::assemble_dedupes_refs_and_keeps_higher_ranked_sections ... ok
+test tests::assemble_packet_files_reads_inputs ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/fixture_assembly.rs (target/debug/deps/fixture_assembly-88cc1e00a229aa69)
+
+running 2 tests
+test budget_fixture_is_trimmed_to_caps ... ok
+test multi_packet_fixture_dedupes_overlapping_refs ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/covy-b1e03727d915e1b0)
+
+running 23 tests
+test cmd_comment::tests::test_compute_uncovered_blocks_compacts_ranges ... ok
+test cmd_comment::tests::test_render_comment_markdown_basic_snapshot_shape ... ok
+test cmd_annotate::tests::test_uncovered_blocks_generates_exact_locations ... ok
+test cmd_annotate::tests::test_build_sarif_limits_findings_without_post_truncate ... ok
+test cmd_annotate::tests::test_build_sarif_has_required_top_level_shape ... ok
+test cmd_init::tests::test_generate_config_with_reports ... ok
+test cmd_init::tests::test_generate_config_without_reports ... ok
+test cmd_init::tests::test_detect_project_name_fallback_to_dir ... ok
+test cmd_merge::tests::test_resolve_globs_empty_ok ... ok
+test cmd_doctor::tests::test_load_config_checked_reports_precise_path ... ok
+test cmd_init::tests::test_detect_project_name_from_package_json ... ok
+test cmd_init::tests::test_detect_project_name_from_cargo_toml ... ok
+test cmd_map_paths::tests::test_resolve_report_files_deduplicates_and_sorts ... ok
+test cmd_merge::tests::test_write_file_creates_parent_dirs ... ok
+test cmd_init::tests::test_detect_project_name_from_pom_xml ... ok
+test cmd_map_paths::tests::test_write_strip_prefixes_updates_paths_table ... ok
+test cmd_init::tests::test_discover_finds_reports ... ok
+test cmd_init::tests::test_discover_excludes_node_modules_dir ... ok
+test cmd_common::tests::test_resolve_report_globs_for_config_accepts_repo_relative_pattern ... ok
+test cmd_common::tests::test_resolve_report_globs_for_config_uses_config_dir ... ok
+test cmd_init::tests::test_resolve_init_config_path_defaults_to_cwd ... ok
+test cmd_init::tests::test_resolve_init_config_path_honors_explicit_relative_config ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpA0BJfq/.git/
+test cmd_init::tests::test_resolve_init_config_path_repo_root_mode ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/e2e_test.rs (target/debug/deps/e2e_test-79d2a29bc4edc964)
+
+running 61 tests
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpwuFKxE/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpXlrWax/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpFfMbVK/.git/
+[master (root-commit) 1fcc4d3] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[master (root-commit) b94be6d] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[master (root-commit) b94be6d] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+test test_check_missing_input_file_fails_with_usage_code ... ok
+test test_check_without_coverage_and_state_fails ... ok
+test test_check_rejects_conflicting_input_and_stdin ... ok
+test test_deprecation_warning_can_be_enabled_via_env ... ok
+test test_help ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmptGLNGW/.git/
+test test_check_without_issues_still_works ... ok
+test test_check_still_returns_failure_exit_code_when_gate_fails ... ok
+test test_check_json_output_stays_on_stdout ... ok
+test test_diff_returns_failure_exit_code_when_gate_fails ... ok
+test test_impact_and_shard_and_testmap_schema_flags ... ok
+test test_check_input_works_for_state_file ... ok
+test test_check_with_issues_flag ... ok
+test test_check_can_disable_state_issues_loading ... ok
+test test_check_loads_issues_from_state_by_default ... ok
+test test_ingest_accepts_legacy_out_alias_without_warning_noise ... ok
+test test_check_accepts_packed_issues_input ... ok
+test test_ingest_cobertura ... ok
+test test_ingest_gocov ... ok
+test test_check_loads_coverage_from_state_by_default ... ok
+test test_annotate_writes_sarif_artifact ... ok
+test test_impact_record_builds_v2_testmap ... ok
+test test_impact_json_runs_with_diff_integration ... ok
+test test_impact_print_command_outputs_helper ... ok
+test test_impact_legacy_mode_still_works_without_warning_noise ... ok
+test test_comment_writes_markdown_artifact ... ok
+test test_ingest_jacoco ... ok
+test test_ingest_lcov ... ok
+test test_merge_strict_fails_on_corrupt_artifacts ... ok
+test test_merge_non_strict_skips_corrupt_artifacts ... ok
+test test_ingest_issues_creates_state_file ... ok
+test test_pr_help_shows_canonical_output_flags ... ok
+test test_ingest_legacy_out_alias_suppresses_warning_in_json_mode ... ok
+test test_impact_plan_outputs_stable_json_schema ... ok
+test test_pr_typo_hint_prefers_output_comment_canonical ... ok
+test test_ingest_quiet_json_emits_machine_summary ... ok
+test test_ingest_quiet_without_json_emits_machine_summary ... ok
+test test_report_no_data ... ok
+[master (root-commit) b94be6d] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+test test_shard_plan_accepts_whale_lpt_algorithm ... ok
+test test_shard_plan_nightly_tier_keeps_slow_tagged_tasks ... ok
+test test_shard_plan_rejects_invalid_algorithm ... ok
+test test_shard_plan_pr_tier_excludes_slow_tagged_tasks ... ok
+test test_ingest_with_strip_prefix ... ok
+test test_shard_plan_json_and_file_outputs ... ok
+test test_ingest_then_report ... ok
+test test_shard_plan_supports_python_nodeids ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpS7mxeL/.git/
+test test_merge_writes_output_coverage_state ... ok
+test test_shard_update_rejects_invalid_junit_id_granularity ... ok
+test test_shard_plan_supports_tasks_json ... ok
+test test_shard_update_ingests_jsonl_timings ... ok
+test test_shard_update_ingests_junit_xml_timings ... ok
+test test_shard_update_ingests_junit_xml_timings_by_class ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpW3SgAm/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmphPLzgN/.git/
+test test_report_min_coverage_fail ... ok
+test test_merge_writes_output_issues_state ... ok
+test test_testmap_build_json_outputs_summary ... ok
+test test_testmap_build_supports_python_language_metadata ... ok
+test test_testmap_build_writes_test_to_files_index ... ok
+test test_testmap_build_writes_timings_output ... ok
+test test_github_comment_still_works_without_warning_noise ... ok
+[master (root-commit) b94be6d] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[master (root-commit) b94be6d] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[master (root-commit) b94be6d] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+test test_init_defaults_to_cwd_not_git_root ... ok
+test test_pr_json_stdout_is_pure_json ... ok
+test test_pr_writes_both_artifacts ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+     Running unittests src/lib.rs (target/debug/deps/covy_core-3292693dbda2c538)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/diff_test.rs (target/debug/deps/diff_test-7ca4af233148fbf3)
+
+running 5 tests
+test test_parse_empty_diff ... ok
+test test_parse_multiple_hunks ... ok
+test test_parse_new_file_diff ... ok
+test test_parse_multi_file_diff ... ok
+test test_parse_rename_diff ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/gate_test.rs (target/debug/deps/gate_test-a6621d3e36611f8d)
+
+running 7 tests
+test test_full_gate_with_no_diagnostics_keeps_legacy_behavior ... ok
+test test_gate_all_thresholds_pass ... ok
+test test_gate_deleted_files_ignored ... ok
+test test_full_gate_issue_failure ... ok
+test test_gate_changed_lines_fail ... ok
+test test_gate_no_thresholds ... ok
+test test_gate_uncovered_changed_file ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/covy_ingest-39c009783438b60f)
+
+running 19 tests
+test gocov::tests::test_find_module_end ... ok
+test lcov::tests::test_merge_same_file ... ok
+test jacoco::tests::test_parse_jacoco_basic ... ok
+test gocov::tests::test_parse_gocov_empty ... ok
+test jacoco::tests::test_parse_jacoco_multiple_packages ... ok
+test cobertura::tests::test_parse_cobertura_basic ... ok
+test cobertura::tests::test_parse_cobertura_multiple_classes ... ok
+test lcov::tests::test_parse_empty ... ok
+test llvmcov::tests::test_parse_llvmcov_empty_input ... ok
+test lcov::tests::test_parse_basic_lcov ... ok
+test llvmcov::tests::test_parse_llvmcov_multiple_files ... ok
+test llvmcov::tests::test_parse_llvmcov_basic ... ok
+test sarif::tests::parse_empty_runs ... ok
+test sarif::tests::parse_skips_missing_location_or_line ... ok
+test sarif::tests::fingerprint_fallback_hash_is_used ... ok
+test sarif::tests::parse_strips_file_uri_prefix ... ok
+test sarif::tests::parse_uses_rule_index ... ok
+test sarif::tests::parse_basic_fixture ... ok
+test gocov::tests::test_parse_gocov_basic ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/ingest_test.rs (target/debug/deps/ingest_test-f08e68b0d609012f)
+
+running 12 tests
+test test_detect_diagnostics_format_sarif ... ok
+test test_format_detection_lcov ... ok
+test test_format_detection_jacoco ... ok
+test test_format_detection_cobertura ... ok
+test test_format_detection_gocov ... ok
+test test_ingest_lcov ... ok
+test test_ingest_jacoco ... ok
+test test_ingest_cobertura ... ok
+test test_merge_coverage_data ... ok
+test test_ingest_empty_sarif_diagnostics ... ok
+test test_ingest_sarif_diagnostics ... ok
+test test_ingest_gocov ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/diffy-76c18aa820e0de43)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/e2e_smoke.rs (target/debug/deps/e2e_smoke-e2423440151063a2)
+
+running 1 test
+test test_diffy_analyze_smoke ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running unittests src/lib.rs (target/debug/deps/diffy_core-f5488ab6f5d24179)
+
+running 24 tests
+test diff::tests::test_diff_cache_key_stable ... ok
+test diff::tests::test_parse_hunk_deletion_only ... ok
+test diff::tests::test_parse_hunk_range ... ok
+test diff::tests::test_diff_cache_path_ext ... ok
+test diff::tests::test_parse_diff_output_basic ... ok
+test diff::tests::test_parse_diff_rename ... ok
+test diff::tests::test_parse_diff_new_file ... ok
+test diff::tests::test_parse_hunk_single_line ... ok
+test gate::tests::test_gate_fails_total ... ok
+test gate::tests::test_gate_fails_changed ... ok
+test gate::tests::test_gate_passes ... ok
+test gate::tests::test_gate_new_file_coverage ... ok
+test gate::tests::test_gate_no_coverage_data ... ok
+test gate::tests::test_full_gate_combines_coverage_and_issues ... ok
+test gate::tests::test_issue_gate_thresholds ... ok
+test pipeline::tests::test_resolve_coverage_rejects_paths_with_input_when_configured ... ok
+test report::tests::test_format_line_ranges ... ok
+test report::tests::test_format_line_ranges_empty ... ok
+test report::tests::test_render_json ... ok
+test report::tests::test_render_issues_json ... ok
+test pipeline::tests::test_resolve_coverage_missing_default_state_errors ... ok
+test pipeline::tests::test_state_metadata_compatibility_checks_versions_and_root ... ok
+test pipeline::tests::test_resolve_coverage_paths_take_precedence_when_allowed ... ok
+test pipeline::tests::test_resolve_diagnostics_state_selective_by_changed_paths ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/guardy_core-6df5d05909b32f60)
+
+running 11 tests
+test tests::validate_config_rejects_conflicting_canonical_and_legacy_fields ... ok
+test tests::check_packet_paths_from_top_level_refs ... ok
+test tests::validate_config_rejects_invalid_schema_and_rules ... ok
+test tests::check_packet_scans_summary_for_redaction ... ok
+test tests::check_packet_scans_provenance_for_redaction ... ok
+test tests::check_packet_scans_files_and_symbols_for_redaction ... ok
+test tests::file_based_validate_and_check_roundtrip ... ok
+test tests::check_packet_passes_for_compliant_input ... ok
+test tests::validate_config_accepts_legacy_policy_aliases ... ok
+test tests::validate_config_accepts_canonical_policy_shape ... ok
+test tests::check_packet_reports_policy_violations ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/fixture_policy.rs (target/debug/deps/fixture_policy-24d6d858f19346dc)
+
+running 3 tests
+test invalid_context_fixture_fails_validation ... ok
+test valid_context_fixture_passes_validation ... ok
+test denied_packet_fixture_is_rejected ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/mapy_core-3e2fea6f8a758acb)
+
+running 13 tests
+test tests::classifies_top_level_and_windows_test_paths ... ok
+test tests::focus_term_match_score_graduates_exact_and_partial_matches ... ok
+test tests::file_focus_match_prefers_exact_symbol_matches_over_path_only_matches ... ok
+test tests::extracts_import_leaves_without_mangling_common_syntaxes ... ok
+test tests::writes_incremental_cache_file ... ok
+test tests::build_repo_index_captures_symbol_lines_and_token_regions ... ok
+test tests::deterministic_tie_breaks_are_lexical ... ok
+test tests::focus_symbols_boost_matching_crate_paths_and_attach_symbol_files ... ok
+test tests::update_repo_index_only_touches_changed_files ... ok
+test tests::extracts_java_import_edges_from_ast ... ok
+test tests::extracts_java_symbols_with_modifiers ... ok
+test tests::excludes_generated_paths_by_default ... ok
+test tests::extracts_symbols_for_non_java_languages ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/packet28_daemon_core-68223e4de9d7fe81)
+
+running 13 tests
+test integrity::tests::verify_not_installed ... ok
+test paths::tests::socket_path_uses_short_hashed_temp_location ... ok
+test integrity::tests::verify_orphaned_hash ... ok
+test trust::tests::content_change_revokes_trust ... ok
+test trust::tests::untrusted_filter ... ok
+test trust::tests::trust_and_verify_roundtrip ... ok
+test integrity::tests::verify_no_baseline ... ok
+test trust::tests::load_save_roundtrip ... ok
+test trust::tests::revoke_trust_removes_entry ... ok
+test integrity::tests::compute_hash_returns_hex_string ... ok
+test integrity::tests::store_and_verify_roundtrip ... ok
+test integrity::tests::verify_detects_tampering ... ok
+test storage::tests::appends_and_loads_task_events ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/packet28_reducer_core-9915adb9a37c1b2a)
+
+running 75 tests
+test command::tests::declines_shell_expansion ... ok
+test command::tests::declines_shell_composition ... ok
+test filter::tests::aggressive_filter_strips_block_comments ... ok
+test filter::tests::language_detection ... ok
+test filter::tests::aggressive_filter_strips_comments ... ok
+test filter::tests::minimal_filter_collapses_blanks ... ok
+test command::tests::accepts_env_assignments_and_trailing_redirects ... ok
+test command::tests::accepts_supported_truncation_postprocesses ... ok
+test filter::tests::none_filter_preserves_all ... ok
+test fs::tests::classify_sed_declines_mutating_shapes ... ok
+test git::tests::classify_git_show_supports_compact_summary ... ok
+test fs::tests::reduce_head_adds_region ... ok
+test git::tests::reduce_git_fetch_counts_updated_refs ... ok
+test git::tests::reduce_git_diff_produces_compact_preview ... ok
+test git::tests::reduce_git_show_extracts_subject_and_diff_count ... ok
+test github::tests::classify_github_declines_json_and_patch_variants ... ok
+test github::tests::reduce_github_api_summarizes_json_payload ... ok
+test github::tests::reduce_github_list_summarizes_entries ... ok
+test github::tests::reduce_github_pr_checks_summarizes_status_counts ... ok
+test github::tests::reduce_github_pr_view_summarizes_metadata ... ok
+test github::tests::reduce_github_run_view_summarizes_jobs_and_annotations ... ok
+test go::tests::classify_go_declines_json_variants ... ok
+test go::tests::reduce_go_test_summarizes_packages ... ok
+test infra::tests::classify_infra_declines_following_logs ... ok
+test infra::tests::classify_infra_supports_docker_compose_and_kubectl_describe ... ok
+test go::tests::reduce_golangci_lint_mentions_path_and_count ... ok
+test infra::tests::reduce_curl_extracts_html_title ... ok
+test infra::tests::reduce_kubectl_describe_summarizes_identity_and_events ... ok
+test infra::tests::reduce_kubectl_get_mentions_pending_rows ... ok
+test infra::tests::reduce_kubectl_get_summarizes_rows ... ok
+test javascript::tests::classify_javascript_accepts_tsc ... ok
+test javascript::tests::classify_javascript_declines_json_and_fix_variants ... ok
+test javascript::tests::classify_javascript_supports_prettier_next_and_prisma ... ok
+test javascript::tests::reduce_next_build_counts_routes ... ok
+test javascript::tests::reduce_eslint_uses_problem_count ... ok
+test javascript::tests::reduce_prettier_summarizes_files_needing_format ... ok
+test javascript::tests::reduce_vitest_summarizes_results ... ok
+test parser::tests::collapse_blank_lines_works ... ok
+test parser::tests::collapse_repeated_lines_works ... ok
+test parser::tests::extract_json_array_basic ... ok
+test javascript::tests::reduce_tsc_summarizes_errors ... ok
+test parser::tests::extract_json_object_basic ... ok
+test parser::tests::extract_json_object_none_when_missing ... ok
+test parser::tests::extract_json_object_with_strings ... ok
+test parser::tests::parse_result_into_value ... ok
+test parser::tests::parse_result_map ... ok
+test parser::tests::strip_ansi_preserves_plain_text ... ok
+test parser::tests::strip_ansi_removes_color_codes ... ok
+test parser::tests::truncate_output_exact ... ok
+test parser::tests::truncate_output_long ... ok
+test parser::tests::truncate_output_short ... ok
+test parser::types::tests::build_result_files ... ok
+test parser::types::tests::lint_result_summary ... ok
+test parser::types::tests::test_result_summary_all_pass ... ok
+test parser::types::tests::test_result_summary_with_failures ... ok
+test parser::types::tests::test_result_summary_with_skipped ... ok
+test python::tests::classify_python_accepts_python_module_pytest ... ok
+test python::tests::classify_python_declines_json_pytest ... ok
+test python::tests::classify_python_supports_mypy_and_uv_pip ... ok
+test python::tests::reduce_mypy_summarizes_first_error_code ... ok
+test python::tests::reduce_pip_outdated_summarizes_json_rows ... ok
+test python::tests::reduce_ruff_check_mentions_primary_path ... ok
+test python::tests::reduce_pytest_summarizes_results ... ok
+test python::tests::reduce_ruff_format_summarizes_reformat ... ok
+test rust::tests::classify_rust_declines_json_shaping ... ok
+test rust::tests::reduce_rust_test_extracts_result_summary ... ok
+test tee::tests::should_tee_disabled ... ok
+test rust::tests::reduce_rust_build_extracts_paths_and_regions ... ok
+test tee::tests::should_tee_respects_mode ... ok
+test tee::tests::tee_raw_skips_small_output ... ok
+test tests::compact_preview_mentions_groups ... ok
+test tests::normalize_absolute_path_strips_root ... ok
+test tests::parse_grep_output_line_accepts_grep_h_output_for_single_file ... ok
+test tests::parse_grep_output_line_accepts_rg_single_file_output ... ok
+test tee::tests::tee_raw_writes_large_output ... ok
+
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/packet28d-ed9a0a4dacafa26c)
+
+running 43 tests
+test hooks::tests::host_budget_override_changes_effective_budget ... ok
+test hooks::tests::relaunch_preference_daemon_managed_is_default ... ok
+test hooks::tests::graduated_threshold_levels_are_computed_correctly ... ok
+test tests::brief_always_starts_with_supersession_header ... ok
+test tests::budget_pruning_shrinks_critical_sections_before_dropping_them ... ok
+test tests::budget_pruning_drops_optional_sections_before_critical_ones ... ok
+test tests::build_budget_notes_section_is_empty_without_budget_pruning ... ok
+test tests::checkpoint_context_lines_surface_saved_focus ... ok
+test tests::compute_handoff_state_accepts_newer_hook_boundaries_with_legacy_second_timestamps ... ok
+test tests::compute_handoff_state_requires_checkpoint_and_tracks_newer_intentions ... ok
+test tests::derive_query_focus_extracts_symbol_terms ... ok
+test tests::derive_query_focus_filters_stopwords_but_keeps_symbols ... ok
+test tests::definition_hits_outrank_bulk_references ... ok
+test tests::expand_scope_paths_pulls_adjacent_role_files ... ok
+test tests::explicit_limits_override_verbosity_alias ... ok
+test tests::broad_generic_tokens_do_not_outrank_exact_symbol_hits ... ok
+test tests::exact_symbol_query_returns_definition_first_without_fallback ... ok
+test tests::extract_code_evidence_prefers_method_match_over_class_declaration ... ok
+test tests::extract_code_evidence_ignores_license_headers_and_prefers_focus_symbols ... ok
+test tests::extract_code_evidence_prefers_query_hits_and_context ... ok
+test tests::extract_code_evidence_prefers_region_hints_when_present ... ok
+test tests::extract_code_evidence_prefers_symbol_definitions_over_comment_mentions ... ok
+test tests::infer_scope_paths_prefers_explicit_paths ... ok
+test tests::inherit_broker_request_defaults_reuses_previous_follow_up_shape ... ok
+test tests::normalize_plan_steps_trims_and_assigns_missing_ids ... ok
+test tests::omitted_explicit_limits_use_deterministic_action_defaults ... ok
+test tests::postprocess_selected_sections_adds_budget_notes_and_compacts_tool_activity ... ok
+test tests::reducer_search_only_runs_when_evidence_sections_are_allowed ... ok
+test tests::render_task_memory_lines_surfaces_recent_state ... ok
+test tests::extract_code_evidence_skips_unrelated_signatures_when_symbol_focus_exists ... ok
+test tests::choose_tool_uses_the_same_staged_search_planner ... ok
+test tests::prepare_handoff_only_resumes_recorded_handoff_artifacts ... ok
+test tests::vague_query_triggers_fallback_only_after_weak_first_pass ... ok
+test hooks::tests::host_budget_override_affects_threshold_calculation ... ok
+test hooks::tests::duplicate_cached_packet_does_not_grow_hook_window ... ok
+test hooks::tests::successful_handoff_preparation_clears_hook_window ... ok
+test hooks::tests::relaunch_not_requested_when_host_managed ... ok
+test hooks::tests::relaunch_requested_when_daemon_managed_with_command ... ok
+test hooks::tests::edit_invalidation_busts_git_cache ... ok
+test hooks::tests::threshold_level_returned_in_response ... ok
+test hooks::tests::edit_invalidation_busts_fs_cache ... ok
+test hooks::tests::e2e_hook_threshold_handoff_cycle ... ok
+test hooks::tests::threshold_accumulation_triggers_exceeded_without_stop_boundary ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.12s
+
+     Running unittests src/lib.rs (target/debug/deps/stacky_core-c4082e224a4bbb23)
+
+running 2 tests
+test tests::parses_and_dedupes_repeated_failures ... ok
+test tests::packet_output_is_deterministic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/reducer_smoke.rs (target/debug/deps/reducer_smoke-da697e78c0e37458)
+
+running 2 tests
+test stack_fixture_reduces_and_dedupes ... ok
+test stack_packet_json_is_stable ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/suite_cli-a214f57f33e17cc6)
+
+running 57 tests
+test agent_surface::tests::cursor_fragment_mentions_non_trivial_scope ... ok
+test ccusage::tests::parse_ccusage_invalid_returns_none ... ok
+test agent_surface::tests::mcp_example_uses_requested_root ... ok
+test agent_surface::tests::claude_fragment_contains_required_guidance ... ok
+test cmd_daemon_client::tests::normal_daemon_errors_do_not_trigger_protocol_restart ... ok
+test cmd_daemon_client::tests::protocol_mismatch_errors_are_detected ... ok
+test ccusage::tests::parse_ccusage_output_works ... ok
+test cmd_hook::tests::post_tool_skips_reducer_runner_command ... ok
+test cmd_common_machine_support::tests::compact_handle_path_does_not_keep_debug_payload ... ok
+test cmd_hook::tests::pretool_declines_ambiguous_infra_command ... ok
+test cmd_hook::tests::pretool_declines_ambiguous_go_command ... ok
+test cmd_hook::tests::pretool_declines_ambiguous_javascript_command ... ok
+test cmd_hook::tests::pretool_declines_ambiguous_github_command ... ok
+test cmd_common_machine_support::tests::compact_context_assemble_payload_drops_duplicate_bulk_fields ... ok
+test cmd_hook::tests::pretool_declines_ambiguous_fs_sed_command ... ok
+test cmd_hook::tests::pretool_declines_composed_command ... ok
+test cmd_hook::tests::pretool_rewrites_strict_fs_command ... ok
+test cmd_hook::tests::pretool_declines_ambiguous_python_command ... ok
+test cmd_hook::tests::pretool_rewrites_strict_git_command ... ok
+test cmd_hook::tests::pretool_rewrites_strict_github_command ... ok
+test cmd_hook::tests::pretool_rewrites_strict_go_command ... ok
+test cmd_hook::tests::pretool_rewrites_strict_infra_command ... ok
+test cmd_hook::tests::pretool_rewrites_strict_javascript_command ... ok
+test cmd_hook::tests::pretool_rewrites_strict_python_command ... ok
+test cmd_hook::tests::pretool_rewrites_strict_rust_command ... ok
+test cmd_hook::tests::read_reducer_marks_read_operation ... ok
+test cmd_setup::tests::generated_relaunch_is_disabled_when_packet28_agent_is_missing ... ok
+test cmd_setup::tests::generated_relaunch_preserves_custom_commands ... ok
+test cmd_setup::tests::generated_relaunch_uses_packet28_agent_when_available ... ok
+test cmd_setup::tests::select_setup_runtimes_keeps_explicit_runtime_requests ... ok
+test cmd_setup::tests::select_setup_runtimes_prefers_detected_runtimes_for_all ... ok
+test economics::tests::compute_savings_opus ... ok
+test economics::tests::compute_savings_sonnet ... ok
+test economics::tests::format_tokens_various ... ok
+test economics::tests::format_usd_various ... ok
+test packet28_agent::tests::derived_task_id_is_stable ... ok
+test route_registry::tests::declines_read_glob_without_shell_expansion ... ok
+test packet28_agent::tests::wrapper_parser_accepts_wait_for_handoff ... ok
+test packet28_agent::tests::wrapper_parser_accepts_task_id_without_task_text ... ok
+test packet28_agent::tests::wrapper_parser_keeps_child_args_after_separator ... ok
+test route_registry::tests::glob_without_cwd_still_rejects ... ok
+test packet28_agent::tests::wrapper_parser_accepts_task_text ... ok
+test route_registry::tests::routes_cat_with_sed_pipe_to_read_range ... ok
+test route_registry::tests::routes_env_prefixed_reducer_commands ... ok
+test route_registry::tests::routes_grep_glob_path_to_native_tool ... ok
+test route_registry::tests::routes_grep_with_head_pipe_to_native_tool_limit ... ok
+test route_registry::tests::routes_reducer_commands_with_truncation_pipe ... ok
+test route_registry::tests::routes_simple_reads_to_native_tool ... ok
+test route_registry::tests::routes_tree_command_to_native_tool ... ok
+test route_registry::tests::routes_tree_glob_to_native_tool ... ok
+test route_registry::tests::tolerates_trailing_redirects_for_reducer_routes ... ok
+test route_registry::tests::routes_tree_with_head_pipe_to_native_tool_limit ... ok
+test route_registry::tests::glob_no_matches_keeps_original ... ok
+test route_registry::tests::glob_expansion_preserves_flags ... ok
+test route_registry::tests::cargo_test_glob_expansion ... ok
+test route_registry::tests::routes_git_diff_glob_with_cwd ... ok
+test cmd_setup::tests::write_claude_hook_config_installs_packet28_hooks ... ok
+
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/Packet28-e698ff98402879b2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/packet28-agent.rs (target/debug/deps/packet28_agent-04c29978ad35bc0f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/e2e_smoke.rs (target/debug/deps/e2e_smoke-8f0d1eb68b4d5534)
+
+running 87 tests
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpJyW8J4/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpJ2Huox/.git/
+[master (root-commit) e3b52cc] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+[master (root-commit) e3b52cc] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+[master 36efc6b] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[master 36efc6b] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test test_packet28_agent_requires_child_command ... ok
+test test_packet28_agent_returns_child_exit_code ... ok
+test test_packet28_agent_persists_bootstrap_and_exports_env ... ok
+test test_compact_packets_respect_byte_slo_and_estimate ... ok
+   Compiling suite-packet-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-packet-core)
+   Compiling context-memory-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/context-memory-core)
+   Compiling context-scheduler-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/context-scheduler-core)
+   Compiling suite-foundation-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-foundation-core)
+   Compiling suite-policy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-policy-core)
+   Compiling stacky-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/stacky-core)
+   Compiling mapy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/mapy-core)
+   Compiling suite-proxy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-proxy-core)
+   Compiling buildy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/buildy-core)
+   Compiling packet28-reducer-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/packet28-reducer-core)
+   Compiling diffy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/diffy-core)
+   Compiling testy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/testy-core)
+   Compiling contextq-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/contextq-core)
+   Compiling guardy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/guardy-core)
+   Compiling covy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/covy-core)
+   Compiling covy-ingest v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/covy-ingest)
+   Compiling testy-cli-common v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/testy-cli-common)
+   Compiling context-kernel-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/context-kernel-core)
+   Compiling packet28-daemon-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/packet28-daemon-core)
+   Compiling packet28d v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/packet28d)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.05s
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpQHllLT/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpxSpVtB/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpm3U7Cy/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmp1QVacX/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmph9PUpI/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpkLT8in/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpGcnhjg/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpIKw44I/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpWgo0rs/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpUQX8v8/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmp89v2Lm/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmp2xMjzJ/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpDwFcIk/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpzwFsGK/.git/
+[master (root-commit) 4fed1e4] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+test test_packet28_agent_bootstraps_broker_session ... ok
+test test_packet28_hook_pretool_rewrites_supported_python_command ... ok
+test test_packet28_hook_pretool_rewrites_supported_infra_command ... ok
+test test_packet28_hook_pretool_rewrites_supported_go_command ... ok
+test test_packet28_hook_pretool_rewrites_supported_git_command ... ok
+test test_packet28_hook_pretool_rewrites_supported_javascript_command ... ok
+test test_packet28_hook_pretool_rewrites_supported_github_command ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpxqj5N5/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpm4zZN8/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpyx3goK/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpnl9IgB/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpJdxHt1/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpMTYluh/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpATgVbc/.git/
+test test_packet28_daemon_task_await_handoff_reports_ready_status ... ok
+test test_packet28_mcp_accepts_newline_json_stdio ... ok
+[master (root-commit) cc182a9] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+test test_packet28_agent_resumes_from_checkpoint_handoff ... ok
+test test_suite_agent_prompt_outputs_all_supported_fragments ... ok
+test test_suite_agent_prompt_root_is_reflected_in_command_example ... ok
+test test_suite_build_reduce_governed_smoke ... ok
+test test_suite_context_assemble_governed_smoke ... ok
+test test_packet28_daemon_task_launch_agent_spawns_child_from_handoff ... ok
+test test_suite_context_assemble_machine_failure_emits_suite_error_v1 ... ok
+test test_suite_context_assemble_smoke ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpS0Xfud/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpIXzByH/.git/
+test test_suite_context_assemble_task_id_compresses_read_section ... ok
+test test_suite_context_correlate_emits_v1_findings ... ok
+test test_packet28_agent_wait_for_handoff_times_out_when_checkpoint_missing ... ok
+test test_suite_context_recall_returns_recent_hits ... ok
+test test_suite_context_state_append_then_snapshot ... ok
+test test_suite_cover_check_report_json_compat_maps_to_packet_wrapper ... ok
+test test_suite_cover_check_rich_json_smoke ... ok
+test test_suite_context_store_cli_list_get_prune_stats_json ... ok
+test test_suite_cover_check_smoke ... ok
+test test_suite_cover_check_terminal_default ... ok
+test test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpzJjB3I/.git/
+test test_packet28_mcp_write_intention_derives_task_id_from_full_text ... ok
+test test_packet28_mcp_native_tools_return_slim_results_and_fetch_full_artifacts ... ok
+Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpATgVbc/slow_mcp.py", line 34, in <module>
+    write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "slow", "version": "1"}}})
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpATgVbc/slow_mcp.py", line 21, in write_message
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe
+  File "/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpATgVbc/slow_mcp.py", line 34, in <module>
+    write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "slow", "version": "1"}}})
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpATgVbc/slow_mcp.py", line 21, in write_message
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe
+  File "/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpATgVbc/slow_mcp.py", line 34, in <module>
+    write_message({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "slow", "version": "1"}}})
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpATgVbc/slow_mcp.py", line 21, in write_message
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpTEvgJa/.git/
+test test_packet28_hook_reducer_runner_reuses_cached_summary_without_rerunning_command ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmp0tOqpA/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpfxLwqV/.git/
+test test_packet28_daemon_task_await_handoff_can_require_newer_context_version ... ok
+test test_packet28_mcp_proxy_caches_tool_catalog_and_respects_timeout_ms ... FAILED
+test test_packet28_mcp_proxy_namespaces_colliding_tools ... ok
+test test_suite_context_non_assemble_via_daemon_smoke ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpRC56JI/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpTv3248/.git/
+test test_packet28_mcp_native_read_auto_captures_regions ... ok
+test test_packet28_mcp_proxy_compacts_allowlisted_read_tool_results ... ok
+test test_suite_daemon_start_status_stop_cycle ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpmW0edB/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpMSMG9l/.git/
+[master (root-commit) cc182a9] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpokSoDM/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmphRtwpz/.git/
+[master (root-commit) cc182a9] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+test test_suite_diff_analyze_governed_json_metadata_shape ... ok
+test test_suite_diff_analyze_governed_smoke ... ok
+test test_suite_diff_analyze_json_includes_cache_block ... ok
+test test_suite_diff_analyze_smoke ... ok
+[master (root-commit) cc182a9] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+[master (root-commit) cc182a9] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+test test_suite_guard_check_exit_code_stable_for_denied_packet ... ok
+test test_suite_guard_check_detects_wrapped_packet_redaction ... ok
+test test_suite_daemon_index_rebuild_and_status ... ok
+test test_suite_guard_validate_exit_code_stable_for_invalid_config ... ok
+[master 91c327d] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test test_suite_guard_validate_smoke ... ok
+test test_suite_guard_validate_with_context_config_flag ... ok
+test test_suite_guard_check_smoke ... ok
+[master (root-commit) cc182a9] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+[master (root-commit) cc182a9] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+[master 91c327d] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test test_suite_map_repo_json_smoke ... ok
+test test_suite_map_repo_cache_flag_writes_kernel_cache_file ... ok
+test test_suite_map_repo_legacy_json_compat_shape ... ok
+[master 91c327d] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[master 91c327d] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test test_suite_map_repo_rich_json_smoke ... ok
+test test_suite_map_repo_rich_governed_section_body_uses_rich_payload ... ok
+test test_suite_map_repo_profiles_and_handle_fetch_share_hash ... ok
+test test_suite_proxy_run_json_smoke ... ok
+test test_suite_proxy_run_cache_flag_writes_kernel_cache_file ... ok
+test test_suite_map_repo_terminal_shows_cache_hit_and_miss ... ok
+test test_suite_proxy_run_rich_json_smoke ... ok
+test test_suite_proxy_run_rich_governed_section_body_uses_rich_payload ... ok
+test test_suite_governed_local_workflow_smoke ... ok
+[master 91c327d] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test test_suite_output_flag_writes_to_file ... ok
+test test_suite_proxy_run_profiles_and_handle_fetch_share_hash ... ok
+[master 91c327d] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test test_suite_stack_slice_governed_smoke ... ok
+test test_suite_test_impact_governed_json_metadata_shape ... ok
+test test_suite_test_impact_governed_smoke ... ok
+test test_suite_test_impact_smoke ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpEV8g8t/.git/
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmp7jlGkC/.git/
+test test_suite_daemon_suppresses_disconnect_log_noise ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpZtYUtL/.git/
+test test_suite_diff_analyze_task_id_propagates_focus_to_map_repo ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpHIFS8Y/.git/
+test test_suite_diff_analyze_via_daemon_matches_packet_shape ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmp9EZHle/.git/
+test test_suite_recall_json_surfaces_summary_field ... ok
+test test_suite_recall_prefers_summary_snippet_over_target_name ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpKODzb3/.git/
+test test_suite_stack_and_build_via_daemon_emit_packet_wrappers ... ok
+test test_suite_daemon_task_submit_accepts_pascal_case_watch_kind ... ok
+test test_suite_daemon_failed_submit_cleans_up_task_and_watches ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpLNgE0j/.git/
+test test_suite_daemon_task_submit_returns_watch_id_and_watch_list ... ok
+test test_suite_daemon_task_submit_autofills_blank_and_missing_step_ids ... ok
+Initialized empty Git repository in /private/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/.tmpBCct7Z/.git/
+test test_suite_test_map_and_shard_via_daemon_auto_start ... ok
+[master (root-commit) ca55492] init
+ 2 files changed, 10 insertions(+)
+ create mode 100644 src/alpha.rs
+ create mode 100644 src/beta.rs
+test test_suite_via_daemon_uses_explicit_daemon_root_for_map_repo ... ok
+test test_suite_via_daemon_honors_daemon_root_env ... ok
+[master 55e83e4] change alpha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test test_suite_via_daemon_diff_wrapper_surfaces_cache_hit ... ok
+test test_packet28_doctor_reports_healthy_runtime ... ok
+test test_packet28_doctor_reports_healthy_stack ... ok
+
+failures:
+
+---- test_packet28_mcp_proxy_caches_tool_catalog_and_respects_timeout_ms stdout ----
+
+thread 'test_packet28_mcp_proxy_caches_tool_catalog_and_respects_timeout_ms' (186395) panicked at crates/suite-cli/tests/e2e_smoke.rs:208:5:
+proxy tool catalog never exposed required tool 'slow.read'
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_packet28_mcp_proxy_caches_tool_catalog_and_respects_timeout_ms
+
+test result: FAILED. 86 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 42.21s
+
+error: test failed, to rerun pass `-p suite-cli --test e2e_smoke`
+TESTS FAILED
+
+=== Target crate tests ===
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling suite-packet-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-packet-core)
+   Compiling mapy-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/mapy-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.50s
+     Running unittests src/lib.rs (target/debug/deps/mapy_core-26d7a49b889aba5b)
+
+running 13 tests
+test tests::classifies_top_level_and_windows_test_paths ... ok
+test tests::focus_term_match_score_graduates_exact_and_partial_matches ... ok
+test tests::file_focus_match_prefers_exact_symbol_matches_over_path_only_matches ... ok
+test tests::extracts_import_leaves_without_mangling_common_syntaxes ... ok
+test tests::build_repo_index_captures_symbol_lines_and_token_regions ... ok
+test tests::deterministic_tie_breaks_are_lexical ... ok
+test tests::extracts_java_import_edges_from_ast ... ok
+test tests::extracts_java_symbols_with_modifiers ... ok
+test tests::writes_incremental_cache_file ... ok
+test tests::update_repo_index_only_touches_changed_files ... ok
+test tests::focus_symbols_boost_matching_crate_paths_and_attach_symbol_files ... ok
+test tests::excludes_generated_paths_by_default ... ok
+test tests::extracts_symbols_for_non_java_languages ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+   Doc-tests mapy_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+  mapy-core: PASS
+    Blocking waiting for file lock on package cache
+   Compiling suite-packet-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-packet-core)
+   Compiling suite-foundation-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-foundation-core)
+   Compiling contextq-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/contextq-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.44s
+     Running unittests src/lib.rs (target/debug/deps/contextq_core-320fd79e1ad4214b)
+
+running 8 tests
+test tests::compact_assembly_drops_duplicate_section_refs_and_text_blobs ... ok
+test tests::assemble_respects_tight_budget ... ok
+test tests::default_section_body_uses_pretty_json_in_rich_mode ... ok
+test tests::default_section_body_prefers_packet_summary_in_compact_mode ... ok
+test tests::derives_refs_from_envelope_top_level_refs ... ok
+test tests::assemble_dedupes_refs_and_keeps_higher_ranked_sections ... ok
+test tests::task_aware_assembly_boosts_focus_and_compresses_read_sections ... ok
+test tests::assemble_packet_files_reads_inputs ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/fixture_assembly.rs (target/debug/deps/fixture_assembly-1e2b68b0a07a58d2)
+
+running 2 tests
+test budget_fixture_is_trimmed_to_caps ... ok
+test multi_packet_fixture_dedupes_overlapping_refs ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+   Doc-tests contextq_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+  contextq-core: PASS
+    Blocking waiting for file lock on artifact directory
+   Compiling suite-packet-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/suite-packet-core)
+   Compiling packet28-reducer-core v0.2.31 (/Users/utsavsharma/Documents/GitHub/Coverage/crates/packet28-reducer-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 56.94s
+     Running unittests src/lib.rs (target/debug/deps/packet28_reducer_core-15fdcd2b31a7f6f2)
+
+running 75 tests
+test filter::tests::aggressive_filter_strips_block_comments ... ok
+test filter::tests::aggressive_filter_strips_comments ... ok
+test filter::tests::minimal_filter_collapses_blanks ... ok
+test filter::tests::language_detection ... ok
+test command::tests::declines_shell_composition ... ok
+test command::tests::declines_shell_expansion ... ok
+test command::tests::accepts_env_assignments_and_trailing_redirects ... ok
+test filter::tests::none_filter_preserves_all ... ok
+test fs::tests::classify_sed_declines_mutating_shapes ... ok
+test git::tests::classify_git_show_supports_compact_summary ... ok
+test command::tests::accepts_supported_truncation_postprocesses ... ok
+test git::tests::reduce_git_fetch_counts_updated_refs ... ok
+test fs::tests::reduce_head_adds_region ... ok
+test git::tests::reduce_git_diff_produces_compact_preview ... ok
+test git::tests::reduce_git_show_extracts_subject_and_diff_count ... ok
+test github::tests::classify_github_declines_json_and_patch_variants ... ok
+test github::tests::reduce_github_api_summarizes_json_payload ... ok
+test github::tests::reduce_github_list_summarizes_entries ... ok
+test github::tests::reduce_github_pr_checks_summarizes_status_counts ... ok
+test github::tests::reduce_github_pr_view_summarizes_metadata ... ok
+test github::tests::reduce_github_run_view_summarizes_jobs_and_annotations ... ok
+test go::tests::classify_go_declines_json_variants ... ok
+test go::tests::reduce_go_test_summarizes_packages ... ok
+test infra::tests::classify_infra_declines_following_logs ... ok
+test go::tests::reduce_golangci_lint_mentions_path_and_count ... ok
+test infra::tests::classify_infra_supports_docker_compose_and_kubectl_describe ... ok
+test infra::tests::reduce_curl_extracts_html_title ... ok
+test infra::tests::reduce_kubectl_describe_summarizes_identity_and_events ... ok
+test infra::tests::reduce_kubectl_get_mentions_pending_rows ... ok
+test infra::tests::reduce_kubectl_get_summarizes_rows ... ok
+test javascript::tests::classify_javascript_accepts_tsc ... ok
+test javascript::tests::classify_javascript_declines_json_and_fix_variants ... ok
+test javascript::tests::classify_javascript_supports_prettier_next_and_prisma ... ok
+test javascript::tests::reduce_eslint_uses_problem_count ... ok
+test javascript::tests::reduce_next_build_counts_routes ... ok
+test javascript::tests::reduce_prettier_summarizes_files_needing_format ... ok
+test javascript::tests::reduce_tsc_summarizes_errors ... ok
+test parser::tests::collapse_blank_lines_works ... ok
+test javascript::tests::reduce_vitest_summarizes_results ... ok
+test parser::tests::collapse_repeated_lines_works ... ok
+test parser::tests::extract_json_array_basic ... ok
+test parser::tests::extract_json_object_basic ... ok
+test parser::tests::extract_json_object_none_when_missing ... ok
+test parser::tests::extract_json_object_with_strings ... ok
+test parser::tests::parse_result_into_value ... ok
+test parser::tests::parse_result_map ... ok
+test parser::tests::strip_ansi_preserves_plain_text ... ok
+test parser::tests::strip_ansi_removes_color_codes ... ok
+test parser::tests::truncate_output_exact ... ok
+test parser::tests::truncate_output_long ... ok
+test parser::tests::truncate_output_short ... ok
+test parser::types::tests::build_result_files ... ok
+test parser::types::tests::lint_result_summary ... ok
+test parser::types::tests::test_result_summary_all_pass ... ok
+test parser::types::tests::test_result_summary_with_failures ... ok
+test parser::types::tests::test_result_summary_with_skipped ... ok
+test python::tests::classify_python_accepts_python_module_pytest ... ok
+test python::tests::classify_python_declines_json_pytest ... ok
+test python::tests::classify_python_supports_mypy_and_uv_pip ... ok
+test python::tests::reduce_mypy_summarizes_first_error_code ... ok
+test python::tests::reduce_pip_outdated_summarizes_json_rows ... ok
+test python::tests::reduce_pytest_summarizes_results ... ok
+test python::tests::reduce_ruff_check_mentions_primary_path ... ok
+test python::tests::reduce_ruff_format_summarizes_reformat ... ok
+test rust::tests::classify_rust_declines_json_shaping ... ok
+test rust::tests::reduce_rust_build_extracts_paths_and_regions ... ok
+test rust::tests::reduce_rust_test_extracts_result_summary ... ok
+test tee::tests::should_tee_disabled ... ok
+test tee::tests::should_tee_respects_mode ... ok
+test tee::tests::tee_raw_skips_small_output ... ok
+test tests::compact_preview_mentions_groups ... ok
+test tests::normalize_absolute_path_strips_root ... ok
+test tests::parse_grep_output_line_accepts_grep_h_output_for_single_file ... ok
+test tests::parse_grep_output_line_accepts_rg_single_file_output ... ok
+test tee::tests::tee_raw_writes_large_output ... ok
+
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests packet28_reducer_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+  packet28-reducer-core: PASS
+
+=== Benchmark: cargo test -p mapy-core ===
+
+=== Results ===
+run_id:        d61ce50-1774271767
+tests_pass:    false
+test_time_ms:  147731
+avg_latency:   0ms
+score:         0
+
+Row appended to autoresearch/results.tsv
+Log: autoresearch/logs/d61ce50-1774271767.log
+
+=== Verify local Packet28 setup ===
+  packet28 setup --root .
+  packet28 doctor --root .
