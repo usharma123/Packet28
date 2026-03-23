@@ -600,6 +600,7 @@ fn update_repo_index_only_touches_changed_files() {
 fn focus_term_match_score_graduates_exact_and_partial_matches() {
     assert_eq!(focus_term_match_score("shuffle", "shuffle"), 1.0);
     assert_eq!(focus_term_match_score("shuffleConfig", "shuffle"), 0.6);
+    assert_eq!(focus_term_match_score("assemble", "assembly"), 0.45);
     assert_eq!(focus_term_match_score("ArrayUtils", "shuffle"), 0.0);
 }
 
@@ -655,4 +656,37 @@ fn file_focus_match_rewards_multiple_path_term_hits() {
     assert!(multi > single_file);
     assert_eq!(single_path, 0.3);
     assert_eq!(single_file, 0.3);
+}
+
+#[test]
+fn build_repo_map_prefers_stem_close_multi_term_paths() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("crates/contextq-core/src")).unwrap();
+    std::fs::create_dir_all(root.join("crates/assembly-core/src")).unwrap();
+    std::fs::write(root.join("crates/contextq-core/src/assemble.rs"), "pub fn run() {}\n").unwrap();
+    std::fs::write(root.join("crates/contextq-core/src/lib.rs"), "pub fn lib() {}\n").unwrap();
+    std::fs::write(root.join("crates/assembly-core/src/lib.rs"), "pub fn lib() {}\n").unwrap();
+
+    let env = build_repo_map(RepoMapRequest {
+        repo_root: root.to_string_lossy().to_string(),
+        focus_symbols: vec!["assembly".to_string(), "contextq".to_string()],
+        max_files: 3,
+        max_symbols: 8,
+        ..RepoMapRequest::default()
+    })
+    .unwrap();
+
+    let ranked_paths = env
+        .payload
+        .files_ranked
+        .iter()
+        .filter_map(|ranked| env.files.get(ranked.file_idx))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        ranked_paths.first().map(String::as_str),
+        Some("crates/contextq-core/src/assemble.rs")
+    );
 }
