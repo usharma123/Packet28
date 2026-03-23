@@ -1733,16 +1733,7 @@ pub(crate) fn file_focus_match(
     let path_match = if explicit_path_match {
         1.0
     } else {
-        focus_symbols
-            .iter()
-            .map(|candidate| {
-                if normalized_path.contains(candidate) {
-                    0.3
-                } else {
-                    0.0
-                }
-            })
-            .fold(0.0, f64::max)
+        path_focus_match_score(&normalized_path, focus_symbols)
     };
 
     let symbol_match = symbols
@@ -1755,6 +1746,38 @@ pub(crate) fn file_focus_match(
         .fold(0.0, f64::max);
 
     path_match.max(symbol_match)
+}
+
+fn path_focus_match_score(normalized_path: &str, focus_symbols: &BTreeSet<String>) -> f64 {
+    let path_tokens = normalized_path
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mut term_scores = focus_symbols
+        .iter()
+        .filter_map(|candidate| {
+            let token_score = path_tokens
+                .iter()
+                .map(|token| focus_term_match_score(token, candidate))
+                .fold(0.0, f64::max);
+            let match_score = if normalized_path.contains(candidate) {
+                1.0
+            } else {
+                token_score
+            };
+            (match_score > 0.0).then_some(match_score)
+        })
+        .collect::<Vec<_>>();
+    term_scores.sort_by(|left, right| right.total_cmp(left));
+
+    match term_scores.as_slice() {
+        [] => 0.0,
+        [first] => 0.3 * *first,
+        [first, rest @ ..] => {
+            let bonus = rest.iter().take(2).sum::<f64>() * 0.15;
+            (0.3 * *first + bonus).min(0.6)
+        }
+    }
 }
 
 fn proximity_score(path: &str, focus_paths: &[String]) -> f64 {
