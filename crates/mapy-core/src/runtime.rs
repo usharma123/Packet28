@@ -206,6 +206,22 @@ fn build_repo_map_from_scans(
         normalized_focus_paths.clone()
     };
 
+    // Build set of "focus files" — files directly matching focus criteria.
+    // Used to give an importer affinity boost to files that import them.
+    let focus_file_basenames: BTreeSet<String> = if !focus_symbols.is_empty() || !normalized_focus_paths.is_empty() {
+        by_file
+            .iter()
+            .filter(|(path, scan)| {
+                file_focus_match(path, &scan.symbols, &normalized_focus_paths, &focus_symbols) > 0.5
+            })
+            .filter_map(|(path, _)| {
+                Path::new(path).file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
+            })
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+
     let mut ranked_files_tmp = Vec::<RankedFileTmp>::new();
     let mut ranked_symbols_tmp = Vec::<RankedSymbolTmp>::new();
 
@@ -218,6 +234,14 @@ fn build_repo_map_from_scans(
         let dependency_centrality = degree as f64 / max_degree as f64;
         let recency_hint = (scan.mtime_secs.saturating_sub(oldest)) as f64 / recency_span as f64;
 
+        // Importer affinity: if this file imports a focus-matching file, boost it
+        let importer_affinity = if !focus_file_basenames.is_empty() {
+            let imports_focus = scan.imports.iter().any(|imp| focus_file_basenames.contains(imp));
+            if imports_focus { 0.15 } else { 0.0 }
+        } else {
+            0.0
+        };
+
         let (focus_weight, dependency_weight) = if focus_symbols.is_empty() {
             (0.45, 0.20)
         } else {
@@ -226,7 +250,8 @@ fn build_repo_map_from_scans(
         let score = focus_weight * focus_match
             + 0.25 * change_proximity
             + dependency_weight * dependency_centrality
-            + 0.10 * recency_hint;
+            + 0.10 * recency_hint
+            + importer_affinity;
 
         ranked_files_tmp.push(RankedFileTmp {
             path: path.clone(),
