@@ -1,5 +1,53 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySourceTier {
+    CuratedMemory,
+    Telemetry,
+    #[default]
+    Standard,
+}
+
+impl MemorySourceTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemorySourceTier::CuratedMemory => "curated_memory",
+            MemorySourceTier::Telemetry => "telemetry",
+            MemorySourceTier::Standard => "standard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    Brief,
+    Handoff,
+    RecommendedAction,
+    Evidence,
+    ToolTrace,
+    FocusInference,
+    StateWrite,
+    #[default]
+    Other,
+}
+
+impl MemoryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryKind::Brief => "brief",
+            MemoryKind::Handoff => "handoff",
+            MemoryKind::RecommendedAction => "recommended_action",
+            MemoryKind::Evidence => "evidence",
+            MemoryKind::ToolTrace => "tool_trace",
+            MemoryKind::FocusInference => "focus_inference",
+            MemoryKind::StateWrite => "state_write",
+            MemoryKind::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct CorrelationEvidenceRef {
@@ -41,7 +89,9 @@ pub struct ContextManagePacketRef {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_tier: Option<String>,
+    pub source_tier: Option<MemorySourceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_kind: Option<MemoryKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packet_types: Vec<String>,
     pub est_tokens: u64,

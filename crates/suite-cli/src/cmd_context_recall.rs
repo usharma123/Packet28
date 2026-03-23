@@ -29,6 +29,8 @@ pub fn run_recall(args: RecallArgs) -> Result<i32> {
             packet_types: args.packet_types,
             path_filters: args.path_filters,
             symbol_filters: args.symbol_filters,
+            mode: args.mode.into(),
+            include_debug: args.include_debug,
         },
     );
 
@@ -85,6 +87,8 @@ pub fn run_recall_remote(args: RecallArgs, daemon_root: &Path) -> Result<i32> {
             packet_types: args.packet_types.clone(),
             path_filters: args.path_filters.clone(),
             symbol_filters: args.symbol_filters.clone(),
+            mode: Some(args.mode.into()),
+            include_debug: args.include_debug,
         },
     )?;
 

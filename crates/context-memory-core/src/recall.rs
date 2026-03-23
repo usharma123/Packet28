@@ -316,11 +316,44 @@ impl PacketCache {
         }
 
         let mut hits = Vec::new();
-        let explicit_telemetry_query = query_explicitly_targets_telemetry(query, options);
+        let effective_mode = resolve_recall_mode(query, options);
+        let newest_curated_by_dedupe = self
+            .recall_docs
+            .values()
+            .filter_map(|doc| {
+                (doc.source_tier == MemorySourceTier::CuratedMemory).then_some((
+                    doc.dedupe_key.as_ref()?,
+                    (doc.created_at_unix, &doc.cache_key),
+                ))
+            })
+            .fold(
+                HashMap::<String, (u64, String)>::new(),
+                |mut acc, (dedupe_key, (created_at_unix, cache_key))| {
+                    let update = acc
+                        .get(dedupe_key)
+                        .map(|(seen_created_at, seen_key)| {
+                            created_at_unix > *seen_created_at
+                                || (created_at_unix == *seen_created_at && cache_key > seen_key)
+                        })
+                        .unwrap_or(true);
+                    if update {
+                        acc.insert(dedupe_key.clone(), (created_at_unix, cache_key.clone()));
+                    }
+                    acc
+                },
+            );
         for (cache_key, base_score) in candidate_scores {
             let Some(doc) = self.recall_docs.get(&cache_key) else {
                 continue;
             };
+            let dedupe_superseded = doc
+                .dedupe_key
+                .as_ref()
+                .and_then(|dedupe_key| newest_curated_by_dedupe.get(dedupe_key))
+                .is_some_and(|(_, newest_key)| newest_key != &doc.cache_key);
+            if (doc.superseded || dedupe_superseded) && !options.include_debug {
+                continue;
+            }
             if let Some(target) = target_filter.as_ref() {
                 if !doc.target.to_ascii_lowercase().contains(target) {
                     continue;
@@ -398,6 +431,12 @@ impl PacketCache {
                 .cloned()
                 .collect::<Vec<_>>();
             let matched_packet_type = !packet_type_filters.is_empty();
+            let explicit_filter_match = !matched_paths.is_empty()
+                || !matched_symbols.is_empty()
+                || matched_packet_type
+                || task_filter
+                    .as_ref()
+                    .is_some_and(|task_id| doc.task_ids.iter().any(|item| item == task_id));
 
             let mut score = base_score;
             let task_scoped_match = task_filter
@@ -423,10 +462,11 @@ impl PacketCache {
             }
             score += recall_source_tier_score(
                 doc.source_tier,
-                explicit_telemetry_query,
+                effective_mode,
                 !matched_paths.is_empty(),
                 !matched_symbols.is_empty(),
                 task_scoped_match,
+                explicit_filter_match,
             );
             score += (1.0_f64 / (1.0_f64 + (age_secs as f64 / 86_400.0_f64))).min(1.0_f64) * 0.25;
 
@@ -465,14 +505,22 @@ impl PacketCache {
             if task_scoped_match {
                 match_reasons.push("task_scope".to_string());
             }
+            match effective_mode {
+                RecallMode::Auto => match_reasons.push("mode_auto".to_string()),
+                RecallMode::Conceptual => match_reasons.push("mode_conceptual".to_string()),
+                RecallMode::Telemetry => match_reasons.push("mode_telemetry".to_string()),
+            }
             match doc.source_tier {
-                RecallSourceTier::CuratedMemory => {
+                MemorySourceTier::CuratedMemory => {
                     match_reasons.push("curated_memory".to_string());
                 }
-                RecallSourceTier::Telemetry => {
+                MemorySourceTier::Telemetry => {
                     match_reasons.push("telemetry".to_string());
                 }
-                RecallSourceTier::Standard => {}
+                MemorySourceTier::Standard => {}
+            }
+            if doc.superseded || dedupe_superseded {
+                match_reasons.push("superseded".to_string());
             }
 
             hits.push(RecallHit {
@@ -491,6 +539,7 @@ impl PacketCache {
                 task_ids: doc.task_ids.clone(),
                 budget_estimate: doc.budget_estimate.clone(),
                 source_tier: doc.source_tier,
+                memory_kind: doc.memory_kind,
             });
         }
 
@@ -530,29 +579,56 @@ fn query_explicitly_targets_telemetry(query: &str, options: &RecallOptions) -> b
         })
 }
 
+fn resolve_recall_mode(query: &str, options: &RecallOptions) -> RecallMode {
+    match options.mode {
+        RecallMode::Auto => {
+            if query_explicitly_targets_telemetry(query, options) {
+                RecallMode::Telemetry
+            } else {
+                RecallMode::Conceptual
+            }
+        }
+        mode => mode,
+    }
+}
+
 fn recall_source_tier_score(
     source_tier: RecallSourceTier,
-    explicit_telemetry_query: bool,
+    mode: RecallMode,
     has_path_match: bool,
     has_symbol_match: bool,
     task_scoped_match: bool,
+    explicit_filter_match: bool,
 ) -> f64 {
-    match source_tier {
-        RecallSourceTier::CuratedMemory => 3.0,
-        RecallSourceTier::Telemetry => {
-            let mut score = -3.0;
-            if explicit_telemetry_query {
-                score += 2.5;
+    match mode {
+        RecallMode::Auto | RecallMode::Conceptual => match source_tier {
+            MemorySourceTier::CuratedMemory => 3.0,
+            MemorySourceTier::Telemetry => {
+                let mut score = if explicit_filter_match { -1.25 } else { -4.25 };
+                if has_path_match || has_symbol_match {
+                    score += 1.0;
+                }
+                if task_scoped_match {
+                    score += 0.5;
+                }
+                score
             }
-            if has_path_match || has_symbol_match {
-                score += 1.0;
+            MemorySourceTier::Standard => 0.0,
+        },
+        RecallMode::Telemetry => match source_tier {
+            MemorySourceTier::CuratedMemory => 0.5,
+            MemorySourceTier::Telemetry => {
+                let mut score = 3.0;
+                if has_path_match || has_symbol_match {
+                    score += 1.0;
+                }
+                if task_scoped_match {
+                    score += 0.5;
+                }
+                score
             }
-            if task_scoped_match {
-                score += 0.5;
-            }
-            score
-        }
-        RecallSourceTier::Standard => 0.0,
+            MemorySourceTier::Standard => 0.0,
+        },
     }
 }
 

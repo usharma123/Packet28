@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use suite_packet_core::{MemoryKind, MemorySourceTier};
 
 use crate::PacketCache;
 
@@ -116,6 +117,8 @@ pub struct RecallOptions {
     pub packet_types: Vec<String>,
     pub path_filters: Vec<String>,
     pub symbol_filters: Vec<String>,
+    pub mode: RecallMode,
+    pub include_debug: bool,
 }
 
 impl Default for RecallOptions {
@@ -130,6 +133,8 @@ impl Default for RecallOptions {
             packet_types: Vec::new(),
             path_filters: Vec::new(),
             symbol_filters: Vec::new(),
+            mode: RecallMode::Auto,
+            include_debug: false,
         }
     }
 }
@@ -151,23 +156,15 @@ pub struct RecallBudgetEstimate {
     pub runtime_ms: u64,
 }
 
+pub type RecallSourceTier = MemorySourceTier;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RecallSourceTier {
-    CuratedMemory,
-    Telemetry,
+pub enum RecallMode {
     #[default]
-    Standard,
-}
-
-impl RecallSourceTier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RecallSourceTier::CuratedMemory => "curated_memory",
-            RecallSourceTier::Telemetry => "telemetry",
-            RecallSourceTier::Standard => "standard",
-        }
-    }
+    Auto,
+    Conceptual,
+    Telemetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -188,6 +185,7 @@ pub struct RecallHit {
     pub task_ids: Vec<String>,
     pub budget_estimate: RecallBudgetEstimate,
     pub source_tier: RecallSourceTier,
+    pub memory_kind: MemoryKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

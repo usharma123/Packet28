@@ -272,6 +272,8 @@ pub(crate) fn run_context_recall(request: ContextRecallRequest) -> Result<Contex
             packet_types: request.packet_types,
             path_filters: request.path_filters,
             symbol_filters: request.symbol_filters,
+            mode: request.mode.unwrap_or_default(),
+            include_debug: request.include_debug,
         },
     );
     Ok(ContextRecallResponse {

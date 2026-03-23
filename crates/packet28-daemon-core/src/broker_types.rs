@@ -1,5 +1,30 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerHandoffStatus {
+    #[default]
+    Ready,
+    Consumed,
+    Superseded,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct BrokerHandoffDescriptor {
+    pub handoff_id: String,
+    pub task_id: String,
+    pub artifact_id: String,
+    pub context_version: String,
+    pub checkpoint_id: Option<String>,
+    pub status: BrokerHandoffStatus,
+    pub generated_at_unix_ms: u64,
+    pub consumed_at_unix_ms: Option<u64>,
+    pub superseded_by_handoff_id: Option<String>,
+    pub resume_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerAction {
@@ -89,6 +114,8 @@ pub struct BrokerGetContextRequest {
     pub default_max_items_per_section: Option<usize>,
     pub section_item_limits: BTreeMap<String, usize>,
     pub persist_artifacts: Option<bool>,
+    pub recall_mode: Option<context_memory_core::RecallMode>,
+    pub include_debug_memory: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -98,6 +125,8 @@ pub struct BrokerPacketRef {
     pub target: String,
     pub score: f64,
     pub summary: Option<String>,
+    pub source_tier: Option<suite_packet_core::MemorySourceTier>,
+    pub memory_kind: Option<suite_packet_core::MemoryKind>,
     pub packet_types: Vec<String>,
     pub est_tokens: u64,
     pub est_bytes: u64,
@@ -311,6 +340,8 @@ pub struct BrokerEstimateContextRequest {
     pub default_max_items_per_section: Option<usize>,
     pub section_item_limits: BTreeMap<String, usize>,
     pub persist_artifacts: Option<bool>,
+    pub recall_mode: Option<context_memory_core::RecallMode>,
+    pub include_debug_memory: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -338,6 +369,7 @@ pub struct BrokerPrepareHandoffRequest {
     pub task_id: String,
     pub query: Option<String>,
     pub response_mode: Option<BrokerResponseMode>,
+    pub include_debug_memory: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -347,6 +379,7 @@ pub struct BrokerPrepareHandoffResponse {
     pub handoff_ready: bool,
     pub handoff_reason: String,
     pub latest_checkpoint_id: Option<String>,
+    pub handoff: Option<BrokerHandoffDescriptor>,
     pub latest_handoff_artifact_id: Option<String>,
     pub latest_handoff_generated_at_unix: Option<u64>,
     pub latest_handoff_checkpoint_id: Option<String>,
@@ -458,6 +491,7 @@ pub struct BrokerTaskStatusResponse {
     pub latest_context_reason: Option<String>,
     pub handoff_ready: bool,
     pub handoff_reason: Option<String>,
+    pub handoff: Option<BrokerHandoffDescriptor>,
     pub latest_handoff_artifact_id: Option<String>,
     pub latest_handoff_generated_at_unix: Option<u64>,
     pub latest_handoff_checkpoint_id: Option<String>,

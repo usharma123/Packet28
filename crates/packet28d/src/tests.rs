@@ -768,7 +768,8 @@ fn relevant_context_renders_human_summaries_without_debug_ids() {
                         .to_string(),
                 ),
                 reason: Some("curated_memory".to_string()),
-                source_tier: Some("curated_memory".to_string()),
+                source_tier: Some(suite_packet_core::MemorySourceTier::CuratedMemory),
+                memory_kind: Some(suite_packet_core::MemoryKind::Handoff),
                 packet_types: vec!["suite.packet28.broker_memory.v1".to_string()],
                 est_tokens: 24,
                 est_bytes: 96,
@@ -783,7 +784,8 @@ fn relevant_context_renders_human_summaries_without_debug_ids() {
                         .to_string(),
                 ),
                 reason: Some("curated_memory".to_string()),
-                source_tier: Some("curated_memory".to_string()),
+                source_tier: Some(suite_packet_core::MemorySourceTier::CuratedMemory),
+                memory_kind: Some(suite_packet_core::MemoryKind::Brief),
                 packet_types: vec!["suite.context.manage.v1".to_string()],
                 est_tokens: 18,
                 est_bytes: 72,
@@ -1116,6 +1118,7 @@ fn prepare_handoff_only_resumes_recorded_handoff_artifacts() {
             task_id: "task-resume-guard".to_string(),
             query: None,
             response_mode: Some(BrokerResponseMode::Slim),
+            include_debug_memory: false,
         },
     )
     .unwrap();

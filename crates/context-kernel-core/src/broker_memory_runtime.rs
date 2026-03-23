@@ -4,10 +4,18 @@ use super::*;
 #[serde(default)]
 struct BrokerMemoryRequest {
     task_id: String,
-    memory_kind: String,
+    memory_kind: suite_packet_core::MemoryKind,
     summary: String,
     brief: String,
     context_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dedupe_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
+    #[serde(default)]
+    superseded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     artifact_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,6 +61,10 @@ pub(crate) fn run_broker_memory_write(
         "summary": request.summary,
         "brief": request.brief,
         "context_version": request.context_version,
+        "checkpoint_id": request.checkpoint_id,
+        "dedupe_key": request.dedupe_key,
+        "superseded_by": request.superseded_by,
+        "superseded": request.superseded,
         "artifact_id": request.artifact_id,
         "next_action_summary": request.next_action_summary,
         "latest_intention_text": request.latest_intention_text,
@@ -68,7 +80,7 @@ pub(crate) fn run_broker_memory_write(
             .iter()
             .map(|name| json!({"name": name}))
             .collect::<Vec<_>>(),
-        "source_tier": "curated_memory",
+        "source_tier": suite_packet_core::MemorySourceTier::CuratedMemory,
     });
     let payload_bytes = serde_json::to_vec(&payload)
         .map(|buf| buf.len())
@@ -140,12 +152,19 @@ pub(crate) fn run_broker_memory_write(
             "context_version": request.context_version,
             "artifact_id": request.artifact_id,
             "hash": envelope.hash,
-            "source_tier": "curated_memory",
+            "checkpoint_id": request.checkpoint_id,
+            "dedupe_key": request.dedupe_key,
+            "superseded_by": request.superseded_by,
+            "superseded": request.superseded,
+            "source_tier": suite_packet_core::MemorySourceTier::CuratedMemory,
         }),
     };
 
     ctx.set_shared("task_id", Value::String(request.task_id.clone()));
-    ctx.set_shared("memory_kind", Value::String(request.memory_kind.clone()));
+    ctx.set_shared(
+        "memory_kind",
+        Value::String(request.memory_kind.as_str().to_string()),
+    );
 
     Ok(ReducerResult {
         output_packets: vec![packet],

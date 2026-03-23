@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use context_memory_core::{PacketCache, PersistConfig, RecallScope as MemoryRecallScope};
+use context_memory_core::{
+    PacketCache, PersistConfig, RecallMode as MemoryRecallMode, RecallScope as MemoryRecallScope,
+};
 use serde_json::Value;
 
 pub(crate) use crate::cmd_context_kernel::{
@@ -18,6 +20,23 @@ pub enum RecallScopeArg {
     Global,
     TaskFirst,
     TaskOnly,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum RecallModeArg {
+    Auto,
+    Conceptual,
+    Telemetry,
+}
+
+impl From<RecallModeArg> for MemoryRecallMode {
+    fn from(value: RecallModeArg) -> Self {
+        match value {
+            RecallModeArg::Auto => MemoryRecallMode::Auto,
+            RecallModeArg::Conceptual => MemoryRecallMode::Conceptual,
+            RecallModeArg::Telemetry => MemoryRecallMode::Telemetry,
+        }
+    }
 }
 
 impl From<RecallScopeArg> for MemoryRecallScope {
@@ -448,6 +467,14 @@ pub struct RecallArgs {
     /// Optional symbol substring filter
     #[arg(long = "symbol")]
     pub(crate) symbol_filters: Vec<String>,
+
+    /// Recall scoring lane
+    #[arg(long, value_enum, default_value_t = RecallModeArg::Auto)]
+    pub(crate) mode: RecallModeArg,
+
+    /// Include superseded or stale curated memory in results
+    #[arg(long)]
+    pub(crate) include_debug: bool,
 
     /// Emit JSON output
     #[arg(long)]

@@ -183,6 +183,8 @@ fn augment_assemble_with_task_memory(
             budget_tokens,
             budget_bytes,
             scope: RecallScope::TaskFirst,
+            mode: RecallMode::Conceptual,
+            include_debug: false,
             checkpoint_id: None,
             focus_paths: Vec::new(),
             focus_symbols: Vec::new(),
@@ -197,6 +199,7 @@ fn augment_assemble_with_task_memory(
             limit: 8,
             task_id: Some(snapshot.task_id.clone()),
             scope: RecallScope::TaskFirst,
+            mode: RecallMode::Conceptual,
             ..RecallOptions::default()
         },
     )?;
@@ -358,6 +361,8 @@ pub(crate) fn run_contextq_manage(
             scope: request.scope,
             path_filters: request.focus_paths.clone(),
             symbol_filters: request.focus_symbols.clone(),
+            mode: request.mode,
+            include_debug: request.include_debug,
             ..RecallOptions::default()
         },
     )?;
@@ -373,7 +378,8 @@ pub(crate) fn run_contextq_manage(
             score: hit.score,
             summary: hit.summary.clone(),
             reason: hit.match_reasons.first().cloned(),
-            source_tier: Some(hit.source_tier.as_str().to_string()),
+            source_tier: Some(hit.source_tier),
+            memory_kind: Some(hit.memory_kind),
             packet_types: hit.packet_types.clone(),
             est_tokens: hit.budget_estimate.est_tokens,
             est_bytes: hit.budget_estimate.est_bytes,
@@ -401,7 +407,8 @@ pub(crate) fn run_contextq_manage(
             score: hit.score,
             summary: hit.summary.clone(),
             reason: Some("outside_working_set_budget".to_string()),
-            source_tier: Some(hit.source_tier.as_str().to_string()),
+            source_tier: Some(hit.source_tier),
+            memory_kind: Some(hit.memory_kind),
             packet_types: hit.packet_types.clone(),
             est_tokens: hit.budget_estimate.est_tokens,
             est_bytes: hit.budget_estimate.est_bytes,

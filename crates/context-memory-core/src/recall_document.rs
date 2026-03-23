@@ -18,6 +18,9 @@ pub(crate) struct RecallDocument {
     pub(crate) doc_length: usize,
     pub(crate) budget_estimate: RecallBudgetEstimate,
     pub(crate) source_tier: RecallSourceTier,
+    pub(crate) memory_kind: MemoryKind,
+    pub(crate) superseded: bool,
+    pub(crate) dedupe_key: Option<String>,
 }
 
 pub(crate) fn build_recall_document(
@@ -25,6 +28,9 @@ pub(crate) fn build_recall_document(
     workspace_root: Option<&Path>,
 ) -> RecallDocument {
     let source_tier = classify_recall_source_tier(entry);
+    let memory_kind = classify_memory_kind(entry);
+    let superseded = is_superseded_entry(entry);
+    let dedupe_key = entry_dedupe_key(entry);
     let mut corpus = Vec::new();
     let mut summaries = Vec::new();
     let mut path_terms = Vec::new();
@@ -137,19 +143,25 @@ pub(crate) fn build_recall_document(
         doc_length,
         budget_estimate,
         source_tier,
+        memory_kind,
+        superseded,
+        dedupe_key,
     }
 }
 
 fn classify_recall_source_tier(entry: &PacketCacheEntry) -> RecallSourceTier {
+    if let Some(source_tier) = source_tier_from_entry(entry) {
+        return source_tier;
+    }
     let target = entry.target.to_ascii_lowercase();
     if target.starts_with("agenty.state.") {
-        return RecallSourceTier::Telemetry;
+        return MemorySourceTier::Telemetry;
     }
     if target.starts_with("contextq.")
         || target.starts_with("packet28.broker_memory.")
         || target.starts_with("packet28.broker.memory.")
     {
-        return RecallSourceTier::CuratedMemory;
+        return MemorySourceTier::CuratedMemory;
     }
     if entry.packets.iter().any(|packet| {
         packet
@@ -165,9 +177,147 @@ fn classify_recall_source_tier(entry: &PacketCacheEntry) -> RecallSourceTier {
             })
             .unwrap_or(false)
     }) {
-        return RecallSourceTier::CuratedMemory;
+        return MemorySourceTier::CuratedMemory;
     }
-    RecallSourceTier::Standard
+    MemorySourceTier::Standard
+}
+
+fn source_tier_from_entry(entry: &PacketCacheEntry) -> Option<MemorySourceTier> {
+    entry
+        .metadata
+        .get("source_tier")
+        .and_then(parse_source_tier)
+        .or_else(|| {
+            entry.packets.iter().find_map(|packet| {
+                packet
+                    .metadata
+                    .get("source_tier")
+                    .and_then(parse_source_tier)
+                    .or_else(|| packet.body.get("source_tier").and_then(parse_source_tier))
+                    .or_else(|| {
+                        packet
+                            .body
+                            .get("payload")
+                            .and_then(|payload| payload.get("source_tier"))
+                            .and_then(parse_source_tier)
+                    })
+            })
+        })
+}
+
+fn classify_memory_kind(entry: &PacketCacheEntry) -> MemoryKind {
+    if let Some(memory_kind) = entry
+        .metadata
+        .get("memory_kind")
+        .and_then(parse_memory_kind)
+    {
+        return memory_kind;
+    }
+    for packet in &entry.packets {
+        if let Some(memory_kind) = packet
+            .metadata
+            .get("memory_kind")
+            .and_then(parse_memory_kind)
+            .or_else(|| packet.body.get("memory_kind").and_then(parse_memory_kind))
+            .or_else(|| {
+                packet
+                    .body
+                    .get("payload")
+                    .and_then(|payload| payload.get("memory_kind"))
+                    .and_then(parse_memory_kind)
+            })
+        {
+            return memory_kind;
+        }
+        if let Some(op) = packet
+            .body
+            .get("payload")
+            .and_then(|payload| payload.get("op"))
+            .and_then(Value::as_str)
+            .or_else(|| packet.body.get("op").and_then(Value::as_str))
+        {
+            match op.to_ascii_lowercase().as_str() {
+                "focus_inferred" => return MemoryKind::FocusInference,
+                "evidence_captured" => return MemoryKind::Evidence,
+                "tool_invocation_started"
+                | "tool_invocation_completed"
+                | "tool_invocation_failed"
+                | "tool_result" => return MemoryKind::ToolTrace,
+                "file_read" | "file_edit" | "intention" | "checkpoint_save" => {
+                    return MemoryKind::StateWrite
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let target = entry.target.to_ascii_lowercase();
+    if target.starts_with("packet28.broker_memory.")
+        || target.starts_with("packet28.broker.memory.")
+    {
+        return MemoryKind::Brief;
+    }
+    if target.starts_with("agenty.state.") {
+        return MemoryKind::StateWrite;
+    }
+    MemoryKind::Other
+}
+
+fn is_superseded_entry(entry: &PacketCacheEntry) -> bool {
+    entry
+        .metadata
+        .get("superseded")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            entry.packets.iter().find_map(|packet| {
+                packet
+                    .metadata
+                    .get("superseded")
+                    .and_then(Value::as_bool)
+                    .or_else(|| packet.body.get("superseded").and_then(Value::as_bool))
+                    .or_else(|| {
+                        packet
+                            .body
+                            .get("payload")
+                            .and_then(|payload| payload.get("superseded"))
+                            .and_then(Value::as_bool)
+                    })
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn entry_dedupe_key(entry: &PacketCacheEntry) -> Option<String> {
+    entry
+        .metadata
+        .get("dedupe_key")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            entry.packets.iter().find_map(|packet| {
+                packet
+                    .metadata
+                    .get("dedupe_key")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        packet
+                            .body
+                            .get("payload")
+                            .and_then(|payload| payload.get("dedupe_key"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+            })
+        })
+}
+
+fn parse_source_tier(value: &Value) -> Option<MemorySourceTier> {
+    serde_json::from_value::<MemorySourceTier>(value.clone()).ok()
+}
+
+fn parse_memory_kind(value: &Value) -> Option<MemoryKind> {
+    serde_json::from_value::<MemoryKind>(value.clone()).ok()
 }
 
 pub(crate) fn extract_budget_estimate(

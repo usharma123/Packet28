@@ -319,6 +319,14 @@ pub(crate) fn load_context_manage_for_task(
             "budget_tokens": request.budget_tokens.unwrap_or_else(broker_default_budget_tokens),
             "budget_bytes": request.budget_bytes.unwrap_or_else(broker_default_budget_bytes),
             "scope": "task_first",
+            "mode": request.recall_mode.unwrap_or_else(|| {
+                if matches!(request.action.unwrap_or(BrokerAction::Plan), BrokerAction::Inspect) {
+                    context_memory_core::RecallMode::Telemetry
+                } else {
+                    context_memory_core::RecallMode::Conceptual
+                }
+            }),
+            "include_debug": request.include_debug_memory,
             "focus_paths": focus_paths,
             "focus_symbols": focus_symbols,
         }),

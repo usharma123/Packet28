@@ -1,9 +1,12 @@
 use super::*;
 
 fn packet_source_kind(packet: &suite_packet_core::ContextManagePacketRef) -> BrokerSourceKind {
-    if packet.target.starts_with("agenty.state.") {
+    if packet.source_tier == Some(suite_packet_core::MemorySourceTier::Telemetry)
+        || packet.target.starts_with("agenty.state.")
+    {
         BrokerSourceKind::SelfAuthored
-    } else if packet.target.starts_with("contextq.")
+    } else if packet.source_tier == Some(suite_packet_core::MemorySourceTier::CuratedMemory)
+        || packet.target.starts_with("contextq.")
         || packet.target.starts_with("packet28.broker_memory.")
         || packet.target.starts_with("mapy.")
         || packet.target.starts_with("context.")
@@ -20,10 +23,17 @@ fn render_relevant_context_line(packet: &suite_packet_core::ContextManagePacketR
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let rendered = match (packet.source_tier.as_deref(), summary) {
-        (_, Some(summary)) => summary.to_string(),
-        (Some("curated_memory"), None) => "curated task memory".to_string(),
-        (Some("telemetry"), None) => "task telemetry".to_string(),
+    let rendered = match (packet.source_tier, packet.memory_kind, summary) {
+        (_, _, Some(summary)) => summary.to_string(),
+        (_, Some(suite_packet_core::MemoryKind::Handoff), None) => "checkpoint handoff".to_string(),
+        (_, Some(suite_packet_core::MemoryKind::Brief), None) => "task brief".to_string(),
+        (_, Some(suite_packet_core::MemoryKind::Evidence), None) => "task evidence".to_string(),
+        (Some(suite_packet_core::MemorySourceTier::CuratedMemory), _, None) => {
+            "curated task memory".to_string()
+        }
+        (Some(suite_packet_core::MemorySourceTier::Telemetry), _, None) => {
+            "task telemetry".to_string()
+        }
         _ => "relevant context".to_string(),
     };
     format!("- {rendered}")

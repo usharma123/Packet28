@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use context_memory_core::{
     basename_alias, normalize_context_path, CachePacket, DeltaReuseHooks, NoopDeltaReuseHooks,
-    PacketCache, RecallHit, RecallOptions, RecallScope,
+    PacketCache, RecallHit, RecallMode, RecallOptions, RecallScope,
 };
 
 pub use context_memory_core::PersistConfig;
@@ -63,6 +63,8 @@ struct ContextManageRequest {
     budget_tokens: u64,
     budget_bytes: usize,
     scope: RecallScope,
+    mode: RecallMode,
+    include_debug: bool,
     checkpoint_id: Option<String>,
     focus_paths: Vec<String>,
     focus_symbols: Vec<String>,
@@ -76,6 +78,8 @@ impl Default for ContextManageRequest {
             budget_tokens: contextq_core::DEFAULT_BUDGET_TOKENS,
             budget_bytes: contextq_core::DEFAULT_BUDGET_BYTES,
             scope: RecallScope::TaskFirst,
+            mode: RecallMode::Conceptual,
+            include_debug: false,
             checkpoint_id: None,
             focus_paths: Vec::new(),
             focus_symbols: Vec::new(),

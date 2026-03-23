@@ -172,6 +172,8 @@ pub(crate) fn compute_broker_response(
                         target: packet.target.clone(),
                         score: packet.score,
                         summary: packet.summary.clone(),
+                        source_tier: packet.source_tier,
+                        memory_kind: packet.memory_kind,
                         packet_types: packet.packet_types.clone(),
                         est_tokens: packet.est_tokens,
                         est_bytes: packet.est_bytes,
@@ -258,6 +260,8 @@ fn estimate_request_to_get_request(
         default_max_items_per_section: request.default_max_items_per_section,
         section_item_limits: request.section_item_limits.clone(),
         persist_artifacts: request.persist_artifacts,
+        recall_mode: request.recall_mode,
+        include_debug_memory: request.include_debug_memory,
     }
 }
 
