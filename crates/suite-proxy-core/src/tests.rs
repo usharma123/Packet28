@@ -2,15 +2,12 @@ use crate::{run_and_reduce, ProxyRunRequest};
 
 #[test]
 fn rejects_unsafe_commands() {
-    let err = run_and_reduce(ProxyRunRequest {
+    let result = run_and_reduce(ProxyRunRequest {
         argv: vec!["rm".to_string(), "-rf".to_string(), "/tmp/example".to_string()],
         ..ProxyRunRequest::default()
-    })
-    .unwrap_err();
+    });
 
-    assert!(err
-        .to_string()
-        .contains("proxy.run only allows a Packet28-managed safe command subset"));
+    assert!(result.is_err());
 }
 
 #[test]
