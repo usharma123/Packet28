@@ -28,3 +28,13 @@ fn deterministic_reduction_for_same_input() {
     assert_eq!(left.hash, right.hash);
     assert_eq!(left.payload.lines_out, right.payload.lines_out);
 }
+
+#[test]
+fn allows_safe_git_subset() {
+    let result = run_and_reduce(ProxyRunRequest {
+        argv: vec!["git".to_string(), "status".to_string(), "--short".to_string()],
+        ..ProxyRunRequest::default()
+    });
+
+    assert!(result.is_ok());
+}
