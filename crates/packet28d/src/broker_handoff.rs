@@ -1,5 +1,6 @@
 use super::*;
 use crate::broker_context::compute_broker_response;
+use packet28_daemon_core::{BrokerHandoffDescriptor, BrokerHandoffStatus};
 
 pub(crate) fn next_action_summary(
     manage: Option<&suite_packet_core::ContextManagePayload>,
@@ -35,12 +36,107 @@ fn normalize_timestamp_millis(value: u64) -> u64 {
     }
 }
 
+pub(crate) fn latest_handoff_descriptor(
+    task: Option<&TaskRecord>,
+) -> Option<BrokerHandoffDescriptor> {
+    task.and_then(|task| {
+        task.latest_handoff_id
+            .as_ref()
+            .and_then(|handoff_id| {
+                task.handoffs
+                    .iter()
+                    .find(|handoff| &handoff.handoff_id == handoff_id)
+                    .cloned()
+            })
+            .or_else(|| {
+                task.handoffs
+                    .iter()
+                    .max_by(|a, b| {
+                        a.generated_at_unix_ms
+                            .cmp(&b.generated_at_unix_ms)
+                            .then_with(|| a.handoff_id.cmp(&b.handoff_id))
+                    })
+                    .cloned()
+            })
+    })
+}
+
+pub(crate) fn latest_ready_handoff_descriptor(
+    task: Option<&TaskRecord>,
+) -> Option<BrokerHandoffDescriptor> {
+    task.and_then(|task| {
+        task.handoffs
+            .iter()
+            .filter(|handoff| handoff.status == BrokerHandoffStatus::Ready)
+            .max_by(|a, b| {
+                a.generated_at_unix_ms
+                    .cmp(&b.generated_at_unix_ms)
+                    .then_with(|| a.handoff_id.cmp(&b.handoff_id))
+            })
+            .cloned()
+    })
+}
+
+fn derive_handoff_id(task_id: &str, generated_at_unix_ms: u64) -> String {
+    format!("{task_id}:handoff:{generated_at_unix_ms}")
+}
+
+fn promote_new_ready_handoff(task: &mut TaskRecord, mut handoff: BrokerHandoffDescriptor) {
+    for existing in &mut task.handoffs {
+        if matches!(
+            existing.status,
+            BrokerHandoffStatus::Ready | BrokerHandoffStatus::Consumed
+        ) {
+            existing.status = BrokerHandoffStatus::Superseded;
+            existing.superseded_by_handoff_id = Some(handoff.handoff_id.clone());
+        }
+    }
+    handoff.status = BrokerHandoffStatus::Ready;
+    task.latest_handoff_id = Some(handoff.handoff_id.clone());
+    task.latest_handoff_artifact_id = Some(handoff.artifact_id.clone());
+    task.latest_handoff_generated_at_unix = Some(handoff.generated_at_unix_ms);
+    task.latest_handoff_checkpoint_id = handoff.checkpoint_id.clone();
+    task.handoffs.push(handoff);
+    task.handoffs.sort_by(|a, b| {
+        b.generated_at_unix_ms
+            .cmp(&a.generated_at_unix_ms)
+            .then_with(|| a.handoff_id.cmp(&b.handoff_id))
+    });
+}
+
+pub(crate) fn mark_handoff_consumed(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    handoff_id: &str,
+) -> Result<Option<BrokerHandoffDescriptor>> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    let Some(task) = guard.tasks.tasks.get_mut(task_id) else {
+        return Ok(None);
+    };
+    let Some(handoff) = task
+        .handoffs
+        .iter_mut()
+        .find(|handoff| handoff.handoff_id == handoff_id)
+    else {
+        return Ok(None);
+    };
+    handoff.status = BrokerHandoffStatus::Consumed;
+    handoff.resume_count = handoff.resume_count.saturating_add(1);
+    handoff.consumed_at_unix_ms = Some(now_unix_millis());
+    let updated = handoff.clone();
+    persist_state(&guard)?;
+    Ok(Some(updated))
+}
+
 pub(crate) fn compute_handoff_state(
     task: Option<&TaskRecord>,
     snapshot: &suite_packet_core::AgentSnapshotPayload,
 ) -> (bool, String) {
-    let latest_handoff_at = task
-        .and_then(|task| task.latest_handoff_generated_at_unix)
+    let latest_ready_handoff = latest_ready_handoff_descriptor(task);
+    let latest_handoff_at = latest_ready_handoff
+        .as_ref()
+        .map(|handoff| handoff.generated_at_unix_ms)
+        .or_else(|| task.and_then(|task| task.latest_handoff_generated_at_unix))
         .map(normalize_timestamp_millis);
     let latest_hook_boundary_at = task
         .and_then(|task| task.latest_hook_boundary_at_unix)
@@ -75,8 +171,10 @@ pub(crate) fn compute_handoff_state(
         );
     }
     let checkpoint_id = snapshot.latest_checkpoint_id.as_ref().unwrap();
-    let latest_handoff_checkpoint_id =
-        task.and_then(|task| task.latest_handoff_checkpoint_id.as_ref());
+    let latest_handoff_checkpoint_id = latest_ready_handoff
+        .as_ref()
+        .and_then(|handoff| handoff.checkpoint_id.as_ref())
+        .or_else(|| task.and_then(|task| task.latest_handoff_checkpoint_id.as_ref()));
     let has_newer_intention = snapshot.latest_intention.as_ref().is_some_and(|intention| {
         let intention_at = normalize_timestamp_millis(intention.occurred_at_unix);
         latest_handoff_at.is_none_or(|handoff_at| intention_at > handoff_at)
@@ -153,7 +251,10 @@ pub(crate) fn slim_broker_response(
     }
 }
 
-fn broker_memory_kind_for_task(state: &Arc<Mutex<DaemonState>>, task_id: &str) -> String {
+fn broker_memory_kind_for_task(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+) -> suite_packet_core::MemoryKind {
     state
         .lock()
         .ok()
@@ -165,13 +266,13 @@ fn broker_memory_kind_for_task(state: &Arc<Mutex<DaemonState>>, task_id: &str) -
                 .and_then(|task| task.latest_context_reason.clone())
         })
         .filter(|reason| reason == "prepare_handoff")
-        .map(|_| "handoff".to_string())
-        .unwrap_or_else(|| "brief".to_string())
+        .map(|_| suite_packet_core::MemoryKind::Handoff)
+        .unwrap_or(suite_packet_core::MemoryKind::Brief)
 }
 
 fn broker_memory_summary(
     task_id: &str,
-    memory_kind: &str,
+    memory_kind: suite_packet_core::MemoryKind,
     response: &BrokerGetContextResponse,
 ) -> String {
     let headline = response
@@ -188,7 +289,9 @@ fn broker_memory_summary(
         })
         .unwrap_or_else(|| "resume the current task".to_string());
     match memory_kind {
-        "handoff" => format!("Checkpoint handoff for {task_id}: {headline}"),
+        suite_packet_core::MemoryKind::Handoff => {
+            format!("Checkpoint handoff for {task_id}: {headline}")
+        }
         _ => format!("Current task context for {task_id}: {headline}"),
     }
 }
@@ -200,7 +303,17 @@ fn persist_broker_memory_entry(
 ) -> Result<()> {
     let kernel = state.lock().map_err(lock_err)?.kernel.clone();
     let memory_kind = broker_memory_kind_for_task(state, task_id);
-    let summary = broker_memory_summary(task_id, &memory_kind, response);
+    let summary = broker_memory_summary(task_id, memory_kind, response);
+    let checkpoint_id = load_agent_snapshot_for_task(state, task_id)?.latest_checkpoint_id;
+    let summary_hash = blake3::hash(summary.trim().as_bytes()).to_hex().to_string();
+    let lineage = checkpoint_id
+        .clone()
+        .unwrap_or_else(|| "no-checkpoint".to_string());
+    let dedupe_key = format!(
+        "{task_id}:{}:{lineage}:{}",
+        memory_kind.as_str(),
+        &summary_hash[..12]
+    );
     let latest_intention_text = response
         .latest_intention
         .as_ref()
@@ -218,6 +331,8 @@ fn persist_broker_memory_entry(
             "summary": summary,
             "brief": response.brief,
             "context_version": response.context_version,
+            "checkpoint_id": checkpoint_id,
+            "dedupe_key": dedupe_key,
             "artifact_id": response.artifact_id,
             "next_action_summary": response.next_action_summary,
             "latest_intention_text": latest_intention_text,
@@ -420,6 +535,8 @@ fn handoff_context_request(
             ("recommended_actions".to_string(), 4),
         ]),
         persist_artifacts: Some(true),
+        recall_mode: Some(context_memory_core::RecallMode::Conceptual),
+        include_debug_memory: request.include_debug_memory,
         ..BrokerGetContextRequest::default()
     }
 }
@@ -433,29 +550,34 @@ pub(crate) fn broker_prepare_handoff(
     }
     let snapshot = load_agent_snapshot_for_task(&state, &request.task_id)?;
     let task = load_task_record(&state, &request.task_id);
+    let latest_handoff = latest_handoff_descriptor(task.as_ref());
+    let latest_ready_handoff = latest_ready_handoff_descriptor(task.as_ref());
     let (handoff_ready, handoff_reason) = compute_handoff_state(task.as_ref(), &snapshot);
     let latest_intention = snapshot.latest_intention.clone();
     let next_action_summary = next_action_summary(None, &snapshot);
     if !handoff_ready {
-        if let Some(existing_task) = task.as_ref() {
-            if let (Some(existing_context_version), Some(latest_handoff_artifact_id)) = (
-                existing_task.latest_context_version.as_deref(),
-                existing_task.latest_handoff_artifact_id.as_deref(),
-            ) {
+        if let Some(existing_handoff) = latest_ready_handoff.as_ref() {
+            if let Some(existing_context_version) = task
+                .as_ref()
+                .and_then(|task| task.latest_context_version.as_deref())
+                .or(Some(existing_handoff.context_version.as_str()))
+            {
                 let root = state.lock().map_err(lock_err)?.root.clone();
                 if let Some(existing_context) = load_versioned_broker_response(
                     &root,
                     &request.task_id,
                     existing_context_version,
                 )? {
-                    if existing_context.artifact_id.as_deref() == Some(latest_handoff_artifact_id) {
+                    if existing_context.artifact_id.as_deref()
+                        == Some(existing_handoff.artifact_id.as_str())
+                    {
                         let context = if matches!(
                             request.response_mode.unwrap_or(BrokerResponseMode::Slim),
                             BrokerResponseMode::Slim
                         ) {
                             slim_broker_response(
                                 &existing_context,
-                                existing_task.latest_handoff_artifact_id.clone(),
+                                Some(existing_handoff.artifact_id.clone()),
                             )
                         } else {
                             existing_context
@@ -466,14 +588,12 @@ pub(crate) fn broker_prepare_handoff(
                             handoff_reason: "Latest handoff artifact is available for resume."
                                 .to_string(),
                             latest_checkpoint_id: snapshot.latest_checkpoint_id,
-                            latest_handoff_artifact_id: existing_task
-                                .latest_handoff_artifact_id
-                                .clone(),
-                            latest_handoff_generated_at_unix: existing_task
-                                .latest_handoff_generated_at_unix,
-                            latest_handoff_checkpoint_id: existing_task
-                                .latest_handoff_checkpoint_id
-                                .clone(),
+                            handoff: Some(existing_handoff.clone()),
+                            latest_handoff_artifact_id: Some(existing_handoff.artifact_id.clone()),
+                            latest_handoff_generated_at_unix: Some(
+                                existing_handoff.generated_at_unix_ms,
+                            ),
+                            latest_handoff_checkpoint_id: existing_handoff.checkpoint_id.clone(),
                             latest_intention,
                             next_action_summary: context.next_action_summary.clone(),
                             context: Some(context),
@@ -487,15 +607,28 @@ pub(crate) fn broker_prepare_handoff(
             handoff_ready,
             handoff_reason,
             latest_checkpoint_id: snapshot.latest_checkpoint_id,
-            latest_handoff_artifact_id: task
+            handoff: latest_handoff.clone(),
+            latest_handoff_artifact_id: latest_handoff
                 .as_ref()
-                .and_then(|task| task.latest_handoff_artifact_id.clone()),
-            latest_handoff_generated_at_unix: task
+                .map(|handoff| handoff.artifact_id.clone())
+                .or_else(|| {
+                    task.as_ref()
+                        .and_then(|task| task.latest_handoff_artifact_id.clone())
+                }),
+            latest_handoff_generated_at_unix: latest_handoff
                 .as_ref()
-                .and_then(|task| task.latest_handoff_generated_at_unix),
-            latest_handoff_checkpoint_id: task
+                .map(|handoff| handoff.generated_at_unix_ms)
+                .or_else(|| {
+                    task.as_ref()
+                        .and_then(|task| task.latest_handoff_generated_at_unix)
+                }),
+            latest_handoff_checkpoint_id: latest_handoff
                 .as_ref()
-                .and_then(|task| task.latest_handoff_checkpoint_id.clone()),
+                .and_then(|handoff| handoff.checkpoint_id.clone())
+                .or_else(|| {
+                    task.as_ref()
+                        .and_then(|task| task.latest_handoff_checkpoint_id.clone())
+                }),
             latest_intention,
             next_action_summary,
             context: None,
@@ -513,12 +646,26 @@ pub(crate) fn broker_prepare_handoff(
         &context,
     )?;
     let generated_at = now_unix_millis();
+    let artifact_id = context
+        .artifact_id
+        .clone()
+        .unwrap_or_else(|| context.context_version.clone());
+    let handoff = BrokerHandoffDescriptor {
+        handoff_id: derive_handoff_id(&request.task_id, generated_at),
+        task_id: request.task_id.clone(),
+        artifact_id: artifact_id.clone(),
+        context_version: context.context_version.clone(),
+        checkpoint_id: snapshot.latest_checkpoint_id.clone(),
+        status: BrokerHandoffStatus::Ready,
+        generated_at_unix_ms: generated_at,
+        consumed_at_unix_ms: None,
+        superseded_by_handoff_id: None,
+        resume_count: 0,
+    };
     {
         let mut guard = state.lock().map_err(lock_err)?;
         let task = ensure_task_record_mut(&mut guard.tasks, &request.task_id);
-        task.latest_handoff_artifact_id = context.artifact_id.clone();
-        task.latest_handoff_generated_at_unix = Some(generated_at);
-        task.latest_handoff_checkpoint_id = snapshot.latest_checkpoint_id.clone();
+        promote_new_ready_handoff(task, handoff.clone());
         persist_state(&guard)?;
     }
     let context = if matches!(
@@ -536,7 +683,8 @@ pub(crate) fn broker_prepare_handoff(
         handoff_ready: true,
         handoff_reason,
         latest_checkpoint_id: snapshot.latest_checkpoint_id.clone(),
-        latest_handoff_artifact_id: context.artifact_id.clone(),
+        handoff: Some(handoff.clone()),
+        latest_handoff_artifact_id: Some(artifact_id),
         latest_handoff_generated_at_unix: Some(generated_at),
         latest_handoff_checkpoint_id: snapshot.latest_checkpoint_id.clone(),
         latest_intention,

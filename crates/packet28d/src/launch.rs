@@ -64,6 +64,7 @@ pub(crate) struct TaskLaunchBootstrap {
     pub(crate) response: BrokerGetContextResponse,
     pub(crate) bootstrap_path: PathBuf,
     pub(crate) handoff_path: Option<String>,
+    pub(crate) handoff_id: Option<String>,
     pub(crate) handoff_artifact_id: Option<String>,
     pub(crate) handoff_checkpoint_id: Option<String>,
     pub(crate) handoff_reason: Option<String>,
@@ -93,11 +94,12 @@ fn task_prepare_handoff_bootstrap(
     handoff_path: &Path,
 ) -> Result<TaskLaunchBootstrap> {
     let handoff = broker_prepare_handoff(
-        state,
+        state.clone(),
         BrokerPrepareHandoffRequest {
             task_id: task_id.clone(),
             query,
             response_mode: Some(BrokerResponseMode::Full),
+            include_debug_memory: false,
         },
     )?;
     if !handoff.handoff_ready {
@@ -119,12 +121,20 @@ fn task_prepare_handoff_bootstrap(
     }
     fs::write(handoff_path, serde_json::to_vec(&response)?)
         .with_context(|| format!("failed to write '{}'", handoff_path.display()))?;
+    let handoff_id = handoff
+        .handoff
+        .as_ref()
+        .map(|handoff| handoff.handoff_id.clone());
+    if let Some(handoff_id) = handoff_id.as_deref() {
+        let _ = crate::broker_handoff::mark_handoff_consumed(&state, &task_id, handoff_id)?;
+    }
     Ok(TaskLaunchBootstrap {
         mode: "handoff",
         task_id,
         response,
         bootstrap_path: bootstrap_path.to_path_buf(),
         handoff_path: Some(handoff_path.to_string_lossy().to_string()),
+        handoff_id,
         handoff_artifact_id: handoff.latest_handoff_artifact_id,
         handoff_checkpoint_id: handoff.latest_handoff_checkpoint_id,
         handoff_reason: Some(handoff.handoff_reason),
@@ -272,6 +282,10 @@ pub(crate) fn task_launch_agent(
             bootstrap.handoff_path.clone().unwrap_or_default(),
         )
         .env(
+            "PACKET28_HANDOFF_ID",
+            bootstrap.handoff_id.clone().unwrap_or_default(),
+        )
+        .env(
             "PACKET28_HANDOFF_ARTIFACT_ID",
             bootstrap.handoff_artifact_id.clone().unwrap_or_default(),
         )
@@ -370,6 +384,7 @@ pub(crate) fn task_launch_agent(
         bootstrap_mode: bootstrap.mode.to_string(),
         bootstrap_path: bootstrap.bootstrap_path.to_string_lossy().to_string(),
         log_path: log_path.to_string_lossy().to_string(),
+        handoff_id: bootstrap.handoff_id,
         handoff_artifact_id: bootstrap.handoff_artifact_id,
         handoff_checkpoint_id: bootstrap.handoff_checkpoint_id,
         started_at_unix,

@@ -348,6 +348,7 @@ fn materialize_task_artifacts(
                 task_id: task_id.to_string(),
                 query: None,
                 response_mode: Some(packet28_daemon_core::BrokerResponseMode::Full),
+                include_debug_memory: false,
             },
         )?;
     }

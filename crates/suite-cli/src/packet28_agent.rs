@@ -187,6 +187,10 @@ pub fn run(cli: Packet28AgentCli) -> Result<i32> {
             bootstrap.handoff_path.unwrap_or_default(),
         )
         .env(
+            "PACKET28_HANDOFF_ID",
+            bootstrap.handoff_id.unwrap_or_default(),
+        )
+        .env(
             "PACKET28_HANDOFF_ARTIFACT_ID",
             bootstrap.handoff_artifact_id.unwrap_or_default(),
         )
@@ -221,6 +225,7 @@ struct BootstrapContext {
     response: BrokerGetContextResponse,
     bootstrap_path: PathBuf,
     handoff_path: Option<String>,
+    handoff_id: Option<String>,
     handoff_artifact_id: Option<String>,
     handoff_checkpoint_id: Option<String>,
     handoff_reason: Option<String>,
@@ -311,6 +316,7 @@ fn prepare_fresh_bootstrap(task_id: String, bootstrap_path: &std::path::Path) ->
         response,
         bootstrap_path: bootstrap_path.to_path_buf(),
         handoff_path: None,
+        handoff_id: None,
         handoff_artifact_id: None,
         handoff_checkpoint_id: None,
         handoff_reason: None,
@@ -330,6 +336,7 @@ fn prepare_handoff_bootstrap(
             task_id: task_id.clone(),
             query,
             response_mode: Some(packet28_daemon_core::BrokerResponseMode::Full),
+            include_debug_memory: false,
         },
     )?;
     if !handoff.handoff_ready {
@@ -351,12 +358,20 @@ fn prepare_handoff_bootstrap(
             handoff_path.display()
         )
     })?;
+    let handoff_id = handoff
+        .handoff
+        .as_ref()
+        .map(|handoff| handoff.handoff_id.clone());
+    if let Some(handoff_id) = handoff_id.as_deref() {
+        let _ = crate::broker_client::task_mark_handoff_consumed(root, &task_id, handoff_id);
+    }
     Ok(BootstrapContext {
         mode: BOOTSTRAP_MODE_HANDOFF,
         task_id,
         response,
         bootstrap_path: bootstrap_path.to_path_buf(),
         handoff_path: Some(handoff_path.to_string_lossy().to_string()),
+        handoff_id,
         handoff_artifact_id: handoff.latest_handoff_artifact_id,
         handoff_checkpoint_id: handoff.latest_handoff_checkpoint_id,
         handoff_reason: Some(handoff.handoff_reason),

@@ -127,6 +127,7 @@ fn maybe_prepare_handoff_from_hooks(
         accepted: true,
         handoff_ready: status.handoff_ready,
         handoff_reason: status.handoff_reason.clone(),
+        handoff: status.handoff.clone(),
         latest_handoff_artifact_id: status.latest_handoff_artifact_id.clone(),
         latest_context_version: status.latest_context_version.clone(),
         additional_context: None,
@@ -145,10 +146,12 @@ fn maybe_prepare_handoff_from_hooks(
                 task_id: task_id.to_string(),
                 query: None,
                 response_mode: Some(BrokerResponseMode::Slim),
+                include_debug_memory: false,
             },
         )?;
         response.handoff_ready = prepared.handoff_ready;
         response.handoff_reason = Some(prepared.handoff_reason.clone());
+        response.handoff = prepared.handoff.clone();
         response.latest_handoff_artifact_id = prepared.latest_handoff_artifact_id.clone();
         response.latest_context_version = prepared
             .context

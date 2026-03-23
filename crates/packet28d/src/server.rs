@@ -1,4 +1,5 @@
 use super::*;
+use packet28_daemon_core::TaskMarkHandoffConsumedResponse;
 
 pub(crate) fn handle_connection(
     state: Arc<Mutex<DaemonState>>,
@@ -192,6 +193,16 @@ fn handle_request(
         DaemonRequest::TaskAwaitHandoff { request } => {
             let response = task_await_handoff(state, request)?;
             Ok(DaemonResponse::TaskAwaitHandoff { response })
+        }
+        DaemonRequest::TaskMarkHandoffConsumed { request } => {
+            let response = TaskMarkHandoffConsumedResponse {
+                handoff: crate::broker_handoff::mark_handoff_consumed(
+                    &state,
+                    &request.task_id,
+                    &request.handoff_id,
+                )?,
+            };
+            Ok(DaemonResponse::TaskMarkHandoffConsumed { response })
         }
         DaemonRequest::TaskLaunchAgent { request } => {
             let response = task_launch_agent(state, request)?;

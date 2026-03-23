@@ -17,6 +17,9 @@ pub enum DaemonRequest {
     TaskAwaitHandoff {
         request: TaskAwaitHandoffRequest,
     },
+    TaskMarkHandoffConsumed {
+        request: TaskMarkHandoffConsumedRequest,
+    },
     TaskLaunchAgent {
         request: TaskLaunchAgentRequest,
     },
@@ -120,6 +123,9 @@ pub enum DaemonResponse {
     },
     TaskAwaitHandoff {
         response: TaskAwaitHandoffResponse,
+    },
+    TaskMarkHandoffConsumed {
+        response: TaskMarkHandoffConsumedResponse,
     },
     TaskLaunchAgent {
         response: TaskLaunchAgentResponse,

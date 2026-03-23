@@ -6,7 +6,7 @@ use packet28_daemon_core::{
     BrokerPrepareHandoffRequest, BrokerPrepareHandoffResponse, BrokerTaskStatusRequest,
     BrokerTaskStatusResponse, BrokerWriteOp, BrokerWriteStateRequest, BrokerWriteStateResponse,
     DaemonRequest, DaemonResponse, HookIngestRequest, HookIngestResponse, TaskAwaitHandoffRequest,
-    TaskAwaitHandoffResponse,
+    TaskAwaitHandoffResponse, TaskMarkHandoffConsumedRequest, TaskMarkHandoffConsumedResponse,
 };
 
 pub fn resolve_root(root: &str) -> PathBuf {
@@ -93,6 +93,30 @@ pub fn await_handoff(
     ensure_daemon(root)?;
     match crate::cmd_daemon::send_request(root, &DaemonRequest::TaskAwaitHandoff { request })? {
         DaemonResponse::TaskAwaitHandoff { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+pub fn task_mark_handoff_consumed(
+    root: &Path,
+    task_id: &str,
+    handoff_id: &str,
+) -> Result<TaskMarkHandoffConsumedResponse> {
+    if task_id.trim().is_empty() || handoff_id.trim().is_empty() {
+        anyhow::bail!("task handoff consume requires task_id and handoff_id");
+    }
+    crate::cmd_daemon::ensure_daemon(root)?;
+    match crate::cmd_daemon::send_request(
+        root,
+        &DaemonRequest::TaskMarkHandoffConsumed {
+            request: TaskMarkHandoffConsumedRequest {
+                task_id: task_id.to_string(),
+                handoff_id: handoff_id.to_string(),
+            },
+        },
+    )? {
+        DaemonResponse::TaskMarkHandoffConsumed { response } => Ok(response),
         DaemonResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
     }

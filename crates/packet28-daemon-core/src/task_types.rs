@@ -19,6 +19,19 @@ pub struct TaskAwaitHandoffResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
+pub struct TaskMarkHandoffConsumedRequest {
+    pub task_id: String,
+    pub handoff_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TaskMarkHandoffConsumedResponse {
+    pub handoff: Option<BrokerHandoffDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TaskLaunchAgentRequest {
     pub task_id: String,
     pub task: Option<String>,
@@ -36,6 +49,7 @@ pub struct TaskLaunchAgentResponse {
     pub bootstrap_mode: String,
     pub bootstrap_path: String,
     pub log_path: String,
+    pub handoff_id: Option<String>,
     pub handoff_artifact_id: Option<String>,
     pub handoff_checkpoint_id: Option<String>,
     pub started_at_unix: u64,
@@ -68,9 +82,12 @@ pub struct TaskRecord {
     pub latest_brief_hash: Option<String>,
     pub latest_brief_generated_at_unix: Option<u64>,
     pub latest_context_reason: Option<String>,
+    pub latest_handoff_id: Option<String>,
     pub latest_handoff_artifact_id: Option<String>,
     pub latest_handoff_generated_at_unix: Option<u64>,
     pub latest_handoff_checkpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoffs: Vec<BrokerHandoffDescriptor>,
     pub latest_agent_pid: Option<u32>,
     pub latest_agent_bootstrap_mode: Option<String>,
     pub latest_agent_log_path: Option<String>,

@@ -377,7 +377,7 @@ pub(crate) fn broker_write_state(
 
     let previous_version = current_context_version(&state, &request.task_id)?;
     let version = bump_context_version(&state, &request.task_id)?;
-    if request.refresh_context.unwrap_or(true) {
+    let event_payload = if request.refresh_context.unwrap_or(true) {
         if let Some(response) =
             refresh_broker_context_for_task(&state, &request.task_id, Some(previous_version))?
         {
@@ -387,26 +387,57 @@ pub(crate) fn broker_write_state(
                 .iter()
                 .map(|section| section.id.clone())
                 .collect::<Vec<_>>();
-            let _ = emit_task_event(
-                state.clone(),
-                &request.task_id,
-                "context_updated",
-                json!({
-                    "context_version": response.context_version,
-                    "changed_section_ids": changed_section_ids,
-                    "removed_section_ids": response.delta.removed_section_ids,
-                    "reason": state.lock().ok()
-                        .and_then(|guard| guard.tasks.tasks.get(&request.task_id).and_then(|task| task.latest_context_reason.clone()))
-                        .unwrap_or_else(|| "state_write".to_string()),
-                    "summary": response
-                        .sections
-                        .first()
-                        .map(|section| section.title.clone())
-                        .unwrap_or_else(|| "broker refresh".to_string()),
-                }),
-            );
+            json!({
+                "context_version": response.context_version,
+                "changed_section_ids": changed_section_ids,
+                "removed_section_ids": response.delta.removed_section_ids,
+                "reason": state.lock().ok()
+                    .and_then(|guard| guard.tasks.tasks.get(&request.task_id).and_then(|task| task.latest_context_reason.clone()))
+                    .unwrap_or_else(|| "state_write".to_string()),
+                "summary": response
+                    .sections
+                    .first()
+                    .map(|section| section.title.clone())
+                    .unwrap_or_else(|| "broker refresh".to_string()),
+            })
+        } else {
+            json!({
+                "context_version": version,
+                "changed_section_ids": [],
+                "removed_section_ids": [],
+                "reason": state.lock().ok()
+                    .and_then(|guard| guard.tasks.tasks.get(&request.task_id).and_then(|task| task.latest_context_reason.clone()))
+                    .unwrap_or_else(|| "state_write".to_string()),
+                "summary": request
+                    .note
+                    .clone()
+                    .or_else(|| request.text.clone())
+                    .or_else(|| request.result_summary.clone())
+                    .unwrap_or_else(|| "state write accepted".to_string()),
+            })
         }
-    }
+    } else {
+        json!({
+            "context_version": version,
+            "changed_section_ids": [],
+            "removed_section_ids": [],
+            "reason": state.lock().ok()
+                .and_then(|guard| guard.tasks.tasks.get(&request.task_id).and_then(|task| task.latest_context_reason.clone()))
+                .unwrap_or_else(|| "state_write".to_string()),
+            "summary": request
+                .note
+                .clone()
+                .or_else(|| request.text.clone())
+                .or_else(|| request.result_summary.clone())
+                .unwrap_or_else(|| "state write accepted".to_string()),
+        })
+    };
+    let _ = emit_task_event(
+        state.clone(),
+        &request.task_id,
+        "context_updated",
+        event_payload,
+    );
 
     Ok(BrokerWriteStateResponse {
         event_id: event.event_id,
@@ -468,10 +499,11 @@ pub(crate) fn broker_task_status(
         .tasks
         .get(&request.task_id)
         .cloned();
+    let latest_handoff = crate::broker_handoff::latest_handoff_descriptor(task.as_ref());
+    let latest_ready_handoff =
+        crate::broker_handoff::latest_ready_handoff_descriptor(task.as_ref());
     let (handoff_needed, handoff_reason) = compute_handoff_state(task.as_ref(), &snapshot);
-    let handoff_available = task.as_ref().is_some_and(|task| {
-        task.latest_handoff_artifact_id.is_some() && task.latest_context_version.is_some()
-    });
+    let handoff_available = latest_ready_handoff.is_some();
     let handoff_ready = handoff_needed || handoff_available;
     let handoff_reason = if handoff_needed {
         handoff_reason
@@ -492,15 +524,28 @@ pub(crate) fn broker_task_status(
             .and_then(|task| task.latest_context_reason.clone()),
         handoff_ready,
         handoff_reason: Some(handoff_reason),
-        latest_handoff_artifact_id: task
+        handoff: latest_handoff.clone(),
+        latest_handoff_artifact_id: latest_handoff
             .as_ref()
-            .and_then(|task| task.latest_handoff_artifact_id.clone()),
-        latest_handoff_generated_at_unix: task
+            .map(|handoff| handoff.artifact_id.clone())
+            .or_else(|| {
+                task.as_ref()
+                    .and_then(|task| task.latest_handoff_artifact_id.clone())
+            }),
+        latest_handoff_generated_at_unix: latest_handoff
             .as_ref()
-            .and_then(|task| task.latest_handoff_generated_at_unix),
-        latest_handoff_checkpoint_id: task
+            .map(|handoff| handoff.generated_at_unix_ms)
+            .or_else(|| {
+                task.as_ref()
+                    .and_then(|task| task.latest_handoff_generated_at_unix)
+            }),
+        latest_handoff_checkpoint_id: latest_handoff
             .as_ref()
-            .and_then(|task| task.latest_handoff_checkpoint_id.clone()),
+            .and_then(|handoff| handoff.checkpoint_id.clone())
+            .or_else(|| {
+                task.as_ref()
+                    .and_then(|task| task.latest_handoff_checkpoint_id.clone())
+            }),
         supports_push: true,
         task,
         brief_path: task_brief_markdown_path(&root, &request.task_id)

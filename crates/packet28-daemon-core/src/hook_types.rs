@@ -142,6 +142,7 @@ pub struct HookIngestResponse {
     pub accepted: bool,
     pub handoff_ready: bool,
     pub handoff_reason: Option<String>,
+    pub handoff: Option<crate::BrokerHandoffDescriptor>,
     pub latest_handoff_artifact_id: Option<String>,
     pub latest_context_version: Option<String>,
     pub additional_context: Option<String>,
