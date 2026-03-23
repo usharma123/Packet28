@@ -686,8 +686,15 @@ pub(crate) fn focus_term_match_score(candidate: &str, focus_term: &str) -> f64 {
     if candidate == focus_term {
         return 1.0;
     }
-    if candidate.contains(&focus_term) || focus_term.contains(&candidate) {
+    // Candidate contains the focus term — strong signal (e.g. "shuffleConfig" contains "shuffle")
+    if candidate.contains(&focus_term) {
         return 0.6;
+    }
+    // Focus term contains the candidate — weaker signal, scale by overlap ratio
+    // to penalise short/generic candidates (e.g. "rs" inside "parse_result" → low score)
+    if focus_term.contains(&candidate) {
+        let ratio = candidate.len() as f64 / focus_term.len() as f64;
+        return (0.6 * ratio).max(0.05);
     }
     0.0
 }

@@ -357,6 +357,12 @@ fn focus_term_match_score_graduates_exact_and_partial_matches() {
     assert_eq!(focus_term_match_score("shuffle", "shuffle"), 1.0);
     assert_eq!(focus_term_match_score("shuffleConfig", "shuffle"), 0.6);
     assert_eq!(focus_term_match_score("ArrayUtils", "shuffle"), 0.0);
+    // Reverse contains: focus_term contains candidate → scaled by overlap ratio
+    let short_in_long = focus_term_match_score("rs", "parse_result");
+    assert!(short_in_long > 0.0 && short_in_long < 0.2, "short generic match should score low: {short_in_long}");
+    let good_overlap = focus_term_match_score("parse", "parse_result");
+    assert!(good_overlap >= 0.25, "substantial overlap should score higher: {good_overlap}");
+    assert!(good_overlap > short_in_long, "longer overlap should beat short overlap");
 }
 
 #[test]
