@@ -112,7 +112,14 @@ pub fn assemble_packets(
                 }
             }
 
-            let mut score = section.relevance.unwrap_or(0.5) + (section.refs.len() as f64 * 0.05);
+            // Ref-density bonus: favour sections with dense references over long
+            // sections with scattered refs.  Normalize by section character length
+            // so a short section with 5 refs scores higher than a long section with 5.
+            let section_len = (section.title.len() + section.body.len()).max(1) as f64;
+            let ref_density = section.refs.len() as f64 / (section_len / 100.0).max(1.0);
+            let mut score = section.relevance.unwrap_or(0.5)
+                + (section.refs.len() as f64 * 0.05).min(0.5)
+                + (ref_density * 0.02).min(0.3);
             if let Some(snapshot) = options.agent_snapshot.as_ref() {
                 score += section_focus_boost(section, snapshot);
                 score += question_match_boost(section, &question_tokens);
