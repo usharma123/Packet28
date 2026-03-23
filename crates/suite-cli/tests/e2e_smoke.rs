@@ -3395,6 +3395,23 @@ fn test_packet28_mcp_prepare_handoff_requires_checkpoint_and_persists_artifact()
         handoff_context["artifact_id"]
     );
 
+    let (resume_status, resume_output) = run_claude_hook(
+        dir.path(),
+        &json!({
+            "hook_event_name":"SessionStart",
+            "task_id":"task-handoff",
+            "session_id":"session-task-handoff-resume",
+            "cwd": dir.path().display().to_string(),
+        }),
+    );
+    assert_eq!(resume_status, 0);
+    let resume_payload: Value = serde_json::from_str(&resume_output).unwrap();
+    let additional_context = resume_payload["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(additional_context.contains("Packet28 Context v"));
+    assert!(additional_context.contains("Latest Intention"));
+
     child.kill().unwrap();
     child.wait().unwrap();
 

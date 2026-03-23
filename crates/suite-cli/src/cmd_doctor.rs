@@ -206,7 +206,7 @@ impl Drop for McpHarness {
     }
 }
 
-fn run_claude_hook(root: &Path, payload: &Value) -> Result<i32> {
+fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, String)> {
     let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
     let mut child = Command::new(exe)
         .current_dir(root)
@@ -215,21 +215,64 @@ fn run_claude_hook(root: &Path, payload: &Value) -> Result<i32> {
         .arg("--root")
         .arg(root.to_str().unwrap_or("."))
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start Packet28 Claude hook for doctor")?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(serde_json::to_string(payload)?.as_bytes())?;
     }
-    let status = child.wait()?;
+    let output = child.wait_with_output()?;
+    let status = output.status;
     if !status.success() && status.code() != Some(2) {
         return Err(anyhow!(
             "claude hook exited with status {:?}",
             status.code()
         ));
     }
-    Ok(status.code().unwrap_or_default())
+    Ok((
+        status.code().unwrap_or_default(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+    ))
+}
+
+fn run_claude_hook(root: &Path, payload: &Value) -> Result<i32> {
+    Ok(run_claude_hook_with_output(root, payload)?.0)
+}
+
+fn wait_for_handoff_ready(
+    harness: &mut McpHarness,
+    task_id: &str,
+    timeout: Duration,
+    request_id_base: u64,
+) -> Result<Value> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut request_id = request_id_base;
+    loop {
+        harness.send(&json!({
+            "jsonrpc":"2.0",
+            "id":request_id,
+            "method":"tools/call",
+            "params":{
+                "name":"packet28.task_status",
+                "arguments":{"task_id":task_id}
+            }
+        }))?;
+        let status = harness.read_response(request_id, timeout)?;
+        let payload = &status["result"]["structuredContent"];
+        let ready = payload["handoff_ready"] == json!(true);
+        let has_artifact = payload["latest_handoff_artifact_id"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty());
+        if ready && has_artifact {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(status);
+        }
+        request_id = request_id.saturating_add(1);
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub fn run(args: DoctorArgs) -> Result<i32> {
@@ -642,9 +685,17 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                 "cwd": root.display().to_string()
             }),
         )?;
+        let handoff_status = wait_for_handoff_ready(&mut handoff_harness, &task_id, timeout, 6)?;
+        let handoff_status_payload = &handoff_status["result"]["structuredContent"];
+        let handoff_artifact_id = handoff_status_payload["latest_handoff_artifact_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("handoff artifact id was not recorded"))?
+            .to_string();
+
         handoff_harness.send(&json!({
             "jsonrpc":"2.0",
-            "id":6,
+            "id":12,
             "method":"tools/call",
             "params":{
                 "name":"packet28.prepare_handoff",
@@ -654,7 +705,7 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                 }
             }
         }))?;
-        let handoff = handoff_harness.read_response(6, timeout)?;
+        let handoff = handoff_harness.read_response(12, timeout)?;
         let handoff_task_id = handoff["result"]["structuredContent"]["task_id"]
             .as_str()
             .unwrap_or("unknown");
@@ -666,11 +717,52 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         if handoff["result"]["structuredContent"]["handoff_ready"] != json!(true) {
             return Err(anyhow!("prepare_handoff did not return a ready handoff"));
         }
+        if handoff["result"]["structuredContent"]["latest_handoff_artifact_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            return Err(anyhow!(
+                "prepare_handoff did not return a handoff artifact id"
+            ));
+        }
+        if handoff["result"]["structuredContent"]["context"].is_null() {
+            return Err(anyhow!(
+                "prepare_handoff did not return a resumable context payload"
+            ));
+        }
+
+        let resume_session_id = format!("{task_id}-resume");
+        let (resume_status, resume_stdout) = run_claude_hook_with_output(
+            root,
+            &json!({
+                "hook_event_name":"SessionStart",
+                "task_id":task_id,
+                "session_id":resume_session_id,
+                "cwd": root.display().to_string()
+            }),
+        )?;
+        if resume_status != 0 {
+            return Err(anyhow!("resume SessionStart hook did not succeed"));
+        }
+        let resume_payload: Value = serde_json::from_str(&resume_stdout)
+            .context("resume SessionStart hook did not emit valid JSON output")?;
+        let additional_context = resume_payload["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("resume SessionStart hook did not return additionalContext"))?;
+        if !additional_context.contains("Packet28 Context v") {
+            return Err(anyhow!(
+                "resume SessionStart hook returned unexpected additionalContext for handoff artifact {handoff_artifact_id}"
+            ));
+        }
         handoff_round_trip = DoctorCheck {
             name: "handoff_round_trip",
             ok: true,
             required: true,
-            detail: format!("task_id={task_id} checkpointed handoff ok"),
+            detail: format!(
+                "task_id={task_id} checkpointed handoff ok artifact={handoff_artifact_id}"
+            ),
         };
 
         Ok(())
