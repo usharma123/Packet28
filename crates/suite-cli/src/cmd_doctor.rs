@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -67,6 +68,7 @@ struct McpHarness {
     stdin: ChildStdin,
     responses: Receiver<McpHarnessEvent>,
     stderr: Arc<Mutex<String>>,
+    buffered: VecDeque<Value>,
 }
 
 enum McpHarnessEvent {
@@ -107,6 +109,7 @@ impl McpHarness {
             stdin,
             responses,
             stderr,
+            buffered: VecDeque::new(),
         })
     }
 
@@ -121,6 +124,13 @@ impl McpHarness {
     fn read_response(&mut self, expected_id: u64, timeout: Duration) -> Result<Value> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            if let Some(index) = self
+                .buffered
+                .iter()
+                .position(|value| value.get("id").and_then(Value::as_u64) == Some(expected_id))
+            {
+                return Ok(self.buffered.remove(index).unwrap());
+            }
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .ok_or_else(|| {
@@ -138,6 +148,7 @@ impl McpHarness {
                     if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
                         return Ok(value);
                     }
+                    self.buffered.push_back(value);
                 }
                 McpHarnessEvent::StreamError(error) => {
                     return Err(self.diagnostic_error(format!(
@@ -151,6 +162,13 @@ impl McpHarness {
     fn read_notification(&mut self, method: &str, timeout: Duration) -> Result<Value> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            if let Some(index) = self
+                .buffered
+                .iter()
+                .position(|value| value.get("method").and_then(Value::as_str) == Some(method))
+            {
+                return Ok(self.buffered.remove(index).unwrap());
+            }
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .ok_or_else(|| {
@@ -166,6 +184,7 @@ impl McpHarness {
                     if value.get("method").and_then(Value::as_str) == Some(method) {
                         return Ok(value);
                     }
+                    self.buffered.push_back(value);
                 }
                 McpHarnessEvent::StreamError(error) => {
                     return Err(self.diagnostic_error(format!(
@@ -512,7 +531,7 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
     let mut push_notifications = DoctorCheck {
         name: "push_notifications",
         ok: false,
-        required: false,
+        required: true,
         detail: "skipped because reducer round trip did not complete".to_string(),
     };
     let mut handoff_round_trip = DoctorCheck {
@@ -654,17 +673,20 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                     DoctorCheck {
                         name: "push_notifications",
                         ok: true,
-                        required: false,
+                        required: true,
                         detail: format!("notification received for task_id={task_id}"),
                     }
                 }
                 Err(err) => DoctorCheck {
                     name: "push_notifications",
                     ok: false,
-                    required: false,
-                    detail: format!("notification probe skipped: {err}"),
+                    required: true,
+                    detail: format!("notification probe failed: {err}"),
                 },
             };
+        if !push_notifications.ok {
+            return Err(anyhow!(push_notifications.detail.clone()));
+        }
 
         drop(harness);
         let mut handoff_harness = McpHarness::start(root)?;
@@ -687,6 +709,13 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         )?;
         let handoff_status = wait_for_handoff_ready(&mut handoff_harness, &task_id, timeout, 6)?;
         let handoff_status_payload = &handoff_status["result"]["structuredContent"];
+        if handoff_status_payload["handoff"]["handoff_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            return Err(anyhow!("handoff descriptor id was not recorded"));
+        }
         let handoff_artifact_id = handoff_status_payload["latest_handoff_artifact_id"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
@@ -729,6 +758,15 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         if handoff["result"]["structuredContent"]["context"].is_null() {
             return Err(anyhow!(
                 "prepare_handoff did not return a resumable context payload"
+            ));
+        }
+        if handoff["result"]["structuredContent"]["handoff"]["handoff_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            return Err(anyhow!(
+                "prepare_handoff did not return a handoff descriptor"
             ));
         }
 
@@ -775,6 +813,8 @@ fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             reducer_round_trip.detail = err.to_string();
             push_notifications.detail = "skipped because reducer round trip failed".to_string();
             handoff_round_trip.detail = "skipped because reducer round trip failed".to_string();
+        } else if !push_notifications.ok {
+            push_notifications.detail = err.to_string();
         } else if !handoff_round_trip.ok {
             handoff_round_trip.detail = err.to_string();
         }

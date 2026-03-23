@@ -506,6 +506,7 @@ pub(crate) fn handle_packet28_prepare_handoff(
             task_id: args.task_id,
             query: args.query,
             response_mode: args.response_mode,
+            include_debug_memory: false,
         },
     )?;
     Ok(serde_json::to_value(response)?)
@@ -513,12 +514,17 @@ pub(crate) fn handle_packet28_prepare_handoff(
 
 pub(crate) fn handle_packet28_write_intention(
     root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
     args: Packet28WriteIntentionArgs,
 ) -> Result<Value> {
     let text = args.text.trim();
     if text.is_empty() {
         return Err(anyhow!("packet28.write_intention requires text"));
     }
+    if args.task_id.trim().is_empty() {
+        return Err(anyhow!("packet28.write_intention requires task_id"));
+    }
+    crate::cmd_mcp::support::track_task(session, root, &args.task_id)?;
     let response = crate::broker_client::write_intention(
         root,
         BrokerWriteStateRequest {

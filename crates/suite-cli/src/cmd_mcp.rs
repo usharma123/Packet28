@@ -270,10 +270,10 @@ fn start_notification_thread(
                 Ok(frames) => frames,
                 Err(_) => continue,
             };
-            let mut newest_seq = last_seen_seq;
+            let mut newest_delivered_seq = last_seen_seq;
             for frame in frames.into_iter().filter(|frame| frame.seq > last_seen_seq) {
-                newest_seq = newest_seq.max(frame.seq);
                 if frame.event.kind != "context_updated" {
+                    newest_delivered_seq = newest_delivered_seq.max(frame.seq);
                     continue;
                 }
                 let mut params = match frame.event.data {
@@ -298,14 +298,23 @@ fn start_notification_thread(
                     "method":"notifications/packet28.context_updated",
                     "params": Value::Object(params),
                 });
-                if let Ok(mut guard) = writer.lock() {
-                    let _ = write_message(&mut *guard, &notification, framing);
+                let write_ok = if let Ok(mut guard) = writer.lock() {
+                    write_message(&mut *guard, &notification, framing).is_ok()
+                } else {
+                    false
+                };
+                if !write_ok {
+                    if let Ok(mut guard) = session.lock() {
+                        guard.shutdown = true;
+                    }
+                    return;
                 }
+                newest_delivered_seq = newest_delivered_seq.max(frame.seq);
             }
-            if newest_seq > last_seen_seq {
+            if newest_delivered_seq > last_seen_seq {
                 if let Ok(mut guard) = session.lock() {
                     if let Some(current) = guard.tracked_tasks.get_mut(&task_id) {
-                        *current = newest_seq;
+                        *current = newest_delivered_seq;
                     }
                 }
             }
@@ -340,6 +349,13 @@ fn handle_method(
         "initialize" => {
             if let Ok(mut guard) = session.lock() {
                 guard.initialized = true;
+                for (task_id, last_seen_seq) in guard.tracked_tasks.clone() {
+                    let latest_seq = load_task_events(root, &task_id)
+                        .ok()
+                        .and_then(|frames| frames.last().map(|frame| frame.seq))
+                        .unwrap_or(last_seen_seq);
+                    guard.tracked_tasks.insert(task_id, latest_seq);
+                }
             }
             Ok(json!({
                 "protocolVersion": "2024-11-05",
@@ -640,7 +656,7 @@ fn handle_tool_call(
                     updated_at_unix: packet28_daemon_core::now_unix(),
                 },
             )?;
-            handle_packet28_write_intention(root, request)?
+            handle_packet28_write_intention(root, session, request)?
         }
         "packet28.task_status" => {
             let task_id = resolve_session_task_id(

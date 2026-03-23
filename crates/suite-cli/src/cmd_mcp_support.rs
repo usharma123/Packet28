@@ -406,17 +406,24 @@ pub(crate) fn broker_task_status_via_session(
     task_id: &str,
 ) -> Result<BrokerTaskStatusResponse> {
     let task_id = resolve_session_task_id(session, root, task_id, None, "packet28.task_status")?;
-    match send_daemon_request_via_session(
+    let mut response = match send_daemon_request_via_session(
         root,
         session,
         &DaemonRequest::BrokerTaskStatus {
-            request: BrokerTaskStatusRequest { task_id },
+            request: BrokerTaskStatusRequest {
+                task_id: task_id.clone(),
+            },
         },
     )? {
         DaemonResponse::BrokerTaskStatus { response } => Ok(response),
         DaemonResponse::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected daemon response: {other:?}")),
-    }
+    }?;
+    let supports_push = session.lock().ok().is_some_and(|guard| {
+        guard.initialized && guard.framing.is_some() && guard.tracked_tasks.contains_key(&task_id)
+    });
+    response.supports_push = supports_push;
+    Ok(response)
 }
 
 pub(crate) fn next_task_invocation(
