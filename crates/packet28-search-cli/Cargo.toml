@@ -1,0 +1,20 @@
+[package]
+name = "packet28-search-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+packet28-reducer-core = { version = "0.2.0", path = "../packet28-reducer-core" }
+packet28-search-core = { version = "0.2.0", path = "../packet28-search-core" }
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
