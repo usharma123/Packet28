@@ -434,7 +434,12 @@ pub(crate) fn packet28_search_via_session(
     match send_daemon_request_via_session(
         root,
         session,
-        &DaemonRequest::Packet28Search { request },
+        &DaemonRequest::Packet28Search {
+            request: packet28_daemon_core::Packet28SearchRequest {
+                request,
+                force_indexed: false,
+            },
+        },
     )? {
         DaemonResponse::Packet28Search { response } => Ok(response),
         DaemonResponse::Error { message } => Err(anyhow!(message)),

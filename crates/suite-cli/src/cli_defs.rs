@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::{
     cmd_agent_prompt, cmd_build, cmd_compact, cmd_context, cmd_cover, cmd_daemon, cmd_diff,
     cmd_discover, cmd_doctor, cmd_guard, cmd_hook, cmd_impact, cmd_learn, cmd_map, cmd_map_query,
-    cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy, cmd_setup, cmd_shard, cmd_stack,
+    cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy, cmd_search, cmd_setup, cmd_shard, cmd_stack,
 };
 
 #[derive(Parser)]
@@ -11,7 +11,7 @@ use crate::{
     name = "Packet28",
     version = env!("PACKET28_VERSION"),
     about = "Umbrella platform CLI for suite domains",
-    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 agent-prompt --format claude\n  Packet28 daemon status --root . --json\n  Packet28 doctor --root . --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
+    after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 agent-prompt --format claude\n  Packet28 daemon status --root . --json\n  Packet28 doctor --root . --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json\n  Packet28 search query . 'handle_packet28_search' --fixed-string --compact"
 )]
 pub struct Cli {
     /// Path to config file
@@ -74,6 +74,8 @@ pub enum Commands {
     Discover(cmd_discover::DiscoverArgs),
     /// Learn error→correction patterns from session history
     Learn(cmd_learn::LearnArgs),
+    /// Indexed regex search commands
+    Search(cmd_search::SearchArgs),
 }
 
 #[derive(Args)]

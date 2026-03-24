@@ -232,6 +232,39 @@ fn workspace_packet28_version() -> String {
         .to_string()
 }
 
+#[test]
+fn packet28_search_command_is_exposed_via_main_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn handle_packet28_search() {}\n",
+    )
+    .unwrap();
+
+    suite_cmd()
+        .args(["search", "build", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("build_ms="))
+        .stdout(predicate::str::contains("generation="));
+
+    suite_cmd()
+        .args([
+            "search",
+            "query",
+            dir.path().to_str().unwrap(),
+            "handle_packet28_search",
+            "--fixed-string",
+            "--compact",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("packet28_ms="))
+        .stdout(predicate::str::contains("backend="))
+        .stdout(predicate::str::contains("hit=src/lib.rs#L1"));
+}
+
 fn write_intention_via_mcp(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,

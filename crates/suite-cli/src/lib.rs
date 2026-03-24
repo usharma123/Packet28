@@ -34,6 +34,7 @@ pub mod cmd_map_repo;
 pub mod cmd_mcp;
 pub mod cmd_packet;
 pub mod cmd_proxy;
+pub mod cmd_search;
 pub mod cmd_setup;
 pub mod cmd_shard;
 pub mod cmd_stack;

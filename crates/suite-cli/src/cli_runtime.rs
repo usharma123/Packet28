@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use crate::{
     cmd_agent_prompt, cmd_build, cmd_common, cmd_compact, cmd_context, cmd_cover, cmd_daemon,
     cmd_diff, cmd_discover, cmd_doctor, cmd_guard, cmd_hook, cmd_impact, cmd_learn, cmd_map,
-    cmd_map_query, cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy, cmd_setup, cmd_shard, cmd_stack,
+    cmd_map_query, cmd_map_repo, cmd_mcp, cmd_packet, cmd_proxy, cmd_search, cmd_setup,
+    cmd_shard, cmd_stack,
     BuildCommands, Cli, Commands, ContextCommands, CoverCommands, DiffCommands, GuardCommands,
     MapCommands, StackCommands, TestCommands,
 };
@@ -104,6 +105,7 @@ pub fn run_cli_local(cli: Cli) -> Result<i32> {
         Commands::Setup(args) => cmd_setup::run(args),
         Commands::Discover(args) => cmd_discover::run(args),
         Commands::Learn(args) => cmd_learn::run(args),
+        Commands::Search(args) => cmd_search::run(args),
     }
 }
 
@@ -346,7 +348,9 @@ fn machine_error_context(cli: &Cli) -> Option<MachineErrorContext> {
                 _ => None,
             }
         }
-        Commands::Compact(_) | Commands::Discover(_) | Commands::Learn(_) => None,
+        Commands::Compact(_) | Commands::Discover(_) | Commands::Learn(_) | Commands::Search(_) => {
+            None
+        }
         Commands::Daemon(_)
         | Commands::Guard(_)
         | Commands::AgentPrompt(_)
