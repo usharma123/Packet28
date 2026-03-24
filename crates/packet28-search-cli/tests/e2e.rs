@@ -236,3 +236,36 @@ fn query_command_supports_daemon_transport_for_subtree_roots() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
+
+#[test]
+fn indexed_engine_mode_is_enforced_over_daemon_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    fs::create_dir_all(workspace.join(".git")).unwrap();
+    let subtree = workspace.join("crates/search-sample");
+    write_fixture(&subtree);
+
+    cli()
+        .args(["build", workspace.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let mut daemon = start_daemon(workspace);
+
+    cli()
+        .args([
+            "query",
+            subtree.to_str().unwrap(),
+            ".+",
+            "--engine",
+            "indexed",
+            "--transport",
+            "daemon",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("planner could not derive"));
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}

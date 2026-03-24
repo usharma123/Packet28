@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use packet28_daemon_core::{
     read_socket_message, resolve_workspace_root, socket_path, write_socket_message, DaemonRequest,
-    DaemonResponse,
+    DaemonResponse, Packet28SearchRequest as DaemonPacket28SearchRequest,
 };
 use packet28_reducer_core::{SearchRequest, SearchResult};
 use packet28_search_core::{
@@ -244,7 +244,11 @@ fn execute_search_daemon(
     let daemon_request = daemon_search_request(&canonical_root, &workspace_root, request)?;
     match engine {
         EngineMode::Indexed | EngineMode::Auto => {
-            let result = send_daemon_search(&workspace_root, daemon_request)?;
+            let result = send_daemon_search(
+                &workspace_root,
+                daemon_request,
+                matches!(engine, EngineMode::Indexed),
+            )?;
             normalize_daemon_result(&canonical_root, &workspace_root, result)
         }
         EngineMode::Legacy => {
@@ -341,14 +345,26 @@ fn normalize_daemon_result(
 }
 
 #[cfg(unix)]
-fn send_daemon_search(root: &PathBuf, request: SearchRequest) -> Result<SearchResult> {
+fn send_daemon_search(
+    root: &PathBuf,
+    request: SearchRequest,
+    force_indexed: bool,
+) -> Result<SearchResult> {
     let socket = socket_path(root);
     let stream = UnixStream::connect(&socket)
         .map_err(|err| anyhow!("failed to connect to daemon socket '{}': {err}", socket.display()))?;
     let reader_stream = stream.try_clone()?;
     let mut writer = BufWriter::new(stream);
     let mut reader = BufReader::new(reader_stream);
-    write_socket_message(&mut writer, &DaemonRequest::Packet28Search { request })?;
+    write_socket_message(
+        &mut writer,
+        &DaemonRequest::Packet28Search {
+            request: DaemonPacket28SearchRequest {
+                request,
+                force_indexed,
+            },
+        },
+    )?;
     match read_socket_message(&mut reader)? {
         DaemonResponse::Packet28Search { response } => Ok(response),
         DaemonResponse::Error { message } => Err(anyhow!(message)),
@@ -357,7 +373,11 @@ fn send_daemon_search(root: &PathBuf, request: SearchRequest) -> Result<SearchRe
 }
 
 #[cfg(not(unix))]
-fn send_daemon_search(_root: &PathBuf, _request: SearchRequest) -> Result<SearchResult> {
+fn send_daemon_search(
+    _root: &PathBuf,
+    _request: SearchRequest,
+    _force_indexed: bool,
+) -> Result<SearchResult> {
     Err(anyhow!("daemon transport is only supported on unix platforms"))
 }
 

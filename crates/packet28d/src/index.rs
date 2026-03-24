@@ -305,8 +305,12 @@ pub(crate) fn daemon_index_clear(
 
 pub(crate) fn daemon_packet28_search(
     state: Arc<Mutex<DaemonState>>,
-    request: packet28_reducer_core::SearchRequest,
+    request: packet28_daemon_core::Packet28SearchRequest,
 ) -> Result<packet28_reducer_core::SearchResult> {
+    let packet28_daemon_core::Packet28SearchRequest {
+        request,
+        force_indexed,
+    } = request;
     let (root, runtime) = {
         let guard = state.lock().map_err(lock_err)?;
         (
@@ -315,6 +319,9 @@ pub(crate) fn daemon_packet28_search(
         )
     };
     let Some(runtime) = runtime else {
+        if force_indexed {
+            anyhow::bail!("regex search index is not ready");
+        }
         let mut fallback = packet28_reducer_core::search(&root, &request)?;
         if let Some(engine) = fallback.engine.as_mut() {
             engine.fallback_reason = Some("regex search index is not ready".to_string());
@@ -323,6 +330,9 @@ pub(crate) fn daemon_packet28_search(
     };
     if let Some(reason) = packet28_search_core::guarded_fallback_reason(&root, &runtime, &request)?
     {
+        if force_indexed {
+            anyhow::bail!("{reason}");
+        }
         let mut fallback = packet28_reducer_core::search(&root, &request)?;
         if let Some(engine) = fallback.engine.as_mut() {
             engine.fallback_reason = Some(reason);

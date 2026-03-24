@@ -91,7 +91,7 @@ pub enum DaemonRequest {
         request: HookIngestRequest,
     },
     Packet28Search {
-        request: packet28_reducer_core::SearchRequest,
+        request: Packet28SearchRequest,
     },
     DaemonIndexStatus {
         request: DaemonIndexStatusRequest,
@@ -102,6 +102,13 @@ pub enum DaemonRequest {
     DaemonIndexClear {
         request: DaemonIndexClearRequest,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Packet28SearchRequest {
+    pub request: packet28_reducer_core::SearchRequest,
+    pub force_indexed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
