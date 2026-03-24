@@ -426,6 +426,22 @@ pub(crate) fn broker_task_status_via_session(
     Ok(response)
 }
 
+pub(crate) fn packet28_search_via_session(
+    root: &Path,
+    session: &Arc<Mutex<McpSessionState>>,
+    request: packet28_reducer_core::SearchRequest,
+) -> Result<packet28_reducer_core::SearchResult> {
+    match send_daemon_request_via_session(
+        root,
+        session,
+        &DaemonRequest::Packet28Search { request },
+    )? {
+        DaemonResponse::Packet28Search { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
 pub(crate) fn next_task_invocation(
     session: &Arc<Mutex<McpSessionState>>,
     task_id: &str,

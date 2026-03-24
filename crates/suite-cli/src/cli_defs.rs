@@ -9,7 +9,7 @@ use crate::{
 #[derive(Parser)]
 #[command(
     name = "Packet28",
-    version,
+    version = env!("PACKET28_VERSION"),
     about = "Umbrella platform CLI for suite domains",
     after_help = "Examples:\n  Packet28 diff analyze --coverage tests/fixtures/lcov/basic.info --base HEAD --head HEAD --json\n  Packet28 agent-prompt --format claude\n  Packet28 daemon status --root . --json\n  Packet28 doctor --root . --json\n  Packet28 context store stats --json\n  Packet28 context recall --query \"missing mappings in parser\" --json"
 )]

@@ -16,6 +16,7 @@ serde_json.workspace = true
 context-kernel-core = { version = "0.2.0", path = "../context-kernel-core" }
 context-memory-core = { version = "0.2.0", path = "../context-memory-core" }
 suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
+packet28-reducer-core = { version = "0.2.0", path = "../packet28-reducer-core" }
 fs2 = "0.4"
 
 [dev-dependencies]

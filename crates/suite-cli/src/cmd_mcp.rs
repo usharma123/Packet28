@@ -366,7 +366,7 @@ fn handle_method(
                 },
                 "serverInfo": {
                     "name": "Packet28",
-                    "version": env!("CARGO_PKG_VERSION")
+                    "version": env!("PACKET28_VERSION")
                 }
             }))
         }

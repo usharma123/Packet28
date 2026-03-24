@@ -316,6 +316,10 @@ fn handle_request(
             let response = hook_ingest(state, request)?;
             Ok(DaemonResponse::HookIngest { response })
         }
+        DaemonRequest::Packet28Search { request } => {
+            let response = daemon_packet28_search(state, request)?;
+            Ok(DaemonResponse::Packet28Search { response })
+        }
         DaemonRequest::DaemonIndexStatus { request: _ } => {
             let response = daemon_index_status(state)?;
             Ok(DaemonResponse::DaemonIndexStatus { response })

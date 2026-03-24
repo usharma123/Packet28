@@ -16,7 +16,7 @@ const BOOTSTRAP_MODE_HANDOFF: &str = "handoff";
 #[derive(Debug, Parser)]
 #[command(
     name = "packet28-agent",
-    version,
+    version = env!("PACKET28_VERSION"),
     about = "Run Packet28 checkpointed handoff bootstrap before delegating to an agent runtime",
     trailing_var_arg = true,
     after_help = "Examples:\n  packet28-agent --task-id task-auth-broker --wait-for-handoff -- codex exec \"continue the task\"\n  packet28-agent --task \"continue auth broker\" --wait-for-handoff -- codex exec \"continue the task\""
