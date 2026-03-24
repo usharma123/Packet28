@@ -6,7 +6,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::types::{SearchGroup, SearchMatch, SearchRequest, SearchResult};
+use crate::types::{SearchEngineStats, SearchGroup, SearchMatch, SearchRequest, SearchResult};
 
 pub(crate) const DEFAULT_MAX_TOTAL_MATCHES: usize = 50;
 const MAX_TOTAL_MATCHES_LIMIT: usize = 200;
@@ -221,6 +221,7 @@ pub fn search(root: &Path, request: &SearchRequest) -> Result<SearchResult> {
         }
     }
 
+    let resolved_path_count = resolved_paths.len();
     let paths = groups.keys().cloned().collect::<Vec<_>>();
     let regions = groups
         .values()
@@ -276,6 +277,20 @@ pub fn search(root: &Path, request: &SearchRequest) -> Result<SearchResult> {
         groups: grouped,
         compact_preview,
         diagnostics,
+        engine: Some(SearchEngineStats {
+            engine: "legacy_rg".to_string(),
+            index_generation: None,
+            base_commit: None,
+            plan_kind: None,
+            planner_fallback: None,
+            stale_reason: None,
+            candidates_examined: resolved_path_count,
+            candidate_files: resolved_path_count,
+            verified_files: resolved_path_count,
+            index_lookups: 0,
+            postings_bytes_read: 0,
+            fallback_reason: Some("daemon indexed search unavailable".to_string()),
+        }),
     })
 }
 

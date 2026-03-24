@@ -46,6 +46,24 @@ pub struct SearchResult {
     pub groups: Vec<SearchGroup>,
     pub compact_preview: String,
     pub diagnostics: Vec<String>,
+    pub engine: Option<SearchEngineStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct SearchEngineStats {
+    pub engine: String,
+    pub index_generation: Option<u64>,
+    pub base_commit: Option<String>,
+    pub plan_kind: Option<String>,
+    pub planner_fallback: Option<String>,
+    pub stale_reason: Option<String>,
+    pub candidates_examined: usize,
+    pub candidate_files: usize,
+    pub verified_files: usize,
+    pub index_lookups: usize,
+    pub postings_bytes_read: u64,
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
