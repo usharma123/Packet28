@@ -1,6 +1,6 @@
 # Packet28 Regex Search Benchmark
 
-_Generated: 2026-03-24T15:36:34.366155+00:00_
+_Generated: 2026-03-24T16:53:56.850869+00:00_
 
 ## Setup
 
@@ -14,29 +14,29 @@ _Generated: 2026-03-24T15:36:34.366155+00:00_
 
 ### Tool Versions
 
-- `packet28-search-cli`: `git 1af6c09`
-- `packet28d`: `packet28d 0.2.36`
+- `packet28-search-cli`: `git c67fab7`
+- `packet28d`: `packet28d 0.2.37`
 - `ripgrep`: `ripgrep 15.1.0`
 - `grep`: `grep (BSD grep, GNU compatible) 2.6.0-FreeBSD`
 - `ast-grep`: `ast-grep 0.42.0`
 
 ### One-Time Packet28 Index Build Times
 
-- `workspace daemon index`: `11694.258 ms`
-- `inproc crates/packet28-search-cli`: `84.190 ms`
-- `inproc crates/packet28-search-core`: `793.689 ms`
-- `inproc crates/packet28d`: `606.149 ms`
-- `inproc crates/suite-cli`: `1179.397 ms`
+- `workspace daemon index`: `11272.235 ms`
+- `inproc crates/packet28-search-cli`: `92.605 ms`
+- `inproc crates/packet28-search-core`: `769.273 ms`
+- `inproc crates/packet28d`: `584.910 ms`
+- `inproc crates/suite-cli`: `1209.519 ms`
 
 ## Summary
 
 | Tool | Scenarios | Avg Mean ms | Avg Compact Tokens | Avg True Hits / 1k Tokens | Exact-Match Rate |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `packet28-daemon` | 8 | 7.344 | 16.4 | 492.2 | 100% |
-| `ripgrep` | 8 | 8.898 | 16.4 | 492.2 | 100% |
-| `grep` | 8 | 9.016 | 16.4 | 492.2 | 100% |
-| `packet28-inproc` | 8 | 12.453 | 16.4 | 492.2 | 100% |
-| `ast-grep` | 4 | 19.016 | 15.2 | 66.0 | 50% |
+| `packet28-daemon` | 8 | 5.815 | 16.4 | 492.2 | 100% |
+| `ripgrep` | 8 | 7.995 | 16.4 | 492.2 | 100% |
+| `grep` | 8 | 8.335 | 16.4 | 492.2 | 100% |
+| `packet28-inproc` | 8 | 11.125 | 16.4 | 492.2 | 100% |
+| `ast-grep` | 4 | 17.889 | 15.2 | 66.0 | 50% |
 
 ## Function Definition
 
@@ -49,11 +49,11 @@ Single Rust function definition lookup for handle_packet28_search.
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 4.014 | 16 | 16.0 | 100% | 100% | yes |
-| `packet28-inproc` | 9.374 | 16 | 16.0 | 100% | 100% | yes |
-| `ripgrep` | 10.756 | 16 | 16.0 | 100% | 100% | yes |
-| `grep` | 17.354 | 16 | 16.0 | 100% | 100% | yes |
-| `ast-grep` | 25.847 | 17 | 17.0 | 1% | 100% | no |
+| `packet28-daemon` | 2.820 | 16 | 16.0 | 100% | 100% | yes |
+| `packet28-inproc` | 7.394 | 16 | 16.0 | 100% | 100% | yes |
+| `ripgrep` | 7.412 | 16 | 16.0 | 100% | 100% | yes |
+| `grep` | 17.075 | 16 | 16.0 | 100% | 100% | yes |
+| `ast-grep` | 25.526 | 17 | 17.0 | 1% | 100% | no |
 
 ### Commands
 
@@ -83,11 +83,11 @@ Exact call-site lookup for packet28_search_via_session(root, session, request.cl
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 4.223 | 16 | 16.0 | 100% | 100% | yes |
-| `packet28-inproc` | 8.281 | 16 | 16.0 | 100% | 100% | yes |
-| `ripgrep` | 8.419 | 16 | 16.0 | 100% | 100% | yes |
-| `grep` | 16.604 | 16 | 16.0 | 100% | 100% | yes |
-| `ast-grep` | 25.668 | 16 | 16.0 | 100% | 100% | yes |
+| `packet28-daemon` | 2.396 | 16 | 16.0 | 100% | 100% | yes |
+| `packet28-inproc` | 9.541 | 16 | 16.0 | 100% | 100% | yes |
+| `ripgrep` | 8.420 | 16 | 16.0 | 100% | 100% | yes |
+| `grep` | 15.630 | 16 | 16.0 | 100% | 100% | yes |
+| `ast-grep` | 25.029 | 16 | 16.0 | 100% | 100% | yes |
 
 ### Commands
 
@@ -116,11 +116,11 @@ Exact call-site lookup for daemon_packet28_search(state, request).
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 3.238 | 14 | 14.0 | 100% | 100% | yes |
-| `packet28-inproc` | 9.850 | 14 | 14.0 | 100% | 100% | yes |
-| `ripgrep` | 9.239 | 14 | 14.0 | 100% | 100% | yes |
-| `grep` | 6.768 | 14 | 14.0 | 100% | 100% | yes |
-| `ast-grep` | 12.953 | 14 | 14.0 | 100% | 100% | yes |
+| `packet28-daemon` | 2.553 | 14 | 14.0 | 100% | 100% | yes |
+| `packet28-inproc` | 7.583 | 14 | 14.0 | 100% | 100% | yes |
+| `ripgrep` | 7.652 | 14 | 14.0 | 100% | 100% | yes |
+| `grep` | 6.191 | 14 | 14.0 | 100% | 100% | yes |
+| `ast-grep` | 11.347 | 14 | 14.0 | 100% | 100% | yes |
 
 ### Commands
 
@@ -151,11 +151,11 @@ Anchored line-start regex for SearchRequest literal construction in the standalo
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 12.574 | 13 | 13.0 | 100% | 100% | yes |
-| `packet28-inproc` | 17.944 | 13 | 13.0 | 100% | 100% | yes |
-| `ripgrep` | 8.189 | 13 | 13.0 | 100% | 100% | yes |
-| `grep` | 4.592 | 13 | 13.0 | 100% | 100% | yes |
-| `ast-grep` | 11.596 | 14 | 14.0 | 10% | 100% | no |
+| `packet28-daemon` | 10.471 | 13 | 13.0 | 100% | 100% | yes |
+| `packet28-inproc` | 15.172 | 13 | 13.0 | 100% | 100% | yes |
+| `ripgrep` | 7.746 | 13 | 13.0 | 100% | 100% | yes |
+| `grep` | 2.798 | 13 | 13.0 | 100% | 100% | yes |
+| `ast-grep` | 9.656 | 14 | 14.0 | 10% | 100% | no |
 
 ### Commands
 
@@ -185,10 +185,10 @@ Alternation over three standalone CLI command handlers.
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 5.938 | 13 | 4.3 | 100% | 100% | yes |
-| `packet28-inproc` | 9.901 | 13 | 4.3 | 100% | 100% | yes |
-| `ripgrep` | 8.557 | 13 | 4.3 | 100% | 100% | yes |
-| `grep` | 2.778 | 13 | 4.3 | 100% | 100% | yes |
+| `packet28-daemon` | 4.346 | 13 | 4.3 | 100% | 100% | yes |
+| `packet28-inproc` | 8.148 | 13 | 4.3 | 100% | 100% | yes |
+| `ripgrep` | 7.980 | 13 | 4.3 | 100% | 100% | yes |
+| `grep` | 2.983 | 13 | 4.3 | 100% | 100% | yes |
 
 ### Commands
 
@@ -215,10 +215,10 @@ Cross-file alternation over Packet28 search/read/fetch handler names in suite-cl
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 6.218 | 21 | 2.6 | 100% | 100% | yes |
-| `packet28-inproc` | 11.090 | 21 | 2.6 | 100% | 100% | yes |
-| `ripgrep` | 9.581 | 21 | 2.6 | 100% | 100% | yes |
-| `grep` | 16.410 | 21 | 2.6 | 100% | 100% | yes |
+| `packet28-daemon` | 4.061 | 21 | 2.6 | 100% | 100% | yes |
+| `packet28-inproc` | 8.513 | 21 | 2.6 | 100% | 100% | yes |
+| `ripgrep` | 9.243 | 21 | 2.6 | 100% | 100% | yes |
+| `grep` | 14.771 | 21 | 2.6 | 100% | 100% | yes |
 
 ### Commands
 
@@ -247,10 +247,10 @@ Broad declaration regex over the packet28-search-core crate.
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 12.300 | 19 | 1.1 | 100% | 100% | yes |
-| `packet28-inproc` | 16.376 | 19 | 1.1 | 100% | 100% | yes |
-| `ripgrep` | 7.828 | 19 | 1.1 | 100% | 100% | yes |
-| `grep` | 4.789 | 19 | 1.1 | 100% | 100% | yes |
+| `packet28-daemon` | 10.091 | 19 | 1.1 | 100% | 100% | yes |
+| `packet28-inproc` | 17.726 | 19 | 1.1 | 100% | 100% | yes |
+| `ripgrep` | 8.450 | 19 | 1.1 | 100% | 100% | yes |
+| `grep` | 4.579 | 19 | 1.1 | 100% | 100% | yes |
 
 ### Commands
 
@@ -279,10 +279,10 @@ Common function-signature regex over the standalone search CLI.
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 10.250 | 19 | 0.5 | 100% | 100% | yes |
-| `packet28-inproc` | 16.811 | 19 | 0.5 | 100% | 100% | yes |
-| `ripgrep` | 8.616 | 19 | 0.5 | 100% | 100% | yes |
-| `grep` | 2.835 | 19 | 0.5 | 100% | 100% | yes |
+| `packet28-daemon` | 9.784 | 19 | 0.5 | 100% | 100% | yes |
+| `packet28-inproc` | 14.923 | 19 | 0.5 | 100% | 100% | yes |
+| `ripgrep` | 7.054 | 19 | 0.5 | 100% | 100% | yes |
+| `grep` | 2.652 | 19 | 0.5 | 100% | 100% | yes |
 
 ### Commands
 
