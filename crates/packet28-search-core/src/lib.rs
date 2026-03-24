@@ -635,7 +635,8 @@ pub fn indexed_search(
 }
 
 fn build_verifier(request: &SearchRequest, query: &str) -> Result<Verifier> {
-    if request.fixed_string && !request.whole_word {
+    if request.fixed_string && !request.whole_word && !matches!(request.case_sensitive, Some(false))
+    {
         return Ok(Verifier::FixedBytes {
             needle: query.as_bytes().to_vec(),
             case_insensitive: matches!(request.case_sensitive, Some(false)),
@@ -672,6 +673,15 @@ fn compile_request(request: &SearchRequest) -> Result<CompiledSearch> {
 
 fn build_search_plan(request: &SearchRequest, query: &str) -> Result<(SearchPlan, Option<String>)> {
     if request.fixed_string {
+        if matches!(request.case_sensitive, Some(false)) && !query.is_ascii() {
+            return Ok((
+                SearchPlan::All,
+                Some(
+                    "unicode ignore-case fixed-string queries use regex fallback instead of ASCII-only index normalization"
+                        .to_string(),
+                ),
+            ));
+        }
         let literal = normalize_for_index(query.as_bytes());
         if build_covering_hashes(&literal).is_empty() {
             return Ok((
@@ -1824,7 +1834,10 @@ fn normalize_for_index(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn should_fallback_to_rg(candidate_count: usize, all_path_count: usize) -> bool {
-    if candidate_count == 0 || all_path_count == 0 {
+    if candidate_count == 0 {
+        return true;
+    }
+    if all_path_count == 0 {
         return false;
     }
     candidate_count > MAX_INDEX_VERIFY_CANDIDATES
@@ -2094,13 +2107,18 @@ fn normalize_capture_path(root: &Path, text: &str) -> String {
     let path = PathBuf::from(trimmed);
     if path.is_absolute() {
         if let Ok(stripped) = path.strip_prefix(root) {
-            return stripped.to_string_lossy().replace('\\', "/");
+            return stripped
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_string();
         }
     }
-    trimmed
+    let normalized = trimmed
         .trim_start_matches("./")
         .trim_start_matches('/')
-        .replace('\\', "/")
+        .replace('\\', "/");
+    normalized.trim_end_matches('/').to_string()
 }
 
 fn resolve_requested_paths(root: &Path, requested_paths: &[String]) -> (Vec<String>, Vec<String>) {
@@ -2475,6 +2493,28 @@ mod tests {
     }
 
     #[test]
+    fn guarded_fallback_triggers_when_query_hits_only_skipped_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub struct Alpha;\n").unwrap();
+        let large = format!(
+            "{}needle_only_in_large_file\n",
+            "x".repeat(MAX_INDEXED_FILE_BYTES + 32)
+        );
+        fs::write(root.join("src/large.txt"), large).unwrap();
+
+        let runtime = rebuild_full_index(root, true).unwrap();
+        let request = SearchRequest {
+            query: "needle_only_in_large_file".to_string(),
+            fixed_string: true,
+            ..SearchRequest::default()
+        };
+        let reason = guarded_fallback_reason(root, &runtime, &request).unwrap();
+        assert!(reason.is_some());
+    }
+
+    #[test]
     fn positional_pruning_respects_literal_order() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2496,6 +2536,40 @@ mod tests {
         };
         let result = indexed_search(root, &runtime, &request).unwrap();
         assert_eq!(result.paths, vec!["src/good.rs".to_string()]);
+    }
+
+    #[test]
+    fn indexed_search_matches_directory_filters_with_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runtime = build_fixture_index(root);
+        let request = SearchRequest {
+            query: "AlphaVariant".to_string(),
+            fixed_string: true,
+            requested_paths: vec!["src/nested/".to_string()],
+            ..SearchRequest::default()
+        };
+        let result = indexed_search(root, &runtime, &request).unwrap();
+        assert_eq!(result.paths, vec!["src/nested/mod.rs".to_string()]);
+    }
+
+    #[test]
+    fn indexed_search_handles_non_ascii_ignore_case_fixed_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "const CAFE: &str = \"café\";\n").unwrap();
+
+        let runtime = rebuild_full_index(root, true).unwrap();
+        let request = SearchRequest {
+            query: "CAFÉ".to_string(),
+            fixed_string: true,
+            case_sensitive: Some(false),
+            ..SearchRequest::default()
+        };
+        let result = indexed_search(root, &runtime, &request).unwrap();
+        assert_eq!(result.match_count, 1);
+        assert_eq!(result.paths, vec!["src/lib.rs".to_string()]);
     }
 
     #[test]
