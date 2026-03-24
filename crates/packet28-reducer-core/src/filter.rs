@@ -214,13 +214,7 @@ mod tests {
         let result = apply_filter(&lines, FilterLevel::Minimal, Language::Rust);
         assert_eq!(
             result,
-            vec![
-                "fn main() {",
-                "",
-                "    println!(\"hello\");",
-                "",
-                "}",
-            ]
+            vec!["fn main() {", "", "    println!(\"hello\");", "", "}",]
         );
     }
 

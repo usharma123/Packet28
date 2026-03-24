@@ -1031,7 +1031,11 @@ mod tests {
         assert!(decision.argv.contains(&"src/b.rs".to_string()));
         assert_eq!(
             decision.original_argv,
-            Some(vec!["git".to_string(), "diff".to_string(), "src/*.rs".to_string()])
+            Some(vec![
+                "git".to_string(),
+                "diff".to_string(),
+                "src/*.rs".to_string()
+            ])
         );
     }
 
@@ -1069,7 +1073,11 @@ mod tests {
         let cwd = tmp.path();
         fs::create_dir_all(cwd.join("tests")).unwrap();
         fs::write(cwd.join("tests/test_foo.rs"), "#[test] fn t() {}").unwrap();
-        fs::write(cwd.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0.1.0\"\n").unwrap();
+        fs::write(
+            cwd.join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
         let decision = decide_command_route_with_cwd("cargo test tests/test_*.rs", cwd);
         assert_eq!(decision.kind, RouteKind::ReducerRewrite);
         assert!(decision.argv.contains(&"tests/test_foo.rs".to_string()));

@@ -661,9 +661,7 @@ fn build_pretool_rewrite(
     // In hook context, promote NativeTool → ReducerRewrite when the reducer-core
     // also classifies the command (e.g. head/cat/sed → fs family).
     if matches!(decision.kind, crate::route_registry::RouteKind::NativeTool) {
-        if let Some(spec) =
-            packet28_reducer_core::classify_command_argv(&command, &decision.argv)
-        {
+        if let Some(spec) = packet28_reducer_core::classify_command_argv(&command, &decision.argv) {
             decision = crate::route_registry::RouteDecision {
                 kind: crate::route_registry::RouteKind::ReducerRewrite,
                 reason: None,

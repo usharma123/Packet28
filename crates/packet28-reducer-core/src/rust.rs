@@ -289,8 +289,7 @@ fn compact_cargo_test_failures(output: &str) -> String {
 }
 
 fn compact_clippy_output(output: &str) -> String {
-    let mut by_rule: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
+    let mut by_rule: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut first_example: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
 

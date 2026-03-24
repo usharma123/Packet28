@@ -41,9 +41,7 @@ pub fn classify_infra_command(command: &str, argv: &[String]) -> Option<CommandR
         "curl" if classify_curl(argv) => {
             ("curl_fetch", suite_packet_core::ToolOperationKind::Fetch)
         }
-        "aws" if classify_aws(argv) => {
-            ("aws_cli", suite_packet_core::ToolOperationKind::Fetch)
-        }
+        "aws" if classify_aws(argv) => ("aws_cli", suite_packet_core::ToolOperationKind::Fetch),
         _ => return None,
     };
 

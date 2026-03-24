@@ -1,19 +1,19 @@
 mod command;
+pub mod filter;
 mod fs;
 pub(crate) mod git;
 mod github;
 mod go;
 mod infra;
 mod javascript;
+pub mod parser;
 mod python;
 mod read;
 mod rust;
 mod search;
+pub mod tee;
 #[cfg(test)]
 mod tests;
-pub mod parser;
-pub mod filter;
-pub mod tee;
 mod types;
 
 pub use command::{classify_command, classify_command_argv, reduce_command_output};

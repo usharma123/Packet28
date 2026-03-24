@@ -132,9 +132,7 @@ pub fn reduce_javascript_command(
         operation_kind: spec.operation_kind,
         summary,
         compact_preview: match spec.canonical_kind.as_str() {
-            "javascript_test" | "javascript_vitest" if failed => {
-                compact_vitest_failures(&combined)
-            }
+            "javascript_test" | "javascript_vitest" if failed => compact_vitest_failures(&combined),
             "javascript_tsc" if failed => compact_tsc_errors(&combined),
             "javascript_next_build" if !failed => compact_next_routes(&combined),
             _ => String::new(),
@@ -529,11 +527,7 @@ fn compact_tsc_errors(output: &str) -> String {
         }
         let parts: Vec<&str> = trimmed.splitn(2, ':').collect();
         if parts.len() == 2 {
-            let file = parts[0]
-                .split('(')
-                .next()
-                .unwrap_or(parts[0])
-                .to_string();
+            let file = parts[0].split('(').next().unwrap_or(parts[0]).to_string();
             by_file
                 .entry(file)
                 .or_default()

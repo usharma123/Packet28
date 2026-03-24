@@ -42,9 +42,7 @@ pub fn default_trust_store_path() -> PathBuf {
     #[cfg(unix)]
     {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(format!(
-                "{home}/.local/share/packet28/trusted_filters.json"
-            ));
+            return PathBuf::from(format!("{home}/.local/share/packet28/trusted_filters.json"));
         }
     }
     PathBuf::from("/tmp/packet28/trusted_filters.json")

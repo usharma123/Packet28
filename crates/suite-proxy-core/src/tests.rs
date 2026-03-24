@@ -32,7 +32,11 @@ fn deterministic_reduction_for_same_input() {
 #[test]
 fn allows_safe_git_subset() {
     let result = run_and_reduce(ProxyRunRequest {
-        argv: vec!["git".to_string(), "status".to_string(), "--short".to_string()],
+        argv: vec![
+            "git".to_string(),
+            "status".to_string(),
+            "--short".to_string(),
+        ],
         ..ProxyRunRequest::default()
     });
 
