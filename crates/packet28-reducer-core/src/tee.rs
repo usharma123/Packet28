@@ -76,12 +76,7 @@ pub fn should_tee(config: &TeeConfig, exit_code: i32) -> bool {
 /// Skips small outputs (<500 chars) to avoid noise.
 /// Enforces max_file_size by truncating.
 /// Rotates old files to stay within max_files.
-pub fn tee_raw(
-    config: &TeeConfig,
-    raw: &str,
-    slug: &str,
-    exit_code: i32,
-) -> Option<PathBuf> {
+pub fn tee_raw(config: &TeeConfig, raw: &str, slug: &str, exit_code: i32) -> Option<PathBuf> {
     if !should_tee(config, exit_code) {
         return None;
     }
@@ -103,7 +98,13 @@ pub fn tee_raw(
     // Sanitize slug for filename
     let safe_slug: String = slug
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
         .take(60)
         .collect();
 
@@ -118,7 +119,10 @@ pub fn tee_raw(
     // Truncate to max_file_size
     let content = if raw.len() > config.max_file_size {
         let truncated = &raw[..config.max_file_size.saturating_sub(50)];
-        format!("{truncated}\n\n... (truncated at {} bytes)", config.max_file_size)
+        format!(
+            "{truncated}\n\n... (truncated at {} bytes)",
+            config.max_file_size
+        )
     } else {
         raw.to_string()
     };
@@ -132,12 +136,7 @@ pub fn tee_raw(
 }
 
 /// Tee raw output and return a hint string for the LLM.
-pub fn tee_and_hint(
-    config: &TeeConfig,
-    raw: &str,
-    slug: &str,
-    exit_code: i32,
-) -> Option<String> {
+pub fn tee_and_hint(config: &TeeConfig, raw: &str, slug: &str, exit_code: i32) -> Option<String> {
     let path = tee_raw(config, raw, slug, exit_code)?;
     Some(format!(
         "Full raw output saved to: {} ({} bytes). Use `compact fetch-raw` to retrieve.",

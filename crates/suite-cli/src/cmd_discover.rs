@@ -78,11 +78,7 @@ pub fn run(args: DiscoverArgs) -> Result<i32> {
         if let Ok(commands) = extract_bash_commands(file) {
             for (cmd, est_tokens) in commands {
                 report.commands_found += 1;
-                let program = cmd
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+                let program = cmd.split_whitespace().next().unwrap_or("").to_string();
                 *command_counts.entry(program.clone()).or_insert(0) += 1;
                 *command_tokens.entry(program).or_insert(0) += est_tokens;
             }
@@ -91,9 +87,9 @@ pub fn run(args: DiscoverArgs) -> Result<i32> {
 
     for (program, count) in &command_counts {
         let tokens = command_tokens.get(program).copied().unwrap_or(0);
-        let classified =
-            packet28_reducer_core::classify_command(&format!("{program} --help")).is_some()
-                || is_known_reducible(program);
+        let classified = packet28_reducer_core::classify_command(&format!("{program} --help"))
+            .is_some()
+            || is_known_reducible(program);
 
         if classified {
             report.supported_commands += count;
@@ -179,10 +175,7 @@ fn collect_session_files(dir: &Path, limit: usize) -> Result<Vec<PathBuf>> {
             if let Ok(entries) = fs::read_dir(&scan_dir) {
                 for sub_entry in entries.flatten() {
                     let sub_path = sub_entry.path();
-                    if sub_path
-                        .extension()
-                        .is_some_and(|ext| ext == "jsonl")
-                    {
+                    if sub_path.extension().is_some_and(|ext| ext == "jsonl") {
                         files.push(sub_path);
                     }
                 }
@@ -206,8 +199,7 @@ fn collect_session_files(dir: &Path, limit: usize) -> Result<Vec<PathBuf>> {
 
 fn extract_bash_commands(path: &Path) -> Result<Vec<(String, u64)>> {
     let mut commands = Vec::new();
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
     for line in content.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -250,14 +242,40 @@ fn extract_bash_commands(path: &Path) -> Result<Vec<(String, u64)>> {
 fn is_known_reducible(program: &str) -> bool {
     matches!(
         program,
-        "git" | "cargo" | "gh" | "go" | "golangci-lint"
-            | "docker" | "kubectl" | "curl"
-            | "python" | "python3" | "pytest" | "ruff" | "mypy"
-            | "pip" | "pip3" | "uv"
-            | "npm" | "pnpm" | "yarn" | "npx"
-            | "tsc" | "eslint" | "vitest" | "prettier"
-            | "next" | "prisma" | "playwright"
-            | "ls" | "find" | "cat" | "head" | "tail" | "sed" | "diff"
+        "git"
+            | "cargo"
+            | "gh"
+            | "go"
+            | "golangci-lint"
+            | "docker"
+            | "kubectl"
+            | "curl"
+            | "python"
+            | "python3"
+            | "pytest"
+            | "ruff"
+            | "mypy"
+            | "pip"
+            | "pip3"
+            | "uv"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "npx"
+            | "tsc"
+            | "eslint"
+            | "vitest"
+            | "prettier"
+            | "next"
+            | "prisma"
+            | "playwright"
+            | "ls"
+            | "find"
+            | "cat"
+            | "head"
+            | "tail"
+            | "sed"
+            | "diff"
             | "aws"
     )
 }

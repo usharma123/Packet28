@@ -77,9 +77,7 @@ pub fn run(args: LearnArgs) -> Result<i32> {
     for file in &session_files {
         if let Ok(corrections) = extract_corrections(file) {
             for (failed, success) in corrections {
-                *correction_counts
-                    .entry((failed, success))
-                    .or_insert(0) += 1;
+                *correction_counts.entry((failed, success)).or_insert(0) += 1;
             }
         }
     }
@@ -177,8 +175,7 @@ fn collect_session_files(dir: &Path, limit: usize) -> Result<Vec<PathBuf>> {
 }
 
 fn extract_corrections(path: &Path) -> Result<Vec<(String, String)>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
     let mut bash_results: Vec<(String, bool)> = Vec::new();
 
@@ -189,14 +186,27 @@ fn extract_corrections(path: &Path) -> Result<Vec<(String, String)>> {
 
         // Look for tool results from Bash commands
         if value.get("type").and_then(Value::as_str) == Some("user") {
-            if let Some(content) = value.get("message").and_then(|m| m.get("content")).and_then(Value::as_array) {
+            if let Some(content) = value
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+            {
                 for block in content {
                     if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                        let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                        let result_content = block.get("content").and_then(Value::as_str).unwrap_or("");
+                        let is_error = block
+                            .get("is_error")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let result_content =
+                            block.get("content").and_then(Value::as_str).unwrap_or("");
                         // Try to extract the command from the context
                         if let Some(cmd) = extract_command_from_context(&value) {
-                            bash_results.push((cmd, is_error || result_content.contains("error") || result_content.contains("Error")));
+                            bash_results.push((
+                                cmd,
+                                is_error
+                                    || result_content.contains("error")
+                                    || result_content.contains("Error"),
+                            ));
                         }
                     }
                 }
@@ -205,12 +215,20 @@ fn extract_corrections(path: &Path) -> Result<Vec<(String, String)>> {
 
         // Also look for assistant tool_use with Bash
         if value.get("type").and_then(Value::as_str) == Some("assistant") {
-            if let Some(content) = value.get("message").and_then(|m| m.get("content")).and_then(Value::as_array) {
+            if let Some(content) = value
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+            {
                 for block in content {
                     if block.get("type").and_then(Value::as_str) == Some("tool_use")
                         && block.get("name").and_then(Value::as_str) == Some("Bash")
                     {
-                        if let Some(cmd) = block.get("input").and_then(|i| i.get("command")).and_then(Value::as_str) {
+                        if let Some(cmd) = block
+                            .get("input")
+                            .and_then(|i| i.get("command"))
+                            .and_then(Value::as_str)
+                        {
                             // This will be matched with its result later
                             bash_results.push((cmd.to_string(), false));
                         }
@@ -249,9 +267,10 @@ fn extract_command_from_context(value: &Value) -> Option<String> {
         .iter()
         .find_map(|block| {
             if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                block.get("content").and_then(Value::as_str).map(|c| {
-                    c.lines().next().unwrap_or("").to_string()
-                })
+                block
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|c| c.lines().next().unwrap_or("").to_string())
             } else {
                 None
             }
@@ -268,11 +287,11 @@ fn truncate_command(cmd: &str, max: usize) -> String {
 
 fn write_corrections_rules(corrections: &[Correction]) -> Result<()> {
     let dir = PathBuf::from(".claude/rules");
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
     let path = dir.join("cli-corrections.md");
-    let mut content = String::from("# CLI Corrections (auto-generated by `covy compact learn`)\n\n");
+    let mut content =
+        String::from("# CLI Corrections (auto-generated by `covy compact learn`)\n\n");
     content.push_str("These patterns were learned from session history.\n\n");
 
     for correction in corrections.iter().take(50) {
@@ -282,8 +301,7 @@ fn write_corrections_rules(corrections: &[Correction]) -> Result<()> {
         ));
     }
 
-    fs::write(&path, &content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    fs::write(&path, &content).with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(())
 }

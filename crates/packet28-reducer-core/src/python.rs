@@ -563,10 +563,7 @@ fn compact_ruff_output(output: &str) -> String {
             let location = format!("{}:{}", parts[0], parts[1]);
             let rule_msg = parts[3].trim();
             let rule = rule_msg.split_whitespace().next().unwrap_or("");
-            by_rule
-                .entry(rule.to_string())
-                .or_default()
-                .push(location);
+            by_rule.entry(rule.to_string()).or_default().push(location);
         }
     }
     if by_rule.is_empty() {

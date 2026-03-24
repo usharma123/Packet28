@@ -63,7 +63,10 @@ impl LintResult {
                 .max_by_key(|(_, issues)| issues.len())
                 .map(|(rule, issues)| format!("{} ({})", rule, issues.len()))
                 .unwrap_or_default();
-            format!("{} issues across {} rules; top: {}", self.total, rule_count, top_rule)
+            format!(
+                "{} issues across {} rules; top: {}",
+                self.total, rule_count, top_rule
+            )
         } else {
             format!("{} issues", self.total)
         }
@@ -209,10 +212,7 @@ mod tests {
                 rule: "W291".to_string(),
             }],
         );
-        let result = LintResult {
-            total: 3,
-            by_rule,
-        };
+        let result = LintResult { total: 3, by_rule };
         assert_eq!(
             result.summary_line(),
             "3 issues across 2 rules; top: E401 (2)"

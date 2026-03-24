@@ -62,9 +62,7 @@ pub fn reduce_git_command(
         String::new()
     } else {
         match spec.canonical_kind.as_str() {
-            "git_diff" | "git_show" if stdout.contains("diff --git ") => {
-                compact_diff(stdout, 500)
-            }
+            "git_diff" | "git_show" if stdout.contains("diff --git ") => compact_diff(stdout, 500),
             "git_status" => compact_git_status(stdout),
             "git_log" => compact_git_log(stdout, 20),
             _ => String::new(),

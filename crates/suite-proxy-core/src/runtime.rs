@@ -14,8 +14,7 @@ const DEFAULT_MAX_OUTPUT_BYTES: usize = 24_000;
 const DEFAULT_MAX_LINES: usize = 160;
 const DEFAULT_PACKET_BYTE_CAP: usize = 2_500;
 const HIGHLIGHT_CAP: usize = 6;
-const SAFE_COMMAND_ERROR: &str =
-    "proxy.run only allows: ls, find, grep, git status, git log";
+const SAFE_COMMAND_ERROR: &str = "proxy.run only allows: ls, find, grep, git status, git log";
 
 #[derive(Debug, Clone)]
 struct ScoredLine {

@@ -11,7 +11,9 @@ use packet28_daemon_core::{
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::route_registry::{build_route_rewrite, decide_command_route_with_cwd, NativeToolKind, RouteKind};
+use crate::route_registry::{
+    build_route_rewrite, decide_command_route_with_cwd, NativeToolKind, RouteKind,
+};
 
 #[derive(Args)]
 pub struct CompactArgs {
