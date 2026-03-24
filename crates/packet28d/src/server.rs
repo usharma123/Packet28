@@ -320,6 +320,10 @@ fn handle_request(
             let response = daemon_packet28_search(state, request)?;
             Ok(DaemonResponse::Packet28Search { response })
         }
+        DaemonRequest::Packet28SearchGuard { request } => {
+            let response = crate::index::daemon_packet28_search_guard(state, request)?;
+            Ok(DaemonResponse::Packet28SearchGuard { response })
+        }
         DaemonRequest::DaemonIndexStatus { request: _ } => {
             let response = daemon_index_status(state)?;
             Ok(DaemonResponse::DaemonIndexStatus { response })

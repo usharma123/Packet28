@@ -305,8 +305,12 @@ pub(crate) fn daemon_index_clear(
 
 pub(crate) fn daemon_packet28_search(
     state: Arc<Mutex<DaemonState>>,
-    request: packet28_reducer_core::SearchRequest,
+    request: packet28_daemon_core::Packet28SearchRequest,
 ) -> Result<packet28_reducer_core::SearchResult> {
+    let packet28_daemon_core::Packet28SearchRequest {
+        request,
+        force_indexed,
+    } = request;
     let (root, runtime) = {
         let guard = state.lock().map_err(lock_err)?;
         (
@@ -314,12 +318,57 @@ pub(crate) fn daemon_packet28_search(
             guard.interactive_index.regex_runtime.clone(),
         )
     };
-    let runtime = runtime.ok_or_else(|| anyhow!("regex search index is not ready"))?;
+    let Some(runtime) = runtime else {
+        if force_indexed {
+            anyhow::bail!("regex search index is not ready");
+        }
+        let mut fallback = packet28_reducer_core::search(&root, &request)?;
+        if let Some(engine) = fallback.engine.as_mut() {
+            engine.fallback_reason = Some("regex search index is not ready".to_string());
+        }
+        return Ok(fallback);
+    };
     if let Some(reason) = packet28_search_core::guarded_fallback_reason(&root, &runtime, &request)?
     {
-        return Err(anyhow!(reason));
+        if force_indexed {
+            anyhow::bail!("{reason}");
+        }
+        let mut fallback = packet28_reducer_core::search(&root, &request)?;
+        if let Some(engine) = fallback.engine.as_mut() {
+            engine.fallback_reason = Some(reason);
+        }
+        return Ok(fallback);
     }
     packet28_search_core::indexed_search(&root, &runtime, &request)
+}
+
+pub(crate) fn daemon_packet28_search_guard(
+    state: Arc<Mutex<DaemonState>>,
+    request: packet28_daemon_core::Packet28SearchRequest,
+) -> Result<packet28_daemon_core::Packet28SearchGuardResponse> {
+    let packet28_daemon_core::Packet28SearchRequest {
+        request,
+        force_indexed,
+    } = request;
+    let (root, runtime) = {
+        let guard = state.lock().map_err(lock_err)?;
+        (
+            guard.root.clone(),
+            guard.interactive_index.regex_runtime.clone(),
+        )
+    };
+    let fallback_reason = match runtime {
+        Some(runtime) => {
+            if force_indexed {
+                None
+            } else {
+                packet28_search_core::guarded_fallback_reason(&root, &runtime, &request)?
+            }
+        }
+        None if force_indexed => None,
+        None => Some("regex search index is not ready".to_string()),
+    };
+    Ok(packet28_daemon_core::Packet28SearchGuardResponse { fallback_reason })
 }
 
 fn apply_regex_manifest_status(

@@ -91,7 +91,10 @@ pub enum DaemonRequest {
         request: HookIngestRequest,
     },
     Packet28Search {
-        request: packet28_reducer_core::SearchRequest,
+        request: Packet28SearchRequest,
+    },
+    Packet28SearchGuard {
+        request: Packet28SearchRequest,
     },
     DaemonIndexStatus {
         request: DaemonIndexStatusRequest,
@@ -102,6 +105,19 @@ pub enum DaemonRequest {
     DaemonIndexClear {
         request: DaemonIndexClearRequest,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Packet28SearchRequest {
+    pub request: packet28_reducer_core::SearchRequest,
+    pub force_indexed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Packet28SearchGuardResponse {
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +219,9 @@ pub enum DaemonResponse {
     },
     Packet28Search {
         response: packet28_reducer_core::SearchResult,
+    },
+    Packet28SearchGuard {
+        response: Packet28SearchGuardResponse,
     },
     DaemonIndexStatus {
         response: DaemonIndexStatusResponse,

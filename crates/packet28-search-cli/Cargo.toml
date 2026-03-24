@@ -11,6 +11,7 @@ homepage.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+packet28-daemon-core = { version = "0.2.0", path = "../packet28-daemon-core" }
 packet28-reducer-core = { version = "0.2.0", path = "../packet28-reducer-core" }
 packet28-search-core = { version = "0.2.0", path = "../packet28-search-core" }
 
