@@ -1,7 +1,7 @@
 use super::*;
 use crate::cmd_mcp::support::{
     load_raw_output_artifact, load_tool_result_artifact, next_task_invocation,
-    store_result_artifact, write_auto_capture_state_batch_via_session,
+    packet28_search_via_session, store_result_artifact, write_auto_capture_state_batch_via_session,
 };
 use glob::Pattern;
 
@@ -269,42 +269,48 @@ pub(crate) fn handle_packet28_search(
     let (sequence, invocation_id) = next_task_invocation(session, task_id)?;
     let request_summary = search_request_summary(&args);
 
+    let request = packet28_reducer_core::SearchRequest {
+        query: query.to_string(),
+        requested_paths: args.paths.clone(),
+        fixed_string: args.fixed_string,
+        case_sensitive: args.case_sensitive,
+        whole_word: args.whole_word,
+        context_lines: args.context_lines,
+        max_matches_per_file: args.max_matches_per_file,
+        max_total_matches: args.max_total_matches,
+    };
     let started_at = Instant::now();
-    let search_result = match packet28_reducer_core::search(
-        root,
-        &packet28_reducer_core::SearchRequest {
-            query: query.to_string(),
-            requested_paths: args.paths.clone(),
-            fixed_string: args.fixed_string,
-            case_sensitive: args.case_sensitive,
-            whole_word: args.whole_word,
-            context_lines: args.context_lines,
-            max_matches_per_file: args.max_matches_per_file,
-            max_total_matches: args.max_total_matches,
-        },
-    ) {
+    let search_result = match packet28_search_via_session(root, session, request.clone()) {
         Ok(result) => result,
-        Err(error) => {
-            let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            write_native_tool_failure(
-                root,
-                session,
-                task_id,
-                &invocation_id,
-                sequence,
-                "packet28.search",
-                suite_packet_core::ToolOperationKind::Search,
-                request_summary,
-                error.to_string(),
-                "native_tool",
-                None,
-                None,
-                None,
-                None,
-                duration_ms,
-            )?;
-            return Err(error);
-        }
+        Err(daemon_error) => match packet28_reducer_core::search(root, &request) {
+            Ok(mut fallback) => {
+                if let Some(engine) = fallback.engine.as_mut() {
+                    engine.fallback_reason = Some(daemon_error.to_string());
+                }
+                fallback
+            }
+            Err(error) => {
+                let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                write_native_tool_failure(
+                    root,
+                    session,
+                    task_id,
+                    &invocation_id,
+                    sequence,
+                    "packet28.search",
+                    suite_packet_core::ToolOperationKind::Search,
+                    request_summary,
+                    error.to_string(),
+                    "native_tool",
+                    None,
+                    None,
+                    None,
+                    None,
+                    duration_ms,
+                )?;
+                return Err(error);
+            }
+        },
     };
     let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let groups = search_result
@@ -367,6 +373,7 @@ pub(crate) fn handle_packet28_search(
         "groups": groups,
         "compact_preview": compact_preview,
         "diagnostics": diagnostics,
+        "engine": search_result.engine,
         "response_mode": "full",
     });
     let artifact_id = Some(store_result_artifact(

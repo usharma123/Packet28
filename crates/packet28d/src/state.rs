@@ -24,6 +24,7 @@ pub(crate) struct CachedSourceFile {
 pub(crate) struct InteractiveIndexRuntime {
     pub(crate) manifest: DaemonIndexManifest,
     pub(crate) snapshot: Option<Arc<mapy_core::RepoIndexSnapshot>>,
+    pub(crate) regex_runtime: Option<packet28_search_core::RegexIndexRuntime>,
 }
 
 pub(crate) enum IndexCommand {

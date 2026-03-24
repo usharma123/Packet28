@@ -1,5 +1,5 @@
 [package]
-name = "packet28-daemon-core"
+name = "packet28-search-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,14 +10,11 @@ homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-blake3.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-context-kernel-core = { version = "0.2.0", path = "../context-kernel-core" }
-context-memory-core = { version = "0.2.0", path = "../context-memory-core" }
-suite-packet-core = { version = "0.2.0", path = "../suite-packet-core" }
+clap.workspace = true
 packet28-reducer-core = { version = "0.2.0", path = "../packet28-reducer-core" }
-fs2 = "0.4"
+packet28-search-core = { version = "0.2.0", path = "../packet28-search-core" }
 
 [dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
 tempfile.workspace = true

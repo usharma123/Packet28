@@ -221,6 +221,17 @@ fn initialize_mcp_session(stdin: &mut ChildStdin, stdout: &mut BufReader<ChildSt
     let _ = read_mcp_message_for_id(stdout, 1);
 }
 
+fn workspace_packet28_version() -> String {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = workspace.parent().unwrap().parent().unwrap();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let value: toml::Value = toml::from_str(&manifest).unwrap();
+    value["workspace"]["package"]["version"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 fn write_intention_via_mcp(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
@@ -2733,6 +2744,21 @@ fn test_suite_daemon_index_rebuild_and_status() {
                     .unwrap_or(0)
                     > 0
             );
+            assert!(
+                status
+                    .get("manifest")
+                    .and_then(|manifest| manifest.get("regex_weight_table_version"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+            );
+            assert_eq!(
+                status
+                    .get("manifest")
+                    .and_then(|manifest| manifest.get("regex_status"))
+                    .and_then(Value::as_str),
+                Some("ready")
+            );
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -3634,6 +3660,7 @@ fn test_packet28_mcp_native_tools_return_slim_results_and_fetch_full_artifacts()
     assert_eq!(search_full_payload["response_mode"], "full");
     assert_eq!(search_full_payload["query"], "Alpha");
     assert!(search_full_payload["groups"].as_array().unwrap().len() >= 1);
+    assert!(search_full_payload["engine"].is_object());
 
     write_mcp_message(
         &mut stdin,
@@ -4073,6 +4100,10 @@ fn test_packet28_mcp_accepts_newline_json_stdio() {
     );
     let initialize = read_mcp_message_newline(&mut stdout);
     assert_eq!(initialize["result"]["serverInfo"]["name"], "Packet28");
+    assert_eq!(
+        initialize["result"]["serverInfo"]["version"],
+        workspace_packet28_version()
+    );
     assert_eq!(initialize["result"]["protocolVersion"], "2024-11-05");
     assert!(initialize["result"]["capabilities"]["experimental"].is_null());
 

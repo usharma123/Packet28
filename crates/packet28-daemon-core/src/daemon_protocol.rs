@@ -90,6 +90,9 @@ pub enum DaemonRequest {
     HookIngest {
         request: HookIngestRequest,
     },
+    Packet28Search {
+        request: packet28_reducer_core::SearchRequest,
+    },
     DaemonIndexStatus {
         request: DaemonIndexStatusRequest,
     },
@@ -197,6 +200,9 @@ pub enum DaemonResponse {
     },
     HookIngest {
         response: HookIngestResponse,
+    },
+    Packet28Search {
+        response: packet28_reducer_core::SearchResult,
     },
     DaemonIndexStatus {
         response: DaemonIndexStatusResponse,

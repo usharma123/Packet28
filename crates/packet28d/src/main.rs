@@ -89,7 +89,8 @@ use crate::commands::{
 use crate::hooks::hook_ingest;
 use crate::index::{
     build_index_status, daemon_index_clear, daemon_index_rebuild, daemon_index_status,
-    enqueue_full_index_rebuild, enqueue_incremental_index_paths, spawn_index_worker,
+    daemon_packet28_search, enqueue_full_index_rebuild, enqueue_incremental_index_paths,
+    spawn_index_worker,
 };
 use crate::launch::{task_await_handoff, task_launch_agent};
 use crate::planning::*;
@@ -173,6 +174,7 @@ fn serve(root: PathBuf) -> Result<()> {
     let watches = load_watch_registry(&root)?;
     let manifest = load_index_manifest_file(&root);
     let snapshot = load_index_snapshot_file(&root, &manifest);
+    let regex_runtime = packet28_search_core::load_runtime(&root).unwrap_or_default();
     let (index_tx, index_rx) = mpsc::channel();
     let state = Arc::new(Mutex::new(DaemonState {
         root: root.clone(),
@@ -184,7 +186,11 @@ fn serve(root: PathBuf) -> Result<()> {
         watcher_handles: HashMap::new(),
         subscribers: HashMap::new(),
         source_file_cache: BTreeMap::new(),
-        interactive_index: InteractiveIndexRuntime { manifest, snapshot },
+        interactive_index: InteractiveIndexRuntime {
+            manifest,
+            snapshot,
+            regex_runtime: Some(regex_runtime),
+        },
         index_tx,
         shutting_down: false,
     }));
@@ -197,6 +203,14 @@ fn serve(root: PathBuf) -> Result<()> {
         let should_queue = {
             let guard = state.lock().map_err(lock_err)?;
             guard.interactive_index.snapshot.is_none()
+                || guard.interactive_index.regex_runtime.is_none()
+                || guard
+                    .interactive_index
+                    .regex_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| {
+                        !runtime.is_loaded() || runtime.manifest.status != "ready"
+                    })
                 || guard.interactive_index.manifest.status != "ready"
         };
         if should_queue {
