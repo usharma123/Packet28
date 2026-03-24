@@ -1,6 +1,6 @@
 # Packet28 Regex Search Benchmark
 
-_Generated: 2026-03-24T15:16:21.005920+00:00_
+_Generated: 2026-03-24T15:36:34.366155+00:00_
 
 ## Setup
 
@@ -14,7 +14,7 @@ _Generated: 2026-03-24T15:16:21.005920+00:00_
 
 ### Tool Versions
 
-- `packet28-search-cli`: `git 6b6084e`
+- `packet28-search-cli`: `git 1af6c09`
 - `packet28d`: `packet28d 0.2.36`
 - `ripgrep`: `ripgrep 15.1.0`
 - `grep`: `grep (BSD grep, GNU compatible) 2.6.0-FreeBSD`
@@ -22,21 +22,21 @@ _Generated: 2026-03-24T15:16:21.005920+00:00_
 
 ### One-Time Packet28 Index Build Times
 
-- `workspace daemon index`: `10714.853 ms`
-- `inproc crates/packet28-search-cli`: `70.592 ms`
-- `inproc crates/packet28-search-core`: `781.356 ms`
-- `inproc crates/packet28d`: `586.964 ms`
-- `inproc crates/suite-cli`: `1160.310 ms`
+- `workspace daemon index`: `11694.258 ms`
+- `inproc crates/packet28-search-cli`: `84.190 ms`
+- `inproc crates/packet28-search-core`: `793.689 ms`
+- `inproc crates/packet28d`: `606.149 ms`
+- `inproc crates/suite-cli`: `1179.397 ms`
 
 ## Summary
 
 | Tool | Scenarios | Avg Mean ms | Avg Compact Tokens | Avg True Hits / 1k Tokens | Exact-Match Rate |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `packet28-daemon` | 8 | 6.879 | 16.4 | 452.7 | 100% |
-| `ripgrep` | 8 | 8.235 | 16.4 | 452.7 | 100% |
-| `grep` | 8 | 8.886 | 16.4 | 452.7 | 100% |
-| `packet28-inproc` | 8 | 11.701 | 16.4 | 452.7 | 100% |
-| `ast-grep` | 4 | 18.438 | 15.2 | 66.0 | 50% |
+| `packet28-daemon` | 8 | 7.344 | 16.4 | 492.2 | 100% |
+| `ripgrep` | 8 | 8.898 | 16.4 | 492.2 | 100% |
+| `grep` | 8 | 9.016 | 16.4 | 492.2 | 100% |
+| `packet28-inproc` | 8 | 12.453 | 16.4 | 492.2 | 100% |
+| `ast-grep` | 4 | 19.016 | 15.2 | 66.0 | 50% |
 
 ## Function Definition
 
@@ -49,11 +49,11 @@ Single Rust function definition lookup for handle_packet28_search.
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 3.413 | 16 | 16.0 | 100% | 100% | yes |
-| `packet28-inproc` | 8.322 | 16 | 16.0 | 100% | 100% | yes |
-| `ripgrep` | 9.475 | 16 | 16.0 | 100% | 100% | yes |
-| `grep` | 15.243 | 16 | 16.0 | 100% | 100% | yes |
-| `ast-grep` | 25.329 | 17 | 17.0 | 1% | 100% | no |
+| `packet28-daemon` | 4.014 | 16 | 16.0 | 100% | 100% | yes |
+| `packet28-inproc` | 9.374 | 16 | 16.0 | 100% | 100% | yes |
+| `ripgrep` | 10.756 | 16 | 16.0 | 100% | 100% | yes |
+| `grep` | 17.354 | 16 | 16.0 | 100% | 100% | yes |
+| `ast-grep` | 25.847 | 17 | 17.0 | 1% | 100% | no |
 
 ### Commands
 
@@ -83,11 +83,11 @@ Exact call-site lookup for packet28_search_via_session(root, session, request.cl
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 3.623 | 16 | 16.0 | 100% | 100% | yes |
-| `packet28-inproc` | 8.560 | 16 | 16.0 | 100% | 100% | yes |
-| `ripgrep` | 8.198 | 16 | 16.0 | 100% | 100% | yes |
-| `grep` | 15.807 | 16 | 16.0 | 100% | 100% | yes |
-| `ast-grep` | 25.058 | 16 | 16.0 | 100% | 100% | yes |
+| `packet28-daemon` | 4.223 | 16 | 16.0 | 100% | 100% | yes |
+| `packet28-inproc` | 8.281 | 16 | 16.0 | 100% | 100% | yes |
+| `ripgrep` | 8.419 | 16 | 16.0 | 100% | 100% | yes |
+| `grep` | 16.604 | 16 | 16.0 | 100% | 100% | yes |
+| `ast-grep` | 25.668 | 16 | 16.0 | 100% | 100% | yes |
 
 ### Commands
 
@@ -116,11 +116,11 @@ Exact call-site lookup for daemon_packet28_search(state, request).
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 2.994 | 14 | 14.0 | 100% | 100% | yes |
-| `packet28-inproc` | 8.111 | 14 | 14.0 | 100% | 100% | yes |
-| `ripgrep` | 8.230 | 14 | 14.0 | 100% | 100% | yes |
-| `grep` | 6.677 | 14 | 14.0 | 100% | 100% | yes |
-| `ast-grep` | 13.203 | 14 | 14.0 | 100% | 100% | yes |
+| `packet28-daemon` | 3.238 | 14 | 14.0 | 100% | 100% | yes |
+| `packet28-inproc` | 9.850 | 14 | 14.0 | 100% | 100% | yes |
+| `ripgrep` | 9.239 | 14 | 14.0 | 100% | 100% | yes |
+| `grep` | 6.768 | 14 | 14.0 | 100% | 100% | yes |
+| `ast-grep` | 12.953 | 14 | 14.0 | 100% | 100% | yes |
 
 ### Commands
 
@@ -151,11 +151,11 @@ Anchored line-start regex for SearchRequest literal construction in the standalo
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 11.265 | 13 | 13.0 | 100% | 100% | yes |
-| `packet28-inproc` | 16.626 | 13 | 13.0 | 100% | 100% | yes |
-| `ripgrep` | 8.818 | 13 | 13.0 | 100% | 100% | yes |
-| `grep` | 3.278 | 13 | 13.0 | 100% | 100% | yes |
-| `ast-grep` | 10.161 | 14 | 14.0 | 10% | 100% | no |
+| `packet28-daemon` | 12.574 | 13 | 13.0 | 100% | 100% | yes |
+| `packet28-inproc` | 17.944 | 13 | 13.0 | 100% | 100% | yes |
+| `ripgrep` | 8.189 | 13 | 13.0 | 100% | 100% | yes |
+| `grep` | 4.592 | 13 | 13.0 | 100% | 100% | yes |
+| `ast-grep` | 11.596 | 14 | 14.0 | 10% | 100% | no |
 
 ### Commands
 
@@ -185,10 +185,10 @@ Alternation over three standalone CLI command handlers.
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 4.599 | 13 | 4.3 | 100% | 100% | yes |
-| `packet28-inproc` | 8.695 | 13 | 4.3 | 100% | 100% | yes |
-| `ripgrep` | 8.135 | 13 | 4.3 | 100% | 100% | yes |
-| `grep` | 3.119 | 13 | 4.3 | 100% | 100% | yes |
+| `packet28-daemon` | 5.938 | 13 | 4.3 | 100% | 100% | yes |
+| `packet28-inproc` | 9.901 | 13 | 4.3 | 100% | 100% | yes |
+| `ripgrep` | 8.557 | 13 | 4.3 | 100% | 100% | yes |
+| `grep` | 2.778 | 13 | 4.3 | 100% | 100% | yes |
 
 ### Commands
 
@@ -215,10 +215,10 @@ Cross-file alternation over Packet28 search/read/fetch handler names in suite-cl
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 5.579 | 21 | 2.6 | 100% | 100% | yes |
-| `packet28-inproc` | 10.642 | 21 | 2.6 | 100% | 100% | yes |
-| `ripgrep` | 8.936 | 21 | 2.6 | 100% | 100% | yes |
-| `grep` | 16.378 | 21 | 2.6 | 100% | 100% | yes |
+| `packet28-daemon` | 6.218 | 21 | 2.6 | 100% | 100% | yes |
+| `packet28-inproc` | 11.090 | 21 | 2.6 | 100% | 100% | yes |
+| `ripgrep` | 9.581 | 21 | 2.6 | 100% | 100% | yes |
+| `grep` | 16.410 | 21 | 2.6 | 100% | 100% | yes |
 
 ### Commands
 
@@ -247,10 +247,10 @@ Broad declaration regex over the packet28-search-core crate.
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 10.783 | 19 | 1.1 | 100% | 100% | yes |
-| `packet28-inproc` | 15.629 | 19 | 1.1 | 100% | 100% | yes |
-| `ripgrep` | 6.990 | 19 | 1.1 | 100% | 100% | yes |
-| `grep` | 7.976 | 19 | 1.1 | 100% | 100% | yes |
+| `packet28-daemon` | 12.300 | 19 | 1.1 | 100% | 100% | yes |
+| `packet28-inproc` | 16.376 | 19 | 1.1 | 100% | 100% | yes |
+| `ripgrep` | 7.828 | 19 | 1.1 | 100% | 100% | yes |
+| `grep` | 4.789 | 19 | 1.1 | 100% | 100% | yes |
 
 ### Commands
 
@@ -271,18 +271,18 @@ Broad declaration regex over the packet28-search-core crate.
 Common function-signature regex over the standalone search CLI.
 
 - Root: `crates/packet28-search-cli`
-- Canonical hits (`ripgrep`): `src/main.rs:79, src/main.rs:89, src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:258, src/main.rs:281, src/main.rs:307, src/main.rs:344, src/main.rs:360, src/main.rs:365, src/main.rs:370, src/main.rs:374, src/main.rs:380, src/main.rs:384, src/main.rs:396, src/main.rs:441, src/main.rs:451, tests/e2e.rs:12, tests/e2e.rs:16, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98, tests/e2e.rs:113, tests/e2e.rs:155, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207`
-- Packet28 daemon backend: `legacy_rg` transport: `daemon` total: `34`
-- Packet28 inproc backend: `legacy_rg` transport: `inproc` total: `34`
+- Canonical hits (`ripgrep`): `src/main.rs:79, src/main.rs:89, src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:262, src/main.rs:285, src/main.rs:311, src/main.rs:348, src/main.rs:357, src/main.rs:362, src/main.rs:390, src/main.rs:399, src/main.rs:426, src/main.rs:434, src/main.rs:439, src/main.rs:443, src/main.rs:449, src/main.rs:453, src/main.rs:465, src/main.rs:510, src/main.rs:520, tests/e2e.rs:12, tests/e2e.rs:16, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98, tests/e2e.rs:113, tests/e2e.rs:155, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:241, tests/e2e.rs:274`
+- Packet28 daemon backend: `legacy_rg` transport: `daemon` total: `40`
+- Packet28 inproc backend: `legacy_rg` transport: `inproc` total: `40`
 - Packet28 daemon fallback reason: `planner derived only weak/common literals; routing broad regex to legacy_rg`
 - Packet28 inproc fallback reason: `planner derived only weak/common literals; routing broad regex to legacy_rg`
 
 | Tool | Mean ms | Compact Tokens | Tokens / True Hit | Precision | Recall | Exact |
 | --- | ---: | ---: | ---: | ---: | ---: | :---: |
-| `packet28-daemon` | 12.773 | 19 | 0.6 | 100% | 100% | yes |
-| `packet28-inproc` | 17.020 | 19 | 0.6 | 100% | 100% | yes |
-| `ripgrep` | 7.097 | 19 | 0.6 | 100% | 100% | yes |
-| `grep` | 2.607 | 19 | 0.6 | 100% | 100% | yes |
+| `packet28-daemon` | 10.250 | 19 | 0.5 | 100% | 100% | yes |
+| `packet28-inproc` | 16.811 | 19 | 0.5 | 100% | 100% | yes |
+| `ripgrep` | 8.616 | 19 | 0.5 | 100% | 100% | yes |
+| `grep` | 2.835 | 19 | 0.5 | 100% | 100% | yes |
 
 ### Commands
 
@@ -293,10 +293,10 @@ Common function-signature regex over the standalone search CLI.
 
 ### Match Sets
 
-- `packet28-daemon` found: `src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:258, src/main.rs:281, src/main.rs:307, src/main.rs:344, src/main.rs:360, src/main.rs:365, src/main.rs:370, src/main.rs:374, src/main.rs:380, src/main.rs:384, src/main.rs:396, src/main.rs:441, src/main.rs:451, src/main.rs:79, src/main.rs:89, tests/e2e.rs:113, tests/e2e.rs:12, tests/e2e.rs:155, tests/e2e.rs:16, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98`
-- `packet28-inproc` found: `src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:258, src/main.rs:281, src/main.rs:307, src/main.rs:344, src/main.rs:360, src/main.rs:365, src/main.rs:370, src/main.rs:374, src/main.rs:380, src/main.rs:384, src/main.rs:396, src/main.rs:441, src/main.rs:451, src/main.rs:79, src/main.rs:89, tests/e2e.rs:113, tests/e2e.rs:12, tests/e2e.rs:155, tests/e2e.rs:16, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98`
-- `ripgrep` found: `src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:258, src/main.rs:281, src/main.rs:307, src/main.rs:344, src/main.rs:360, src/main.rs:365, src/main.rs:370, src/main.rs:374, src/main.rs:380, src/main.rs:384, src/main.rs:396, src/main.rs:441, src/main.rs:451, src/main.rs:79, src/main.rs:89, tests/e2e.rs:113, tests/e2e.rs:12, tests/e2e.rs:155, tests/e2e.rs:16, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98`
-- `grep` found: `src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:258, src/main.rs:281, src/main.rs:307, src/main.rs:344, src/main.rs:360, src/main.rs:365, src/main.rs:370, src/main.rs:374, src/main.rs:380, src/main.rs:384, src/main.rs:396, src/main.rs:441, src/main.rs:451, src/main.rs:79, src/main.rs:89, tests/e2e.rs:113, tests/e2e.rs:12, tests/e2e.rs:155, tests/e2e.rs:16, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98`
+- `packet28-daemon` found: `src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:262, src/main.rs:285, src/main.rs:311, src/main.rs:348, src/main.rs:357, src/main.rs:362, src/main.rs:390, src/main.rs:399, src/main.rs:426, src/main.rs:434, src/main.rs:439, src/main.rs:443, src/main.rs:449, src/main.rs:453, src/main.rs:465, src/main.rs:510, src/main.rs:520, src/main.rs:79, src/main.rs:89, tests/e2e.rs:113, tests/e2e.rs:12, tests/e2e.rs:155, tests/e2e.rs:16, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:241, tests/e2e.rs:274, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98`
+- `packet28-inproc` found: `src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:262, src/main.rs:285, src/main.rs:311, src/main.rs:348, src/main.rs:357, src/main.rs:362, src/main.rs:390, src/main.rs:399, src/main.rs:426, src/main.rs:434, src/main.rs:439, src/main.rs:443, src/main.rs:449, src/main.rs:453, src/main.rs:465, src/main.rs:510, src/main.rs:520, src/main.rs:79, src/main.rs:89, tests/e2e.rs:113, tests/e2e.rs:12, tests/e2e.rs:155, tests/e2e.rs:16, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:241, tests/e2e.rs:274, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98`
+- `ripgrep` found: `src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:262, src/main.rs:285, src/main.rs:311, src/main.rs:348, src/main.rs:357, src/main.rs:362, src/main.rs:390, src/main.rs:399, src/main.rs:426, src/main.rs:434, src/main.rs:439, src/main.rs:443, src/main.rs:449, src/main.rs:453, src/main.rs:465, src/main.rs:510, src/main.rs:520, src/main.rs:79, src/main.rs:89, tests/e2e.rs:113, tests/e2e.rs:12, tests/e2e.rs:155, tests/e2e.rs:16, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:241, tests/e2e.rs:274, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98`
+- `grep` found: `src/main.rs:101, src/main.rs:110, src/main.rs:137, src/main.rs:171, src/main.rs:184, src/main.rs:204, src/main.rs:237, src/main.rs:262, src/main.rs:285, src/main.rs:311, src/main.rs:348, src/main.rs:357, src/main.rs:362, src/main.rs:390, src/main.rs:399, src/main.rs:426, src/main.rs:434, src/main.rs:439, src/main.rs:443, src/main.rs:449, src/main.rs:453, src/main.rs:465, src/main.rs:510, src/main.rs:520, src/main.rs:79, src/main.rs:89, tests/e2e.rs:113, tests/e2e.rs:12, tests/e2e.rs:155, tests/e2e.rs:16, tests/e2e.rs:160, tests/e2e.rs:182, tests/e2e.rs:207, tests/e2e.rs:241, tests/e2e.rs:274, tests/e2e.rs:31, tests/e2e.rs:35, tests/e2e.rs:40, tests/e2e.rs:52, tests/e2e.rs:98`
 
 ## Observations
 

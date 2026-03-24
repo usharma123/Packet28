@@ -514,7 +514,7 @@ def main() -> None:
         lines.append("")
         lines.append("## Setup")
         lines.append("")
-        lines.append("- Workspace: `/Users/utsavsharma/Documents/GitHub/Coverage`")
+        lines.append(f"- Workspace: `{WORKSPACE}`")
         lines.append("- Packet28 in-process indexes were pre-built per search root before timing.")
         lines.append("- Packet28 daemon transport was measured against a resident `packet28d` running at the workspace root, with subtree searches mapped into requested-path filters.")
         lines.append("- Speed was measured with `hyperfine` using 2 warmups and 8 measured runs, with stdout redirected to `/dev/null`.")
