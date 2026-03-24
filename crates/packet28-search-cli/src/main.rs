@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use packet28_daemon_core::{
     read_socket_message, resolve_workspace_root, socket_path, write_socket_message, DaemonRequest,
-    DaemonResponse, Packet28SearchRequest as DaemonPacket28SearchRequest,
+    DaemonResponse, Packet28SearchGuardResponse, Packet28SearchRequest as DaemonPacket28SearchRequest,
 };
 use packet28_reducer_core::{SearchRequest, SearchResult};
 use packet28_search_core::{
@@ -265,7 +265,7 @@ fn guard_reason(
     transport: TransportMode,
 ) -> Result<Option<String>> {
     match transport {
-        TransportMode::Daemon => Ok(None),
+        TransportMode::Daemon => daemon_guard_reason(root, request),
         TransportMode::Inproc => {
             let runtime = load_runtime(root)?;
             guarded_fallback_reason(root, &runtime, request)
@@ -273,7 +273,7 @@ fn guard_reason(
         TransportMode::Auto => {
             let workspace_root = resolve_workspace_root(root);
             if daemon_available(&workspace_root) {
-                Ok(None)
+                daemon_guard_reason(root, request)
             } else {
                 let runtime = load_runtime(root)?;
                 guarded_fallback_reason(root, &runtime, request)
@@ -345,6 +345,20 @@ fn normalize_daemon_result(
 }
 
 #[cfg(unix)]
+fn daemon_guard_reason(root: &PathBuf, request: &SearchRequest) -> Result<Option<String>> {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let workspace_root = resolve_workspace_root(&canonical_root);
+    let daemon_request = daemon_search_request(&canonical_root, &workspace_root, request)?;
+    let response = send_daemon_guard(&workspace_root, daemon_request)?;
+    Ok(response.fallback_reason)
+}
+
+#[cfg(not(unix))]
+fn daemon_guard_reason(_root: &PathBuf, _request: &SearchRequest) -> Result<Option<String>> {
+    Err(anyhow!("daemon transport is only supported on unix platforms"))
+}
+
+#[cfg(unix)]
 fn send_daemon_search(
     root: &PathBuf,
     request: SearchRequest,
@@ -378,6 +392,41 @@ fn send_daemon_search(
     _request: SearchRequest,
     _force_indexed: bool,
 ) -> Result<SearchResult> {
+    Err(anyhow!("daemon transport is only supported on unix platforms"))
+}
+
+#[cfg(unix)]
+fn send_daemon_guard(
+    root: &PathBuf,
+    request: SearchRequest,
+) -> Result<Packet28SearchGuardResponse> {
+    let socket = socket_path(root);
+    let stream = UnixStream::connect(&socket)
+        .map_err(|err| anyhow!("failed to connect to daemon socket '{}': {err}", socket.display()))?;
+    let reader_stream = stream.try_clone()?;
+    let mut writer = BufWriter::new(stream);
+    let mut reader = BufReader::new(reader_stream);
+    write_socket_message(
+        &mut writer,
+        &DaemonRequest::Packet28SearchGuard {
+            request: DaemonPacket28SearchRequest {
+                request,
+                force_indexed: false,
+            },
+        },
+    )?;
+    match read_socket_message(&mut reader)? {
+        DaemonResponse::Packet28SearchGuard { response } => Ok(response),
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+#[cfg(not(unix))]
+fn send_daemon_guard(
+    _root: &PathBuf,
+    _request: SearchRequest,
+) -> Result<Packet28SearchGuardResponse> {
     Err(anyhow!("daemon transport is only supported on unix platforms"))
 }
 

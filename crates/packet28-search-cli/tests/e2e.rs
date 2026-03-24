@@ -269,3 +269,35 @@ fn indexed_engine_mode_is_enforced_over_daemon_transport() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
+
+#[test]
+fn guard_reports_daemon_fallback_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    fs::create_dir_all(workspace.join(".git")).unwrap();
+    let subtree = workspace.join("crates/search-sample");
+    write_fixture(&subtree);
+
+    cli()
+        .args(["build", workspace.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let mut daemon = start_daemon(workspace);
+
+    cli()
+        .args([
+            "guard",
+            subtree.to_str().unwrap(),
+            ".+",
+            "--transport",
+            "daemon",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mode=fallback"))
+        .stdout(predicate::str::contains("reason="));
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}

@@ -342,6 +342,35 @@ pub(crate) fn daemon_packet28_search(
     packet28_search_core::indexed_search(&root, &runtime, &request)
 }
 
+pub(crate) fn daemon_packet28_search_guard(
+    state: Arc<Mutex<DaemonState>>,
+    request: packet28_daemon_core::Packet28SearchRequest,
+) -> Result<packet28_daemon_core::Packet28SearchGuardResponse> {
+    let packet28_daemon_core::Packet28SearchRequest {
+        request,
+        force_indexed,
+    } = request;
+    let (root, runtime) = {
+        let guard = state.lock().map_err(lock_err)?;
+        (
+            guard.root.clone(),
+            guard.interactive_index.regex_runtime.clone(),
+        )
+    };
+    let fallback_reason = match runtime {
+        Some(runtime) => {
+            if force_indexed {
+                None
+            } else {
+                packet28_search_core::guarded_fallback_reason(&root, &runtime, &request)?
+            }
+        }
+        None if force_indexed => None,
+        None => Some("regex search index is not ready".to_string()),
+    };
+    Ok(packet28_daemon_core::Packet28SearchGuardResponse { fallback_reason })
+}
+
 fn apply_regex_manifest_status(
     manifest: &mut DaemonIndexManifest,
     runtime: &packet28_search_core::RegexIndexRuntime,

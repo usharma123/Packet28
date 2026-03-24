@@ -93,6 +93,9 @@ pub enum DaemonRequest {
     Packet28Search {
         request: Packet28SearchRequest,
     },
+    Packet28SearchGuard {
+        request: Packet28SearchRequest,
+    },
     DaemonIndexStatus {
         request: DaemonIndexStatusRequest,
     },
@@ -109,6 +112,12 @@ pub enum DaemonRequest {
 pub struct Packet28SearchRequest {
     pub request: packet28_reducer_core::SearchRequest,
     pub force_indexed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Packet28SearchGuardResponse {
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +219,9 @@ pub enum DaemonResponse {
     },
     Packet28Search {
         response: packet28_reducer_core::SearchResult,
+    },
+    Packet28SearchGuard {
+        response: Packet28SearchGuardResponse,
     },
     DaemonIndexStatus {
         response: DaemonIndexStatusResponse,
