@@ -314,10 +314,20 @@ pub(crate) fn daemon_packet28_search(
             guard.interactive_index.regex_runtime.clone(),
         )
     };
-    let runtime = runtime.ok_or_else(|| anyhow!("regex search index is not ready"))?;
+    let Some(runtime) = runtime else {
+        let mut fallback = packet28_reducer_core::search(&root, &request)?;
+        if let Some(engine) = fallback.engine.as_mut() {
+            engine.fallback_reason = Some("regex search index is not ready".to_string());
+        }
+        return Ok(fallback);
+    };
     if let Some(reason) = packet28_search_core::guarded_fallback_reason(&root, &runtime, &request)?
     {
-        return Err(anyhow!(reason));
+        let mut fallback = packet28_reducer_core::search(&root, &request)?;
+        if let Some(engine) = fallback.engine.as_mut() {
+            engine.fallback_reason = Some(reason);
+        }
+        return Ok(fallback);
     }
     packet28_search_core::indexed_search(&root, &runtime, &request)
 }

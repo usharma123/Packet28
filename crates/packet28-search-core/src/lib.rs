@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::weights::{pair_weight, WEIGHT_TABLE_VERSION};
 
-const REGEX_INDEX_SCHEMA_VERSION: u32 = 2;
+const REGEX_INDEX_SCHEMA_VERSION: u32 = 3;
 const REGEX_DIR_NAME: &str = "regex-v1";
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const BASE_LOOKUP_FILE_NAME: &str = "base.lookup.dat";
@@ -38,10 +38,10 @@ const LOOKUP_ROW_BYTES: usize = 24;
 const SHORT_GRAM_BYTES: usize = 2;
 const MIN_GRAM_BYTES: usize = 3;
 const MAX_GRAM_BYTES: usize = 24;
-const MAX_LITERAL_COVER: usize = 3;
+const MAX_LITERAL_COVER: usize = 8;
 const MAX_INDEXED_FILE_BYTES: usize = 2 * 1024 * 1024;
 const SEGMENT_DOC_BATCH_SIZE: usize = 256;
-const SEGMENT_RECORD_BYTES: usize = 13;
+const SEGMENT_RECORD_BYTES: usize = 14;
 const MAX_INDEX_VERIFY_CANDIDATES: usize = 96;
 const MAX_INDEX_VERIFY_NUMERATOR: usize = 1;
 const MAX_INDEX_VERIFY_DENOMINATOR: usize = 3;
@@ -142,37 +142,70 @@ struct CompiledSearch {
     plan: SearchPlan,
     plan_kind: String,
     planner_fallback: Option<String>,
+    must_fallback_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct HeapItem {
     hash: u64,
     doc_id: u32,
-    summary: u8,
+    summary: PositionSummary,
     segment_idx: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PositionSummary(u8);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PositionSummary {
+    buckets: u8,
+    repeated: bool,
+}
 
 impl PositionSummary {
     fn new(bucket: u8) -> Self {
-        Self(((bucket & 0x0f) << 4) | (bucket & 0x0f))
+        Self {
+            buckets: ((bucket & 0x0f) << 4) | (bucket & 0x0f),
+            repeated: false,
+        }
     }
 
     fn first_bucket(self) -> u8 {
-        self.0 >> 4
+        self.buckets >> 4
     }
 
     fn last_bucket(self) -> u8 {
-        self.0 & 0x0f
+        self.buckets & 0x0f
+    }
+
+    fn repeated(self) -> bool {
+        self.repeated
     }
 
     fn update(&mut self, bucket: u8) {
         let bucket = bucket & 0x0f;
         let first = self.first_bucket().min(bucket);
         let last = self.last_bucket().max(bucket);
-        self.0 = (first << 4) | last;
+        self.buckets = (first << 4) | last;
+        self.repeated = true;
+    }
+
+    fn merge(&mut self, other: PositionSummary) {
+        let first = self.first_bucket().min(other.first_bucket());
+        let last = self.last_bucket().max(other.last_bucket());
+        self.buckets = (first << 4) | last;
+        self.repeated = true;
+        if other.repeated {
+            self.repeated = true;
+        }
+    }
+
+    fn encode(self) -> [u8; 2] {
+        [self.buckets, u8::from(self.repeated)]
+    }
+
+    fn decode(bytes: [u8; 2]) -> Self {
+        Self {
+            buckets: bytes[0],
+            repeated: bytes[1] != 0,
+        }
     }
 }
 
@@ -211,12 +244,17 @@ enum LayerKind {
 struct QueryCache {
     postings: HashMap<(LayerKind, u64), Option<Vec<PostingEntry>>>,
     literal_candidates: HashMap<Vec<u8>, BTreeSet<String>>,
+    literal_hashes: HashMap<Vec<u8>, Vec<u64>>,
+    literal_repeat_requirements: HashMap<Vec<u8>, HashMap<u64, bool>>,
     literal_windows: HashMap<(String, Vec<u8>), Option<LiteralWindow>>,
 }
 
 #[derive(Clone)]
 enum Verifier {
-    Regex(Regex),
+    Regex {
+        regex: Regex,
+        whole_file_prefilter: bool,
+    },
     FixedBytes {
         needle: Vec<u8>,
         case_insensitive: bool,
@@ -465,25 +503,31 @@ pub fn guarded_fallback_reason(
             .unwrap_or_else(|| "regex search index is not ready".to_string());
         return Ok(Some(reason));
     }
-    let compiled = compile_request(request)?;
+    let loaded = runtime
+        .loaded
+        .as_ref()
+        .ok_or_else(|| anyhow!("regex index not loaded"))?;
+    let compiled = compile_request(request, loaded.as_ref())?;
+    if let Some(reason) = compiled.must_fallback_reason.clone() {
+        return Ok(Some(reason));
+    }
     if matches!(compiled.plan, SearchPlan::All) {
         return Ok(Some(compiled.planner_fallback.unwrap_or_else(|| {
             "planner could not derive a selective index plan".to_string()
         })));
     }
-    let loaded = runtime
-        .loaded
-        .as_ref()
-        .ok_or_else(|| anyhow!("regex index not loaded"))?;
     let (resolved_paths, _) = resolve_requested_paths(root, &request.requested_paths);
     let requested_filter = requested_filter_set(&resolved_paths);
     let all_paths = all_indexed_paths(loaded.as_ref(), requested_filter.as_ref());
     let mut engine = SearchEngineStats {
-        engine: "sparse_regex_index".to_string(),
+        engine: "indexed_regex".to_string(),
         index_generation: Some(runtime.manifest.generation),
         base_commit: runtime.manifest.base_commit.clone(),
         plan_kind: Some(compiled.plan_kind.clone()),
-        planner_fallback: compiled.planner_fallback.clone(),
+        planner_fallback: compiled
+            .must_fallback_reason
+            .clone()
+            .or(compiled.planner_fallback.clone()),
         stale_reason: runtime.manifest.stale_reason.clone(),
         candidates_examined: 0,
         candidate_files: 0,
@@ -527,13 +571,16 @@ pub fn indexed_search(
 
     let (resolved_paths, mut diagnostics) = resolve_requested_paths(root, &request.requested_paths);
     let requested_filter = requested_filter_set(&resolved_paths);
-    let compiled = compile_request(request)?;
+    let compiled = compile_request(request, loaded.as_ref())?;
     let mut engine = SearchEngineStats {
-        engine: "sparse_regex_index".to_string(),
+        engine: "indexed_regex".to_string(),
         index_generation: Some(runtime.manifest.generation),
         base_commit: runtime.manifest.base_commit.clone(),
         plan_kind: Some(compiled.plan_kind.clone()),
-        planner_fallback: compiled.planner_fallback.clone(),
+        planner_fallback: compiled
+            .must_fallback_reason
+            .clone()
+            .or(compiled.planner_fallback.clone()),
         stale_reason: runtime.manifest.stale_reason.clone(),
         candidates_examined: 0,
         candidate_files: 0,
@@ -545,7 +592,11 @@ pub fn indexed_search(
     let mut cache = QueryCache::default();
 
     let all_paths = all_indexed_paths(loaded.as_ref(), requested_filter.as_ref());
-    if let Some(reason) = compiled.planner_fallback.clone() {
+    if let Some(reason) = compiled
+        .must_fallback_reason
+        .clone()
+        .or(compiled.planner_fallback.clone())
+    {
         diagnostics.push(reason);
     }
     let candidate_paths = candidate_paths_for_plan(
@@ -652,22 +703,34 @@ fn build_verifier(request: &SearchRequest, query: &str) -> Result<Verifier> {
     } else {
         pattern
     };
+    let whole_file_prefilter = if request.fixed_string {
+        true
+    } else {
+        let hir = regex_syntax::parse(query)
+            .with_context(|| format!("unsupported regex syntax for packet28.search: {query}"))?;
+        !hir_has_line_anchors(&hir)
+    };
     let regex = RegexBuilder::new(&pattern)
         .case_insensitive(matches!(request.case_sensitive, Some(false)))
         .build()
         .with_context(|| format!("unsupported regex syntax for packet28.search: {query}"))?;
-    Ok(Verifier::Regex(regex))
+    Ok(Verifier::Regex {
+        regex,
+        whole_file_prefilter,
+    })
 }
 
-fn compile_request(request: &SearchRequest) -> Result<CompiledSearch> {
+fn compile_request(request: &SearchRequest, loaded: &LoadedIndex) -> Result<CompiledSearch> {
     let query = request.query.trim();
     let verifier = build_verifier(request, query)?;
     let (plan, planner_fallback) = build_search_plan(request, query)?;
+    let must_fallback_reason = classify_plan_fallback_reason(loaded, &plan);
     Ok(CompiledSearch {
         verifier,
         plan_kind: plan.kind_str().to_string(),
         plan,
         planner_fallback,
+        must_fallback_reason,
     })
 }
 
@@ -701,6 +764,118 @@ fn build_search_plan(request: &SearchRequest, query: &str) -> Result<(SearchPlan
         "planner could not derive required literals; verifying all indexed candidates".to_string()
     });
     Ok((plan, planner_fallback))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanStrength {
+    Strong,
+    Weak,
+}
+
+fn classify_plan_fallback_reason(loaded: &LoadedIndex, plan: &SearchPlan) -> Option<String> {
+    match assess_plan_strength(loaded, plan) {
+        Some(PlanStrength::Strong) => None,
+        Some(PlanStrength::Weak) => Some(
+            "planner derived only weak/common literals; routing broad regex to legacy_rg"
+                .to_string(),
+        ),
+        None => Some("planner could not derive an index-safe branch set".to_string()),
+    }
+}
+
+fn assess_plan_strength(loaded: &LoadedIndex, plan: &SearchPlan) -> Option<PlanStrength> {
+    match plan {
+        SearchPlan::All => None,
+        SearchPlan::Literal(literal) => Some(literal_strength(loaded, literal)),
+        SearchPlan::And(children) => {
+            let mut saw_strong = false;
+            let sibling_literal_count = children
+                .iter()
+                .filter(|child| matches!(child, SearchPlan::Literal(_)))
+                .count();
+            for child in children {
+                match assess_plan_strength_with_siblings(loaded, child, sibling_literal_count) {
+                    Some(PlanStrength::Strong) => saw_strong = true,
+                    Some(PlanStrength::Weak) => {}
+                    None => return None,
+                }
+            }
+            Some(if saw_strong {
+                PlanStrength::Strong
+            } else {
+                PlanStrength::Weak
+            })
+        }
+        SearchPlan::Or(children) => {
+            let mut saw_strong = false;
+            for child in children {
+                match assess_plan_strength(loaded, child) {
+                    Some(PlanStrength::Strong) => saw_strong = true,
+                    Some(PlanStrength::Weak) => return None,
+                    None => return None,
+                }
+            }
+            Some(if saw_strong {
+                PlanStrength::Strong
+            } else {
+                PlanStrength::Weak
+            })
+        }
+    }
+}
+
+fn assess_plan_strength_with_siblings(
+    loaded: &LoadedIndex,
+    plan: &SearchPlan,
+    sibling_literal_count: usize,
+) -> Option<PlanStrength> {
+    match plan {
+        SearchPlan::Literal(literal) => Some(literal_strength_with_siblings(
+            loaded,
+            literal,
+            sibling_literal_count,
+        )),
+        _ => assess_plan_strength(loaded, plan),
+    }
+}
+
+fn literal_strength(loaded: &LoadedIndex, literal: &[u8]) -> PlanStrength {
+    literal_strength_with_siblings(loaded, literal, 0)
+}
+
+fn literal_strength_with_siblings(
+    loaded: &LoadedIndex,
+    literal: &[u8],
+    sibling_literal_count: usize,
+) -> PlanStrength {
+    let total_paths = all_indexed_paths(loaded, None).len().max(1);
+    let min_docs = select_covering_candidates(loaded, literal)
+        .into_iter()
+        .map(|candidate| {
+            lookup_posting_count(&loaded.base, candidate.hash)
+                .unwrap_or(0)
+                .saturating_add(lookup_posting_count(&loaded.overlay, candidate.hash).unwrap_or(0))
+                as usize
+        })
+        .min()
+        .unwrap_or(total_paths);
+    let literal_len = literal.len();
+    if literal_len <= 3 && min_docs.saturating_mul(4) > total_paths {
+        return PlanStrength::Weak;
+    }
+    if literal_len <= 4 && sibling_literal_count == 0 && min_docs.saturating_mul(3) > total_paths {
+        return PlanStrength::Weak;
+    }
+    if literal_len >= 6 || min_docs <= 8 {
+        return PlanStrength::Strong;
+    }
+    if sibling_literal_count > 0 && min_docs.saturating_mul(2) <= total_paths {
+        return PlanStrength::Strong;
+    }
+    if min_docs.saturating_mul(8) <= total_paths {
+        return PlanStrength::Strong;
+    }
+    PlanStrength::Weak
 }
 
 fn plan_from_hir(hir: &Hir) -> SearchPlan {
@@ -894,22 +1069,53 @@ fn candidate_paths_for_plan(
             if let Some(cached) = cache.literal_candidates.get(literal) {
                 return Ok(cached.clone());
             }
-            let hashes = select_covering_hashes(loaded, literal);
-            if hashes.is_empty() {
+            let candidates = select_covering_candidates(loaded, literal);
+            if candidates.is_empty() {
                 return Ok(all_paths.clone());
             }
             let mut literal_paths: Option<BTreeSet<String>> = None;
-            for hash in hashes {
-                let current = paths_for_hash(loaded, hash, requested_filter, cache, engine)?;
+            let mut selected_hashes = Vec::new();
+            let mut covered = vec![false; literal.len()];
+            let mut previous_size = all_paths.len();
+            for candidate in candidates {
+                let current =
+                    paths_for_hash(loaded, candidate.hash, requested_filter, cache, engine)?;
                 literal_paths = Some(match literal_paths {
                     Some(existing) => existing.intersection(&current).cloned().collect(),
                     None => current,
                 });
+                selected_hashes.push(candidate.hash);
+                let coverage_end = candidate.end.min(covered.len());
+                for slot in covered
+                    .iter_mut()
+                    .take(coverage_end)
+                    .skip(candidate.start)
+                {
+                    *slot = true;
+                }
+                let covered_all = covered.iter().all(|covered_byte| *covered_byte);
+                let current_size = literal_paths.as_ref().map_or(0, BTreeSet::len);
+                let materially_reduced = current_size.saturating_mul(10) < previous_size.saturating_mul(9);
+                if should_stop_literal_refinement(
+                    current_size,
+                    all_paths.len(),
+                    covered_all,
+                    selected_hashes.len(),
+                    materially_reduced,
+                ) {
+                    break;
+                }
+                previous_size = current_size.max(1);
             }
             let resolved = literal_paths.unwrap_or_else(|| all_paths.clone());
             cache
                 .literal_candidates
                 .insert(literal.clone(), resolved.clone());
+            cache.literal_hashes.insert(literal.clone(), selected_hashes);
+            cache.literal_repeat_requirements.insert(
+                literal.clone(),
+                repeat_requirements_for_literal(literal),
+            );
             Ok(resolved)
         }
         SearchPlan::And(children) => {
@@ -960,7 +1166,10 @@ fn estimate_plan_cardinality(
     match plan {
         SearchPlan::All => all_path_count,
         SearchPlan::Literal(literal) => {
-            let hashes = select_covering_hashes(loaded, literal);
+            let hashes = select_covering_candidates(loaded, literal)
+                .into_iter()
+                .map(|candidate| candidate.hash)
+                .collect::<Vec<_>>();
             if hashes.is_empty() {
                 return all_path_count;
             }
@@ -1024,7 +1233,7 @@ fn estimate_hash_cardinality(
         .saturating_add(lookup_posting_count(&loaded.overlay, hash).unwrap_or(0)) as usize
 }
 
-fn select_covering_hashes(loaded: &LoadedIndex, literal: &[u8]) -> Vec<u64> {
+fn select_covering_candidates(loaded: &LoadedIndex, literal: &[u8]) -> Vec<SparseCandidate> {
     let mut candidates = build_covering_candidates(literal);
     candidates.sort_by(|left, right| {
         let left_docs = lookup_posting_count(&loaded.base, left.hash)
@@ -1041,12 +1250,30 @@ fn select_covering_hashes(loaded: &LoadedIndex, literal: &[u8]) -> Vec<u64> {
     });
     let mut selected = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut covered = vec![false; literal.len()];
     for candidate in candidates {
-        if seen.insert(candidate.hash) {
-            selected.push(candidate.hash);
-            if selected.len() >= MAX_LITERAL_COVER {
-                break;
+        if !seen.insert(candidate.hash) {
+            continue;
+        }
+        let adds_new_coverage = covered
+            .iter()
+            .enumerate()
+            .skip(candidate.start)
+            .take(candidate.end.saturating_sub(candidate.start))
+            .any(|(_idx, slot)| !*slot);
+        if adds_new_coverage || selected.len() < SHORT_GRAM_BYTES {
+            let coverage_end = candidate.end.min(covered.len());
+            for slot in covered
+                .iter_mut()
+                .take(coverage_end)
+                .skip(candidate.start)
+            {
+                *slot = true;
             }
+            selected.push(candidate);
+        }
+        if selected.len() >= MAX_LITERAL_COVER && covered.iter().all(|covered_byte| *covered_byte) {
+            break;
         }
     }
     selected
@@ -1161,9 +1388,12 @@ fn verify_path(
         )
     })?;
     match verifier {
-        Verifier::Regex(regex) => {
+        Verifier::Regex {
+            regex,
+            whole_file_prefilter,
+        } => {
             let text = String::from_utf8_lossy(&bytes);
-            if !regex.is_match(&text) {
+            if *whole_file_prefilter && !regex.is_match(text.as_ref()) {
                 return Ok(Vec::new());
             }
             collect_line_matches(path, &text, max_matches_per_file, |line| {
@@ -1348,10 +1578,10 @@ fn write_segment_files(
 ) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for (segment_idx, batch) in docs.chunks(SEGMENT_DOC_BATCH_SIZE).enumerate() {
-        let mut pairs = Vec::<(u64, u32, u8)>::new();
+        let mut pairs = Vec::<(u64, u32, PositionSummary)>::new();
         for doc in batch {
             for gram in &doc.grams {
-                pairs.push((gram.hash, doc.doc_id, gram.summary.0));
+                pairs.push((gram.hash, doc.doc_id, gram.summary));
             }
         }
         pairs.sort_unstable();
@@ -1363,13 +1593,13 @@ fn write_segment_files(
     Ok(paths)
 }
 
-fn write_segment_file(path: &Path, pairs: &[(u64, u32, u8)]) -> Result<()> {
+fn write_segment_file(path: &Path, pairs: &[(u64, u32, PositionSummary)]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     let mut file = File::create(&tmp)?;
     for (hash, doc_id, summary) in pairs {
         file.write_all(&hash.to_le_bytes())?;
         file.write_all(&doc_id.to_le_bytes())?;
-        file.write_all(&[*summary])?;
+        file.write_all(&summary.encode())?;
     }
     file.flush()?;
     drop(file);
@@ -1405,12 +1635,10 @@ fn merge_segment_files(segment_paths: &[PathBuf]) -> Result<(Vec<(u64, u64, u32,
             current_docs.clear();
         }
         match current_docs.last_mut() {
-            Some(last) if last.doc_id == item.doc_id => last
-                .summary
-                .update(PositionSummary(item.summary).last_bucket()),
+            Some(last) if last.doc_id == item.doc_id => last.summary.merge(item.summary),
             _ => current_docs.push(PostingEntry {
                 doc_id: item.doc_id,
-                summary: PositionSummary(item.summary),
+                summary: item.summary,
             }),
         }
         if let Some((next_hash, next_doc_id, next_summary)) =
@@ -1428,7 +1656,7 @@ fn merge_segment_files(segment_paths: &[PathBuf]) -> Result<(Vec<(u64, u64, u32,
     Ok((rows, postings))
 }
 
-fn read_segment_pair(reader: &mut BufReader<File>) -> Result<Option<(u64, u32, u8)>> {
+fn read_segment_pair(reader: &mut BufReader<File>) -> Result<Option<(u64, u32, PositionSummary)>> {
     let mut record = [0u8; SEGMENT_RECORD_BYTES];
     match reader.read_exact(&mut record) {
         Ok(()) => {}
@@ -1438,7 +1666,7 @@ fn read_segment_pair(reader: &mut BufReader<File>) -> Result<Option<(u64, u32, u
     Ok(Some((
         u64::from_le_bytes(record[0..8].try_into().expect("segment hash width")),
         u32::from_le_bytes(record[8..12].try_into().expect("segment doc id width")),
-        record[12],
+        PositionSummary::decode([record[12], record[13]]),
     )))
 }
 
@@ -1546,7 +1774,7 @@ fn encode_postings(entries: &[PostingEntry]) -> Vec<u8> {
         previous = entry.doc_id;
     }
     for entry in entries {
-        out.push(entry.summary.0);
+        out.extend_from_slice(&entry.summary.encode());
     }
     out
 }
@@ -1565,16 +1793,19 @@ fn decode_postings(bytes: &[u8]) -> Result<Vec<PostingEntry>> {
         doc_ids.push(current);
         index += consumed;
     }
-    let summary_end = index.saturating_add(count);
+    let summary_end = index.saturating_add(count.saturating_mul(2));
     if bytes.len() < summary_end {
         return Err(anyhow!("posting block missing positional summaries"));
     }
     Ok(doc_ids
         .into_iter()
-        .zip(bytes[index..summary_end].iter().copied())
-        .map(|(doc_id, summary)| PostingEntry {
+        .enumerate()
+        .map(|(offset, doc_id)| PostingEntry {
             doc_id,
-            summary: PositionSummary(summary),
+            summary: PositionSummary::decode([
+                bytes[index + (offset * 2)],
+                bytes[index + (offset * 2) + 1],
+            ]),
         })
         .collect())
 }
@@ -1845,6 +2076,27 @@ fn should_fallback_to_rg(candidate_count: usize, all_path_count: usize) -> bool 
             > all_path_count.saturating_mul(MAX_INDEX_VERIFY_NUMERATOR)
 }
 
+fn should_stop_literal_refinement(
+    candidate_count: usize,
+    all_path_count: usize,
+    covered_all: bool,
+    selected_count: usize,
+    materially_reduced: bool,
+) -> bool {
+    if candidate_count == 0 || selected_count >= MAX_LITERAL_COVER {
+        return true;
+    }
+    if !covered_all {
+        return false;
+    }
+    if !materially_reduced && selected_count >= 3 {
+        return true;
+    }
+    candidate_count <= 8
+        || candidate_count.saturating_mul(8) <= all_path_count
+        || selected_count >= 4
+}
+
 fn bucket_for_offset(offset: usize, byte_len: usize) -> u8 {
     if byte_len <= 1 {
         return 0;
@@ -1929,7 +2181,21 @@ fn literal_window_for_path(
     if let Some(cached) = cache.literal_windows.get(&cache_key) {
         return *cached;
     }
-    let hashes = select_covering_hashes(loaded, literal);
+    let hashes = cache
+        .literal_hashes
+        .get(literal)
+        .cloned()
+        .unwrap_or_else(|| {
+            select_covering_candidates(loaded, literal)
+                .into_iter()
+                .map(|candidate| candidate.hash)
+                .collect()
+        });
+    let repeat_requirements = cache
+        .literal_repeat_requirements
+        .get(literal)
+        .cloned()
+        .unwrap_or_else(|| repeat_requirements_for_literal(literal));
     if hashes.is_empty() {
         cache.literal_windows.insert(cache_key, None);
         return None;
@@ -1940,6 +2206,10 @@ fn literal_window_for_path(
     let mut union_latest = 0u8;
     for hash in hashes {
         let summary = lookup_summary_for_path(loaded, hash, path, cache)?;
+        if repeat_requirements.get(&hash).copied().unwrap_or(false) && !summary.repeated() {
+            cache.literal_windows.insert(cache_key, None);
+            return None;
+        }
         overlap_earliest = overlap_earliest.max(summary.first_bucket());
         overlap_latest = overlap_latest.min(summary.last_bucket());
         union_earliest = union_earliest.min(summary.first_bucket());
@@ -1956,6 +2226,41 @@ fn literal_window_for_path(
     });
     cache.literal_windows.insert(cache_key, window);
     window
+}
+
+fn repeat_requirements_for_literal(literal: &[u8]) -> HashMap<u64, bool> {
+    let mut counts = HashMap::<u64, usize>::new();
+    let normalized = normalize_for_index(literal);
+    for gram in normalized.windows(SHORT_GRAM_BYTES) {
+        *counts.entry(hash_bytes(gram)).or_insert(0) += 1;
+    }
+    for gram in normalized.windows(MIN_GRAM_BYTES) {
+        *counts.entry(hash_bytes(gram)).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(hash, count)| (count > 1).then_some((hash, true)))
+        .collect()
+}
+
+fn hir_has_line_anchors(hir: &Hir) -> bool {
+    match hir.kind() {
+        HirKind::Look(look) => matches!(
+            look,
+            regex_syntax::hir::Look::Start
+                | regex_syntax::hir::Look::End
+                | regex_syntax::hir::Look::StartLF
+                | regex_syntax::hir::Look::EndLF
+                | regex_syntax::hir::Look::StartCRLF
+                | regex_syntax::hir::Look::EndCRLF
+        ),
+        HirKind::Capture(capture) => hir_has_line_anchors(&capture.sub),
+        HirKind::Concat(children) | HirKind::Alternation(children) => {
+            children.iter().any(hir_has_line_anchors)
+        }
+        HirKind::Repetition(repetition) => hir_has_line_anchors(&repetition.sub),
+        HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) => false,
+    }
 }
 
 fn lookup_summary_for_path(
@@ -2551,6 +2856,77 @@ mod tests {
         };
         let result = indexed_search(root, &runtime, &request).unwrap();
         assert_eq!(result.paths, vec!["src/nested/mod.rs".to_string()]);
+    }
+
+    #[test]
+    fn indexed_search_matches_anchored_line_start_regexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn build() {\n    SearchRequest {\n        query: pattern,\n    };\n}\n",
+        )
+        .unwrap();
+
+        let runtime = rebuild_full_index(root, true).unwrap();
+        let request = SearchRequest {
+            query: r"^\s*SearchRequest\s*\{".to_string(),
+            ..SearchRequest::default()
+        };
+        let result = indexed_search(root, &runtime, &request).unwrap();
+        assert_eq!(result.match_count, 1);
+        assert_eq!(result.paths, vec!["src/main.rs".to_string()]);
+        assert_eq!(result.groups[0].matches[0].line, 2);
+    }
+
+    #[test]
+    fn regex_verifier_disables_whole_file_prefilter_for_anchored_queries() {
+        let anchored = build_verifier(&SearchRequest::default(), r"^\s*SearchRequest\s*\{")
+            .expect("anchored verifier");
+        let plain = build_verifier(&SearchRequest::default(), r"handle_packet28_search")
+            .expect("plain verifier");
+
+        match anchored {
+            Verifier::Regex {
+                whole_file_prefilter,
+                ..
+            } => assert!(!whole_file_prefilter),
+            _ => panic!("expected regex verifier"),
+        }
+        match plain {
+            Verifier::Regex {
+                whole_file_prefilter,
+                ..
+            } => assert!(whole_file_prefilter),
+            _ => panic!("expected regex verifier"),
+        }
+    }
+
+    #[test]
+    fn literal_candidate_planning_caches_selected_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runtime = build_fixture_index(root);
+        let loaded = runtime.loaded.as_ref().expect("loaded index");
+        let all_paths = all_indexed_paths(loaded.as_ref(), None);
+        let mut cache = QueryCache::default();
+        let mut engine = SearchEngineStats::default();
+        let literal = b"alpha_service".to_vec();
+
+        let paths = candidate_paths_for_plan(
+            loaded.as_ref(),
+            &SearchPlan::Literal(literal.clone()),
+            None,
+            &all_paths,
+            &mut cache,
+            &mut engine,
+        )
+        .expect("candidate paths");
+
+        assert_eq!(paths, BTreeSet::from(["src/lib.rs".to_string()]));
+        assert!(cache.literal_hashes.contains_key(&literal));
+        assert!(!cache.literal_hashes[&literal].is_empty());
     }
 
     #[test]
