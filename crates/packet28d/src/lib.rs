@@ -225,22 +225,32 @@ fn reconcile_task_event_high_waters(
         let durable_sequence = *event_tails
             .get(task_id)
             .ok_or_else(|| anyhow!("task '{task_id}' is missing from the event-tail snapshot"))?;
+        // The durable event log is the sequence owner: `append_next_task_event`
+        // fsyncs a frame before the in-memory high-water is bumped, so the log
+        // always leads the registry. A registry high-water that is *ahead* of
+        // the log therefore means the log lost committed bytes (truncation or
+        // loss), not that the registry is authoritative. Rather than fail the
+        // whole daemon closed on one such task, self-heal by trusting the
+        // durable log tail and persist the correction (the caller stages every
+        // changed task). A high-water that trails the log is the ordinary
+        // crash-after-append case and is bumped up as before.
         match durable_sequence {
             None if task.last_event_seq == 0 => {}
             None => {
-                anyhow::bail!(
-                    "task registry high-water {} for '{}' is ahead of its missing event log",
-                    task.last_event_seq,
-                    task_id
-                );
+                daemon_log(&format!(
+                    "healing task '{task_id}': registry high-water {} is ahead of a missing event log; resetting it to 0",
+                    task.last_event_seq
+                ));
+                task.last_event_seq = 0;
+                changed_task_ids.insert(task_id.clone());
             }
             Some(durable_sequence) if task.last_event_seq > durable_sequence => {
-                anyhow::bail!(
-                    "task registry high-water {} for '{}' is ahead of durable event sequence {}",
-                    task.last_event_seq,
-                    task_id,
-                    durable_sequence
-                );
+                daemon_log(&format!(
+                    "healing task '{task_id}': registry high-water {} is ahead of durable event sequence {durable_sequence}; resetting it to {durable_sequence}",
+                    task.last_event_seq
+                ));
+                task.last_event_seq = durable_sequence;
+                changed_task_ids.insert(task_id.clone());
             }
             Some(durable_sequence) if task.last_event_seq < durable_sequence => {
                 task.last_event_seq = durable_sequence;
