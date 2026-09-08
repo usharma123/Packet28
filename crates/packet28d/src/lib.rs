@@ -225,22 +225,32 @@ fn reconcile_task_event_high_waters(
         let durable_sequence = *event_tails
             .get(task_id)
             .ok_or_else(|| anyhow!("task '{task_id}' is missing from the event-tail snapshot"))?;
+        // The durable event log is the sequence owner: `append_next_task_event`
+        // fsyncs a frame before the in-memory high-water is bumped, so the log
+        // always leads the registry. A registry high-water that is *ahead* of
+        // the log therefore means the log lost committed bytes (truncation or
+        // loss), not that the registry is authoritative. Rather than fail the
+        // whole daemon closed on one such task, self-heal by trusting the
+        // durable log tail and persist the correction (the caller stages every
+        // changed task). A high-water that trails the log is the ordinary
+        // crash-after-append case and is bumped up as before.
         match durable_sequence {
             None if task.last_event_seq == 0 => {}
             None => {
-                anyhow::bail!(
-                    "task registry high-water {} for '{}' is ahead of its missing event log",
-                    task.last_event_seq,
-                    task_id
-                );
+                daemon_log(&format!(
+                    "healing task '{task_id}': registry high-water {} is ahead of a missing event log; resetting it to 0",
+                    task.last_event_seq
+                ));
+                task.last_event_seq = 0;
+                changed_task_ids.insert(task_id.clone());
             }
             Some(durable_sequence) if task.last_event_seq > durable_sequence => {
-                anyhow::bail!(
-                    "task registry high-water {} for '{}' is ahead of durable event sequence {}",
-                    task.last_event_seq,
-                    task_id,
-                    durable_sequence
-                );
+                daemon_log(&format!(
+                    "healing task '{task_id}': registry high-water {} is ahead of durable event sequence {durable_sequence}; resetting it to {durable_sequence}",
+                    task.last_event_seq
+                ));
+                task.last_event_seq = durable_sequence;
+                changed_task_ids.insert(task_id.clone());
             }
             Some(durable_sequence) if task.last_event_seq < durable_sequence => {
                 task.last_event_seq = durable_sequence;
@@ -260,25 +270,25 @@ struct TaskRestartReconciliation {
     replan_task_ids: Vec<String>,
 }
 
-/// Validates restart work before any lifecycle or watch state is mutated.
+/// Validates restart work before any lifecycle or watch state is mutated, and
+/// heals per-task inconsistencies that must not brick the whole daemon.
 ///
 /// A live process group cannot be authenticated from its persisted numeric PID
-/// alone because operating systems reuse process identifiers. Startup
-/// therefore fails closed until an operator quiesces that group, instead of
+/// alone because operating systems reuse process identifiers. That case stays
+/// fatal: startup fails closed until an operator quiesces the group, instead of
 /// risking signalling an unrelated process.
-fn preflight_restart_recovery(tasks: &TaskRegistry) -> Result<()> {
-    for (task_id, task) in &tasks.tasks {
-        if matches!(
-            task.lifecycle,
-            TaskLifecycle::ReplanPending
-                | TaskLifecycle::RunningRecoveredReplan
-                | TaskLifecycle::RunningReplanPending
-        ) && (!task.sequence_present || task.sequence.is_none())
-        {
-            anyhow::bail!(
-                "startup replan task '{task_id}' has no stored sequence and cannot be recovered"
-            );
-        }
+///
+/// A replan task that lost its stored kernel sequence, by contrast, cannot be
+/// re-executed but must not take the whole daemon down. It is downgraded to
+/// `Idle` (keeping its record and recording why in `last_error`) so the rest of
+/// the workspace recovers; the task can be resubmitted. Returns the ids of tasks
+/// healed this way so the caller persists the downgrade.
+fn preflight_restart_recovery(tasks: &mut TaskRegistry) -> Result<BTreeSet<String>> {
+    let mut healed = BTreeSet::new();
+    for (task_id, task) in &mut tasks.tasks {
+        // A live recovered agent must never be orphaned; keep this fatal, and
+        // check it first so a task that is both live and missing its sequence
+        // still fails closed rather than being silently downgraded.
         if task.latest_agent_completed_at_unix.is_none() {
             if let Some(pid) = task.latest_agent_pid {
                 if crate::launch::recovered_agent_process_group_exists(pid)? {
@@ -289,8 +299,28 @@ fn preflight_restart_recovery(tasks: &TaskRegistry) -> Result<()> {
                 }
             }
         }
+        if matches!(
+            task.lifecycle,
+            TaskLifecycle::ReplanPending
+                | TaskLifecycle::RunningRecoveredReplan
+                | TaskLifecycle::RunningReplanPending
+        ) && (!task.sequence_present || task.sequence.is_none())
+        {
+            daemon_log(&format!(
+                "healing task '{task_id}': {:?} lifecycle has no stored sequence to replan; downgrading to Idle",
+                task.lifecycle
+            ));
+            task.lifecycle = TaskLifecycle::Idle;
+            let evidence =
+                "durable replan sequence was missing after restart; downgraded to idle".to_string();
+            task.last_error = Some(match task.last_error.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing}; {evidence}"),
+                _ => evidence,
+            });
+            healed.insert(task_id.clone());
+        }
     }
-    Ok(())
+    Ok(healed)
 }
 
 /// Reconciles lifecycle state that cannot survive process ownership changes.

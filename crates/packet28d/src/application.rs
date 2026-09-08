@@ -131,7 +131,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
     // persistence owner has authenticated it and assumed revision ownership.
     let mut tasks = durable_tasks.clone();
     let mut watches = durable_watches.clone();
-    preflight_restart_recovery(&tasks)?;
+    let preflight_healed = preflight_restart_recovery(&mut tasks)?;
     let event_high_water_changes = reconcile_task_event_high_waters(&mut tasks, &event_tails)?;
     let restart_reconciliation =
         reconcile_interrupted_task_lifecycles(&mut tasks, &mut watches, now_unix())?;
@@ -160,6 +160,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
     for task_id in event_high_water_changes
         .iter()
         .chain(&restart_reconciliation.changed_task_ids)
+        .chain(&preflight_healed)
     {
         let task = tasks
             .tasks
