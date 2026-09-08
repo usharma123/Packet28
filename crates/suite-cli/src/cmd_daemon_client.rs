@@ -355,6 +355,68 @@ pub(crate) fn resolve_root_arg(root: &str) -> PathBuf {
     resolve_workspace_root(&cwd)
 }
 
+/// Default size ceiling for `packet28d.log` before it is rotated on the next
+/// daemon start. Kept intentionally modest so a crash-loop cannot balloon the
+/// active log into the gigabytes observed in long-lived workspaces.
+#[cfg(unix)]
+const DAEMON_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Number of rotated `packet28d.log.N` generations retained. Total on-disk log
+/// footprint is bounded by roughly `(DAEMON_LOG_MAX_BACKUPS + 1) * max_bytes`.
+#[cfg(unix)]
+const DAEMON_LOG_MAX_BACKUPS: usize = 3;
+
+/// Environment override for the rotation threshold, in bytes. A non-positive or
+/// unparsable value falls back to [`DAEMON_LOG_MAX_BYTES`].
+#[cfg(unix)]
+const DAEMON_LOG_MAX_BYTES_ENV: &str = "PACKET28_DAEMON_LOG_MAX_BYTES";
+
+#[cfg(unix)]
+fn daemon_log_max_bytes() -> u64 {
+    std::env::var(DAEMON_LOG_MAX_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DAEMON_LOG_MAX_BYTES)
+}
+
+#[cfg(unix)]
+fn daemon_log_backup_path(log_path: &Path, index: usize) -> PathBuf {
+    let mut name = log_path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{index}"));
+    log_path.with_file_name(name)
+}
+
+/// Rotates `log_path` when it has grown past `max_bytes`, keeping up to
+/// `max_backups` numbered generations (`packet28d.log.1` .. `.max_backups`).
+///
+/// This runs on every daemon (re)start. A healthy daemon logs sparsely, but a
+/// crash-loop restarts repeatedly and each restart previously reopened the same
+/// file in append mode, which is how a multi-gigabyte `packet28d.log` was
+/// observed. Rotation is best-effort: any filesystem error is ignored so a
+/// rotation problem can never block the daemon from starting.
+#[cfg(unix)]
+fn rotate_daemon_log_if_needed(log_path: &Path, max_bytes: u64, max_backups: usize) {
+    if max_bytes == 0 || max_backups == 0 {
+        return;
+    }
+    let Ok(metadata) = std::fs::metadata(log_path) else {
+        return;
+    };
+    if !metadata.is_file() || metadata.len() < max_bytes {
+        return;
+    }
+    // Drop the oldest generation, shift the remaining backups up by one, then
+    // move the active log into the first backup slot so the daemon starts fresh.
+    let _ = std::fs::remove_file(daemon_log_backup_path(log_path, max_backups));
+    for index in (1..max_backups).rev() {
+        let from = daemon_log_backup_path(log_path, index);
+        let to = daemon_log_backup_path(log_path, index + 1);
+        let _ = std::fs::rename(&from, &to);
+    }
+    let _ = std::fs::rename(log_path, daemon_log_backup_path(log_path, 1));
+}
+
 #[cfg(unix)]
 fn start_daemon(root: &Path) -> Result<()> {
     let binary = packet28d_binary()?;
@@ -365,6 +427,7 @@ fn start_daemon(root: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create daemon log dir '{}'", parent.display()))?;
     }
+    rotate_daemon_log_if_needed(&log_path, daemon_log_max_bytes(), DAEMON_LOG_MAX_BACKUPS);
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -688,6 +751,71 @@ mod tests {
         assert!(error
             .to_string()
             .contains("failed to read authenticated daemon runtime metadata"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_log_rotates_only_past_threshold_and_shifts_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("packet28d.log");
+
+        // A small log is left untouched.
+        std::fs::write(&log, b"small").unwrap();
+        rotate_daemon_log_if_needed(&log, 1024, 3);
+        assert!(log.exists());
+        assert!(!daemon_log_backup_path(&log, 1).exists());
+
+        // Crossing the threshold moves the active log into `.1`.
+        std::fs::write(&log, vec![b'x'; 2048]).unwrap();
+        rotate_daemon_log_if_needed(&log, 1024, 3);
+        assert!(!log.exists(), "active log should be rotated away");
+        assert_eq!(
+            std::fs::read(daemon_log_backup_path(&log, 1))
+                .unwrap()
+                .len(),
+            2048
+        );
+
+        // A second rotation shifts `.1` -> `.2` and installs the new `.1`.
+        std::fs::write(&log, vec![b'y'; 2048]).unwrap();
+        rotate_daemon_log_if_needed(&log, 1024, 3);
+        assert_eq!(
+            std::fs::read(daemon_log_backup_path(&log, 1)).unwrap(),
+            vec![b'y'; 2048]
+        );
+        assert_eq!(
+            std::fs::read(daemon_log_backup_path(&log, 2)).unwrap(),
+            vec![b'x'; 2048]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_log_rotation_bounds_backup_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("packet28d.log");
+        for _ in 0..5 {
+            std::fs::write(&log, vec![b'z'; 2048]).unwrap();
+            rotate_daemon_log_if_needed(&log, 1024, 2);
+        }
+        assert!(daemon_log_backup_path(&log, 1).exists());
+        assert!(daemon_log_backup_path(&log, 2).exists());
+        assert!(
+            !daemon_log_backup_path(&log, 3).exists(),
+            "backups beyond max_backups must be pruned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_log_max_bytes_env_override_is_respected() {
+        let default = super::DAEMON_LOG_MAX_BYTES;
+        std::env::set_var(super::DAEMON_LOG_MAX_BYTES_ENV, "4096");
+        assert_eq!(daemon_log_max_bytes(), 4096);
+        std::env::set_var(super::DAEMON_LOG_MAX_BYTES_ENV, "not-a-number");
+        assert_eq!(daemon_log_max_bytes(), default);
+        std::env::remove_var(super::DAEMON_LOG_MAX_BYTES_ENV);
+        assert_eq!(daemon_log_max_bytes(), default);
     }
 
     #[cfg(unix)]
