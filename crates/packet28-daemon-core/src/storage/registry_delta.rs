@@ -1070,6 +1070,82 @@ pub struct QuarantinedCorruptTaskEventLog {
     pub reason: String,
 }
 
+/// Scans for corrupt task event logs without modifying anything.
+///
+/// This is the read-only half of daemon-repair: it reports every admitted task
+/// whose durable event log fails integrity validation so an operator can see
+/// what a repair would quarantine before applying it.
+///
+/// # Errors
+///
+/// Returns the same errors as [`load_task_watch_registry_with_deltas`] plus the
+/// event-tail reader; a non-corruption failure (IO, lock, lease) propagates.
+pub fn inspect_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    scan_corrupt_task_event_logs(root)
+}
+
+/// Quarantines every corrupt task event log while the daemon is stopped.
+///
+/// For each task whose event log fails integrity validation this moves the log
+/// aside (to a sibling `*.corrupt-<unix>` file, preserved for inspection) and
+/// durably resets the owning task's event high-water to zero through a
+/// journal-safe registry delta, so a subsequent daemon start is clean and
+/// consistent. Returns the quarantined tasks (empty when nothing was corrupt).
+///
+/// Intended for offline operator recovery; run it with the daemon stopped. It
+/// acquires the task-store writer lease, so a running daemon makes it fail
+/// closed rather than racing live state.
+///
+/// # Errors
+///
+/// Returns the scan errors above plus filesystem errors from moving a log aside
+/// and the registry-delta errors from resetting the high-water.
+pub fn repair_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    let mut corrupt = scan_corrupt_task_event_logs(root)?;
+    if corrupt.is_empty() {
+        return Ok(corrupt);
+    }
+    move_corrupt_event_logs_aside(&mut corrupt)?;
+    reset_quarantined_task_high_waters(root, &corrupt)?;
+    Ok(corrupt)
+}
+
+/// Durably resets the event high-water of every quarantined task to zero using
+/// one journal-safe registry delta, matching the now-empty event logs.
+fn reset_quarantined_task_high_waters(
+    root: &Path,
+    corrupt: &[QuarantinedCorruptTaskEventLog],
+) -> Result<()> {
+    let loaded = load_task_watch_registry_with_deltas(root)?;
+    let mut batch = RegistryDeltaBatch::default();
+    for record in corrupt {
+        if let Some(task) = loaded.tasks.tasks.get(&record.task_id) {
+            if task.last_event_seq != 0 {
+                let mut updated = task.clone();
+                updated.last_event_seq = 0;
+                batch = batch.upsert_task(updated);
+            }
+        }
+    }
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let next = loaded.replayed_revision.checked_next().ok_or_else(|| {
+        DaemonCoreError::InvalidRegistryDeltaBatch {
+            root: root.to_path_buf(),
+            message: "registry revision exhausted while repairing corrupt task event logs"
+                .to_string(),
+        }
+    })?;
+    let revisions = RegistryRevisionRange::single(next).map_err(|error| {
+        DaemonCoreError::InvalidRegistryDeltaBatch {
+            root: root.to_path_buf(),
+            message: error.to_string(),
+        }
+    })?;
+    append_task_watch_registry_delta(root, revisions, &batch)
+}
+
 /// Returns true for durable event-log integrity failures that recovery can
 /// safely quarantine, as opposed to environmental IO, lock, or lease failures
 /// that must still fail closed.
@@ -3084,6 +3160,84 @@ mod tests {
             load_task_watch_registry_with_deltas_and_event_tails(root.path()).unwrap();
         assert!(reloaded.tasks.tasks.contains_key("bad"));
         assert_eq!(reloaded_tails.get("bad"), Some(&None));
+    }
+
+    #[test]
+    fn repair_quarantines_corrupt_event_log_and_resets_high_water() {
+        let root = tempdir().unwrap();
+        checkpoint(root.path(), [task("bad", &[]), task("good", &[])], []);
+
+        {
+            let lease =
+                crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap();
+            let mut authority = load_registry_admission_authority(root.path(), lease).unwrap();
+            for _ in 0..2 {
+                append_next_task_event_with_authority(
+                    root.path(),
+                    &authority,
+                    "bad",
+                    &DaemonEvent {
+                        kind: "seed".to_string(),
+                        occurred_at_unix: 1,
+                        data: serde_json::Value::Null,
+                    },
+                )
+                .unwrap();
+            }
+            append_next_task_event_with_authority(
+                root.path(),
+                &authority,
+                "good",
+                &DaemonEvent {
+                    kind: "seed".to_string(),
+                    occurred_at_unix: 1,
+                    data: serde_json::Value::Null,
+                },
+            )
+            .unwrap();
+            // Record a non-zero durable high-water for "bad" so the reset is
+            // observable.
+            let mut updated = task("bad", &[]);
+            updated.last_event_seq = 2;
+            append_task_watch_registry_delta_with_authority(
+                root.path(),
+                &mut authority,
+                RegistryRevisionRange::single(RegistryRevision::new(1)).unwrap(),
+                &RegistryDeltaBatch::default().upsert_task(updated),
+            )
+            .unwrap();
+        }
+
+        let bad_storage = checked_task_storage_id(root.path(), "bad").unwrap();
+        let bad_log = task_event_log_path(root.path(), &bad_storage);
+        let contents = fs::read_to_string(&bad_log).unwrap();
+        let mut frames = contents.lines().filter(|line| !line.is_empty());
+        let _first = frames.next().expect("first frame present");
+        let second = frames.next().expect("second frame present");
+        fs::write(&bad_log, format!("{second}\n")).unwrap();
+
+        // Dry-run inspect reports the corruption without changing anything.
+        let found = inspect_corrupt_task_event_logs(root.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].task_id, "bad");
+        assert!(bad_log.exists());
+
+        // Repair moves the log aside and resets the high-water.
+        let repaired = repair_corrupt_task_event_logs(root.path()).unwrap();
+        assert_eq!(repaired.len(), 1);
+        assert!(repaired[0].quarantined_path.as_ref().unwrap().exists());
+        assert!(!bad_log.exists());
+
+        // The store now loads cleanly with a reset high-water and empty tail.
+        let (loaded, tails) =
+            load_task_watch_registry_with_deltas_and_event_tails(root.path()).unwrap();
+        assert_eq!(loaded.tasks.tasks["bad"].last_event_seq, 0);
+        assert_eq!(tails.get("bad"), Some(&None));
+
+        // Idempotent: a second repair finds nothing to do.
+        assert!(repair_corrupt_task_event_logs(root.path())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

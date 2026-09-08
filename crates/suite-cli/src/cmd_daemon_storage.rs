@@ -1,21 +1,107 @@
 use std::fmt::Write as _;
+use std::path::Path;
 
 use anyhow::{bail, Result};
 use packet28_daemon_core::retention::{
     inspect_task_store, retain_task_store, RetentionMode, RetentionOptions, RetentionOutcome,
     RetentionReason, TaskStoreMetrics, TaskStoreReport,
 };
-use packet28_daemon_core::storage::now_unix;
+use packet28_daemon_core::storage::{
+    inspect_corrupt_task_event_logs, now_unix, repair_corrupt_task_event_logs,
+    QuarantinedCorruptTaskEventLog,
+};
+use serde_json::{json, Value};
 
 use crate::cmd_daemon::{
-    resolve_root_arg, StorageArgs, StorageCleanupArgs, StorageCommands, StorageInspectArgs,
+    daemon_is_running, resolve_root_arg, StorageArgs, StorageCleanupArgs, StorageCommands,
+    StorageInspectArgs, StorageRepairArgs,
 };
 
 pub(crate) fn run_storage(args: StorageArgs) -> Result<i32> {
     match args.command {
         StorageCommands::Inspect(args) => run_inspect(args),
         StorageCommands::Cleanup(args) => run_cleanup(args),
+        StorageCommands::Repair(args) => run_repair(args),
     }
+}
+
+fn run_repair(args: StorageRepairArgs) -> Result<i32> {
+    let root = resolve_root_arg(&args.root);
+    // Repair reads and (with --apply) rewrites the task store under the writer
+    // lease, so it must not race a live daemon.
+    if daemon_is_running(&root) {
+        bail!(
+            "stop the daemon before `daemon storage repair` \
+             (run `packet28 daemon stop`); it needs exclusive access to the task store"
+        );
+    }
+    let records = if args.apply {
+        repair_corrupt_task_event_logs(&root)?
+    } else {
+        inspect_corrupt_task_event_logs(&root)?
+    };
+    emit_repair(&root, &records, args.apply, args.json, args.pretty)?;
+    Ok(0)
+}
+
+fn emit_repair(
+    root: &Path,
+    records: &[QuarantinedCorruptTaskEventLog],
+    applied: bool,
+    json_output: bool,
+    pretty: bool,
+) -> Result<()> {
+    if json_output {
+        let items: Vec<Value> = records
+            .iter()
+            .map(|record| {
+                json!({
+                    "task_id": record.task_id,
+                    "event_log_path": record.event_log_path.display().to_string(),
+                    "quarantined_path": record
+                        .quarantined_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    "reason": record.reason,
+                })
+            })
+            .collect();
+        let report = json!({
+            "workspace_root": root.display().to_string(),
+            "applied": applied,
+            "corrupt_task_event_logs": records.len(),
+            "records": items,
+        });
+        let rendered = if pretty {
+            serde_json::to_string_pretty(&report)?
+        } else {
+            serde_json::to_string(&report)?
+        };
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    if records.is_empty() {
+        println!("no corrupt task event logs found");
+        return Ok(());
+    }
+    let verb = if applied {
+        "quarantined"
+    } else {
+        "found (dry run)"
+    };
+    println!("{verb} {} corrupt task event log(s):", records.len());
+    for record in records {
+        println!("  task_id={} reason={}", record.task_id, record.reason);
+        println!("    event_log={}", record.event_log_path.display());
+        if let Some(quarantined) = &record.quarantined_path {
+            println!("    moved_to={}", quarantined.display());
+        }
+    }
+    if !applied {
+        println!("re-run with --apply to quarantine them (the daemon must be stopped)");
+    }
+    Ok(())
 }
 
 fn run_inspect(args: StorageInspectArgs) -> Result<i32> {

@@ -521,6 +521,20 @@ pub(crate) fn daemon_status_v1(_root: &Path) -> Result<DaemonStatusV1> {
     daemon_not_supported()
 }
 
+/// Returns whether a daemon is currently reachable for `root` without starting
+/// one. Unlike [`daemon_status_v1`], this never calls `ensure_daemon`, so it is
+/// safe as a guard for offline operations that must not race a live daemon.
+#[cfg(unix)]
+pub(crate) fn daemon_is_running(root: &Path) -> bool {
+    let root = normalize_daemon_root(root);
+    daemon_status_existing(&root).is_ok()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn daemon_is_running(_root: &Path) -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn stop_daemon_if_running(root: &Path) -> Result<()> {
     let endpoint = daemon_endpoint(root)?;

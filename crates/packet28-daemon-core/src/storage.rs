@@ -55,9 +55,10 @@ use event_tail::{
 pub(crate) use registry_delta::REGISTRY_DELTA_WAL_HEADER_BYTES;
 pub use registry_delta::{
     append_task_watch_registry_delta, append_task_watch_registry_delta_with_authority,
-    load_registry_admission_authority, load_task_watch_registry_recovering_corrupt_event_logs,
-    load_task_watch_registry_with_deltas, load_task_watch_registry_with_deltas_and_event_tails,
-    registry_delta_wal_path, save_task_watch_registry_checkpoint_at_revision,
+    inspect_corrupt_task_event_logs, load_registry_admission_authority,
+    load_task_watch_registry_recovering_corrupt_event_logs, load_task_watch_registry_with_deltas,
+    load_task_watch_registry_with_deltas_and_event_tails, registry_delta_wal_path,
+    repair_corrupt_task_event_logs, save_task_watch_registry_checkpoint_at_revision,
     save_task_watch_registry_checkpoint_at_revision_with_authority, LoadedTaskWatchRegistry,
     QuarantinedCorruptTaskEventLog, RegistryAdmissionAuthority, RegistryDeltaBatch,
     RegistryDeltaValidationError, RegistryRevision, RegistryRevisionRange,
