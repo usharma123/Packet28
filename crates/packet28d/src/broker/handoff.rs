@@ -268,6 +268,23 @@ fn promote_new_ready_handoff(task: &mut TaskRecord, mut handoff: BrokerHandoffDe
             .cmp(&a.generated_at_unix_ms)
             .then_with(|| a.handoff_id.cmp(&b.handoff_id))
     });
+    cap_handoff_history(&mut task.handoffs);
+}
+
+/// Upper bound on retained handoff descriptors per task.
+///
+/// Superseded handoffs accumulate over a long-lived session. Without a bound the
+/// task record can grow past the paginated record-size limit and poison registry
+/// listing. Keeping the most recent descriptors preserves the active/ready
+/// handoff (always the newest) plus recent history.
+const TASK_HANDOFF_HISTORY_MAX: usize = 64;
+
+/// Truncates `handoffs` to the most recent [`TASK_HANDOFF_HISTORY_MAX`]
+/// descriptors. Callers must pass a slice already ordered newest-first.
+fn cap_handoff_history(handoffs: &mut Vec<BrokerHandoffDescriptor>) {
+    if handoffs.len() > TASK_HANDOFF_HISTORY_MAX {
+        handoffs.truncate(TASK_HANDOFF_HISTORY_MAX);
+    }
 }
 
 pub(crate) fn mark_handoff_consumed(
@@ -872,4 +889,51 @@ pub(crate) fn broker_prepare_handoff(
         next_action_summary: context.next_action_summary.clone(),
         context: Some(context),
     })
+}
+
+#[cfg(test)]
+mod cap_history_tests {
+    use super::*;
+
+    fn handoff(id: usize, generated_at_unix_ms: u64) -> BrokerHandoffDescriptor {
+        BrokerHandoffDescriptor {
+            handoff_id: format!("handoff-{id:05}"),
+            artifact_id: format!("artifact-{id:05}"),
+            generated_at_unix_ms,
+            ..BrokerHandoffDescriptor::default()
+        }
+    }
+
+    #[test]
+    fn promote_bounds_handoff_history_to_the_newest() {
+        let mut task = TaskRecord::default();
+        let total = TASK_HANDOFF_HISTORY_MAX + 40;
+        for index in 0..total {
+            promote_new_ready_handoff(&mut task, handoff(index, index as u64 + 1));
+        }
+
+        assert_eq!(task.handoffs.len(), TASK_HANDOFF_HISTORY_MAX);
+        // Descriptors are ordered newest-first, so the most recent promotion is
+        // retained as the active handoff and the oldest were dropped.
+        assert_eq!(
+            task.handoffs.first().unwrap().handoff_id,
+            format!("handoff-{:05}", total - 1)
+        );
+        assert_eq!(
+            task.latest_handoff_id.as_deref(),
+            Some(format!("handoff-{:05}", total - 1).as_str())
+        );
+        assert!(!task
+            .handoffs
+            .iter()
+            .any(|descriptor| descriptor.handoff_id == "handoff-00000"));
+    }
+
+    #[test]
+    fn cap_handoff_history_is_noop_below_bound() {
+        let mut handoffs: Vec<BrokerHandoffDescriptor> =
+            (0..8).map(|index| handoff(index, index as u64)).collect();
+        cap_handoff_history(&mut handoffs);
+        assert_eq!(handoffs.len(), 8);
+    }
 }

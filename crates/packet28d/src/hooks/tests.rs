@@ -1,6 +1,52 @@
 use super::*;
 use packet28_daemon_protocol::hooks::RelaunchPreference;
+use packet28_daemon_protocol::task::TaskRecord;
 use std::ops::Deref;
+
+#[test]
+fn hook_reducer_cache_is_capped_and_keeps_newest_entries() {
+    let mut task = TaskRecord::default();
+    // Insert well beyond the cap with strictly increasing timestamps so the
+    // newest entries are unambiguous.
+    let total = HOOK_REDUCER_CACHE_MAX_ENTRIES + 100;
+    for index in 0..total {
+        task.hook_reducer_cache.insert(
+            format!("fingerprint-{index:05}"),
+            HookReducerCacheEntry {
+                cache_fingerprint: format!("fingerprint-{index:05}"),
+                occurred_at_unix: index as u64,
+                ..HookReducerCacheEntry::default()
+            },
+        );
+    }
+    prune_hook_reducer_cache(&mut task);
+
+    assert_eq!(
+        task.hook_reducer_cache.len(),
+        HOOK_REDUCER_CACHE_MAX_ENTRIES
+    );
+    // The oldest entries were evicted; the newest are retained.
+    assert!(task
+        .hook_reducer_cache
+        .contains_key(&format!("fingerprint-{:05}", total - 1)));
+    assert!(!task.hook_reducer_cache.contains_key("fingerprint-00000"));
+}
+
+#[test]
+fn hook_reducer_cache_prune_is_noop_below_cap() {
+    let mut task = TaskRecord::default();
+    for index in 0..10u64 {
+        task.hook_reducer_cache.insert(
+            format!("fp-{index}"),
+            HookReducerCacheEntry {
+                occurred_at_unix: index,
+                ..HookReducerCacheEntry::default()
+            },
+        );
+    }
+    prune_hook_reducer_cache(&mut task);
+    assert_eq!(task.hook_reducer_cache.len(), 10);
+}
 
 struct TestDaemonState {
     state: Arc<Mutex<DaemonState>>,
