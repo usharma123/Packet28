@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
@@ -95,6 +93,66 @@ pub(crate) struct SetupPlanChoice {
     pub(crate) fallback_only: bool,
 }
 
+/// `.gitignore` entry for Packet28's always-ephemeral daemon/index state.
+const PACKET28_GITIGNORE_ENTRY: &str = ".packet28/";
+
+/// Returns true when `content` already ignores Packet28's `.packet28/` runtime
+/// directory in any of the common equivalent spellings.
+fn gitignore_covers_packet28_dir(content: &str) -> bool {
+    content.lines().map(str::trim).any(|line| {
+        matches!(
+            line,
+            ".packet28"
+                | ".packet28/"
+                | "/.packet28"
+                | "/.packet28/"
+                | ".packet28/*"
+                | ".packet28/**"
+        )
+    })
+}
+
+/// Ensures the repository `.gitignore` ignores Packet28's `.packet28/` runtime
+/// directory.
+///
+/// The daemon writes runtime and index state under `.packet28/` continuously.
+/// If that directory is tracked, the working tree is perpetually dirty, which
+/// blocks the full regex index from ever publishing (it requires a clean Git
+/// working tree). Ignoring it once breaks that cycle so the index can build.
+///
+/// This only manages Packet28's own ephemeral directory. User instruction files
+/// and MCP config are never auto-ignored. It runs only inside a Git repository,
+/// is idempotent, and preserves any existing `.gitignore` content. Returns the
+/// path when it added the entry, or `None` when no change was needed.
+fn ensure_packet28_gitignore(root: &Path) -> Result<Option<PathBuf>> {
+    if !root.join(".git").exists() {
+        return Ok(None);
+    }
+    let path = root.join(".gitignore");
+    let existing = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read '{}'", path.display()));
+        }
+    };
+    if gitignore_covers_packet28_dir(&existing) {
+        return Ok(None);
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str("# Packet28 daemon runtime and index state\n");
+    updated.push_str(PACKET28_GITIGNORE_ENTRY);
+    updated.push('\n');
+    fs::write(&path, updated).with_context(|| format!("failed to update '{}'", path.display()))?;
+    Ok(Some(path))
+}
+
 pub fn run(args: SetupArgs) -> Result<i32> {
     let root = crate::cmd_daemon::resolve_root_arg(&args.root);
     let root_display = root.display().to_string();
@@ -131,6 +189,23 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     let mut any_hook_runtime_configs_written = false;
     let mut agent_files_ready = false;
     let mut exit_code = 0;
+
+    // Ignore Packet28's own runtime directory before the daemon starts writing
+    // into it. Otherwise a tracked `.packet28/` keeps the working tree dirty and
+    // the full regex index can never publish (it requires a clean tree).
+    if let Some(path) = ensure_packet28_gitignore(&root)? {
+        println!(
+            "  {} ignored {} in {}",
+            "✓".green().bold(),
+            PACKET28_GITIGNORE_ENTRY,
+            path.display().to_string().dimmed()
+        );
+        println!(
+            "  {} commit the updated .gitignore so daemon writes stop dirtying the tree",
+            "hint:".cyan().bold()
+        );
+        println!();
+    }
 
     render_setup_step(
         1,

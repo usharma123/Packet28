@@ -698,6 +698,73 @@ fn setup_never_enables_daemon_managed_relaunch_by_default() {
     assert!(!config.daemon_relaunch_enabled());
 }
 
+#[test]
+fn gitignore_coverage_recognizes_common_spellings() {
+    for spelling in [
+        ".packet28",
+        ".packet28/",
+        "/.packet28",
+        "/.packet28/",
+        ".packet28/*",
+        ".packet28/**",
+    ] {
+        assert!(
+            gitignore_covers_packet28_dir(&format!("target/\n{spelling}\n*.log\n")),
+            "spelling {spelling} should be recognized as covering .packet28"
+        );
+    }
+    assert!(!gitignore_covers_packet28_dir("target/\n.packet28x/\n"));
+    assert!(!gitignore_covers_packet28_dir(""));
+}
+
+#[test]
+fn ensure_gitignore_is_noop_outside_git_repo() {
+    let dir = tempdir().unwrap();
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+    assert!(!dir.path().join(".gitignore").exists());
+}
+
+#[test]
+fn ensure_gitignore_creates_entry_in_git_repo() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+
+    let created = ensure_packet28_gitignore(dir.path()).unwrap();
+    assert_eq!(created, Some(dir.path().join(".gitignore")));
+    let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(gitignore_covers_packet28_dir(&content));
+
+    // Idempotent: a second run makes no change and reports nothing added.
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        content
+    );
+}
+
+#[test]
+fn ensure_gitignore_appends_and_preserves_existing_content() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    // Existing content without a trailing newline must be preserved intact.
+    fs::write(dir.path().join(".gitignore"), "target/\n/dist").unwrap();
+
+    let created = ensure_packet28_gitignore(dir.path()).unwrap();
+    assert!(created.is_some());
+    let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(content.starts_with("target/\n/dist\n"));
+    assert!(gitignore_covers_packet28_dir(&content));
+    assert!(content.contains(".packet28/"));
+}
+
+#[test]
+fn ensure_gitignore_respects_preexisting_coverage() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".gitignore"), "/.packet28/\n").unwrap();
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+}
+
 fn setup_index_status(
     status: &str,
     regex_status: Option<&str>,
