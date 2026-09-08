@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{ErrorKind, Read as _};
 use std::net::TcpListener;
@@ -13,7 +13,7 @@ use context_kernel_core::{Kernel, PersistConfig};
 use packet28_daemon_core::retention::recover_task_store_quarantine_and_acquire_daemon_lease;
 use packet28_daemon_core::storage::{
     ensure_daemon_dir, ensure_daemon_socket_dir,
-    load_task_watch_registry_with_deltas_and_event_tails, now_unix, remove_runtime_files,
+    load_task_watch_registry_recovering_corrupt_event_logs, now_unix, remove_runtime_files,
     write_runtime_info,
 };
 use packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease;
@@ -121,8 +121,23 @@ pub fn serve(root: PathBuf) -> Result<()> {
         kernel.clone(),
         config.max_persistent_roots,
     )?);
-    let (loaded_registry, event_tails) =
-        load_task_watch_registry_with_deltas_and_event_tails(&root)?;
+    let (loaded_registry, event_tails, quarantined_event_logs) =
+        load_task_watch_registry_recovering_corrupt_event_logs(&root)?;
+    for record in &quarantined_event_logs {
+        let moved_to = record
+            .quarantined_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the log was already absent".to_string());
+        daemon_log(&format!(
+            "quarantined corrupt event log for task '{}': {}; moved aside to {} and reset its event high-water",
+            record.task_id, record.reason, moved_to
+        ));
+    }
+    let quarantined_task_ids: BTreeSet<String> = quarantined_event_logs
+        .iter()
+        .map(|record| record.task_id.clone())
+        .collect();
     let checkpoint_revision = loaded_registry.checkpoint_revision;
     let replayed_revision = loaded_registry.replayed_revision;
     let durable_tasks = loaded_registry.tasks;
@@ -131,6 +146,14 @@ pub fn serve(root: PathBuf) -> Result<()> {
     // persistence owner has authenticated it and assumed revision ownership.
     let mut tasks = durable_tasks.clone();
     let mut watches = durable_watches.clone();
+    // A quarantined task's corrupt event log was moved aside, so its durable
+    // tail is now empty. Reset its high-water to match before reconciliation and
+    // persist the reset below so the fix is durable across restarts.
+    for task_id in &quarantined_task_ids {
+        if let Some(task) = tasks.tasks.get_mut(task_id) {
+            task.last_event_seq = 0;
+        }
+    }
     preflight_restart_recovery(&tasks)?;
     let event_high_water_changes = reconcile_task_event_high_waters(&mut tasks, &event_tails)?;
     let restart_reconciliation =
@@ -160,6 +183,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
     for task_id in event_high_water_changes
         .iter()
         .chain(&restart_reconciliation.changed_task_ids)
+        .chain(&quarantined_task_ids)
     {
         let task = tasks
             .tasks
