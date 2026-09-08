@@ -268,6 +268,11 @@ fn load_all_task_pages(
     expected_total: usize,
 ) -> Result<Vec<TaskRecord>> {
     let mut tasks = Vec::new();
+    // Records the daemon skipped because they exceed the per-record pagination
+    // bound. They still count toward `total`, so account for them when checking
+    // completeness; otherwise a single oversized record would look like the
+    // registry changed mid-pagination.
+    let mut omitted_oversized = 0usize;
     let mut after_task_id = None;
     loop {
         let response = client.send_registry_request(&DaemonRegistryRequestV1::TaskListPage {
@@ -287,9 +292,10 @@ fn load_all_task_pages(
                 "daemon task registry changed during pagination; retry the request"
             ));
         }
+        omitted_oversized += page.omitted_oversized.len();
         tasks.extend(page.tasks);
         let Some(next) = page.next_after_task_id else {
-            if tasks.len() != expected_total {
+            if tasks.len() + omitted_oversized != expected_total {
                 return Err(anyhow!(
                     "daemon task registry changed during pagination; retry the request"
                 ));

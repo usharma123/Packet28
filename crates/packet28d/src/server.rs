@@ -12,9 +12,9 @@ use crate::watch::WatchIngress;
 use packet28_daemon_protocol::frame::{FrameError, MAX_SOCKET_MESSAGE_BYTES};
 use packet28_daemon_protocol::message::DaemonTransportAuth;
 use packet28_daemon_protocol::registry::{
-    DaemonRegistryRequestV1, DaemonRegistryResponseV1, RegistryRevisionV1, TaskListPageRequestV1,
-    TaskListPageV1, WatchListPageRequestV1, WatchListPageV1, MAX_REGISTRY_PAGE_ITEM_BYTES,
-    MAX_REGISTRY_PAGE_LIMIT, MAX_REGISTRY_PAGE_RESPONSE_BYTES,
+    DaemonRegistryRequestV1, DaemonRegistryResponseV1, OversizedTaskRecordV1, RegistryRevisionV1,
+    TaskListPageRequestV1, TaskListPageV1, WatchListPageRequestV1, WatchListPageV1,
+    MAX_REGISTRY_PAGE_ITEM_BYTES, MAX_REGISTRY_PAGE_LIMIT, MAX_REGISTRY_PAGE_RESPONSE_BYTES,
 };
 use packet28_daemon_protocol::task::{
     TaskMarkHandoffConsumedResponse, TaskRecord, WatchRegistration,
@@ -1056,6 +1056,7 @@ fn build_task_list_page(
         tasks: Vec::new(),
         next_after_task_id: None,
         total: tasks.len(),
+        omitted_oversized: Vec::new(),
     };
     let mut collection_bytes = 0_usize;
     let mut has_more = false;
@@ -1068,7 +1069,19 @@ fn build_task_list_page(
             has_more = true;
             break;
         }
-        let item_bytes = encoded_registry_page_item_bytes(task, "task", task_id)?;
+        let item_bytes = match encoded_registry_page_item_bytes_checked(task, "task", task_id)? {
+            Ok(item_bytes) => item_bytes,
+            Err(encoded_bytes) => {
+                // Individually oversized: it can never be paginated. Record it
+                // and keep going so one poison record cannot brick the whole
+                // task listing; retention can still target it directly.
+                page.omitted_oversized.push(OversizedTaskRecordV1 {
+                    task_id: task_id.clone(),
+                    encoded_bytes,
+                });
+                continue;
+            }
+        };
         let separator = usize::from(!page.tasks.is_empty());
         let Some(next_bytes) = collection_bytes
             .checked_add(item_bytes)
@@ -1078,10 +1091,14 @@ fn build_task_list_page(
         };
         if next_bytes > MAX_REGISTRY_PAGE_COLLECTION_BYTES {
             if page.tasks.is_empty() {
-                anyhow::bail!(
-                    "task record '{task_id}' cannot fit within the \
-                     {MAX_REGISTRY_PAGE_COLLECTION_BYTES}-byte page collection bound"
-                );
+                // Fits the per-record bound but is larger than the whole
+                // collection budget, so it cannot fit any page. Omit it too
+                // rather than failing the listing.
+                page.omitted_oversized.push(OversizedTaskRecordV1 {
+                    task_id: task_id.clone(),
+                    encoded_bytes: item_bytes as u64,
+                });
+                continue;
             }
             has_more = true;
             break;
@@ -1267,6 +1284,24 @@ fn encoded_registry_page_item_bytes(
         );
     }
     Ok(item_bytes)
+}
+
+/// Like [`encoded_registry_page_item_bytes`] but reports an over-limit record as
+/// `Ok(Err(encoded_bytes))` instead of failing, so a resilient page can skip and
+/// report it rather than poisoning the whole listing. The outer `Err` is still
+/// reserved for genuine encoding failures.
+fn encoded_registry_page_item_bytes_checked(
+    item: &impl Serialize,
+    kind: &str,
+    identifier: &str,
+) -> Result<std::result::Result<usize, u64>> {
+    let item_bytes = serde_json::to_vec(item)
+        .with_context(|| format!("failed to encode {kind} page record '{identifier}'"))?
+        .len();
+    if item_bytes > MAX_REGISTRY_PAGE_ITEM_BYTES {
+        return Ok(Err(item_bytes as u64));
+    }
+    Ok(Ok(item_bytes))
 }
 
 fn ensure_registry_page_response_fits(
@@ -1660,29 +1695,51 @@ mod tests {
     }
 
     #[test]
-    fn registry_pages_reject_an_individually_oversized_record() {
-        let task_id = "task-oversized";
-        let tasks = BTreeMap::from([(
-            task_id.to_string(),
-            TaskRecord {
-                task_id: task_id.to_string(),
-                last_error: Some("x".repeat(MAX_REGISTRY_PAGE_ITEM_BYTES)),
-                ..TaskRecord::default()
-            },
-        )]);
+    fn registry_pages_skip_and_report_an_individually_oversized_record() {
+        let healthy_id = "task-healthy";
+        let oversized_id = "task-oversized";
+        let tasks = BTreeMap::from([
+            (
+                healthy_id.to_string(),
+                TaskRecord {
+                    task_id: healthy_id.to_string(),
+                    ..TaskRecord::default()
+                },
+            ),
+            (
+                oversized_id.to_string(),
+                TaskRecord {
+                    task_id: oversized_id.to_string(),
+                    last_error: Some("x".repeat(MAX_REGISTRY_PAGE_ITEM_BYTES)),
+                    ..TaskRecord::default()
+                },
+            ),
+        ]);
 
-        let error = build_task_list_page(
+        // The oversized record no longer poisons the whole listing: it is
+        // skipped and reported, and the healthy task is still returned.
+        let page = build_task_list_page(
             &tasks,
             &registry_revision(7),
             &TaskListPageRequestV1 {
                 snapshot_revision: None,
                 after_task_id: None,
-                limit: 1,
+                limit: 10,
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("maximum paginated record size"));
+        assert_eq!(
+            page.tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![healthy_id]
+        );
+        assert_eq!(page.omitted_oversized.len(), 1);
+        assert_eq!(page.omitted_oversized[0].task_id, oversized_id);
+        assert!(page.omitted_oversized[0].encoded_bytes >= MAX_REGISTRY_PAGE_ITEM_BYTES as u64);
+        assert_eq!(page.total, 2);
     }
 
     #[test]
