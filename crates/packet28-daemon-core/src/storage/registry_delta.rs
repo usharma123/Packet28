@@ -1048,6 +1048,14 @@ pub fn load_task_watch_registry_with_deltas_and_event_tails(
 /// it rather than silently discarding a large amount of task state.
 pub const MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS: usize = 64;
 
+/// Registry, per-task event tails, and quarantined corrupt event logs returned
+/// by [`load_task_watch_registry_recovering_corrupt_event_logs`].
+pub type RecoveredTaskWatchRegistry = (
+    LoadedTaskWatchRegistry,
+    BTreeMap<String, Option<u64>>,
+    Vec<QuarantinedCorruptTaskEventLog>,
+);
+
 /// A task whose event log failed integrity validation during a recovering load
 /// and was moved aside so the daemon could start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1156,11 +1164,7 @@ fn move_corrupt_event_logs_aside(corrupt: &mut [QuarantinedCorruptTaskEventLog])
 /// failures, plus filesystem errors from moving a corrupt log aside.
 pub fn load_task_watch_registry_recovering_corrupt_event_logs(
     root: &Path,
-) -> Result<(
-    LoadedTaskWatchRegistry,
-    BTreeMap<String, Option<u64>>,
-    Vec<QuarantinedCorruptTaskEventLog>,
-)> {
+) -> Result<RecoveredTaskWatchRegistry> {
     let mut quarantined: Vec<QuarantinedCorruptTaskEventLog> = Vec::new();
     loop {
         match load_task_watch_registry_with_deltas_and_event_tails(root) {

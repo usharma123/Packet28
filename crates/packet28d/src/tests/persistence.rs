@@ -903,7 +903,7 @@ fn admitted_zero_event_task_skips_redundant_pre_event_registry_stage() {
 fn daemon_startup_uses_checkpoint_plus_wal_registry_authority() {
     let source = include_str!("../application.rs");
 
-    assert!(source.contains("load_task_watch_registry_with_deltas_and_event_tails"));
+    assert!(source.contains("load_task_watch_registry_recovering_corrupt_event_logs"));
     assert!(!source.contains("load_task_watch_registry_checkpoint_with_event_tails"));
 }
 
