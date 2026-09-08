@@ -1043,6 +1043,150 @@ pub fn load_task_watch_registry_with_deltas_and_event_tails(
     }
 }
 
+/// Upper bound on tasks auto-quarantined in a single recovering load. A store
+/// with more corrupt event logs than this fails closed so a human can inspect
+/// it rather than silently discarding a large amount of task state.
+pub const MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS: usize = 64;
+
+/// Registry, per-task event tails, and quarantined corrupt event logs returned
+/// by [`load_task_watch_registry_recovering_corrupt_event_logs`].
+pub type RecoveredTaskWatchRegistry = (
+    LoadedTaskWatchRegistry,
+    BTreeMap<String, Option<u64>>,
+    Vec<QuarantinedCorruptTaskEventLog>,
+);
+
+/// A task whose event log failed integrity validation during a recovering load
+/// and was moved aside so the daemon could start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedCorruptTaskEventLog {
+    /// Identifier of the task whose event log was quarantined.
+    pub task_id: String,
+    /// Canonical event-log path that was found corrupt.
+    pub event_log_path: PathBuf,
+    /// Where the corrupt log was moved for inspection, when a move occurred.
+    pub quarantined_path: Option<PathBuf>,
+    /// Human-readable integrity failure that triggered the quarantine.
+    pub reason: String,
+}
+
+/// Returns true for durable event-log integrity failures that recovery can
+/// safely quarantine, as opposed to environmental IO, lock, or lease failures
+/// that must still fail closed.
+fn is_recoverable_event_log_corruption(error: &DaemonCoreError) -> bool {
+    matches!(
+        error,
+        DaemonCoreError::InvalidTaskEventFrame { .. }
+            | DaemonCoreError::AuthorityJsonLimitExceeded { .. }
+    )
+}
+
+/// Identifies every admitted task whose durable event log fails integrity
+/// validation. Non-corruption errors (IO, lease, lock) propagate unchanged so
+/// only genuine event-log corruption is treated as recoverable.
+fn scan_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    let loaded = load_task_watch_registry_with_deltas(root)?;
+    let mut corrupt = Vec::new();
+    for task_id in loaded.tasks.tasks.keys() {
+        match event_tail::task_event_log_tail_sequence(root, task_id) {
+            Ok(_) => {}
+            Err(error) if is_recoverable_event_log_corruption(&error) => {
+                let storage_id = checked_task_storage_id(root, task_id)?;
+                corrupt.push(QuarantinedCorruptTaskEventLog {
+                    task_id: task_id.clone(),
+                    event_log_path: task_event_log_path(root, &storage_id),
+                    quarantined_path: None,
+                    reason: error.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(corrupt)
+}
+
+/// Moves each corrupt task event log aside (renaming it to a sibling
+/// `*.corrupt-<unix>` file) so the task's canonical event-log path becomes
+/// absent and its durable tail reads as empty.
+///
+/// This deliberately does not touch the task registry: mutating the durable
+/// checkpoint here would race the persistence owner that assumes ownership at
+/// startup. The caller resets the quarantined task's event high-water through
+/// the normal persistence path instead. The renamed file is preserved for
+/// inspection. A log that is already absent is ignored.
+fn move_corrupt_event_logs_aside(corrupt: &mut [QuarantinedCorruptTaskEventLog]) -> Result<()> {
+    let stamp = now_unix();
+    for record in corrupt.iter_mut() {
+        let mut dest = record.event_log_path.clone().into_os_string();
+        dest.push(format!(".corrupt-{stamp}"));
+        let dest = PathBuf::from(dest);
+        match fs::rename(&record.event_log_path, &dest) {
+            Ok(()) => record.quarantined_path = Some(dest),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DaemonCoreError::io(
+                    "failed to move a corrupt task event log aside",
+                    &record.event_log_path,
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Loads the durable task/watch registry and event tails, quarantining any task
+/// whose durable event log fails integrity validation instead of failing the
+/// entire load.
+///
+/// A single corrupted task event log otherwise takes the whole daemon down at
+/// startup (`packet28d did not become ready`). This wrapper isolates the bad
+/// task: it moves the corrupt event log aside (to a sibling `*.corrupt-<unix>`
+/// file, preserved for inspection) so the task's tail reads as empty, then
+/// returns the registry — the affected task is still present but its returned
+/// tail is `None`.
+///
+/// The registry is intentionally left unmutated so it does not race the
+/// persistence owner that assumes checkpoint ownership at startup. The caller
+/// must reset each quarantined task's event high-water (`last_event_seq` to 0)
+/// through the normal persistence path so reconciliation stays consistent; the
+/// returned vector lists every quarantined task for that purpose and for
+/// reporting.
+///
+/// Only genuine event-log integrity failures are recovered, and at most
+/// [`MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS`] tasks are quarantined before the
+/// load fails closed. All other errors propagate unchanged.
+///
+/// # Errors
+///
+/// Returns the same errors as
+/// [`load_task_watch_registry_with_deltas_and_event_tails`] for non-recoverable
+/// failures, plus filesystem errors from moving a corrupt log aside.
+pub fn load_task_watch_registry_recovering_corrupt_event_logs(
+    root: &Path,
+) -> Result<RecoveredTaskWatchRegistry> {
+    let mut quarantined: Vec<QuarantinedCorruptTaskEventLog> = Vec::new();
+    loop {
+        match load_task_watch_registry_with_deltas_and_event_tails(root) {
+            Ok((loaded, tails)) => return Ok((loaded, tails, quarantined)),
+            Err(error) => {
+                if !is_recoverable_event_log_corruption(&error) {
+                    return Err(error);
+                }
+                let mut corrupt = scan_corrupt_task_event_logs(root)?;
+                if corrupt.is_empty()
+                    || quarantined.len().saturating_add(corrupt.len())
+                        > MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS
+                {
+                    return Err(error);
+                }
+                move_corrupt_event_logs_aside(&mut corrupt)?;
+                quarantined.extend(corrupt);
+            }
+        }
+    }
+}
+
 /// Commits a full task/watch checkpoint at one replayed WAL revision.
 ///
 /// The supplied registries must equal checkpoint-plus-WAL replay at
@@ -2862,6 +3006,84 @@ mod tests {
             vec!["one", "two"]
         );
         assert_eq!(tails, BTreeMap::from([("task".to_string(), None)]));
+    }
+
+    #[test]
+    fn recovering_load_quarantines_a_corrupt_task_event_log_and_keeps_healthy_tasks() {
+        let root = tempdir().unwrap();
+        checkpoint(root.path(), [task("bad", &[]), task("good", &[])], []);
+
+        {
+            let lease =
+                crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap();
+            let authority = load_registry_admission_authority(root.path(), lease).unwrap();
+            for task_id in ["bad", "good"] {
+                append_next_task_event_with_authority(
+                    root.path(),
+                    &authority,
+                    task_id,
+                    &DaemonEvent {
+                        kind: "seed".to_string(),
+                        occurred_at_unix: 1,
+                        data: serde_json::Value::Null,
+                    },
+                )
+                .unwrap();
+            }
+            // A second event for "bad" so dropping the first frame leaves a
+            // non-contiguous log that starts at sequence 2.
+            append_next_task_event_with_authority(
+                root.path(),
+                &authority,
+                "bad",
+                &DaemonEvent {
+                    kind: "seed-2".to_string(),
+                    occurred_at_unix: 2,
+                    data: serde_json::Value::Null,
+                },
+            )
+            .unwrap();
+        }
+
+        let bad_storage = checked_task_storage_id(root.path(), "bad").unwrap();
+        let bad_log = task_event_log_path(root.path(), &bad_storage);
+        let contents = fs::read_to_string(&bad_log).unwrap();
+        let mut frames = contents.lines().filter(|line| !line.is_empty());
+        let _first = frames.next().expect("first frame present");
+        let second = frames.next().expect("second frame present");
+        fs::write(&bad_log, format!("{second}\n")).unwrap();
+
+        // Baseline: the strict loader fails closed on the corrupt event log.
+        assert!(matches!(
+            load_task_watch_registry_with_deltas_and_event_tails(root.path()),
+            Err(DaemonCoreError::InvalidTaskEventFrame { .. })
+        ));
+
+        // Recovering: the corrupt log is moved aside so both tasks load and
+        // "bad" reports an empty tail.
+        let (loaded, tails, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+        assert!(loaded.tasks.tasks.contains_key("good"));
+        assert!(loaded.tasks.tasks.contains_key("bad"));
+        assert_eq!(tails.get("good"), Some(&Some(1)));
+        assert_eq!(tails.get("bad"), Some(&None));
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].task_id, "bad");
+
+        // The corrupt log was physically moved aside for inspection.
+        let quarantined_path = quarantined[0]
+            .quarantined_path
+            .clone()
+            .expect("corrupt log should be moved aside");
+        assert!(!bad_log.exists());
+        assert!(quarantined_path.exists());
+
+        // The recovery is stable: a plain reload now succeeds with an empty
+        // tail for "bad" (no corruption remains).
+        let (reloaded, reloaded_tails) =
+            load_task_watch_registry_with_deltas_and_event_tails(root.path()).unwrap();
+        assert!(reloaded.tasks.tasks.contains_key("bad"));
+        assert_eq!(reloaded_tails.get("bad"), Some(&None));
     }
 
     #[test]
