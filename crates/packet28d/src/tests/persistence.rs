@@ -439,8 +439,8 @@ fn durable_replan_claim_keeps_ownership_when_another_replan_arrives_during_its_b
 }
 
 #[test]
-fn restart_preflight_rejects_malformed_work_without_mutating_earlier_tasks() {
-    let tasks = TaskRegistry {
+fn restart_preflight_heals_a_replan_task_without_a_stored_sequence() {
+    let mut tasks = TaskRegistry {
         tasks: BTreeMap::from([
             (
                 "a-running".to_string(),
@@ -462,14 +462,19 @@ fn restart_preflight_rejects_malformed_work_without_mutating_earlier_tasks() {
             ),
         ]),
     };
-    let before = serde_json::to_value(&tasks).unwrap();
 
-    let error = preflight_restart_recovery(&tasks).unwrap_err();
+    // The replan task that lost its sequence is downgraded to Idle instead of
+    // failing the whole daemon; unrelated tasks are left untouched.
+    let healed = preflight_restart_recovery(&mut tasks).unwrap();
 
-    assert!(error
-        .to_string()
-        .contains("startup replan task 'z-malformed' has no stored sequence"));
-    assert_eq!(serde_json::to_value(&tasks).unwrap(), before);
+    assert_eq!(healed, BTreeSet::from(["z-malformed".to_string()]));
+    assert_eq!(tasks.tasks["z-malformed"].lifecycle, TaskLifecycle::Idle);
+    assert!(tasks.tasks["z-malformed"]
+        .last_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("downgraded to idle"));
+    assert_eq!(tasks.tasks["a-running"].lifecycle, TaskLifecycle::Running);
 }
 
 #[test]

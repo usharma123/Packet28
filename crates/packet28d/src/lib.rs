@@ -270,25 +270,25 @@ struct TaskRestartReconciliation {
     replan_task_ids: Vec<String>,
 }
 
-/// Validates restart work before any lifecycle or watch state is mutated.
+/// Validates restart work before any lifecycle or watch state is mutated, and
+/// heals per-task inconsistencies that must not brick the whole daemon.
 ///
 /// A live process group cannot be authenticated from its persisted numeric PID
-/// alone because operating systems reuse process identifiers. Startup
-/// therefore fails closed until an operator quiesces that group, instead of
+/// alone because operating systems reuse process identifiers. That case stays
+/// fatal: startup fails closed until an operator quiesces the group, instead of
 /// risking signalling an unrelated process.
-fn preflight_restart_recovery(tasks: &TaskRegistry) -> Result<()> {
-    for (task_id, task) in &tasks.tasks {
-        if matches!(
-            task.lifecycle,
-            TaskLifecycle::ReplanPending
-                | TaskLifecycle::RunningRecoveredReplan
-                | TaskLifecycle::RunningReplanPending
-        ) && (!task.sequence_present || task.sequence.is_none())
-        {
-            anyhow::bail!(
-                "startup replan task '{task_id}' has no stored sequence and cannot be recovered"
-            );
-        }
+///
+/// A replan task that lost its stored kernel sequence, by contrast, cannot be
+/// re-executed but must not take the whole daemon down. It is downgraded to
+/// `Idle` (keeping its record and recording why in `last_error`) so the rest of
+/// the workspace recovers; the task can be resubmitted. Returns the ids of tasks
+/// healed this way so the caller persists the downgrade.
+fn preflight_restart_recovery(tasks: &mut TaskRegistry) -> Result<BTreeSet<String>> {
+    let mut healed = BTreeSet::new();
+    for (task_id, task) in &mut tasks.tasks {
+        // A live recovered agent must never be orphaned; keep this fatal, and
+        // check it first so a task that is both live and missing its sequence
+        // still fails closed rather than being silently downgraded.
         if task.latest_agent_completed_at_unix.is_none() {
             if let Some(pid) = task.latest_agent_pid {
                 if crate::launch::recovered_agent_process_group_exists(pid)? {
@@ -299,8 +299,28 @@ fn preflight_restart_recovery(tasks: &TaskRegistry) -> Result<()> {
                 }
             }
         }
+        if matches!(
+            task.lifecycle,
+            TaskLifecycle::ReplanPending
+                | TaskLifecycle::RunningRecoveredReplan
+                | TaskLifecycle::RunningReplanPending
+        ) && (!task.sequence_present || task.sequence.is_none())
+        {
+            daemon_log(&format!(
+                "healing task '{task_id}': {:?} lifecycle has no stored sequence to replan; downgrading to Idle",
+                task.lifecycle
+            ));
+            task.lifecycle = TaskLifecycle::Idle;
+            let evidence =
+                "durable replan sequence was missing after restart; downgraded to idle".to_string();
+            task.last_error = Some(match task.last_error.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing}; {evidence}"),
+                _ => evidence,
+            });
+            healed.insert(task_id.clone());
+        }
     }
-    Ok(())
+    Ok(healed)
 }
 
 /// Reconciles lifecycle state that cannot survive process ownership changes.
