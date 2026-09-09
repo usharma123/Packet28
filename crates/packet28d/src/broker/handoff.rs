@@ -971,20 +971,29 @@ mod cap_history_tests {
         }
 
         assert_eq!(task.handoffs.len(), TASK_HANDOFF_HISTORY_MAX);
-        // Descriptors are ordered newest-first, so the most recent promotion is
-        // retained as the active handoff and the oldest were dropped.
-        assert_eq!(
-            task.handoffs.first().unwrap().handoff_id,
-            format!("handoff-{:05}", total - 1)
-        );
+        let expected_ids: Vec<_> = ((total - TASK_HANDOFF_HISTORY_MAX)..total)
+            .rev()
+            .map(|index| format!("handoff-{index:05}"))
+            .collect();
+        let retained_ids: Vec<_> = task
+            .handoffs
+            .iter()
+            .map(|descriptor| descriptor.handoff_id.clone())
+            .collect();
+        assert_eq!(retained_ids, expected_ids);
         assert_eq!(
             task.latest_handoff_id.as_deref(),
             Some(format!("handoff-{:05}", total - 1).as_str())
         );
-        assert!(!task
+        assert_eq!(
+            task.handoffs.first().map(|descriptor| descriptor.status),
+            Some(BrokerHandoffStatus::Ready)
+        );
+        assert!(task
             .handoffs
             .iter()
-            .any(|descriptor| descriptor.handoff_id == "handoff-00000"));
+            .skip(1)
+            .all(|descriptor| descriptor.status == BrokerHandoffStatus::Superseded));
     }
 
     #[test]
@@ -993,5 +1002,99 @@ mod cap_history_tests {
             (0..8).map(|index| handoff(index, index as u64)).collect();
         cap_handoff_history(&mut handoffs);
         assert_eq!(handoffs.len(), 8);
+    }
+
+    #[test]
+    fn cap_handoff_history_is_noop_at_bound() {
+        let mut handoffs: Vec<_> = (0..TASK_HANDOFF_HISTORY_MAX)
+            .rev()
+            .map(|index| handoff(index, index as u64))
+            .collect();
+        let ids_before: Vec<_> = handoffs
+            .iter()
+            .map(|descriptor| descriptor.handoff_id.clone())
+            .collect();
+
+        cap_handoff_history(&mut handoffs);
+
+        assert_eq!(handoffs.len(), TASK_HANDOFF_HISTORY_MAX);
+        assert_eq!(
+            handoffs
+                .iter()
+                .map(|descriptor| descriptor.handoff_id.clone())
+                .collect::<Vec<_>>(),
+            ids_before
+        );
+    }
+
+    #[test]
+    fn promotion_past_bound_evicts_only_oldest_and_updates_latest_metadata() {
+        let mut task = TaskRecord::default();
+        for index in 0..TASK_HANDOFF_HISTORY_MAX {
+            promote_new_ready_handoff(&mut task, handoff(index, index as u64));
+        }
+        let mut newest = handoff(TASK_HANDOFF_HISTORY_MAX, TASK_HANDOFF_HISTORY_MAX as u64);
+        newest.checkpoint_id = Some("checkpoint-new".to_string());
+
+        promote_new_ready_handoff(&mut task, newest.clone());
+
+        assert_eq!(task.handoffs.len(), TASK_HANDOFF_HISTORY_MAX);
+        assert_eq!(task.handoffs.first(), Some(&newest));
+        assert!(!task
+            .handoffs
+            .iter()
+            .any(|descriptor| descriptor.handoff_id == "handoff-00000"));
+        let previous = task
+            .handoffs
+            .iter()
+            .find(|descriptor| descriptor.handoff_id == "handoff-00063")
+            .unwrap();
+        assert_eq!(previous.status, BrokerHandoffStatus::Superseded);
+        assert_eq!(
+            previous.superseded_by_handoff_id.as_deref(),
+            Some(newest.handoff_id.as_str())
+        );
+        assert_eq!(
+            task.latest_handoff_id.as_deref(),
+            Some(newest.handoff_id.as_str())
+        );
+        assert_eq!(
+            task.latest_handoff_artifact_id.as_deref(),
+            Some(newest.artifact_id.as_str())
+        );
+        assert_eq!(
+            task.latest_handoff_generated_at_unix,
+            Some(newest.generated_at_unix_ms)
+        );
+        assert_eq!(
+            task.latest_handoff_checkpoint_id.as_deref(),
+            Some("checkpoint-new")
+        );
+    }
+
+    #[test]
+    fn promotion_orders_equal_timestamps_by_handoff_id() {
+        let mut task = TaskRecord::default();
+        promote_new_ready_handoff(&mut task, handoff(2, 99));
+        promote_new_ready_handoff(&mut task, handoff(0, 99));
+        promote_new_ready_handoff(&mut task, handoff(1, 99));
+
+        let ordered_ids: Vec<_> = task
+            .handoffs
+            .iter()
+            .map(|descriptor| descriptor.handoff_id.as_str())
+            .collect();
+        assert_eq!(
+            ordered_ids,
+            vec!["handoff-00000", "handoff-00001", "handoff-00002"]
+        );
+        assert_eq!(task.latest_handoff_id.as_deref(), Some("handoff-00001"));
+        assert_eq!(
+            task.handoffs
+                .iter()
+                .find(|descriptor| descriptor.status == BrokerHandoffStatus::Ready)
+                .map(|descriptor| descriptor.handoff_id.as_str()),
+            Some("handoff-00001")
+        );
     }
 }
