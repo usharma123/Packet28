@@ -535,6 +535,19 @@ pub(crate) fn write_windsurf_hook_config(
     Ok(McpConfigStatus::Written)
 }
 
+/// Writes the shared hook runtime configuration when at least one hook has been configured.
+///
+/// Re-enables hook ingestion when it is disabled and reports whether the configuration
+/// was declined, already configured, or written.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// let status = write_hook_runtime_config(Path::new("."), false).unwrap();
+/// assert!(matches!(status, McpConfigStatus::Declined));
+/// ```
 pub(crate) fn write_hook_runtime_config(
     root: &Path,
     any_hooks_configured: bool,

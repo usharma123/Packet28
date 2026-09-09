@@ -732,6 +732,21 @@ fn write_hook_runtime_config_re_enables_stale_kill_switch() {
     assert_eq!(written.http_hook_token.as_deref(), Some("existing-token"));
 }
 
+/// Creates an index-status fixture with the specified manifest and readiness values.
+///
+/// # Examples
+///
+/// ```
+/// let status = setup_index_status("ready", None, true);
+/// assert!(status.ready);
+/// assert!(status.manifest.regex_status.is_none());
+/// ```
+///
+/// # Arguments
+///
+/// * `status` - Manifest status to parse into the fixture.
+/// * `regex_status` - Optional regex index status and associated metadata.
+/// * `ready` - Whether the overall index is ready.
 fn setup_index_status(
     status: &str,
     regex_status: Option<&str>,

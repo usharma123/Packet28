@@ -191,15 +191,24 @@ impl Drop for McpHarness {
     }
 }
 
-/// Returns the hook runtime config path when durable hook ingest is disabled
-/// (`hooks_enabled: false`).
+/// Detects whether durable hook ingestion is disabled in the runtime configuration.
 ///
-/// In that state packet28d rejects every hook ingest with `accepted: false`,
-/// so the reducer and handoff doctor probes cannot succeed. Surfacing the
-/// config path lets the doctor report the real cause instead of an opaque
-/// "reducer ingest missing" payload dump. A missing or unreadable config is
-/// treated as "not disabled" so the normal smoke path still runs and reports
-/// any other failure.
+/// # Parameters
+///
+/// * `root` - Root directory containing the hook runtime configuration.
+///
+/// # Returns
+///
+/// The hook runtime configuration path when the configuration parses successfully
+/// and `hooks_enabled` is `false`; otherwise, `None`.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// assert!(disabled_hook_runtime_config(Path::new("/nonexistent")).is_none());
+/// ```
 fn disabled_hook_runtime_config(root: &Path) -> Option<std::path::PathBuf> {
     let path = packet28_daemon_protocol::paths::hook_runtime_config_path(root);
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -208,6 +217,18 @@ fn disabled_hook_runtime_config(root: &Path) -> Option<std::path::PathBuf> {
     (!config.hooks_enabled).then_some(path)
 }
 
+/// Runs the Claude hook with a JSON payload and captures its exit code and standard output.
+///
+/// Exit code `2` is treated as an accepted hook result; other unsuccessful exits produce an error.
+///
+/// # Examples
+///
+/// ```no_run
+/// let payload = serde_json::json!({ "hook_event_name": "Stop" });
+/// let (status, output) = run_claude_hook_with_output(root, &payload)?;
+/// println!("{status}: {output}");
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, String)> {
     let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
     let mut child = Command::new(exe)
@@ -277,6 +298,22 @@ fn wait_for_handoff_ready(
     }
 }
 
+/// Runs the MCP doctor smoke tests for handshake, reducer ingestion, push notifications, and handoff round trips.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let checks = check_mcp_round_trip(Path::new("."));
+/// assert!(checks.handshake.required);
+/// ```
+///
+/// `root` identifies the project whose MCP server and hook runtime are tested.
+///
+/// # Returns
+///
+/// The results of the four MCP doctor checks.
 pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
     let timeout = Duration::from_secs(10);
     let task_id = format!(
