@@ -187,6 +187,15 @@ pub struct TaskListPageRequestV1 {
 }
 
 impl Default for TaskListPageRequestV1 {
+    /// Creates a request for the first task page with the default page limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let request = TaskListPageRequestV1::default();
+    /// assert!(request.snapshot_revision.is_none());
+    /// assert!(request.after_task_id.is_none());
+    /// ```
     fn default() -> Self {
         Self {
             snapshot_revision: None,
@@ -194,6 +203,18 @@ impl Default for TaskListPageRequestV1 {
             limit: DEFAULT_REGISTRY_PAGE_LIMIT,
         }
     }
+}
+
+/// A task record that a page could not carry because it exceeds the per-record
+/// pagination bound. Listing skips it (instead of failing) and reports it here
+/// so callers can still enumerate the store and target it for repair/retention.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct OversizedTaskRecordV1 {
+    /// Identifier of the omitted task.
+    pub task_id: String,
+    /// Compact-JSON size of the omitted record, in bytes.
+    pub encoded_bytes: u64,
 }
 
 /// One bounded, lexicographically ordered task-registry page.
@@ -209,6 +230,11 @@ pub struct TaskListPageV1 {
     pub next_after_task_id: Option<String>,
     /// Total number of task records at [`Self::snapshot_revision`].
     pub total: usize,
+    /// Records skipped on this page because they exceed the per-record bound.
+    /// Skipping keeps listing available so one oversized record cannot poison
+    /// the whole enumeration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted_oversized: Vec<OversizedTaskRecordV1>,
 }
 
 /// Cursor request for a lexicographically ordered watch-registry page.
