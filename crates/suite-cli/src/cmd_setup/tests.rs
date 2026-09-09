@@ -698,6 +698,194 @@ fn setup_never_enables_daemon_managed_relaunch_by_default() {
     assert!(!config.daemon_relaunch_enabled());
 }
 
+#[test]
+fn gitignore_coverage_recognizes_common_spellings() {
+    for spelling in [
+        ".packet28",
+        ".packet28/",
+        "/.packet28",
+        "/.packet28/",
+        ".packet28/*",
+        ".packet28/**",
+    ] {
+        assert!(
+            gitignore_covers_packet28_dir(&format!("target/\n{spelling}\n*.log\n")),
+            "spelling {spelling} should be recognized as covering .packet28"
+        );
+    }
+    assert!(gitignore_covers_packet28_dir(".packet28/  \n"));
+    assert!(!gitignore_covers_packet28_dir("target/\n.packet28x/\n"));
+    assert!(!gitignore_covers_packet28_dir(""));
+}
+
+#[test]
+fn gitignore_coverage_preserves_leading_spaces() {
+    assert!(!gitignore_covers_packet28_dir(" .packet28/\n"));
+}
+
+#[test]
+fn gitignore_coverage_rejects_patterns_that_do_not_ignore_the_runtime_directory() {
+    for pattern in [
+        "!.packet28/",
+        "# .packet28/",
+        "\t.packet28/",
+        ".packet28/cache",
+        "nested/.packet28/",
+        ".packet280/",
+    ] {
+        assert!(
+            !gitignore_covers_packet28_dir(pattern),
+            "pattern {pattern:?} must not be treated as covering .packet28/"
+        );
+    }
+}
+
+#[test]
+fn ensure_gitignore_is_noop_outside_git_repo() {
+    let dir = tempdir().unwrap();
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+    assert!(!dir.path().join(".gitignore").exists());
+}
+
+#[test]
+fn ensure_gitignore_creates_entry_in_git_repo() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+
+    let created = ensure_packet28_gitignore(dir.path()).unwrap();
+    assert_eq!(created, Some(dir.path().join(".gitignore")));
+    let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(
+        content,
+        "# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+
+    // Idempotent: a second run makes no change and reports nothing added.
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        content
+    );
+}
+
+#[test]
+fn ensure_gitignore_appends_and_preserves_existing_content() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    // Existing content without a trailing newline must be preserved intact.
+    fs::write(dir.path().join(".gitignore"), "target/\n/dist").unwrap();
+
+    let created = ensure_packet28_gitignore(dir.path()).unwrap();
+    assert!(created.is_some());
+    let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(
+        content,
+        "target/\n/dist\n\n# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+}
+
+#[test]
+fn ensure_gitignore_respects_preexisting_coverage() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".gitignore"), "/.packet28/\n").unwrap();
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+}
+
+#[test]
+fn ensure_gitignore_supports_git_file_marker_used_by_worktrees() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join(".git"), "gitdir: /tmp/example-worktree\n").unwrap();
+
+    assert_eq!(
+        ensure_packet28_gitignore(dir.path()).unwrap(),
+        Some(dir.path().join(".gitignore"))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+}
+
+#[test]
+fn ensure_gitignore_rejects_invalid_utf8_without_replacing_the_file() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let original = b"target/\n\xff\xfe\n";
+    fs::write(dir.path().join(".gitignore"), original).unwrap();
+
+    let error = ensure_packet28_gitignore(dir.path()).unwrap_err();
+
+    assert!(error.to_string().contains("as UTF-8"));
+    assert_eq!(fs::read(dir.path().join(".gitignore")).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_gitignore_rejects_symlink_without_writing_outside_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let outside_gitignore = outside.path().join("outside.gitignore");
+    fs::write(&outside_gitignore, "outside content\n").unwrap();
+    symlink(&outside_gitignore, dir.path().join(".gitignore")).unwrap();
+
+    assert!(ensure_packet28_gitignore(dir.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(&outside_gitignore).unwrap(),
+        "outside content\n"
+    );
+    assert!(fs::symlink_metadata(dir.path().join(".gitignore"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_gitignore_rejects_hard_link_without_writing_outside_workspace() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let outside_gitignore = outside.path().join("outside.gitignore");
+    fs::write(&outside_gitignore, "outside content\n").unwrap();
+    fs::hard_link(&outside_gitignore, dir.path().join(".gitignore")).unwrap();
+
+    assert!(ensure_packet28_gitignore(dir.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(&outside_gitignore).unwrap(),
+        "outside content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "outside content\n"
+    );
+}
+
+/// Builds a daemon index status response for testing.
+///
+/// `regex_status` populates the regex index fields when provided, and `ready`
+/// controls whether the overall index is reported as ready.
+///
+/// # Examples
+///
+/// ```
+/// let response = setup_index_status("ready", Some("ready"), true);
+/// assert!(response.ready);
+/// assert_eq!(response.manifest.regex_status.as_deref(), Some("ready"));
+/// ```
+///
+/// # Parameters
+///
+/// * `status` - The daemon index status to parse.
+/// * `regex_status` - The optional regex index status.
+/// * `ready` - Whether the index is ready.
+///
+/// # Returns
+///
+/// A daemon index status response containing the supplied status values.
 fn setup_index_status(
     status: &str,
     regex_status: Option<&str>,
