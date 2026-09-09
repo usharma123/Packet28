@@ -4422,6 +4422,10 @@ impl<'a> AnchoredFileLock<'a> {
     }
 
     pub(crate) fn validate_attachment(&self) -> std::io::Result<()> {
+        self.validate_named_attachment(&self.name)
+    }
+
+    fn validate_named_attachment(&self, name: &OsStr) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
 
         let metadata = self.file.metadata()?;
@@ -4435,7 +4439,7 @@ impl<'a> AnchoredFileLock<'a> {
             ));
         }
         self.parent.authenticate_regular_file_with_link_count(
-            &self.name,
+            name,
             crate::retention::FileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
@@ -4454,6 +4458,20 @@ impl<'a> AnchoredFileLock<'a> {
 
     pub(crate) fn finish(mut self) -> std::result::Result<(), AnchoredFileLockFinishError> {
         let attachment = self.validate_attachment();
+        let unlock = FileExt::unlock(&self.file);
+        self.locked = false;
+        match (attachment, unlock) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(source), _) => Err(AnchoredFileLockFinishError::Attachment(source)),
+            (Ok(()), Err(source)) => Err(AnchoredFileLockFinishError::Unlock(source)),
+        }
+    }
+
+    pub(crate) fn finish_renamed(
+        mut self,
+        destination_name: &OsStr,
+    ) -> std::result::Result<(), AnchoredFileLockFinishError> {
+        let attachment = self.validate_named_attachment(destination_name);
         let unlock = FileExt::unlock(&self.file);
         self.locked = false;
         match (attachment, unlock) {

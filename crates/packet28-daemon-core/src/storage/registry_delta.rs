@@ -1137,30 +1137,272 @@ fn scan_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTas
 ///
 /// # Examples
 ///
+/// ```ignore
+/// move_corrupt_event_logs_aside(root, &mut corrupt, &writer_lease)?;
 /// ```
-/// let mut corrupt: Vec<QuarantinedCorruptTaskEventLog> = Vec::new();
-/// move_corrupt_event_logs_aside(&mut corrupt)?;
-/// # Ok::<(), DaemonCoreError>(())
-/// ```
-fn move_corrupt_event_logs_aside(corrupt: &mut [QuarantinedCorruptTaskEventLog]) -> Result<()> {
-    let stamp = now_unix();
-    for record in corrupt.iter_mut() {
-        let mut dest = record.event_log_path.clone().into_os_string();
-        dest.push(format!(".corrupt-{stamp}"));
-        let dest = PathBuf::from(dest);
-        match fs::rename(&record.event_log_path, &dest) {
-            Ok(()) => record.quarantined_path = Some(dest),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(DaemonCoreError::io(
-                    "failed to move a corrupt task event log aside",
+fn corrupt_event_log_destination_name(file_name: &str, stamp: u64, attempt: usize) -> String {
+    if attempt == 0 {
+        format!("{file_name}.corrupt-{stamp}")
+    } else {
+        format!("{file_name}.corrupt-{stamp}-{attempt}")
+    }
+}
+
+#[cfg(unix)]
+fn move_corrupt_event_log_aside(
+    root: &Path,
+    record: &QuarantinedCorruptTaskEventLog,
+    writer_lease: &crate::task_store_lease::TaskStoreLease,
+    stamp: u64,
+) -> Result<Option<PathBuf>> {
+    let storage_id = checked_task_storage_id(root, &record.task_id)?;
+    let file_name = event_log_file_name(&storage_id);
+    let Some(events) = open_task_events_capability_for_read(root)? else {
+        return Ok(None);
+    };
+    validate_anchored_event_namespace_aliases(&events, &file_name, &record.event_log_path)?;
+    let file = match events.open_existing_lock_file(OsStr::new(&file_name)) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(None),
+        Err(source) => {
+            return Err(DaemonCoreError::io(
+                "failed to open a corrupt task event log for quarantine",
+                &record.event_log_path,
+                source,
+            ));
+        }
+    };
+    let mut lock = match AnchoredFileLock::lock_existing(
+        &events,
+        OsStr::new(&file_name),
+        record.event_log_path.clone(),
+        file,
+        AnchoredFileLockMode::Exclusive,
+    ) {
+        Ok(lock) => lock,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(DaemonCoreError::io(
+                "failed to acquire exclusive corrupt task event log lock",
+                &record.event_log_path,
+                source,
+            ));
+        }
+    };
+
+    let result = (|| -> Result<Option<(String, PathBuf)>> {
+        writer_lease.validate_namespace_attachment()?;
+        events
+            .validate_display_path_attachment()
+            .map_err(|source| {
+                DaemonCoreError::io(
+                    "task event namespace is detached during quarantine",
                     &record.event_log_path,
-                    error,
-                ));
+                    source,
+                )
+            })?;
+        validate_anchored_event_namespace_aliases(&events, &file_name, &record.event_log_path)?;
+        lock.validate_attachment().map_err(|source| {
+            DaemonCoreError::io(
+                "corrupt task event log binding changed before quarantine",
+                &record.event_log_path,
+                source,
+            )
+        })?;
+
+        match event_tail::inspect_locked_task_event_tail(
+            lock.file_mut(),
+            &record.event_log_path,
+            &storage_id,
+        ) {
+            Ok(_) => return Ok(None),
+            Err(error) if is_recoverable_event_log_corruption(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        for attempt in 0..MAX_TASK_REGISTRY_RECORDS {
+            let destination_name = corrupt_event_log_destination_name(&file_name, stamp, attempt);
+            match events.rename_to_noreplace(
+                OsStr::new(&file_name),
+                &events,
+                OsStr::new(&destination_name),
+            ) {
+                Ok(()) => {
+                    let destination = events.display_path().join(&destination_name);
+                    return Ok(Some((destination_name, destination)));
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(source) => {
+                    return Err(DaemonCoreError::io(
+                        "failed to move a corrupt task event log aside",
+                        &record.event_log_path,
+                        source,
+                    ));
+                }
             }
+        }
+        Err(DaemonCoreError::io(
+            "failed to reserve a unique corrupt task event log destination",
+            &record.event_log_path,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "corrupt task event log destination attempts exhausted",
+            ),
+        ))
+    })();
+
+    let finish = match &result {
+        Ok(Some((destination_name, _))) => lock.finish_renamed(OsStr::new(destination_name)),
+        _ => lock.finish(),
+    };
+    match (result, finish) {
+        (Ok(Some((_, destination))), Ok(())) => Ok(Some(destination)),
+        (Ok(None), Ok(())) => Ok(None),
+        (Ok(_), Err(AnchoredFileLockFinishError::Attachment(source))) => Err(DaemonCoreError::io(
+            "corrupt task event log binding changed during quarantine",
+            &record.event_log_path,
+            source,
+        )),
+        (Ok(_), Err(AnchoredFileLockFinishError::Unlock(source))) => Err(DaemonCoreError::io(
+            "failed to unlock corrupt task event log",
+            &record.event_log_path,
+            source,
+        )),
+        (Err(error), _) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn move_corrupt_event_log_aside(
+    root: &Path,
+    record: &QuarantinedCorruptTaskEventLog,
+    _writer_lease: &crate::task_store_lease::TaskStoreLease,
+    stamp: u64,
+) -> Result<Option<PathBuf>> {
+    let storage_id = checked_task_storage_id(root, &record.task_id)?;
+    let file_name = event_log_file_name(&storage_id);
+    let Some(mut file) = open_task_event_file_for_read(root, &storage_id, &record.event_log_path)?
+    else {
+        return Ok(None);
+    };
+    FileExt::lock_exclusive(&file).map_err(|source| {
+        DaemonCoreError::io(
+            "failed to acquire exclusive corrupt task event log lock",
+            &record.event_log_path,
+            source,
+        )
+    })?;
+    let result = (|| -> Result<Option<PathBuf>> {
+        match event_tail::inspect_locked_task_event_tail(
+            &mut file,
+            &record.event_log_path,
+            &storage_id,
+        ) {
+            Ok(_) => return Ok(None),
+            Err(error) if is_recoverable_event_log_corruption(&error) => {}
+            Err(error) => return Err(error),
+        }
+        for attempt in 0..MAX_TASK_REGISTRY_RECORDS {
+            let destination_name = corrupt_event_log_destination_name(&file_name, stamp, attempt);
+            let destination = task_events_dir(root).join(&destination_name);
+            let reservation = task_events_dir(root).join(format!("{destination_name}.reserve"));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&reservation)
+            {
+                Ok(reservation_file) => drop(reservation_file),
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(DaemonCoreError::io(
+                        "failed to reserve a corrupt task event log destination",
+                        &reservation,
+                        source,
+                    ));
+                }
+            }
+            match fs::symlink_metadata(&destination) {
+                Ok(_) => {
+                    let _ = fs::remove_file(&reservation);
+                    continue;
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    let _ = fs::remove_file(&reservation);
+                    return Err(DaemonCoreError::io(
+                        "failed to inspect a corrupt task event log destination",
+                        &destination,
+                        source,
+                    ));
+                }
+            }
+            let moved = fs::rename(&record.event_log_path, &destination);
+            let cleanup = fs::remove_file(&reservation);
+            match (moved, cleanup) {
+                (Ok(()), Ok(())) => return Ok(Some(destination)),
+                (Err(source), _) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                (Err(source), _) => {
+                    return Err(DaemonCoreError::io(
+                        "failed to move a corrupt task event log aside",
+                        &record.event_log_path,
+                        source,
+                    ));
+                }
+                (Ok(()), Err(source)) => {
+                    return Err(DaemonCoreError::io(
+                        "failed to release a corrupt task event log destination reservation",
+                        &reservation,
+                        source,
+                    ));
+                }
+            }
+        }
+        Err(DaemonCoreError::io(
+            "failed to reserve a unique corrupt task event log destination",
+            &record.event_log_path,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "corrupt task event log destination attempts exhausted",
+            ),
+        ))
+    })();
+    let unlock = FileExt::unlock(&file).map_err(|source| {
+        DaemonCoreError::io(
+            "failed to unlock corrupt task event log",
+            &record.event_log_path,
+            source,
+        )
+    });
+    match (result, unlock) {
+        (Ok(destination), Ok(())) => Ok(destination),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn move_corrupt_event_logs_aside_at_stamp(
+    root: &Path,
+    corrupt: &mut [QuarantinedCorruptTaskEventLog],
+    writer_lease: &crate::task_store_lease::TaskStoreLease,
+    stamp: u64,
+) -> Result<()> {
+    for record in corrupt.iter_mut() {
+        if let Some(destination) = move_corrupt_event_log_aside(root, record, writer_lease, stamp)?
+        {
+            record.quarantined_path = Some(destination);
         }
     }
     Ok(())
+}
+
+fn move_corrupt_event_logs_aside(
+    root: &Path,
+    corrupt: &mut [QuarantinedCorruptTaskEventLog],
+    writer_lease: &crate::task_store_lease::TaskStoreLease,
+) -> Result<()> {
+    move_corrupt_event_logs_aside_at_stamp(root, corrupt, writer_lease, now_unix())
 }
 
 /// Loads the task/watch registry and event-log tails, quarantining recoverable corrupt logs.
@@ -1183,6 +1425,7 @@ fn move_corrupt_event_logs_aside(corrupt: &mut [QuarantinedCorruptTaskEventLog])
 pub fn load_task_watch_registry_recovering_corrupt_event_logs(
     root: &Path,
 ) -> Result<RecoveredTaskWatchRegistry> {
+    let writer_lease = acquire_task_store_writer_lease(root)?;
     let mut quarantined: Vec<QuarantinedCorruptTaskEventLog> = Vec::new();
     loop {
         match load_task_watch_registry_with_deltas_and_event_tails(root) {
@@ -1198,7 +1441,7 @@ pub fn load_task_watch_registry_recovering_corrupt_event_logs(
                 {
                     return Err(error);
                 }
-                move_corrupt_event_logs_aside(&mut corrupt)?;
+                move_corrupt_event_logs_aside(root, &mut corrupt, &writer_lease)?;
                 quarantined.extend(corrupt);
             }
         }
@@ -3102,6 +3345,42 @@ mod tests {
             load_task_watch_registry_with_deltas_and_event_tails(root.path()).unwrap();
         assert!(reloaded.tasks.tasks.contains_key("bad"));
         assert_eq!(reloaded_tails.get("bad"), Some(&None));
+    }
+
+    #[test]
+    fn corrupt_event_log_quarantine_preserves_an_existing_same_stamp_sibling() {
+        let root = tempdir().unwrap();
+        checkpoint(root.path(), [task("bad", &[])], []);
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+
+        let storage_id = checked_task_storage_id(root.path(), "bad").unwrap();
+        let event_log = task_event_log_path(root.path(), &storage_id);
+        fs::write(&event_log, b"not-json\n").unwrap();
+        let file_name = event_log_file_name(&storage_id);
+        let stamp = 42;
+        let earlier_quarantine = task_events_dir(root.path())
+            .join(corrupt_event_log_destination_name(&file_name, stamp, 0));
+        fs::write(&earlier_quarantine, b"earlier quarantine\n").unwrap();
+
+        let writer_lease = acquire_task_store_writer_lease(root.path()).unwrap();
+        let mut corrupt = vec![QuarantinedCorruptTaskEventLog {
+            task_id: "bad".to_string(),
+            event_log_path: event_log.clone(),
+            quarantined_path: None,
+            reason: "invalid task event frame".to_string(),
+        }];
+        move_corrupt_event_logs_aside_at_stamp(root.path(), &mut corrupt, &writer_lease, stamp)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&earlier_quarantine).unwrap(),
+            b"earlier quarantine\n"
+        );
+        let new_quarantine = task_events_dir(root.path())
+            .join(corrupt_event_log_destination_name(&file_name, stamp, 1));
+        assert_eq!(corrupt[0].quarantined_path, Some(new_quarantine.clone()));
+        assert_eq!(fs::read(new_quarantine).unwrap(), b"not-json\n");
+        assert!(!event_log.exists());
     }
 
     #[test]
