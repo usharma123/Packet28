@@ -991,13 +991,21 @@ fn load_task_watch_registry_with_deltas_under_admission(
     })
 }
 
-/// Loads checkpoint-plus-WAL registry authority and authenticated event tails
-/// beneath the same task-registry lock.
+/// Loads the checkpoint and WAL-backed task/watch registry together with each task's authenticated event-log tail sequence.
+///
+/// The registry and event tails are read while holding the same exclusive task-registry lock.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`load_task_watch_registry_with_deltas`] and the
-/// strict task-event tail reader.
+/// Returns an error if registry loading or event-log tail inspection fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// let root = std::path::Path::new("/path/to/workspace");
+/// let (_registry, event_tails) = load_task_watch_registry_with_deltas_and_event_tails(root)?;
+/// # let _: Result<_, _> = Ok::<_, Box<dyn std::error::Error>>(());
+/// ```
 pub fn load_task_watch_registry_with_deltas_and_event_tails(
     root: &Path,
 ) -> Result<(LoadedTaskWatchRegistry, BTreeMap<String, Option<u64>>)> {
@@ -1070,9 +1078,18 @@ pub struct QuarantinedCorruptTaskEventLog {
     pub reason: String,
 }
 
-/// Returns true for durable event-log integrity failures that recovery can
-/// safely quarantine, as opposed to environmental IO, lock, or lease failures
-/// that must still fail closed.
+/// Identifies event-log errors that can be safely quarantined during recovery.
+///
+/// # Examples
+///
+/// ```ignore
+/// if is_recoverable_event_log_corruption(&error) {
+///     quarantine_event_log();
+/// }
+/// ```
+///
+/// Returns `true` for invalid event frames and authority JSON-limit violations,
+/// and `false` for other errors.
 fn is_recoverable_event_log_corruption(error: &DaemonCoreError) -> bool {
     matches!(
         error,
@@ -1081,9 +1098,16 @@ fn is_recoverable_event_log_corruption(error: &DaemonCoreError) -> bool {
     )
 }
 
-/// Identifies every admitted task whose durable event log fails integrity
-/// validation. Non-corruption errors (IO, lease, lock) propagate unchanged so
-/// only genuine event-log corruption is treated as recoverable.
+/// Finds admitted tasks whose event logs contain recoverable integrity errors.
+///
+/// Non-recoverable errors, including I/O, lease, and lock errors, are propagated.
+///
+/// # Examples
+///
+/// ```ignore
+/// let corrupt_logs = scan_corrupt_task_event_logs(root)?;
+/// assert!(corrupt_logs.is_empty());
+/// ```
 fn scan_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
     let loaded = load_task_watch_registry_with_deltas(root)?;
     let mut corrupt = Vec::new();
@@ -1105,15 +1129,19 @@ fn scan_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTas
     Ok(corrupt)
 }
 
-/// Moves each corrupt task event log aside (renaming it to a sibling
-/// `*.corrupt-<unix>` file) so the task's canonical event-log path becomes
-/// absent and its durable tail reads as empty.
+/// Quarantines corrupt task event logs by renaming them to timestamped sibling files.
 ///
-/// This deliberately does not touch the task registry: mutating the durable
-/// checkpoint here would race the persistence owner that assumes ownership at
-/// startup. The caller resets the quarantined task's event high-water through
-/// the normal persistence path instead. The renamed file is preserved for
-/// inspection. A log that is already absent is ignored.
+/// The canonical event-log path is left absent so subsequent tail reads are empty.
+/// Missing logs are ignored, and the task registry is left unchanged. Renamed files
+/// are recorded in `corrupt`.
+///
+/// # Examples
+///
+/// ```
+/// let mut corrupt: Vec<QuarantinedCorruptTaskEventLog> = Vec::new();
+/// move_corrupt_event_logs_aside(&mut corrupt)?;
+/// # Ok::<(), DaemonCoreError>(())
+/// ```
 fn move_corrupt_event_logs_aside(corrupt: &mut [QuarantinedCorruptTaskEventLog]) -> Result<()> {
     let stamp = now_unix();
     for record in corrupt.iter_mut() {
@@ -1135,33 +1163,23 @@ fn move_corrupt_event_logs_aside(corrupt: &mut [QuarantinedCorruptTaskEventLog])
     Ok(())
 }
 
-/// Loads the durable task/watch registry and event tails, quarantining any task
-/// whose durable event log fails integrity validation instead of failing the
-/// entire load.
+/// Loads the task/watch registry and event-log tails, quarantining recoverable corrupt logs.
 ///
-/// A single corrupted task event log otherwise takes the whole daemon down at
-/// startup (`packet28d did not become ready`). This wrapper isolates the bad
-/// task: it moves the corrupt event log aside (to a sibling `*.corrupt-<unix>`
-/// file, preserved for inspection) so the task's tail reads as empty, then
-/// returns the registry — the affected task is still present but its returned
-/// tail is `None`.
-///
-/// The registry is intentionally left unmutated so it does not race the
-/// persistence owner that assumes checkpoint ownership at startup. The caller
-/// must reset each quarantined task's event high-water (`last_event_seq` to 0)
-/// through the normal persistence path so reconciliation stays consistent; the
-/// returned vector lists every quarantined task for that purpose and for
-/// reporting.
-///
-/// Only genuine event-log integrity failures are recovered, and at most
-/// [`MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS`] tasks are quarantined before the
-/// load fails closed. All other errors propagate unchanged.
+/// Quarantined logs are moved to timestamped sibling files, affected tasks remain in
+/// the registry, and their returned event tails are empty. The registry is not mutated.
+/// Recovery stops after [`MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS`] tasks.
 ///
 /// # Errors
 ///
-/// Returns the same errors as
-/// [`load_task_watch_registry_with_deltas_and_event_tails`] for non-recoverable
-/// failures, plus filesystem errors from moving a corrupt log aside.
+/// Returns non-recoverable loading errors and errors encountered while quarantining
+/// corrupt logs.
+///
+/// # Examples
+///
+/// ```no_run
+/// let recovered = load_task_watch_registry_recovering_corrupt_event_logs(root)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn load_task_watch_registry_recovering_corrupt_event_logs(
     root: &Path,
 ) -> Result<RecoveredTaskWatchRegistry> {
