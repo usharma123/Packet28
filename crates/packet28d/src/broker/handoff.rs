@@ -247,6 +247,17 @@ fn derive_handoff_id(task_id: &str, generated_at_unix_ms: u64) -> String {
     format!("{task_id}:handoff:{generated_at_unix_ms}")
 }
 
+/// Promotes a handoff to the task's latest ready handoff.
+///
+/// Existing ready or consumed handoffs are marked as superseded, and handoff
+/// history is retained in newest-first order up to the configured limit.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// promote_new_ready_handoff(&mut task, handoff);
+/// assert_eq!(task.latest_handoff_id.as_deref(), Some("handoff-123"));
+/// ```
 fn promote_new_ready_handoff(task: &mut TaskRecord, mut handoff: BrokerHandoffDescriptor) {
     for existing in &mut task.handoffs {
         if matches!(
@@ -279,14 +290,35 @@ fn promote_new_ready_handoff(task: &mut TaskRecord, mut handoff: BrokerHandoffDe
 /// handoff (always the newest) plus recent history.
 const TASK_HANDOFF_HISTORY_MAX: usize = 64;
 
-/// Truncates `handoffs` to the most recent [`TASK_HANDOFF_HISTORY_MAX`]
-/// descriptors. Callers must pass a slice already ordered newest-first.
+/// Limits handoff history to the most recent descriptors.
+///
+/// The input must already be ordered from newest to oldest.
+///
+/// # Examples
+///
+/// ```
+/// let mut handoffs = Vec::new();
+/// cap_handoff_history(&mut handoffs);
+/// assert!(handoffs.len() <= TASK_HANDOFF_HISTORY_MAX);
+/// ```
 fn cap_handoff_history(handoffs: &mut Vec<BrokerHandoffDescriptor>) {
     if handoffs.len() > TASK_HANDOFF_HISTORY_MAX {
         handoffs.truncate(TASK_HANDOFF_HISTORY_MAX);
     }
 }
 
+/// Marks a handoff as consumed and records its resume time and count.
+///
+/// Returns `None` when the task or handoff does not exist.
+///
+/// # Examples
+///
+/// ```no_run
+/// # let state: Arc<Mutex<DaemonState>> = unimplemented!();
+/// let consumed = mark_handoff_consumed(&state, "task-1", "handoff-1")?;
+/// assert!(consumed.is_some());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub(crate) fn mark_handoff_consumed(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
@@ -726,6 +758,22 @@ fn handoff_context_request(
     }
 }
 
+/// Prepares a broker handoff when the task has sufficient state for transfer.
+///
+/// When a handoff is not ready, returns readiness information and any existing handoff
+/// metadata. If a matching ready handoff artifact is available, returns it for resumption.
+/// When ready, generates and persists a new handoff artifact and returns its descriptor and
+/// broker context.
+///
+/// # Examples
+///
+/// ```ignore
+/// let response = broker_prepare_handoff(state, request)?;
+/// if let Some(context) = response.context {
+///     println!("Prepared context: {}", context.context_version);
+/// }
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub(crate) fn broker_prepare_handoff(
     state: Arc<Mutex<DaemonState>>,
     request: BrokerPrepareHandoffRequest,
@@ -895,6 +943,16 @@ pub(crate) fn broker_prepare_handoff(
 mod cap_history_tests {
     use super::*;
 
+    /// Creates a handoff descriptor with deterministic handoff and artifact identifiers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let descriptor = handoff(7, 1_700_000_000_000);
+    /// assert_eq!(descriptor.handoff_id, "handoff-00007");
+    /// assert_eq!(descriptor.artifact_id, "artifact-00007");
+    /// assert_eq!(descriptor.generated_at_unix_ms, 1_700_000_000_000);
+    /// ```
     fn handoff(id: usize, generated_at_unix_ms: u64) -> BrokerHandoffDescriptor {
         BrokerHandoffDescriptor {
             handoff_id: format!("handoff-{id:05}"),
