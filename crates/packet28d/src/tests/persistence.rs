@@ -903,7 +903,7 @@ fn admitted_zero_event_task_skips_redundant_pre_event_registry_stage() {
 fn daemon_startup_uses_checkpoint_plus_wal_registry_authority() {
     let source = include_str!("../application.rs");
 
-    assert!(source.contains("load_task_watch_registry_with_deltas_and_event_tails"));
+    assert!(source.contains("load_task_watch_registry_recovering_corrupt_event_logs"));
     assert!(!source.contains("load_task_watch_registry_checkpoint_with_event_tails"));
 }
 
@@ -913,6 +913,27 @@ fn daemon_startup_checkpoints_replayed_authority_before_readiness() {
     let checkpoint = source.find("persistence.checkpoint_current()?").unwrap();
     let readiness = source.find("mark_ready(&state)?").unwrap();
 
+    assert!(checkpoint < readiness);
+}
+
+#[test]
+fn daemon_startup_persists_quarantined_event_high_water_resets_before_readiness() {
+    let source = include_str!("../application.rs");
+    let recovering_load = source
+        .find("load_task_watch_registry_recovering_corrupt_event_logs(&root)?")
+        .unwrap();
+    let reset = source.find("task.last_event_seq = 0").unwrap();
+    let quarantine_delta = source.find(".chain(&quarantined_task_ids)").unwrap();
+    let flush = source
+        .find("persistence.stage_and_flush(startup_delta)?")
+        .unwrap();
+    let checkpoint = source.find("persistence.checkpoint_current()?").unwrap();
+    let readiness = source.find("mark_ready(&state)?").unwrap();
+
+    assert!(recovering_load < reset);
+    assert!(reset < quarantine_delta);
+    assert!(quarantine_delta < flush);
+    assert!(flush < checkpoint);
     assert!(checkpoint < readiness);
 }
 
