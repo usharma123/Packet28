@@ -43,21 +43,27 @@ use crate::{
 
 /// Runs one Packet28 daemon instance for `root` until shutdown completes.
 ///
-/// The nearest ancestor containing `.git` becomes the workspace root. This
-/// function changes the process working directory, acquires the workspace's
-/// daemon and task-store leases, binds its configured transport, and blocks
-/// while the owned runtime serves requests. Call it at most once per process.
+/// Resolves the workspace root, acquires lifecycle leases, initializes the daemon,
+/// and serves requests until shutdown. During shutdown, it withdraws readiness,
+/// stops active work, flushes persistence, removes runtime files, and releases
+/// lifecycle leases.
 ///
-/// Shutdown withdraws readiness, cancels active generations, joins runtime
-/// owners, flushes kernel and task persistence, removes runtime files, and only
-/// then releases the lifecycle leases.
+/// # Examples
+///
+/// ```no_run
+/// let root = std::env::current_dir()?;
+/// serve(root)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 ///
 /// # Errors
 ///
-/// Returns an error when root resolution, recovery, lease acquisition,
-/// transport startup, request orchestration, persistence shutdown, or
-/// runtime-file cleanup cannot complete safely. Corrupt or conflicted durable
-/// state fails closed before readiness is published.
+/// Returns an error if workspace resolution, recovery, lease acquisition,
+/// transport startup, runtime operation, persistence shutdown, or runtime-file
+/// cleanup fails. Recoverable corrupt event logs are quarantined during startup;
+/// unrecoverable or conflicting durable state prevents readiness.
+///
+///
 pub fn serve(root: PathBuf) -> Result<()> {
     let root = resolve_root(&root);
 
