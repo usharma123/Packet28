@@ -997,6 +997,21 @@ fn handle_registry_request_v1(
     }
 }
 
+/// Ensures that the daemon has a registry page index for the specified revision.
+///
+/// Rebuilds the index when the stored revision differs and returns an error if
+/// the watch registry contains duplicate watch identifiers.
+///
+/// # Examples
+///
+/// ```ignore
+/// ensure_registry_page_index(&mut state, &revision)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns an error when duplicate watch identifiers are found.
 fn ensure_registry_page_index(
     state: &mut DaemonState,
     revision: &RegistryRevisionV1,
@@ -1033,7 +1048,25 @@ fn ensure_registry_page_index(
     Ok(())
 }
 
-/// Builds a bounded task page while reporting records that cannot fit any page.
+/// Builds a bounded task page from the registry and reports task records that are too large to include.
+///
+/// The page respects the requested cursor and limit, preserves the registry revision, and includes
+/// a cursor for retrieving subsequent results. Individually oversized records and records that exceed
+/// the collection byte budget are reported in `omitted_oversized` so they do not prevent other tasks
+/// from being listed.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let page = build_task_list_page(&tasks, &revision, &request)?;
+/// println!("listed {} tasks", page.tasks.len());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns an error when the request, snapshot, cursor, encoding, byte accounting, or response
+/// size is invalid.
 fn build_task_list_page(
     tasks: &BTreeMap<String, TaskRecord>,
     revision: &RegistryRevisionV1,
@@ -1249,6 +1282,19 @@ fn validate_registry_snapshot(
     Ok(())
 }
 
+/// Validates pagination limits, cursors, and task filters for a registry request.
+///
+/// # Errors
+///
+/// Returns an error if the page limit is outside the supported range or if the
+/// cursor or task filter exceeds the request-size bound.
+///
+/// # Examples
+///
+/// ```
+/// validate_registry_page_request("tasks", 1, None, None)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn validate_registry_page_request(
     kind: &str,
     limit: usize,
@@ -1270,7 +1316,20 @@ fn validate_registry_page_request(
     Ok(())
 }
 
-/// Returns the compact-JSON size of a registry record that fits the item bound.
+/// Computes the compact JSON size of a registry page record.
+///
+/// # Errors
+///
+/// Returns an error if the record cannot be serialized or exceeds the maximum
+/// permitted size for a paginated record.
+///
+/// # Examples
+///
+/// ```
+/// let item = serde_json::json!({ "id": 1 });
+/// let bytes = encoded_registry_page_item_bytes(&item, "task", "1").unwrap();
+/// assert!(bytes > 0);
+/// ```
 fn encoded_registry_page_item_bytes(
     item: &impl Serialize,
     kind: &str,
@@ -1288,10 +1347,23 @@ fn encoded_registry_page_item_bytes(
     Ok(item_bytes)
 }
 
-/// Like [`encoded_registry_page_item_bytes`] but reports an over-limit record as
-/// `Ok(Err(encoded_bytes))` instead of failing, so a resilient page can skip and
-/// report it rather than poisoning the whole listing. The outer `Err` is still
-/// reserved for genuine encoding failures.
+/// Measures a registry page record and identifies records that exceed the per-record size limit.
+///
+/// # Examples
+///
+/// ```
+/// let result = encoded_registry_page_item_bytes_checked(
+///     &serde_json::json!({ "id": "task-1" }),
+///     "task",
+///     "task-1",
+/// )
+/// .unwrap();
+///
+/// assert!(result.is_ok());
+/// ```
+///
+/// An inner `Err` contains the encoded byte count for an oversized record. The
+/// outer `Err` indicates a serialization failure.
 fn encoded_registry_page_item_bytes_checked(
     item: &impl Serialize,
     kind: &str,
@@ -1306,6 +1378,21 @@ fn encoded_registry_page_item_bytes_checked(
     Ok(Ok(item_bytes))
 }
 
+/// Validates that an encoded registry page response fits within the transport size limit.
+///
+/// # Errors
+///
+/// Returns an error if the response cannot be serialized or exceeds the maximum
+/// encoded response size.
+///
+/// # Examples
+///
+/// ```
+/// # fn example(response: &DaemonRegistryResponseV1) -> Result<()> {
+/// ensure_registry_page_response_fits(response, "task")?;
+/// # Ok(())
+/// # }
+/// ```
 fn ensure_registry_page_response_fits(
     response: &DaemonRegistryResponseV1,
     kind: &str,

@@ -257,12 +257,37 @@ fn legacy_daemon_status(root: &Path) -> Result<packet28_daemon_protocol::message
     }
 }
 
+/// Detects whether an error message indicates an unsupported registry extension.
+///
+/// # Returns
+///
+/// `true` if the message reports an unknown variant and lists expected variants, `false` otherwise.
+///
+/// # Examples
+///
+/// ```
+/// assert!(registry_extension_is_unsupported(
+///     "unknown variant `tasks`, expected one of `status`, `watch`"
+/// ));
+/// assert!(!registry_extension_is_unsupported("connection failed"));
+/// ```
 fn registry_extension_is_unsupported(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("unknown variant") && lower.contains("expected one of")
 }
 
-/// Loads every healthy task while accounting for oversized records omitted by the daemon.
+/// Loads all task records from a consistent registry snapshot.
+///
+/// Oversized records omitted by the daemon are counted for completeness validation
+/// but are not included in the returned collection.
+///
+/// # Examples
+///
+/// ```ignore
+/// let tasks = load_all_task_pages(&mut client, &snapshot_revision, expected_total)?;
+/// assert!(tasks.len() <= expected_total);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn load_all_task_pages(
     client: &mut crate::cmd_daemon::PersistentDaemonClient,
     snapshot_revision: &RegistryRevisionV1,
