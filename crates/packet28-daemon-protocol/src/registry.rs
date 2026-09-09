@@ -187,6 +187,7 @@ pub struct TaskListPageRequestV1 {
 }
 
 impl Default for TaskListPageRequestV1 {
+    /// Creates a request for the first task page using the default page limit.
     fn default() -> Self {
         Self {
             snapshot_revision: None,

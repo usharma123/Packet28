@@ -1033,6 +1033,7 @@ fn ensure_registry_page_index(
     Ok(())
 }
 
+/// Builds a bounded task page while reporting records that cannot fit any page.
 fn build_task_list_page(
     tasks: &BTreeMap<String, TaskRecord>,
     revision: &RegistryRevisionV1,
@@ -1269,6 +1270,7 @@ fn validate_registry_page_request(
     Ok(())
 }
 
+/// Returns the compact-JSON size of a registry record that fits the item bound.
 fn encoded_registry_page_item_bytes(
     item: &impl Serialize,
     kind: &str,
@@ -1694,6 +1696,7 @@ mod tests {
         crate::tests::support::shutdown_test_persistence(&state);
     }
 
+    /// Verifies that an oversized record is reported without hiding healthy tasks.
     #[test]
     fn registry_pages_skip_and_report_an_individually_oversized_record() {
         let healthy_id = "task-healthy";

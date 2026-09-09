@@ -262,6 +262,7 @@ fn registry_extension_is_unsupported(message: &str) -> bool {
     lower.contains("unknown variant") && lower.contains("expected one of")
 }
 
+/// Loads every healthy task while accounting for oversized records omitted by the daemon.
 fn load_all_task_pages(
     client: &mut crate::cmd_daemon::PersistentDaemonClient,
     snapshot_revision: &RegistryRevisionV1,
