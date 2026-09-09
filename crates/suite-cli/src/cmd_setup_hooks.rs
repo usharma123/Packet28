@@ -582,13 +582,29 @@ pub(crate) fn write_hook_runtime_config(
     if existed && !changed {
         return Ok(McpConfigStatus::AlreadyConfigured);
     }
+    let bytes = format!("{}\n", serde_json::to_string_pretty(&config)?);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
-    fs::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&config)?),
-    )?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("hook-runtime-v1.json");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        crate::cmd_hook_support::now_unix_millis()
+    ));
+    fs::write(&temp_path, bytes.as_bytes())
+        .with_context(|| format!("failed to write '{}'", temp_path.display()))?;
+    fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "failed to atomically replace '{}' with '{}'",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
     Ok(McpConfigStatus::Written)
 }
 
