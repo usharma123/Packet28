@@ -941,7 +941,10 @@ pub(crate) fn broker_prepare_handoff(
 
 #[cfg(test)]
 mod cap_history_tests {
-    use super::*;
+    use super::{
+        cap_handoff_history, promote_new_ready_handoff, BrokerHandoffDescriptor,
+        BrokerHandoffStatus, TaskRecord, TASK_HANDOFF_HISTORY_MAX,
+    };
 
     /// Creates a handoff descriptor with deterministic handoff and artifact identifiers.
     ///
