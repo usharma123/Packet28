@@ -516,12 +516,65 @@ pub(crate) fn daemon_status_v1(root: &Path) -> Result<DaemonStatusV1> {
     daemon_status_existing(&root)
 }
 
-#[cfg(not(unix))]
+/// Reports that daemon status is unavailable on unsupported platforms.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// assert!(daemon_status_v1(Path::new(".")).is_err());
+/// ```
 pub(crate) fn daemon_status_v1(_root: &Path) -> Result<DaemonStatusV1> {
     daemon_not_supported()
 }
 
+/// Checks whether a reachable daemon exists for `root` without starting one.
+///
+/// # Examples
+///
+/// ```
+/// let running = daemon_is_running(std::path::Path::new("."));
+/// println!("Daemon running: {running}");
+/// ```
+///
+/// `true` if the daemon is reachable for `root`, `false` otherwise.
 #[cfg(unix)]
+pub(crate) fn daemon_is_running(root: &Path) -> bool {
+    let root = normalize_daemon_root(root);
+    daemon_status_existing(&root).is_ok()
+}
+
+/// Determines whether the daemon is reachable for a workspace root.
+///
+/// On unsupported platforms, the daemon is never considered reachable.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// assert!(!daemon_is_running(Path::new(".")));
+/// ```
+pub(crate) fn daemon_is_running(_root: &Path) -> bool {
+    false
+}
+
+/// Stops the daemon for a workspace when its existing endpoint is reachable.
+///
+/// # Errors
+///
+/// Returns the connection or stop-request error if the daemon endpoint remains
+/// reachable after the stop request fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// stop_daemon_if_running(Path::new("."))?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn stop_daemon_if_running(root: &Path) -> Result<()> {
     let endpoint = daemon_endpoint(root)?;
     if !endpoint_may_have_stale_socket(&endpoint) {
