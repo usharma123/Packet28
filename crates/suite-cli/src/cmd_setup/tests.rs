@@ -724,6 +724,23 @@ fn gitignore_coverage_preserves_leading_spaces() {
 }
 
 #[test]
+fn gitignore_coverage_rejects_patterns_that_do_not_ignore_the_runtime_directory() {
+    for pattern in [
+        "!.packet28/",
+        "# .packet28/",
+        "\t.packet28/",
+        ".packet28/cache",
+        "nested/.packet28/",
+        ".packet280/",
+    ] {
+        assert!(
+            !gitignore_covers_packet28_dir(pattern),
+            "pattern {pattern:?} must not be treated as covering .packet28/"
+        );
+    }
+}
+
+#[test]
 fn ensure_gitignore_is_noop_outside_git_repo() {
     let dir = tempdir().unwrap();
     assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
@@ -738,7 +755,10 @@ fn ensure_gitignore_creates_entry_in_git_repo() {
     let created = ensure_packet28_gitignore(dir.path()).unwrap();
     assert_eq!(created, Some(dir.path().join(".gitignore")));
     let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert!(gitignore_covers_packet28_dir(&content));
+    assert_eq!(
+        content,
+        "# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
 
     // Idempotent: a second run makes no change and reports nothing added.
     assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
@@ -758,9 +778,10 @@ fn ensure_gitignore_appends_and_preserves_existing_content() {
     let created = ensure_packet28_gitignore(dir.path()).unwrap();
     assert!(created.is_some());
     let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert!(content.starts_with("target/\n/dist\n"));
-    assert!(gitignore_covers_packet28_dir(&content));
-    assert!(content.contains(".packet28/"));
+    assert_eq!(
+        content,
+        "target/\n/dist\n\n# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
 }
 
 #[test]
@@ -769,6 +790,34 @@ fn ensure_gitignore_respects_preexisting_coverage() {
     fs::create_dir(dir.path().join(".git")).unwrap();
     fs::write(dir.path().join(".gitignore"), "/.packet28/\n").unwrap();
     assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+}
+
+#[test]
+fn ensure_gitignore_supports_git_file_marker_used_by_worktrees() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join(".git"), "gitdir: /tmp/example-worktree\n").unwrap();
+
+    assert_eq!(
+        ensure_packet28_gitignore(dir.path()).unwrap(),
+        Some(dir.path().join(".gitignore"))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+}
+
+#[test]
+fn ensure_gitignore_rejects_invalid_utf8_without_replacing_the_file() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let original = b"target/\n\xff\xfe\n";
+    fs::write(dir.path().join(".gitignore"), original).unwrap();
+
+    let error = ensure_packet28_gitignore(dir.path()).unwrap_err();
+
+    assert!(error.to_string().contains("as UTF-8"));
+    assert_eq!(fs::read(dir.path().join(".gitignore")).unwrap(), original);
 }
 
 #[cfg(unix)]
@@ -792,6 +841,27 @@ fn ensure_gitignore_rejects_symlink_without_writing_outside_workspace() {
         .unwrap()
         .file_type()
         .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_gitignore_rejects_hard_link_without_writing_outside_workspace() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let outside_gitignore = outside.path().join("outside.gitignore");
+    fs::write(&outside_gitignore, "outside content\n").unwrap();
+    fs::hard_link(&outside_gitignore, dir.path().join(".gitignore")).unwrap();
+
+    assert!(ensure_packet28_gitignore(dir.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(&outside_gitignore).unwrap(),
+        "outside content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "outside content\n"
+    );
 }
 
 /// Builds a daemon index status response for testing.
