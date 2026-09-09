@@ -794,6 +794,28 @@ fn ensure_gitignore_rejects_symlink_without_writing_outside_workspace() {
         .is_symlink());
 }
 
+/// Builds a daemon index status response for testing.
+///
+/// `regex_status` populates the regex index fields when provided, and `ready`
+/// controls whether the overall index is reported as ready.
+///
+/// # Examples
+///
+/// ```
+/// let response = setup_index_status("ready", Some("ready"), true);
+/// assert!(response.ready);
+/// assert_eq!(response.manifest.regex_status.as_deref(), Some("ready"));
+/// ```
+///
+/// # Parameters
+///
+/// * `status` - The daemon index status to parse.
+/// * `regex_status` - The optional regex index status.
+/// * `ready` - Whether the index is ready.
+///
+/// # Returns
+///
+/// A daemon index status response containing the supplied status values.
 fn setup_index_status(
     status: &str,
     regex_status: Option<&str>,
