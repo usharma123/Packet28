@@ -535,6 +535,19 @@ pub(crate) fn write_windsurf_hook_config(
     Ok(McpConfigStatus::Written)
 }
 
+/// Writes the shared hook runtime configuration when at least one hook has been configured.
+///
+/// Re-enables hook ingestion when it is disabled and reports whether the configuration
+/// was declined, already configured, or written.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// let status = write_hook_runtime_config(Path::new("."), false).unwrap();
+/// assert!(matches!(status, McpConfigStatus::Declined));
+/// ```
 pub(crate) fn write_hook_runtime_config(
     root: &Path,
     any_hooks_configured: bool,
@@ -556,16 +569,42 @@ pub(crate) fn write_hook_runtime_config(
     };
     let mut changed = apply_generated_http_hook_settings(&mut config, root);
     changed |= apply_generated_relaunch_command(&mut config);
+    // Configuring a hook runtime is an explicit opt-in to hook ingest. If a
+    // prior `packet28 uninstall` (or a manual edit) left the kill switch
+    // engaged, re-enable it here. Otherwise setup reports the HTTP hook as
+    // healthy while the daemon keeps rejecting every ingest with
+    // `accepted: false`, which surfaces downstream as confusing doctor
+    // failures instead of an honest "hooks are disabled" signal.
+    if !config.hooks_enabled {
+        config.hooks_enabled = true;
+        changed = true;
+    }
     if existed && !changed {
         return Ok(McpConfigStatus::AlreadyConfigured);
     }
+    let bytes = format!("{}\n", serde_json::to_string_pretty(&config)?);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
-    fs::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&config)?),
-    )?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("hook-runtime-v1.json");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        crate::cmd_hook_support::now_unix_millis()
+    ));
+    fs::write(&temp_path, bytes.as_bytes())
+        .with_context(|| format!("failed to write '{}'", temp_path.display()))?;
+    fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "failed to atomically replace '{}' with '{}'",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
     Ok(McpConfigStatus::Written)
 }
 

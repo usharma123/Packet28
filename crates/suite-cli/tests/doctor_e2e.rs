@@ -152,6 +152,57 @@ fn test_doctor_cli_reports_healthy_stack() {
 
 #[test]
 #[cfg(unix)]
+fn test_doctor_reports_hook_ingest_disabled_explicitly() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    commit_repo_fixture(dir.path());
+
+    // Simulate a stale kill switch (`hooks_enabled: false`) left by a prior
+    // `packet28 uninstall`. The daemon rejects every hook ingest in this state.
+    let hook_config_path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    fs::create_dir_all(hook_config_path.parent().unwrap()).unwrap();
+    let disabled = packet28_daemon_protocol::hooks::HookRuntimeConfig {
+        hooks_enabled: false,
+        ..Default::default()
+    };
+    fs::write(
+        &hook_config_path,
+        format!("{}\n", serde_json::to_string_pretty(&disabled).unwrap()),
+    )
+    .unwrap();
+
+    let output = suite_cmd()
+        .args(["doctor", "--root", dir.path().to_str().unwrap(), "--json"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+
+    assert_eq!(report["handshake"]["ok"], true);
+    assert_eq!(report["reducer_round_trip"]["ok"], false);
+    let detail = report["reducer_round_trip"]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("hook ingest is disabled") && detail.contains("hooks_enabled=false"),
+        "reducer_round_trip detail should name the disabled hook runtime, got: {detail}"
+    );
+    assert_eq!(report["handoff_round_trip"]["ok"], false);
+    assert!(report["push_notifications"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("disabled"));
+
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
 fn test_doctor_cli_reports_healthy_runtime() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
