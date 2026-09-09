@@ -1070,36 +1070,49 @@ pub struct QuarantinedCorruptTaskEventLog {
     pub reason: String,
 }
 
-/// Scans for corrupt task event logs without modifying anything.
-///
-/// This is the read-only half of daemon-repair: it reports every admitted task
-/// whose durable event log fails integrity validation so an operator can see
-/// what a repair would quarantine before applying it.
+/// Inspects admitted task event logs and reports those that fail integrity validation without modifying any state.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`load_task_watch_registry_with_deltas`] plus the
-/// event-tail reader; a non-corruption failure (IO, lock, lease) propagates.
+/// Returns an error if registry loading or event-log inspection fails for reasons
+/// other than event-log corruption, including I/O, locking, or lease failures.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let corrupt_logs = inspect_corrupt_task_event_logs(Path::new("/var/lib/packet28"))?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Returns
+///
+/// The admitted tasks whose event logs require quarantine.
 pub fn inspect_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
     scan_corrupt_task_event_logs(root)
 }
 
-/// Quarantines every corrupt task event log while the daemon is stopped.
+/// Quarantines corrupt task event logs for offline recovery while the daemon is stopped.
 ///
-/// For each task whose event log fails integrity validation this moves the log
-/// aside (to a sibling `*.corrupt-<unix>` file, preserved for inspection) and
-/// durably resets the owning task's event high-water to zero through a
-/// journal-safe registry delta, so a subsequent daemon start is clean and
-/// consistent. Returns the quarantined tasks (empty when nothing was corrupt).
-///
-/// Intended for offline operator recovery; run it with the daemon stopped. It
-/// acquires the task-store writer lease, so a running daemon makes it fail
-/// closed rather than racing live state.
+/// Each affected log is moved to a sibling `*.corrupt-<unix>` file, and the owning
+/// task's event high-water is durably reset to zero through a registry delta. The
+/// operation acquires the task-store writer lease and fails if a daemon is running.
 ///
 /// # Errors
 ///
-/// Returns the scan errors above plus filesystem errors from moving a log aside
-/// and the registry-delta errors from resetting the high-water.
+/// Returns an error if scanning, quarantining a log, or resetting task high-water
+/// values fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let quarantined = repair_corrupt_task_event_logs(Path::new("/var/lib/my-daemon"))?;
+/// println!("Quarantined {} event logs", quarantined.len());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn repair_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
     let mut corrupt = scan_corrupt_task_event_logs(root)?;
     if corrupt.is_empty() {
@@ -1110,8 +1123,20 @@ pub fn repair_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorr
     Ok(corrupt)
 }
 
-/// Durably resets the event high-water of every quarantined task to zero using
-/// one journal-safe registry delta, matching the now-empty event logs.
+/// Durably resets the event high-water values for quarantined tasks whose event logs were cleared.
+///
+/// Tasks with a zero high-water value are skipped, and no registry delta is written when no
+/// resets are needed.
+///
+/// # Examples
+///
+/// ```no_run
+/// let root = std::path::Path::new("/var/lib/example");
+/// let quarantined = Vec::new();
+///
+/// reset_quarantined_task_high_waters(root, &quarantined)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 fn reset_quarantined_task_high_waters(
     root: &Path,
     corrupt: &[QuarantinedCorruptTaskEventLog],

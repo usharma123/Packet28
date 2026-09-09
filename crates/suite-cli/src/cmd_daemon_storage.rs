@@ -17,6 +17,19 @@ use crate::cmd_daemon::{
     StorageInspectArgs, StorageRepairArgs,
 };
 
+/// Executes the selected daemon storage operation.
+///
+/// # Returns
+///
+/// The operation's process exit status, or an error if execution fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// let exit_code = run_storage(args)?;
+/// std::process::exit(exit_code);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub(crate) fn run_storage(args: StorageArgs) -> Result<i32> {
     match args.command {
         StorageCommands::Inspect(args) => run_inspect(args),
@@ -25,6 +38,20 @@ pub(crate) fn run_storage(args: StorageArgs) -> Result<i32> {
     }
 }
 
+/// Inspects or repairs corrupt task event logs for the selected workspace.
+///
+/// Repair requires exclusive access to the task store and fails when the daemon is running.
+///
+/// # Examples
+///
+/// ```text
+/// packet28 daemon storage repair --root /path/to/workspace
+/// packet28 daemon storage repair --root /path/to/workspace --apply
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if the daemon is running or if inspection, repair, or report emission fails.
 fn run_repair(args: StorageRepairArgs) -> Result<i32> {
     let root = resolve_root_arg(&args.root);
     // Repair reads and (with --apply) rewrites the task store under the writer
@@ -44,6 +71,23 @@ fn run_repair(args: StorageRepairArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// Emits corrupt task event log repair results in JSON or human-readable form.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// emit_repair(Path::new("."), &[], false, false, false).unwrap();
+/// ```
+///
+/// # Arguments
+///
+/// * `root` - The workspace root included in the report.
+/// * `records` - Corrupt task event log records to report.
+/// * `applied` - Whether the records were quarantined rather than inspected.
+/// * `json_output` - Whether to emit JSON output.
+/// * `pretty` - Whether to format JSON output with indentation.
 fn emit_repair(
     root: &Path,
     records: &[QuarantinedCorruptTaskEventLog],
@@ -104,6 +148,25 @@ fn emit_repair(
     Ok(())
 }
 
+/// Inspects the task store at the selected workspace root and emits its report.
+///
+/// # Returns
+///
+/// Returns `0` after the report is emitted.
+///
+/// # Examples
+///
+/// ```no_run
+/// let args = StorageInspectArgs {
+///     root: None,
+///     json: false,
+///     pretty: false,
+/// };
+///
+/// let exit_code = run_inspect(args)?;
+/// assert_eq!(exit_code, 0);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn run_inspect(args: StorageInspectArgs) -> Result<i32> {
     let root = resolve_root_arg(&args.root);
     let report = inspect_task_store(&root, now_unix())?;
