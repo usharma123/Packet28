@@ -3105,6 +3105,222 @@ mod tests {
     }
 
     #[test]
+    fn recovering_load_is_a_noop_when_all_event_logs_are_healthy() {
+        let root = tempdir().unwrap();
+        checkpoint(
+            root.path(),
+            [task("with-events", &[]), task("without-events", &[])],
+            [],
+        );
+
+        {
+            let lease =
+                crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap();
+            let authority = load_registry_admission_authority(root.path(), lease).unwrap();
+            append_next_task_event_with_authority(
+                root.path(),
+                &authority,
+                "with-events",
+                &DaemonEvent {
+                    kind: "healthy".to_string(),
+                    occurred_at_unix: 1,
+                    data: serde_json::Value::Null,
+                },
+            )
+            .unwrap();
+        }
+
+        let (loaded, tails, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        assert_eq!(loaded.tasks.tasks.len(), 2);
+        assert_eq!(tails.get("with-events"), Some(&Some(1)));
+        assert_eq!(tails.get("without-events"), Some(&None));
+        assert!(quarantined.is_empty());
+    }
+
+    #[test]
+    fn recovering_load_quarantines_every_supported_corruption_in_one_pass() {
+        let root = tempdir().unwrap();
+        checkpoint(
+            root.path(),
+            [
+                task("healthy", &[]),
+                task("malformed", &[]),
+                task("oversized", &[]),
+            ],
+            [],
+        );
+
+        {
+            let lease =
+                crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap();
+            let authority = load_registry_admission_authority(root.path(), lease).unwrap();
+            append_next_task_event_with_authority(
+                root.path(),
+                &authority,
+                "healthy",
+                &DaemonEvent {
+                    kind: "healthy".to_string(),
+                    occurred_at_unix: 1,
+                    data: serde_json::Value::Null,
+                },
+            )
+            .unwrap();
+        }
+
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        let malformed_storage = checked_task_storage_id(root.path(), "malformed").unwrap();
+        let malformed_log = task_event_log_path(root.path(), &malformed_storage);
+        let malformed_bytes = b"not-json\n";
+        fs::write(&malformed_log, malformed_bytes).unwrap();
+
+        let oversized_storage = checked_task_storage_id(root.path(), "oversized").unwrap();
+        let oversized_log = task_event_log_path(root.path(), &oversized_storage);
+        let oversized_bytes = vec![b'x'; MAX_TASK_EVENT_LINE_BYTES + 1];
+        fs::write(&oversized_log, &oversized_bytes).unwrap();
+
+        let (loaded, tails, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        assert_eq!(loaded.tasks.tasks.len(), 3);
+        assert_eq!(tails.get("healthy"), Some(&Some(1)));
+        assert_eq!(tails.get("malformed"), Some(&None));
+        assert_eq!(tails.get("oversized"), Some(&None));
+        assert_eq!(
+            quarantined
+                .iter()
+                .map(|record| record.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["malformed", "oversized"]
+        );
+        assert!(quarantined[0].reason.contains("invalid task event frame"));
+        assert!(quarantined[1].reason.contains("crash-partial tail bytes"));
+        assert_eq!(
+            fs::read(
+                quarantined[0]
+                    .quarantined_path
+                    .as_ref()
+                    .expect("malformed log should be quarantined"),
+            )
+            .unwrap(),
+            malformed_bytes
+        );
+        assert_eq!(
+            fs::read(
+                quarantined[1]
+                    .quarantined_path
+                    .as_ref()
+                    .expect("oversized log should be quarantined"),
+            )
+            .unwrap(),
+            oversized_bytes
+        );
+        assert!(!malformed_log.exists());
+        assert!(!oversized_log.exists());
+    }
+
+    #[test]
+    fn recovering_load_accepts_the_corrupt_log_quarantine_limit() {
+        let root = tempdir().unwrap();
+        let task_ids = (0..MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS)
+            .map(|ordinal| format!("corrupt-{ordinal:03}"))
+            .collect::<Vec<_>>();
+        checkpoint(
+            root.path(),
+            task_ids.iter().map(|task_id| task(task_id, &[])),
+            [],
+        );
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        for task_id in &task_ids {
+            let storage_id = checked_task_storage_id(root.path(), task_id).unwrap();
+            fs::write(task_event_log_path(root.path(), &storage_id), b"not-json\n").unwrap();
+        }
+
+        let (loaded, tails, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        assert_eq!(loaded.tasks.tasks.len(), task_ids.len());
+        assert_eq!(quarantined.len(), MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS);
+        assert!(tails.values().all(Option::is_none));
+        assert!(quarantined.iter().all(|record| record
+            .quarantined_path
+            .as_ref()
+            .is_some_and(|path| path.exists())));
+    }
+
+    #[test]
+    fn recovering_load_fails_closed_above_the_corrupt_log_quarantine_limit() {
+        let root = tempdir().unwrap();
+        let task_ids = (0..=MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS)
+            .map(|ordinal| format!("corrupt-{ordinal:03}"))
+            .collect::<Vec<_>>();
+        checkpoint(
+            root.path(),
+            task_ids.iter().map(|task_id| task(task_id, &[])),
+            [],
+        );
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        let event_logs = task_ids
+            .iter()
+            .map(|task_id| {
+                let storage_id = checked_task_storage_id(root.path(), task_id).unwrap();
+                let path = task_event_log_path(root.path(), &storage_id);
+                fs::write(&path, b"not-json\n").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let error =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DaemonCoreError::InvalidTaskEventFrame { .. }
+        ));
+        assert!(event_logs.iter().all(|path| path.exists()));
+        assert!(fs::read_dir(task_events_dir(root.path()))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovering_load_propagates_nonrecoverable_errors_without_moving_corrupt_logs() {
+        let root = tempdir().unwrap();
+        checkpoint(
+            root.path(),
+            [task("a-corrupt", &[]), task("z-unreadable", &[])],
+            [],
+        );
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        let corrupt_storage = checked_task_storage_id(root.path(), "a-corrupt").unwrap();
+        let corrupt_log = task_event_log_path(root.path(), &corrupt_storage);
+        fs::write(&corrupt_log, b"not-json\n").unwrap();
+        let unreadable_storage = checked_task_storage_id(root.path(), "z-unreadable").unwrap();
+        let unreadable_log = task_event_log_path(root.path(), &unreadable_storage);
+        fs::create_dir(&unreadable_log).unwrap();
+
+        let error =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap_err();
+
+        assert!(matches!(error, DaemonCoreError::Io { .. }));
+        assert!(corrupt_log.exists());
+        assert!(unreadable_log.is_dir());
+        assert!(fs::read_dir(task_events_dir(root.path()))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt-")));
+    }
+
+    #[test]
     fn wal_append_rejects_new_task_that_would_adopt_a_managed_entry() {
         for (event_namespace, alias_spelling) in
             [(false, false), (false, true), (true, false), (true, true)]
