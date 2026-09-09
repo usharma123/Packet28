@@ -713,8 +713,14 @@ fn gitignore_coverage_recognizes_common_spellings() {
             "spelling {spelling} should be recognized as covering .packet28"
         );
     }
+    assert!(gitignore_covers_packet28_dir(".packet28/  \n"));
     assert!(!gitignore_covers_packet28_dir("target/\n.packet28x/\n"));
     assert!(!gitignore_covers_packet28_dir(""));
+}
+
+#[test]
+fn gitignore_coverage_preserves_leading_spaces() {
+    assert!(!gitignore_covers_packet28_dir(" .packet28/\n"));
 }
 
 #[test]
@@ -763,6 +769,29 @@ fn ensure_gitignore_respects_preexisting_coverage() {
     fs::create_dir(dir.path().join(".git")).unwrap();
     fs::write(dir.path().join(".gitignore"), "/.packet28/\n").unwrap();
     assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_gitignore_rejects_symlink_without_writing_outside_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let outside_gitignore = outside.path().join("outside.gitignore");
+    fs::write(&outside_gitignore, "outside content\n").unwrap();
+    symlink(&outside_gitignore, dir.path().join(".gitignore")).unwrap();
+
+    assert!(ensure_packet28_gitignore(dir.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(&outside_gitignore).unwrap(),
+        "outside content\n"
+    );
+    assert!(fs::symlink_metadata(dir.path().join(".gitignore"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 fn setup_index_status(

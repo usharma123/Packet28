@@ -2100,6 +2100,7 @@ dependencies = [
  "packet28-daemon-core",
  "packet28-daemon-protocol",
  "packet28-reducer-core",
+ "packet28-state-fs",
  "predicates",
  "regex",
  "rusqlite",

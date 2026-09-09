@@ -10,6 +10,7 @@ use colored::Colorize;
 use packet28_daemon_protocol::hooks::RelaunchPreference;
 use packet28_daemon_protocol::index::DaemonIndexRebuildRequest;
 use packet28_daemon_protocol::message::{DaemonRequest, DaemonResponse};
+use packet28_state_fs::StateDir;
 use serde_json::{json, Value};
 use toml::value::Table as TomlTable;
 
@@ -99,7 +100,7 @@ const PACKET28_GITIGNORE_ENTRY: &str = ".packet28/";
 /// Returns true when `content` already ignores Packet28's `.packet28/` runtime
 /// directory in any of the common equivalent spellings.
 fn gitignore_covers_packet28_dir(content: &str) -> bool {
-    content.lines().map(str::trim).any(|line| {
+    content.lines().map(str::trim_end).any(|line| {
         matches!(
             line,
             ".packet28"
@@ -129,13 +130,15 @@ fn ensure_packet28_gitignore(root: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let path = root.join(".gitignore");
-    let existing = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read '{}'", path.display()));
-        }
-    };
+    let directory = StateDir::open(root, &[], false)
+        .with_context(|| format!("failed to open repository root '{}'", root.display()))?;
+    let existing = directory
+        .read_bounded(".gitignore", u64::MAX)
+        .with_context(|| format!("failed to read '{}'", path.display()))?
+        .map(String::from_utf8)
+        .transpose()
+        .with_context(|| format!("failed to read '{}' as UTF-8", path.display()))?
+        .unwrap_or_default();
     if gitignore_covers_packet28_dir(&existing) {
         return Ok(None);
     }
@@ -149,7 +152,9 @@ fn ensure_packet28_gitignore(root: &Path) -> Result<Option<PathBuf>> {
     updated.push_str("# Packet28 daemon runtime and index state\n");
     updated.push_str(PACKET28_GITIGNORE_ENTRY);
     updated.push('\n');
-    fs::write(&path, updated).with_context(|| format!("failed to update '{}'", path.display()))?;
+    directory
+        .write_atomic(".gitignore", updated.as_bytes())
+        .with_context(|| format!("failed to update '{}'", path.display()))?;
     Ok(Some(path))
 }
 
