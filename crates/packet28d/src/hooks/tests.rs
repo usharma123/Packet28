@@ -1,6 +1,136 @@
 use super::*;
 use packet28_daemon_protocol::hooks::RelaunchPreference;
+use packet28_daemon_protocol::task::TaskRecord;
 use std::ops::Deref;
+
+#[test]
+fn hook_reducer_cache_is_capped_and_keeps_newest_entries() {
+    let mut task = TaskRecord::default();
+    // Insert well beyond the cap with strictly increasing timestamps so the
+    // newest entries are unambiguous.
+    let total = HOOK_REDUCER_CACHE_MAX_ENTRIES + 100;
+    for index in 0..total {
+        task.hook_reducer_cache.insert(
+            format!("fingerprint-{index:05}"),
+            HookReducerCacheEntry {
+                cache_fingerprint: format!("fingerprint-{index:05}"),
+                occurred_at_unix: index as u64,
+                ..HookReducerCacheEntry::default()
+            },
+        );
+    }
+    prune_hook_reducer_cache(&mut task);
+
+    assert_eq!(
+        task.hook_reducer_cache.len(),
+        HOOK_REDUCER_CACHE_MAX_ENTRIES
+    );
+    let expected_fingerprints: Vec<_> = ((total - HOOK_REDUCER_CACHE_MAX_ENTRIES)..total)
+        .map(|index| format!("fingerprint-{index:05}"))
+        .collect();
+    let retained_fingerprints: Vec<_> = task.hook_reducer_cache.keys().cloned().collect();
+    assert_eq!(retained_fingerprints, expected_fingerprints);
+}
+
+#[test]
+fn hook_reducer_cache_prune_is_noop_below_cap() {
+    let mut task = TaskRecord::default();
+    for index in 0..10u64 {
+        task.hook_reducer_cache.insert(
+            format!("fp-{index}"),
+            HookReducerCacheEntry {
+                occurred_at_unix: index,
+                ..HookReducerCacheEntry::default()
+            },
+        );
+    }
+    let fingerprints_before: Vec<_> = task.hook_reducer_cache.keys().cloned().collect();
+    prune_hook_reducer_cache(&mut task);
+    assert_eq!(task.hook_reducer_cache.len(), 10);
+    assert_eq!(
+        task.hook_reducer_cache.keys().cloned().collect::<Vec<_>>(),
+        fingerprints_before
+    );
+}
+
+#[test]
+fn hook_reducer_cache_prune_is_noop_at_cap() {
+    let mut task = TaskRecord::default();
+    for index in 0..HOOK_REDUCER_CACHE_MAX_ENTRIES {
+        task.hook_reducer_cache.insert(
+            format!("fingerprint-{index:05}"),
+            HookReducerCacheEntry {
+                occurred_at_unix: index as u64,
+                ..HookReducerCacheEntry::default()
+            },
+        );
+    }
+    let fingerprints_before: Vec<_> = task.hook_reducer_cache.keys().cloned().collect();
+
+    prune_hook_reducer_cache(&mut task);
+
+    assert_eq!(
+        task.hook_reducer_cache.len(),
+        HOOK_REDUCER_CACHE_MAX_ENTRIES
+    );
+    assert_eq!(
+        task.hook_reducer_cache.keys().cloned().collect::<Vec<_>>(),
+        fingerprints_before
+    );
+}
+
+#[test]
+fn hook_reducer_cache_prune_uses_fingerprint_to_break_timestamp_ties() {
+    let mut task = TaskRecord::default();
+    for index in 0..=HOOK_REDUCER_CACHE_MAX_ENTRIES {
+        task.hook_reducer_cache.insert(
+            format!("fingerprint-{index:05}"),
+            HookReducerCacheEntry {
+                occurred_at_unix: 42,
+                ..HookReducerCacheEntry::default()
+            },
+        );
+    }
+
+    prune_hook_reducer_cache(&mut task);
+
+    assert_eq!(
+        task.hook_reducer_cache.len(),
+        HOOK_REDUCER_CACHE_MAX_ENTRIES
+    );
+    assert!(!task.hook_reducer_cache.contains_key("fingerprint-00000"));
+    assert!(task
+        .hook_reducer_cache
+        .contains_key(&format!("fingerprint-{HOOK_REDUCER_CACHE_MAX_ENTRIES:05}")));
+}
+
+#[test]
+fn cache_update_prunes_the_oldest_entry_after_inserting_a_new_packet() {
+    let mut task = TaskRecord::default();
+    for index in 0..HOOK_REDUCER_CACHE_MAX_ENTRIES {
+        task.hook_reducer_cache.insert(
+            format!("old-{index:05}"),
+            HookReducerCacheEntry {
+                occurred_at_unix: 0,
+                ..HookReducerCacheEntry::default()
+            },
+        );
+    }
+    let mut new_packet = packet("newly reduced packet");
+    new_packet.cache_fingerprint = Some("new-fingerprint".to_string());
+
+    update_cache_for_packet(&mut task, &new_packet, Some("artifact-new".to_string()));
+
+    assert_eq!(
+        task.hook_reducer_cache.len(),
+        HOOK_REDUCER_CACHE_MAX_ENTRIES
+    );
+    assert!(!task.hook_reducer_cache.contains_key("old-00000"));
+    let inserted = task.hook_reducer_cache.get("new-fingerprint").unwrap();
+    assert_eq!(inserted.cache_fingerprint, "new-fingerprint");
+    assert_eq!(inserted.summary, "newly reduced packet");
+    assert_eq!(inserted.artifact_id.as_deref(), Some("artifact-new"));
+}
 
 struct TestDaemonState {
     state: Arc<Mutex<DaemonState>>,

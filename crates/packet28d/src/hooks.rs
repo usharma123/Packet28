@@ -362,6 +362,13 @@ fn cache_hit_for_packet(
     true
 }
 
+/// Stores an eligible reducer packet in the task's cache and prunes excess entries.
+///
+/// # Examples
+///
+/// ```ignore
+/// update_cache_for_packet(&mut task, &packet, Some("artifact-123".to_owned()));
+/// ```
 fn update_cache_for_packet(
     task: &mut TaskRecord,
     packet: &packet28_daemon_protocol::hooks::HookReducerPacket,
@@ -405,8 +412,55 @@ fn update_cache_for_packet(
             rust_epoch: task.hook_rust_epoch,
         },
     );
+    prune_hook_reducer_cache(task);
 }
 
+/// Upper bound on retained per-task hook reducer cache entries.
+///
+/// A long-lived session can otherwise accumulate thousands of distinct
+/// fingerprints, growing the task record past the paginated record-size limit
+/// and poisoning registry listing (see the daemon pagination bound). The cache
+/// is a best-effort dedup aid, so evicting the oldest entries is safe.
+const HOOK_REDUCER_CACHE_MAX_ENTRIES: usize = 256;
+
+/// Prunes a task's hook reducer cache to the configured maximum size.
+///
+/// The oldest entries are removed first, with fingerprints providing deterministic
+/// ordering when entries have the same timestamp.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// prune_hook_reducer_cache(&mut task);
+/// assert!(task.hook_reducer_cache.len() <= HOOK_REDUCER_CACHE_MAX_ENTRIES);
+/// ```
+fn prune_hook_reducer_cache(task: &mut TaskRecord) {
+    let len = task.hook_reducer_cache.len();
+    if len <= HOOK_REDUCER_CACHE_MAX_ENTRIES {
+        return;
+    }
+    let mut ordered: Vec<(u64, String)> = task
+        .hook_reducer_cache
+        .iter()
+        .map(|(key, entry)| (entry.occurred_at_unix, key.clone()))
+        .collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let excess = len - HOOK_REDUCER_CACHE_MAX_ENTRIES;
+    for (_, key) in ordered.into_iter().take(excess) {
+        task.hook_reducer_cache.remove(&key);
+    }
+}
+
+/// Extracts a non-empty workspace fingerprint from a reducer packet.
+///
+/// Whitespace surrounding the fingerprint is preserved.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let fingerprint = packet_workspace_fingerprint(&packet);
+/// assert_eq!(fingerprint, Some("workspace-123"));
+/// ```
 fn packet_workspace_fingerprint(
     packet: &packet28_daemon_protocol::hooks::HookReducerPacket,
 ) -> Option<&str> {
