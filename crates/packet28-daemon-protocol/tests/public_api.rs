@@ -10,7 +10,8 @@ use packet28_daemon_protocol::index::DaemonIndexStatusRequest;
 use packet28_daemon_protocol::message::{DaemonRequest, DaemonResponse, DaemonStatus};
 use packet28_daemon_protocol::paths::{daemon_dir, socket_path};
 use packet28_daemon_protocol::registry::{
-    DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1, RegistryRevisionV1,
+    DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1, OversizedTaskRecordV1,
+    RegistryRevisionV1, TaskListPageV1,
 };
 use packet28_daemon_protocol::task::TaskAwaitHandoffRequest;
 
@@ -234,6 +235,47 @@ fn registry_v1_uses_separate_versioned_wire_tags() {
             "revision": 42
         })
     );
+}
+
+#[test]
+fn task_page_omissions_are_additive_and_round_trip_on_the_wire() {
+    let legacy_page = serde_json::json!({
+        "snapshot_revision": {
+            "instance_id": "daemon-instance",
+            "revision": 42
+        },
+        "tasks": [],
+        "total": 1
+    });
+    let decoded: TaskListPageV1 = serde_json::from_value(legacy_page).unwrap();
+    assert!(decoded.omitted_oversized.is_empty());
+
+    let empty_wire = serde_json::to_value(&decoded).unwrap();
+    assert!(empty_wire.get("omitted_oversized").is_none());
+
+    let page = TaskListPageV1 {
+        omitted_oversized: vec![
+            OversizedTaskRecordV1 {
+                task_id: "task-a".to_string(),
+                encoded_bytes: 1_048_577,
+            },
+            OversizedTaskRecordV1 {
+                task_id: "task-b".to_string(),
+                encoded_bytes: 2_097_152,
+            },
+        ],
+        ..decoded
+    };
+    let wire = serde_json::to_value(&page).unwrap();
+    assert_eq!(
+        wire["omitted_oversized"],
+        serde_json::json!([
+            {"task_id": "task-a", "encoded_bytes": 1_048_577},
+            {"task_id": "task-b", "encoded_bytes": 2_097_152}
+        ])
+    );
+    let round_trip: TaskListPageV1 = serde_json::from_value(wire).unwrap();
+    assert_eq!(round_trip.omitted_oversized, page.omitted_oversized);
 }
 
 #[test]
