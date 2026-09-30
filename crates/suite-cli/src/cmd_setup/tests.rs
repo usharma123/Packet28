@@ -698,6 +698,55 @@ fn setup_never_enables_daemon_managed_relaunch_by_default() {
     assert!(!config.daemon_relaunch_enabled());
 }
 
+#[test]
+fn write_hook_runtime_config_re_enables_stale_kill_switch() {
+    let dir = tempdir().unwrap();
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Simulate the kill switch left engaged by a prior `packet28 uninstall`,
+    // while HTTP hook settings are already present so only `hooks_enabled`
+    // needs fixing.
+    let disabled = HookRuntimeConfig {
+        hooks_enabled: false,
+        http_hook_port: Some(45123),
+        http_hook_token: Some("existing-token".to_string()),
+        ..HookRuntimeConfig::default()
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&disabled).unwrap()),
+    )
+    .unwrap();
+
+    let status = write_hook_runtime_config(dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::Written));
+
+    let written: HookRuntimeConfig =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        written.hooks_enabled,
+        "setup must re-enable hook ingest when configuring a hook runtime"
+    );
+    // Existing HTTP settings are preserved rather than regenerated.
+    assert_eq!(written.http_hook_port, Some(45123));
+    assert_eq!(written.http_hook_token.as_deref(), Some("existing-token"));
+}
+
+/// Creates an index-status fixture with the specified manifest and readiness values.
+///
+/// # Examples
+///
+/// ```
+/// let status = setup_index_status("ready", None, true);
+/// assert!(status.ready);
+/// assert!(status.manifest.regex_status.is_none());
+/// ```
+///
+/// # Arguments
+///
+/// * `status` - Manifest status to parse into the fixture.
+/// * `regex_status` - Optional regex index status and associated metadata.
+/// * `ready` - Whether the overall index is ready.
 fn setup_index_status(
     status: &str,
     regex_status: Option<&str>,
