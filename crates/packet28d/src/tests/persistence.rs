@@ -922,17 +922,24 @@ fn daemon_startup_persists_quarantined_event_high_water_resets_before_readiness(
     let recovering_load = source
         .find("load_task_watch_registry_recovering_corrupt_event_logs(&root)?")
         .unwrap();
-    let reset = source.find("task.last_event_seq = 0").unwrap();
-    let quarantine_delta = source.find(".chain(&quarantined_task_ids)").unwrap();
     let flush = source
         .find("persistence.stage_and_flush(startup_delta)?")
         .unwrap();
     let checkpoint = source.find("persistence.checkpoint_current()?").unwrap();
     let readiness = source.find("mark_ready(&state)?").unwrap();
 
-    assert!(recovering_load < reset);
-    assert!(reset < quarantine_delta);
-    assert!(quarantine_delta < flush);
+    let core_source = include_str!("../../../packet28-daemon-core/src/storage/registry_delta.rs");
+    let load = &core_source[core_source
+        .find("pub fn load_task_watch_registry_recovering_corrupt_event_logs")
+        .unwrap()..];
+    let reset = load
+        .find("reset_corrupt_event_high_waters_admitted(root, &corrupt, &writer_lease)?")
+        .unwrap();
+    let move_log = load
+        .find("move_corrupt_event_logs_aside(root, &mut corrupt, &writer_lease)?")
+        .unwrap();
+    assert!(reset < move_log);
+    assert!(recovering_load < flush);
     assert!(flush < checkpoint);
     assert!(checkpoint < readiness);
 }
