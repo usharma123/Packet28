@@ -35,6 +35,7 @@ packet28-daemon-client.workspace = true
 packet28-daemon-core.workspace = true
 packet28-daemon-protocol.workspace = true
 packet28-reducer-core.workspace = true
+packet28-state-fs.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 colored.workspace = true
