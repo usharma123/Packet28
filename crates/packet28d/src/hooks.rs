@@ -362,6 +362,8 @@ fn cache_hit_for_packet(
     true
 }
 
+/// Stores an eligible reducer packet in the task's cache and prunes excess entries.
+///
 fn update_cache_for_packet(
     task: &mut TaskRecord,
     packet: &packet28_daemon_protocol::hooks::HookReducerPacket,
@@ -405,8 +407,57 @@ fn update_cache_for_packet(
             rust_epoch: task.hook_rust_epoch,
         },
     );
+    prune_hook_reducer_cache(task);
 }
 
+/// Upper bound on retained per-task hook reducer cache entries.
+///
+/// A long-lived session can otherwise accumulate thousands of distinct
+/// fingerprints, growing the task record past the paginated record-size limit
+/// and poisoning registry listing (see the daemon pagination bound). The cache
+/// is a best-effort dedup aid, so evicting the oldest entries is safe.
+const HOOK_REDUCER_CACHE_MAX_ENTRIES: usize = 256;
+const HOOK_REDUCER_CACHE_MAX_BYTES: usize = 256 * 1024;
+
+/// Prunes a task's hook reducer cache to the configured maximum size.
+///
+/// The oldest entries are removed first, with fingerprints providing deterministic
+/// ordering when entries have the same timestamp.
+///
+fn prune_hook_reducer_cache(task: &mut TaskRecord) {
+    let mut encoded_bytes =
+        serde_json::to_vec(&task.hook_reducer_cache).map_or(usize::MAX, |bytes| bytes.len());
+    if task.hook_reducer_cache.len() <= HOOK_REDUCER_CACHE_MAX_ENTRIES
+        && encoded_bytes <= HOOK_REDUCER_CACHE_MAX_BYTES
+    {
+        return;
+    }
+    let mut ordered: Vec<(u64, String)> = task
+        .hook_reducer_cache
+        .iter()
+        .map(|(key, entry)| (entry.occurred_at_unix, key.clone()))
+        .collect();
+    ordered.sort();
+    for (_, key) in ordered {
+        if task.hook_reducer_cache.len() <= HOOK_REDUCER_CACHE_MAX_ENTRIES
+            && encoded_bytes <= HOOK_REDUCER_CACHE_MAX_BYTES
+        {
+            break;
+        }
+        if let Some(entry) = task.hook_reducer_cache.remove(&key) {
+            let removed_bytes = serde_json::to_vec(&key).map_or(0, |bytes| bytes.len())
+                + serde_json::to_vec(&entry).map_or(0, |bytes| bytes.len())
+                + 1
+                + usize::from(!task.hook_reducer_cache.is_empty());
+            encoded_bytes = encoded_bytes.saturating_sub(removed_bytes);
+        }
+    }
+}
+
+/// Extracts a non-empty workspace fingerprint from a reducer packet.
+///
+/// Whitespace surrounding the fingerprint is preserved.
+///
 fn packet_workspace_fingerprint(
     packet: &packet28_daemon_protocol::hooks::HookReducerPacket,
 ) -> Option<&str> {
