@@ -362,7 +362,8 @@ pub(crate) fn resolve_root_arg(root: &str) -> PathBuf {
 const DAEMON_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Number of rotated `packet28d.log.N` generations retained. Total on-disk log
-/// footprint is bounded by roughly `(DAEMON_LOG_MAX_BACKUPS + 1) * max_bytes`.
+/// archives retain their original size. Rotation occurs only at startup; a
+/// single running daemon can exceed the threshold before its next restart.
 #[cfg(unix)]
 const DAEMON_LOG_MAX_BACKUPS: usize = 3;
 
