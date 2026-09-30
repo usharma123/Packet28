@@ -51,6 +51,7 @@ use crate::{
 /// # Examples
 ///
 /// ```no_run
+/// use packet28d::serve;
 /// let root = std::env::current_dir()?;
 /// serve(root)?;
 /// # Ok::<(), anyhow::Error>(())
@@ -152,14 +153,6 @@ pub fn serve(root: PathBuf) -> Result<()> {
     // persistence owner has authenticated it and assumed revision ownership.
     let mut tasks = durable_tasks.clone();
     let mut watches = durable_watches.clone();
-    // A quarantined task's corrupt event log was moved aside, so its durable
-    // tail is now empty. Reset its high-water to match before reconciliation and
-    // persist the reset below so the fix is durable across restarts.
-    for task_id in &quarantined_task_ids {
-        if let Some(task) = tasks.tasks.get_mut(task_id) {
-            task.last_event_seq = 0;
-        }
-    }
     preflight_restart_recovery(&tasks)?;
     let event_high_water_changes = reconcile_task_event_high_waters(&mut tasks, &event_tails)?;
     let restart_reconciliation =
