@@ -202,13 +202,6 @@ impl Drop for McpHarness {
 /// The hook runtime configuration path when the configuration parses successfully
 /// and `hooks_enabled` is `false`; otherwise, `None`.
 ///
-/// # Examples
-///
-/// ```
-/// use std::path::Path;
-///
-/// assert!(disabled_hook_runtime_config(Path::new("/nonexistent")).is_none());
-/// ```
 fn disabled_hook_runtime_config(root: &Path) -> Option<std::path::PathBuf> {
     let path = packet28_daemon_protocol::paths::hook_runtime_config_path(root);
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -221,14 +214,6 @@ fn disabled_hook_runtime_config(root: &Path) -> Option<std::path::PathBuf> {
 ///
 /// Exit code `2` is treated as an accepted hook result; other unsuccessful exits produce an error.
 ///
-/// # Examples
-///
-/// ```no_run
-/// let payload = serde_json::json!({ "hook_event_name": "Stop" });
-/// let (status, output) = run_claude_hook_with_output(root, &payload)?;
-/// println!("{status}: {output}");
-/// # Ok::<(), anyhow::Error>(())
-/// ```
 fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, String)> {
     let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
     let mut child = Command::new(exe)
@@ -299,15 +284,6 @@ fn wait_for_handoff_ready(
 }
 
 /// Runs the MCP doctor smoke tests for handshake, reducer ingestion, push notifications, and handoff round trips.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::path::Path;
-///
-/// let checks = check_mcp_round_trip(Path::new("."));
-/// assert!(checks.handshake.required);
-/// ```
 ///
 /// `root` identifies the project whose MCP server and hook runtime are tested.
 ///
