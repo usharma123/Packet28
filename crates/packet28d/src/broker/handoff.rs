@@ -252,12 +252,6 @@ fn derive_handoff_id(task_id: &str, generated_at_unix_ms: u64) -> String {
 /// Existing ready or consumed handoffs are marked as superseded, and handoff
 /// history is retained in newest-first order up to the configured limit.
 ///
-/// # Examples
-///
-/// ```rust,ignore
-/// promote_new_ready_handoff(&mut task, handoff);
-/// assert_eq!(task.latest_handoff_id.as_deref(), Some("handoff-123"));
-/// ```
 fn promote_new_ready_handoff(task: &mut TaskRecord, mut handoff: BrokerHandoffDescriptor) {
     for existing in &mut task.handoffs {
         if matches!(
@@ -279,7 +273,7 @@ fn promote_new_ready_handoff(task: &mut TaskRecord, mut handoff: BrokerHandoffDe
             .cmp(&a.generated_at_unix_ms)
             .then_with(|| a.handoff_id.cmp(&b.handoff_id))
     });
-    cap_handoff_history(&mut task.handoffs);
+    cap_handoff_history(&mut task.handoffs, task.latest_handoff_id.as_deref());
 }
 
 /// Upper bound on retained handoff descriptors per task.
@@ -294,16 +288,20 @@ const TASK_HANDOFF_HISTORY_MAX: usize = 64;
 ///
 /// The input must already be ordered from newest to oldest.
 ///
-/// # Examples
-///
-/// ```
-/// let mut handoffs = Vec::new();
-/// cap_handoff_history(&mut handoffs);
-/// assert!(handoffs.len() <= TASK_HANDOFF_HISTORY_MAX);
-/// ```
-fn cap_handoff_history(handoffs: &mut Vec<BrokerHandoffDescriptor>) {
+fn cap_handoff_history(handoffs: &mut Vec<BrokerHandoffDescriptor>, active_id: Option<&str>) {
     if handoffs.len() > TASK_HANDOFF_HISTORY_MAX {
-        handoffs.truncate(TASK_HANDOFF_HISTORY_MAX);
+        // Wall clocks can move backwards, and IDs break timestamp ties. The
+        // newly promoted descriptor must survive either case.
+        let active = handoffs
+            .iter()
+            .position(|handoff| Some(handoff.handoff_id.as_str()) == active_id);
+        if let Some(index) = active.filter(|index| *index >= TASK_HANDOFF_HISTORY_MAX) {
+            let descriptor = handoffs.remove(index);
+            handoffs.truncate(TASK_HANDOFF_HISTORY_MAX - 1);
+            handoffs.push(descriptor);
+        } else {
+            handoffs.truncate(TASK_HANDOFF_HISTORY_MAX);
+        }
     }
 }
 
@@ -311,14 +309,6 @@ fn cap_handoff_history(handoffs: &mut Vec<BrokerHandoffDescriptor>) {
 ///
 /// Returns `None` when the task or handoff does not exist.
 ///
-/// # Examples
-///
-/// ```no_run
-/// # let state: Arc<Mutex<DaemonState>> = unimplemented!();
-/// let consumed = mark_handoff_consumed(&state, "task-1", "handoff-1")?;
-/// assert!(consumed.is_some());
-/// # Ok::<(), anyhow::Error>(())
-/// ```
 pub(crate) fn mark_handoff_consumed(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
@@ -765,15 +755,6 @@ fn handoff_context_request(
 /// When ready, generates and persists a new handoff artifact and returns its descriptor and
 /// broker context.
 ///
-/// # Examples
-///
-/// ```ignore
-/// let response = broker_prepare_handoff(state, request)?;
-/// if let Some(context) = response.context {
-///     println!("Prepared context: {}", context.context_version);
-/// }
-/// # Ok::<(), anyhow::Error>(())
-/// ```
 pub(crate) fn broker_prepare_handoff(
     state: Arc<Mutex<DaemonState>>,
     request: BrokerPrepareHandoffRequest,
@@ -1003,7 +984,7 @@ mod cap_history_tests {
     fn cap_handoff_history_is_noop_below_bound() {
         let mut handoffs: Vec<BrokerHandoffDescriptor> =
             (0..8).map(|index| handoff(index, index as u64)).collect();
-        cap_handoff_history(&mut handoffs);
+        cap_handoff_history(&mut handoffs, None);
         assert_eq!(handoffs.len(), 8);
     }
 
@@ -1018,7 +999,7 @@ mod cap_history_tests {
             .map(|descriptor| descriptor.handoff_id.clone())
             .collect();
 
-        cap_handoff_history(&mut handoffs);
+        cap_handoff_history(&mut handoffs, None);
 
         assert_eq!(handoffs.len(), TASK_HANDOFF_HISTORY_MAX);
         assert_eq!(
@@ -1099,5 +1080,29 @@ mod cap_history_tests {
                 .map(|descriptor| descriptor.handoff_id.as_str()),
             Some("handoff-00001")
         );
+    }
+    #[test]
+    fn promotion_preserves_active_handoff_when_clock_regresses_or_ties() {
+        for timestamp in [0, 100] {
+            let mut task = TaskRecord::default();
+            for index in 0..TASK_HANDOFF_HISTORY_MAX {
+                promote_new_ready_handoff(&mut task, handoff(index, 100));
+            }
+            promote_new_ready_handoff(&mut task, handoff(TASK_HANDOFF_HISTORY_MAX, timestamp));
+            let active_id = task.latest_handoff_id.as_ref().unwrap();
+            assert_eq!(task.handoffs.len(), TASK_HANDOFF_HISTORY_MAX);
+            assert_eq!(
+                task.handoffs
+                    .iter()
+                    .filter(|descriptor| descriptor.status == BrokerHandoffStatus::Ready)
+                    .count(),
+                1
+            );
+            assert!(task
+                .handoffs
+                .iter()
+                .any(|descriptor| &descriptor.handoff_id == active_id
+                    && descriptor.status == BrokerHandoffStatus::Ready));
+        }
     }
 }

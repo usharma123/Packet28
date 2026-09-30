@@ -1398,3 +1398,31 @@ fn relaunch_not_requested_for_legacy_generated_command() {
         "legacy generated `claude --continue` must not be relaunched by the daemon"
     );
 }
+
+#[test]
+fn hook_reducer_cache_byte_budget_prevents_large_summaries_poisoning_pagination() {
+    let mut task = TaskRecord::default();
+    for index in 0..HOOK_REDUCER_CACHE_MAX_ENTRIES {
+        task.hook_reducer_cache.insert(
+            format!("entry-{index:04}"),
+            HookReducerCacheEntry {
+                occurred_at_unix: index as u64,
+                summary: "x".repeat(8192),
+                ..HookReducerCacheEntry::default()
+            },
+        );
+    }
+    assert!(
+        serde_json::to_vec(&task).unwrap().len()
+            > packet28_daemon_protocol::registry::MAX_REGISTRY_PAGE_ITEM_BYTES
+    );
+    prune_hook_reducer_cache(&mut task);
+    assert!(
+        serde_json::to_vec(&task.hook_reducer_cache).unwrap().len() <= HOOK_REDUCER_CACHE_MAX_BYTES
+    );
+    assert!(
+        serde_json::to_vec(&task).unwrap().len()
+            < packet28_daemon_protocol::registry::MAX_REGISTRY_PAGE_ITEM_BYTES
+    );
+    assert!(task.hook_reducer_cache.contains_key("entry-0255"));
+}

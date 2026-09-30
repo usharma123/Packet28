@@ -364,11 +364,6 @@ fn cache_hit_for_packet(
 
 /// Stores an eligible reducer packet in the task's cache and prunes excess entries.
 ///
-/// # Examples
-///
-/// ```ignore
-/// update_cache_for_packet(&mut task, &packet, Some("artifact-123".to_owned()));
-/// ```
 fn update_cache_for_packet(
     task: &mut TaskRecord,
     packet: &packet28_daemon_protocol::hooks::HookReducerPacket,
@@ -422,21 +417,19 @@ fn update_cache_for_packet(
 /// and poisoning registry listing (see the daemon pagination bound). The cache
 /// is a best-effort dedup aid, so evicting the oldest entries is safe.
 const HOOK_REDUCER_CACHE_MAX_ENTRIES: usize = 256;
+const HOOK_REDUCER_CACHE_MAX_BYTES: usize = 256 * 1024;
 
 /// Prunes a task's hook reducer cache to the configured maximum size.
 ///
 /// The oldest entries are removed first, with fingerprints providing deterministic
 /// ordering when entries have the same timestamp.
 ///
-/// # Examples
-///
-/// ```rust,ignore
-/// prune_hook_reducer_cache(&mut task);
-/// assert!(task.hook_reducer_cache.len() <= HOOK_REDUCER_CACHE_MAX_ENTRIES);
-/// ```
 fn prune_hook_reducer_cache(task: &mut TaskRecord) {
-    let len = task.hook_reducer_cache.len();
-    if len <= HOOK_REDUCER_CACHE_MAX_ENTRIES {
+    let mut encoded_bytes =
+        serde_json::to_vec(&task.hook_reducer_cache).map_or(usize::MAX, |bytes| bytes.len());
+    if task.hook_reducer_cache.len() <= HOOK_REDUCER_CACHE_MAX_ENTRIES
+        && encoded_bytes <= HOOK_REDUCER_CACHE_MAX_BYTES
+    {
         return;
     }
     let mut ordered: Vec<(u64, String)> = task
@@ -444,10 +437,20 @@ fn prune_hook_reducer_cache(task: &mut TaskRecord) {
         .iter()
         .map(|(key, entry)| (entry.occurred_at_unix, key.clone()))
         .collect();
-    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let excess = len - HOOK_REDUCER_CACHE_MAX_ENTRIES;
-    for (_, key) in ordered.into_iter().take(excess) {
-        task.hook_reducer_cache.remove(&key);
+    ordered.sort();
+    for (_, key) in ordered {
+        if task.hook_reducer_cache.len() <= HOOK_REDUCER_CACHE_MAX_ENTRIES
+            && encoded_bytes <= HOOK_REDUCER_CACHE_MAX_BYTES
+        {
+            break;
+        }
+        if let Some(entry) = task.hook_reducer_cache.remove(&key) {
+            let removed_bytes = serde_json::to_vec(&key).map_or(0, |bytes| bytes.len())
+                + serde_json::to_vec(&entry).map_or(0, |bytes| bytes.len())
+                + 1
+                + usize::from(!task.hook_reducer_cache.is_empty());
+            encoded_bytes = encoded_bytes.saturating_sub(removed_bytes);
+        }
     }
 }
 
@@ -455,12 +458,6 @@ fn prune_hook_reducer_cache(task: &mut TaskRecord) {
 ///
 /// Whitespace surrounding the fingerprint is preserved.
 ///
-/// # Examples
-///
-/// ```rust,ignore
-/// let fingerprint = packet_workspace_fingerprint(&packet);
-/// assert_eq!(fingerprint, Some("workspace-123"));
-/// ```
 fn packet_workspace_fingerprint(
     packet: &packet28_daemon_protocol::hooks::HookReducerPacket,
 ) -> Option<&str> {
