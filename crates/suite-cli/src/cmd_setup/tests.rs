@@ -869,14 +869,6 @@ fn ensure_gitignore_rejects_hard_link_without_writing_outside_workspace() {
 /// `regex_status` populates the regex index fields when provided, and `ready`
 /// controls whether the overall index is reported as ready.
 ///
-/// # Examples
-///
-/// ```
-/// let response = setup_index_status("ready", Some("ready"), true);
-/// assert!(response.ready);
-/// assert_eq!(response.manifest.regex_status.as_deref(), Some("ready"));
-/// ```
-///
 /// # Parameters
 ///
 /// * `status` - The daemon index status to parse.
@@ -973,4 +965,22 @@ fn classify_setup_index_status_reports_failure_when_repo_index_claims_ready_with
         }
         other => panic!("expected failed setup classification, got {other:?}"),
     }
+}
+
+#[test]
+fn gitignore_coverage_respects_later_negations() {
+    assert!(!gitignore_covers_packet28_dir(".packet28/\n!.packet28/\n"));
+    assert!(!gitignore_covers_packet28_dir(
+        ".packet28/**\n!.packet28/task.json\n"
+    ));
+    assert!(!gitignore_covers_packet28_dir(".packet28/*\n!*\n"));
+    assert!(gitignore_covers_packet28_dir("!.packet28/\n.packet28/\n"));
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".gitignore"), ".packet28/\n!.packet28/\n").unwrap();
+    assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_some());
+    assert!(gitignore_covers_packet28_dir(
+        &fs::read_to_string(dir.path().join(".gitignore")).unwrap()
+    ));
+    assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_none());
 }

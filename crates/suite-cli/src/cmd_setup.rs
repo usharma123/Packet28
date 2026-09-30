@@ -99,13 +99,6 @@ const PACKET28_GITIGNORE_ENTRY: &str = ".packet28/";
 
 /// Determines whether the content contains a recognized pattern that ignores Packet28's `.packet28/` runtime directory.
 ///
-/// # Examples
-///
-/// ```
-/// assert!(gitignore_covers_packet28_dir(".packet28/\n"));
-/// assert!(!gitignore_covers_packet28_dir("target/\n"));
-/// ```
-///
 /// # Arguments
 ///
 /// * `content` - The contents of a `.gitignore` file.
@@ -114,8 +107,13 @@ const PACKET28_GITIGNORE_ENTRY: &str = ".packet28/";
 ///
 /// `true` if the content contains a recognized `.packet28/` ignore pattern, `false` otherwise.
 fn gitignore_covers_packet28_dir(content: &str) -> bool {
-    content.lines().map(str::trim_end).any(|line| {
-        matches!(
+    // A later negation can re-include the directory or any descendant. Be
+    // conservative about unfamiliar patterns and append our rule after them.
+    let mut covered = false;
+    for line in content.lines().map(str::trim_end) {
+        if line.starts_with('!') {
+            covered = false;
+        } else if matches!(
             line,
             ".packet28"
                 | ".packet28/"
@@ -123,8 +121,11 @@ fn gitignore_covers_packet28_dir(content: &str) -> bool {
                 | "/.packet28/"
                 | ".packet28/*"
                 | ".packet28/**"
-        )
-    })
+        ) {
+            covered = true;
+        }
+    }
+    covered
 }
 
 /// Ensures a Git repository ignores Packet28's ephemeral runtime directory.
@@ -137,12 +138,6 @@ fn gitignore_covers_packet28_dir(content: &str) -> bool {
 /// `Some` with the `.gitignore` path when an entry is added, or `None` when no
 /// change is needed.
 ///
-/// # Examples
-///
-/// ```no_run
-/// let changed = ensure_packet28_gitignore(std::path::Path::new("."))?;
-/// # Ok::<(), anyhow::Error>(())
-/// ```
 fn ensure_packet28_gitignore(root: &Path) -> Result<Option<PathBuf>> {
     if !root.join(".git").exists() {
         return Ok(None);
@@ -186,13 +181,6 @@ fn ensure_packet28_gitignore(root: &Path) -> Result<Option<PathBuf>> {
 /// `Ok(0)` when setup completes successfully or is canceled; `Ok(1)` when
 /// the daemon or index setup fails; an error when setup cannot proceed.
 ///
-/// # Examples
-///
-/// ```no_run
-/// let exit_code = run(SetupArgs::default())?;
-/// std::process::exit(exit_code);
-/// # Ok::<(), anyhow::Error>(())
-/// ```
 pub fn run(args: SetupArgs) -> Result<i32> {
     let root = crate::cmd_daemon::resolve_root_arg(&args.root);
     let root_display = root.display().to_string();
@@ -241,9 +229,10 @@ pub fn run(args: SetupArgs) -> Result<i32> {
             path.display().to_string().dimmed()
         );
         println!(
-            "  {} commit the updated .gitignore so daemon writes stop dirtying the tree",
+            "  {} commit the updated .gitignore and setup files so the index can publish",
             "hint:".cyan().bold()
         );
+        println!("  hint: .gitignore does not untrack existing files; if .packet28/ is tracked, remove it from the Git index explicitly");
         println!();
     }
 
