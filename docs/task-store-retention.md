@@ -402,3 +402,24 @@ capability-relative revalidation use the same aggregation rules. Retention
 keeps candidate selection, authenticated registry snapshots, lease admission,
 and quarantine mutations. A successful scan supplies measurements; it does not
 authorize deletion or replace revalidation under the retention lease.
+
+## Corrupt event-log recovery
+
+
+Startup quarantines at most 64 corrupt admitted task event logs per attempt.
+The strict event reader still rejects malformed frames, gaps, cross-task frames,
+and oversized frames. Recovery preserves each rejected file in a unique
+`*.events.jsonl.corrupt-<timestamp>[-<collision>]` sibling and keeps healthy tasks.
+For long task identifiers, the destination uses a readable identifier prefix and
+the full BLAKE3 digest of the canonical event filename, keeping all destination
+and reservation names within 255 bytes. The registry retains the full task ID,
+and repair reports associate that ID with the exact quarantine path. A single
+authenticated checkpoint+WAL snapshot remains locked through event inspection,
+so tasks admitted only in the WAL remain valid during recovery.
+Filesystem, namespace, lease, and lock errors still fail closed.
+
+A WAL delta resets affected high-waters before any quarantine move. If startup
+or repair is interrupted, the canonical file is either still corrupt and can
+be retried, or absent with a durable zero high-water. The corrupt bytes are
+preserved for inspection. Startup loads the new durable revision before creating
+its persistence owner.
