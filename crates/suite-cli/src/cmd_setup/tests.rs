@@ -724,6 +724,46 @@ fn gitignore_coverage_preserves_leading_spaces() {
 }
 
 #[test]
+fn gitignore_coverage_matches_git_trailing_space_semantics() {
+    use std::process::Command;
+
+    for (pattern, expected) in [
+        (".packet28/\t\n", false),
+        (".packet28/\u{a0}\n", false),
+        (".packet28/\\ \n", false),
+        (".packet28/\\  \n", false),
+        (".packet28/ \t \n", false),
+        (".packet28/  \n", true),
+        (".packet28/\r\n", true),
+    ] {
+        let dir = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", dir.path().join("no-global-config"))
+                .status()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet", "--template="]).success());
+        fs::write(dir.path().join(".gitignore"), pattern).unwrap();
+        let check = git(&["check-ignore", "--quiet", ".packet28/daemon/runtime.json"]);
+        assert_eq!(check.code(), Some(if expected { 0 } else { 1 }));
+        assert_eq!(
+            gitignore_covers_packet28_dir(pattern),
+            expected,
+            "{pattern:?}"
+        );
+
+        let updated = ensure_packet28_gitignore(dir.path()).unwrap();
+        assert_eq!(updated.is_none(), expected, "{pattern:?}");
+        assert!(git(&["check-ignore", "--quiet", ".packet28/daemon/runtime.json"]).success());
+        assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_none());
+    }
+}
+
+#[test]
 fn gitignore_coverage_rejects_patterns_that_do_not_ignore_the_runtime_directory() {
     for pattern in [
         "!.packet28/",

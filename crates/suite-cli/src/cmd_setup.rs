@@ -110,7 +110,10 @@ fn gitignore_covers_packet28_dir(content: &str) -> bool {
     // A later negation can re-include the directory or any descendant. Be
     // conservative about unfamiliar patterns and append our rule after them.
     let mut covered = false;
-    for line in content.lines().map(str::trim_end) {
+    // Git discards trailing ASCII spaces, but tabs and Unicode whitespace are
+    // literal pattern bytes. Escaped spaces retain a backslash and therefore
+    // cannot match any of the simple spellings recognized below.
+    for line in content.lines().map(|line| line.trim_end_matches(' ')) {
         if line.starts_with('!') {
             covered = false;
         } else if matches!(
