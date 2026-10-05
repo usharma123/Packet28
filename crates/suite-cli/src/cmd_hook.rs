@@ -537,7 +537,14 @@ fn resolve_hook_root(args: &ClaudeHookArgs, payload: &Value) -> PathBuf {
         .unwrap_or_else(|| crate::broker_client::resolve_root("."))
 }
 
+// Claude Code and Codex hooks share this resolver. A task superseded by
+// history recovery continues under its linked successor.
 fn resolve_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Result<String> {
+    let task_id = select_task_id(root, payload, session_id)?;
+    crate::task_runtime::adopt_task_continuation(root, task_id, session_id)
+}
+
+fn select_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Result<String> {
     if let Some(task_id) = json_string(payload, "task_id").filter(|value| !value.trim().is_empty())
     {
         crate::task_runtime::store_active_task(
@@ -570,6 +577,16 @@ fn resolve_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Re
 }
 
 fn resolve_runtime_task_id(
+    root: &Path,
+    payload: &Value,
+    session_id: Option<&str>,
+    runtime: ExternalHookRuntime,
+) -> Result<String> {
+    let task_id = select_runtime_task_id(root, payload, session_id, runtime)?;
+    crate::task_runtime::adopt_task_continuation(root, task_id, session_id)
+}
+
+fn select_runtime_task_id(
     root: &Path,
     payload: &Value,
     session_id: Option<&str>,

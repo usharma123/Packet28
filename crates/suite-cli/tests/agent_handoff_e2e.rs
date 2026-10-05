@@ -112,3 +112,60 @@ fn test_agent_handoff_wait_times_out_when_checkpoint_missing() {
         .assert()
         .success();
 }
+
+#[test]
+#[cfg(unix)]
+fn first_cold_agent_wrapper_resumes_linked_recovery_handoff() {
+    use packet28_daemon_protocol::paths::{task_event_log_path, TaskStorageId};
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write_repo_fixture(dir.path());
+    let task_id = "cold-recovery-agent";
+    seed_checkpointed_handoff_task(dir.path(), task_id, "Keep the original investigation");
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let event_path = task_event_log_path(dir.path(), &TaskStorageId::try_from(task_id).unwrap());
+    fs::write(&event_path, b"{damaged history}\n").unwrap();
+    let output = agent_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--wait-for-handoff",
+            "--handoff-timeout-secs",
+            "5",
+            "--task-id",
+            task_id,
+            "--",
+            "sh",
+            "-c",
+            "printf '%s\\n%s\\n' \"$PACKET28_TASK_ID\" \"$PACKET28_BOOTSTRAP_PATH\"",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    let lines = output.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "cold-recovery-agent-recovered-1");
+    let bootstrap: Value = serde_json::from_slice(&fs::read(lines[1]).unwrap()).unwrap();
+    assert_eq!(
+        bootstrap["latest_intention"]["text"],
+        "Keep the original investigation"
+    );
+    let registry = packet28_daemon_core::storage::load_task_registry(dir.path()).unwrap();
+    assert_eq!(
+        registry.tasks[task_id]
+            .superseded_by
+            .as_ref()
+            .unwrap()
+            .successor_task_id,
+        lines[0]
+    );
+    suite_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+}

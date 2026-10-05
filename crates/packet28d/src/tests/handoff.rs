@@ -264,3 +264,131 @@ fn prepare_handoff_readiness_score_rises_after_verification_evidence() {
         .any(|reason| reason == "missing_recent_verification"));
     assert!(serde_json::to_string(&verified.readiness).unwrap().len() < 512);
 }
+
+#[test]
+fn recovery_successor_resumes_the_inherited_handoff_from_its_owner_namespace() {
+    use packet28_daemon_protocol::broker::{BrokerHandoffDescriptor, BrokerHandoffStatus};
+    use packet28_daemon_protocol::task::TaskHistoryRecovery;
+
+    let state = daemon_test_state();
+    let root = state.lock().unwrap().root.clone();
+    let context = BrokerGetContextResponse {
+        context_version: "ctx-4".to_string(),
+        response_mode: BrokerResponseMode::Full,
+        artifact_id: Some("ctx-4".to_string()),
+        brief: "predecessor handoff context".to_string(),
+        ..BrokerGetContextResponse::default()
+    };
+    let link = TaskHistoryRecovery {
+        predecessor_task_id: "damaged".to_string(),
+        successor_task_id: "damaged-recovered-1".to_string(),
+        ..TaskHistoryRecovery::default()
+    };
+    insert_admitted_task_record(
+        &state,
+        TaskRecord {
+            task_id: "damaged".to_string(),
+            lifecycle: TaskLifecycle::Cancelled,
+            superseded_by: Some(link.clone()),
+            ..TaskRecord::default()
+        },
+    );
+    let owner = TaskStorageId::try_from("damaged").unwrap();
+    let version = ContextVersionStorageId::try_from("ctx-4").unwrap();
+    let version_path = task_version_json_path(&root, &owner, &version);
+    std::fs::create_dir_all(version_path.parent().unwrap()).unwrap();
+    std::fs::write(&version_path, serde_json::to_vec_pretty(&context).unwrap()).unwrap();
+    let handoff = BrokerHandoffDescriptor {
+        handoff_id: "damaged:handoff:9".to_string(),
+        task_id: "damaged".to_string(),
+        artifact_id: "ctx-4".to_string(),
+        context_version: "ctx-4".to_string(),
+        status: BrokerHandoffStatus::Ready,
+        generated_at_unix_ms: 9,
+        ..BrokerHandoffDescriptor::default()
+    };
+    insert_admitted_task_record(
+        &state,
+        TaskRecord {
+            task_id: "damaged-recovered-1".to_string(),
+            latest_handoff_id: Some(handoff.handoff_id.clone()),
+            latest_handoff_artifact_id: Some("ctx-4".to_string()),
+            handoffs: vec![handoff.clone()],
+            recovered_from: Some(link),
+            ..TaskRecord::default()
+        },
+    );
+
+    let response = broker_prepare_handoff(
+        state.clone(),
+        BrokerPrepareHandoffRequest {
+            task_id: "damaged-recovered-1".to_string(),
+            query: None,
+            response_mode: Some(BrokerResponseMode::Full),
+            include_debug_memory: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(response.task_id, "damaged-recovered-1");
+    assert!(response.handoff_ready);
+    assert_eq!(response.handoff, Some(handoff));
+    assert_eq!(
+        response.context.map(|context| context.brief),
+        Some("predecessor handoff context".to_string())
+    );
+}
+
+#[test]
+fn recovery_successor_snapshot_includes_inherited_agent_state() {
+    use packet28_daemon_protocol::task::TaskHistoryRecovery;
+
+    let state = daemon_test_state();
+    let kernel = state.lock().unwrap().kernel.clone();
+    kernel
+        .execute(KernelRequest {
+            target: "agenty.state.write".to_string(),
+            reducer_input: json!({
+                "task_id": "damaged",
+                "event_id": "evt-decision",
+                "occurred_at_unix": 1,
+                "actor": "agent",
+                "kind": "decision_added",
+                "data": {"type": "decision_added", "decision_id": "d1", "text": "Use tokens"}
+            }),
+            ..KernelRequest::default()
+        })
+        .unwrap();
+    insert_admitted_task_record(
+        &state,
+        TaskRecord {
+            task_id: "damaged-recovered-1".to_string(),
+            recovered_from: Some(TaskHistoryRecovery {
+                predecessor_task_id: "damaged".to_string(),
+                successor_task_id: "damaged-recovered-1".to_string(),
+                ..TaskHistoryRecovery::default()
+            }),
+            ..TaskRecord::default()
+        },
+    );
+    let link = state.lock().unwrap().tasks.tasks["damaged-recovered-1"]
+        .recovered_from
+        .clone();
+    insert_admitted_task_record(
+        &state,
+        TaskRecord {
+            task_id: "damaged".to_string(),
+            superseded_by: link,
+            ..TaskRecord::default()
+        },
+    );
+
+    crate::broker::inherit_recovered_agent_state(&state).unwrap();
+    crate::broker::inherit_recovered_agent_state(&state).unwrap();
+
+    let snapshot =
+        crate::broker::load_agent_snapshot_for_task(&state, "damaged-recovered-1").unwrap();
+    assert_eq!(snapshot.event_count, 1);
+    assert_eq!(snapshot.active_decisions.len(), 1);
+    assert_eq!(snapshot.active_decisions[0].text, "Use tokens");
+}

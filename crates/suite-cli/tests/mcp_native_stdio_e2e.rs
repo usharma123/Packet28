@@ -385,3 +385,129 @@ fn test_mcp_native_stdio_accepts_newline_json() {
         .finish(MCP_SHUTDOWN_TIMEOUT)
         .unwrap_or_else(|error| panic!("failed to stop newline MCP server: {error}"));
 }
+
+#[test]
+#[cfg(unix)]
+fn first_cold_mcp_tool_continues_recovered_task() {
+    use packet28_daemon_protocol::paths::{task_event_log_path, TaskStorageId};
+    use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry};
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    let task_id = "cold-mcp-recovery";
+    let mut registry = TaskRegistry::default();
+    registry.tasks.insert(
+        task_id.to_string(),
+        TaskRecord {
+            task_id: task_id.to_string(),
+            last_event_seq: 40,
+            ..TaskRecord::default()
+        },
+    );
+    packet28_daemon_core::storage::save_task_registry(dir.path(), &registry).unwrap();
+    let path = task_event_log_path(dir.path(), &TaskStorageId::try_from(task_id).unwrap());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, b"{damaged history}\n").unwrap();
+    let mut server = start_mcp_server(dir.path());
+    server.request_with_id(json!(1), "initialize", json!({
+        "protocolVersion":"2024-11-05", "capabilities":{}, "clientInfo":{"name":"test","version":"1"}
+    }), MCP_IO_TIMEOUT).unwrap();
+    let result = server.request_with_id(json!(2), "tools/call", json!({
+        "name":"packet28.write_intention", "arguments":{"task_id":task_id,"text":"Continue after cold recovery"}
+    }), MCP_IO_TIMEOUT).unwrap();
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    assert!(result.get("error").is_none(), "{result}");
+    let registry = packet28_daemon_core::storage::load_task_registry(dir.path()).unwrap();
+    let successor = &registry.tasks[task_id]
+        .superseded_by
+        .as_ref()
+        .unwrap()
+        .successor_task_id;
+    let events =
+        packet28_daemon_core::storage::load_task_events_from_offset(dir.path(), successor, 0)
+            .unwrap();
+    assert!(!events.events.is_empty());
+    assert_eq!(events.events[0].seq, 1);
+    server.finish(MCP_SHUTDOWN_TIMEOUT).unwrap();
+    let stop = mcp_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+}
+
+#[test]
+#[cfg(unix)]
+fn idle_mcp_recovers_offline_corrupt_task_without_another_tool_call() {
+    use packet28_daemon_protocol::paths::{ready_path, task_event_log_path, TaskStorageId};
+    use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry};
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    let task_id = "idle-recovery";
+    let mut registry = TaskRegistry::default();
+    registry.tasks.insert(
+        task_id.to_string(),
+        TaskRecord {
+            task_id: task_id.to_string(),
+            ..TaskRecord::default()
+        },
+    );
+    packet28_daemon_core::storage::save_task_registry(dir.path(), &registry).unwrap();
+    let mut server = start_mcp_server(dir.path());
+    server.request_with_id(json!(1), "initialize", json!({
+        "protocolVersion":"2024-11-05", "capabilities":{}, "clientInfo":{"name":"test","version":"1"}
+    }), MCP_IO_TIMEOUT).unwrap();
+    let result = server
+        .request_with_id(
+            json!(2),
+            "tools/call",
+            json!({
+                "name":"packet28.task_status", "arguments":{"task_id":task_id}
+            }),
+            MCP_IO_TIMEOUT,
+        )
+        .unwrap();
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    let stop = mcp_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+    assert!(!ready_path(dir.path()).exists());
+    let path = task_event_log_path(dir.path(), &TaskStorageId::try_from(task_id).unwrap());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, b"{damaged history}\n").unwrap();
+    // No new MCP tool, CLI status, or explicit restart. The notification
+    // reader encounters the old checkpoint and waits for recovery readiness.
+    let receipt = server.receive(Duration::from_secs(15)).unwrap();
+    assert_eq!(
+        receipt["method"], "notifications/packet28.task_recovered",
+        "{receipt}"
+    );
+    let successor = receipt["params"]["successor_task_id"].as_str().unwrap();
+    assert_eq!(successor, "idle-recovery-recovered-1");
+    let write = server
+        .request_with_id(
+            json!(3),
+            "tools/call",
+            json!({
+                "name":"packet28.write_intention", "arguments":{
+                    "task_id":successor, "text":"Continue under the recovered identity"
+                }
+            }),
+            MCP_IO_TIMEOUT,
+        )
+        .unwrap();
+    assert_ne!(write["result"]["isError"], true, "{write}");
+    let update = server.receive(MCP_IO_TIMEOUT).unwrap();
+    assert_eq!(update["method"], "notifications/packet28.context_updated");
+    assert_eq!(update["params"]["task_id"], successor);
+    assert_eq!(update["params"]["event_seq"], 1);
+    server.finish(MCP_SHUTDOWN_TIMEOUT).unwrap();
+    let stop = mcp_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+}

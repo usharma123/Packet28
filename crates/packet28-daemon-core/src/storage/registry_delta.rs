@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::ffi::OsStr;
 #[cfg(unix)]
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
-use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry, WatchRegistration, WatchRegistry};
+use packet28_daemon_protocol::task::{
+    TaskHistoryRecovery, TaskLifecycle, TaskRecord, TaskRegistry, WatchRegistration, WatchRegistry,
+};
 #[cfg(not(unix))]
 use packet28_state_fs::{FileAccess, StateDir, StateFile};
 use serde::{Deserialize, Serialize};
@@ -14,9 +17,6 @@ use thiserror::Error;
 use super::*;
 
 pub(crate) const REGISTRY_DELTA_WAL_FILE_NAME: &str = "task-watch-registry-delta-v1.wal";
-const EVENT_LOG_REPAIR_JOURNAL_FILE_NAME: &str = "task-event-log-repair-v1.json";
-const EVENT_LOG_REPAIR_JOURNAL_VERSION: u32 = 1;
-const MAX_EVENT_LOG_REPAIR_JOURNAL_BYTES: usize = 1024 * 1024;
 const WAL_MAGIC: [u8; 8] = *b"P28RDW01";
 const FRAME_MAGIC: [u8; 8] = *b"P28RDF01";
 const FRAME_FOOTER_MAGIC: [u8; 8] = *b"P28RDE01";
@@ -32,7 +32,6 @@ const FRAME_FOOTER_BYTES: usize = 56;
 std::thread_local! {
     static FAST_TAIL_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static APPLY_WATCH_RECORDS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static FAIL_EVENT_LOG_REPAIR_RESET_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Maximum encoded JSON payload accepted for one atomic registry delta.
@@ -588,6 +587,20 @@ impl RegistryAdmissionAuthority {
         })
     }
 
+    /// Requires `task_id` to be admitted and not superseded by a linked
+    /// history recovery.
+    pub(super) fn require_continuable_task(
+        &self,
+        root: &Path,
+        task_id: &TaskStorageId,
+    ) -> Result<()> {
+        self.require_task(root, task_id)?;
+        self.tasks
+            .tasks
+            .get(task_id.as_str())
+            .map_or(Ok(()), super::require_continuable_task)
+    }
+
     pub(super) const fn lease(&self) -> &crate::task_store_lease::TaskStoreLease {
         &self.lease
     }
@@ -968,29 +981,6 @@ pub fn load_task_watch_registry_with_deltas(root: &Path) -> Result<LoadedTaskWat
     load_task_watch_registry_with_deltas_under_admission(root)
 }
 
-/// Loads checkpoint-plus-WAL state without repairing a crash-torn WAL suffix.
-///
-/// Inspection callers use this path so discovering a torn suffix reports the
-/// corruption without truncating or synchronizing the WAL.
-fn load_task_watch_registry_with_deltas_read_only(root: &Path) -> Result<LoadedTaskWatchRegistry> {
-    #[cfg(unix)]
-    {
-        with_anchored_task_registry_lock(
-            root,
-            RegistryLockMode::Shared,
-            || Ok(()),
-            |daemon| load_under_task_lock_anchored_read_only(root, daemon),
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        let task_path = task_registry_path(root);
-        with_registry_lock(root, &task_path, RegistryLockMode::Shared, || {
-            load_under_task_lock_portable_read_only(root)
-        })
-    }
-}
-
 #[cfg(unix)]
 fn load_task_watch_registry_with_deltas_under_admission(
     root: &Path,
@@ -1017,13 +1007,22 @@ fn load_task_watch_registry_with_deltas_under_admission(
     })
 }
 
-/// Loads checkpoint-plus-WAL registry authority and authenticated event tails
-/// beneath the same task-registry lock.
+/// Loads the checkpoint and WAL-backed task/watch registry together with each task's authenticated event-log tail sequence.
+///
+/// The registry and event tails are read while holding the same exclusive task-registry lock.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`load_task_watch_registry_with_deltas`] and the
-/// strict task-event tail reader.
+/// Returns an error if registry loading or event-log tail inspection fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// let root = std::path::Path::new("/path/to/workspace");
+/// use packet28_daemon_core::storage::load_task_watch_registry_with_deltas_and_event_tails;
+/// let (_registry, event_tails) = load_task_watch_registry_with_deltas_and_event_tails(root)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn load_task_watch_registry_with_deltas_and_event_tails(
     root: &Path,
 ) -> Result<(LoadedTaskWatchRegistry, BTreeMap<String, Option<u64>>)> {
@@ -1069,6 +1068,89 @@ pub fn load_task_watch_registry_with_deltas_and_event_tails(
     }
 }
 
+/// Runs `operation` while the task-registry lock binds a checkpoint+WAL image
+/// in which `task_id` is admitted and not superseded.
+///
+/// Supersession is first durable in the WAL, before any checkpoint, so a
+/// checkpoint-only admission check could still accept the damaged identity.
+/// The shared lock spans `operation`, which serializes it with the exclusive
+/// recovery delta. A torn final WAL frame is rejected without repair; daemon
+/// startup owns that repair.
+pub(super) fn with_continuable_task_admission<T>(
+    root: &Path,
+    task_id: &TaskStorageId,
+    lease: &crate::task_store_lease::TaskStoreLease,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let require = |tasks: &TaskRegistry| -> Result<()> {
+        super::require_registered_task_storage_id(tasks, &task_registry_path(root), task_id)?;
+        tasks
+            .tasks
+            .get(task_id.as_str())
+            .map_or(Ok(()), super::require_continuable_task)
+    };
+    #[cfg(unix)]
+    {
+        let daemon = lease.daemon_capability()?;
+        with_anchored_task_registry_lock(
+            root,
+            RegistryLockMode::Shared,
+            || Ok(()),
+            |locked| {
+                validate_retained_registry_daemon(root, locked, &daemon)?;
+                let checkpoint =
+                    load_task_watch_registry_checkpoint_with_delta_revision_under_task_lock(
+                        root, &daemon,
+                    )?;
+                let wal = open_anchored_registry_wal(&daemon, root)?;
+                let loaded = replay_wal_with_admissions(
+                    root,
+                    wal,
+                    checkpoint.tasks,
+                    checkpoint.watches,
+                    RegistryRevision::new(checkpoint.applied_delta_revision),
+                    None,
+                    false,
+                )?;
+                require(&loaded.loaded.tasks)?;
+                operation()
+            },
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lease;
+        with_registry_lock(
+            root,
+            &task_registry_path(root),
+            RegistryLockMode::Shared,
+            || {
+                let checkpoint =
+                    load_task_watch_registry_checkpoint_with_delta_revision_portable_under_task_lock(
+                        root,
+                    )?;
+                let path = registry_delta_wal_path(root);
+                let wal = open_daemon_state(root)?
+                    .open_existing(REGISTRY_DELTA_WAL_FILE_NAME, FileAccess::ReadOnly)
+                    .map_err(|source| {
+                        wal_io("failed to inspect registry delta WAL", &path, source)
+                    })?;
+                let loaded = replay_wal_with_admissions(
+                    root,
+                    wal,
+                    checkpoint.tasks,
+                    checkpoint.watches,
+                    RegistryRevision::new(checkpoint.applied_delta_revision),
+                    None,
+                    false,
+                )?;
+                require(&loaded.loaded.tasks)?;
+                operation()
+            },
+        )
+    }
+}
+
 /// Upper bound on tasks auto-quarantined in a single recovering load. A store
 /// with more corrupt event logs than this fails closed so a human can inspect
 /// it rather than silently discarding a large amount of task state.
@@ -1094,379 +1176,16 @@ pub struct QuarantinedCorruptTaskEventLog {
     pub quarantined_path: Option<PathBuf>,
     /// Human-readable integrity failure that triggered the quarantine.
     pub reason: String,
+    /// Linked task that continues the superseded task's work.
+    pub successor_task_id: String,
+    /// Exact destination name reserved in the durable link before the move.
+    pub reserved_quarantine_name: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EventLogRepairJournal {
-    version: u32,
-    entries: Vec<EventLogRepairJournalEntry>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EventLogRepairJournalEntry {
-    task_id: String,
-    event_log_path: PathBuf,
-    quarantine_path: PathBuf,
-    reason: String,
-}
-
-impl EventLogRepairJournal {
-    fn empty() -> Self {
-        Self {
-            version: EVENT_LOG_REPAIR_JOURNAL_VERSION,
-            entries: Vec::new(),
-        }
-    }
-
-    fn from_records(root: &Path, records: &[QuarantinedCorruptTaskEventLog]) -> Result<Self> {
-        let entries = records
-            .iter()
-            .map(|record| {
-                let quarantine_path = record.quarantined_path.clone().ok_or_else(|| {
-                    invalid_event_log_repair_journal(
-                        &record.event_log_path,
-                        "repair intent has no quarantine destination",
-                    )
-                })?;
-                let event_log_path = record
-                    .event_log_path
-                    .strip_prefix(root)
-                    .map(Path::to_path_buf)
-                    .map_err(|_| {
-                        invalid_event_log_repair_journal(
-                            &record.event_log_path,
-                            "event log is outside the repair root",
-                        )
-                    })?;
-                let quarantine_path = quarantine_path
-                    .strip_prefix(root)
-                    .map(Path::to_path_buf)
-                    .map_err(|_| {
-                        invalid_event_log_repair_journal(
-                            &quarantine_path,
-                            "quarantine destination is outside the repair root",
-                        )
-                    })?;
-                Ok(EventLogRepairJournalEntry {
-                    task_id: record.task_id.clone(),
-                    event_log_path,
-                    quarantine_path,
-                    reason: record.reason.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            version: EVENT_LOG_REPAIR_JOURNAL_VERSION,
-            entries,
-        })
-    }
-
-    fn into_records(self, root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
-        if self.version != EVENT_LOG_REPAIR_JOURNAL_VERSION {
-            return Err(invalid_event_log_repair_journal(
-                &event_log_repair_journal_path(root),
-                format!("unsupported repair journal version {}", self.version),
-            ));
-        }
-        if self.entries.len() > MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS {
-            return Err(invalid_event_log_repair_journal(
-                &event_log_repair_journal_path(root),
-                "repair journal exceeds the supported task bound",
-            ));
-        }
-        let mut task_ids = BTreeSet::new();
-        let mut records = Vec::with_capacity(self.entries.len());
-        for entry in self.entries {
-            if !task_ids.insert(entry.task_id.clone()) {
-                return Err(invalid_event_log_repair_journal(
-                    &event_log_repair_journal_path(root),
-                    format!("repair journal repeats task {:?}", entry.task_id),
-                ));
-            }
-            let storage_id = checked_task_storage_id(root, &entry.task_id)?;
-            let expected_event_log = task_event_log_path(root, &storage_id);
-            let event_log_path = root.join(&entry.event_log_path);
-            let quarantine_path = root.join(&entry.quarantine_path);
-            if event_log_path != expected_event_log
-                || !is_valid_event_log_quarantine_path(&expected_event_log, &quarantine_path)
-            {
-                return Err(invalid_event_log_repair_journal(
-                    &event_log_repair_journal_path(root),
-                    format!(
-                        "repair journal has an invalid path for task {:?}",
-                        entry.task_id
-                    ),
-                ));
-            }
-            records.push(QuarantinedCorruptTaskEventLog {
-                task_id: entry.task_id,
-                event_log_path,
-                quarantined_path: Some(quarantine_path),
-                reason: entry.reason,
-            });
-        }
-        Ok(records)
-    }
-}
-
-fn event_log_repair_journal_path(root: &Path) -> PathBuf {
-    daemon_dir(root).join(EVENT_LOG_REPAIR_JOURNAL_FILE_NAME)
-}
-
-fn invalid_event_log_repair_journal(path: &Path, message: impl Into<String>) -> DaemonCoreError {
-    DaemonCoreError::io(
-        "invalid corrupt event-log repair journal",
-        path,
-        std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()),
-    )
-}
-
-fn is_valid_event_log_quarantine_path(event_log: &Path, quarantine: &Path) -> bool {
-    if event_log.parent() != quarantine.parent() {
-        return false;
-    }
-    let Some(event_name) = event_log.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    let Some(quarantine_name) = quarantine.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    let Some(suffix) = quarantine_name.strip_prefix(&format!("{event_name}.corrupt-")) else {
-        return false;
-    };
-    !suffix.is_empty()
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'-')
-        && suffix.split('-').all(|part| !part.is_empty())
-}
-
-fn load_event_log_repair_journal(root: &Path) -> Result<EventLogRepairJournal> {
-    let path = event_log_repair_journal_path(root);
-    #[cfg(unix)]
-    let bytes = with_anchored_task_registry_lock(
-        root,
-        RegistryLockMode::Shared,
-        || Ok(()),
-        |daemon| {
-            let name = OsStr::new(EVENT_LOG_REPAIR_JOURNAL_FILE_NAME);
-            if daemon
-                .entry_metadata(name)
-                .map_err(|source| {
-                    DaemonCoreError::io("failed to inspect repair journal", &path, source)
-                })?
-                .is_none()
-            {
-                return Ok(None);
-            }
-            daemon
-                .read_file_limited(name, MAX_EVENT_LOG_REPAIR_JOURNAL_BYTES)
-                .map(Some)
-                .map_err(|source| {
-                    DaemonCoreError::io("failed to read repair journal", &path, source)
-                })
-        },
-    )?;
-    #[cfg(not(unix))]
-    let bytes = open_daemon_state(root)?
-        .read_bounded(
-            EVENT_LOG_REPAIR_JOURNAL_FILE_NAME,
-            MAX_EVENT_LOG_REPAIR_JOURNAL_BYTES as u64,
-        )
-        .map_err(|source| DaemonCoreError::io("failed to read repair journal", &path, source))?;
-    let Some(bytes) = bytes else {
-        return Ok(EventLogRepairJournal::empty());
-    };
-    serde_json::from_slice(&bytes).map_err(|source| {
-        DaemonCoreError::json("failed to decode repair journal from", path, source)
-    })
-}
-
-fn save_event_log_repair_journal(root: &Path, journal: &EventLogRepairJournal) -> Result<()> {
-    let path = event_log_repair_journal_path(root);
-    let bytes = serde_json::to_vec(journal).map_err(|source| {
-        DaemonCoreError::json("failed to encode repair journal for", &path, source)
-    })?;
-    if bytes.len() > MAX_EVENT_LOG_REPAIR_JOURNAL_BYTES {
-        return Err(invalid_event_log_repair_journal(
-            &path,
-            "encoded repair journal exceeds the supported byte bound",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        with_anchored_task_registry_lock(
-            root,
-            RegistryLockMode::Exclusive,
-            || Ok(()),
-            |daemon| {
-                daemon
-                    .write_json_atomically(
-                        OsStr::new(EVENT_LOG_REPAIR_JOURNAL_FILE_NAME),
-                        &bytes,
-                        ".event-log-repair-journal-write",
-                    )
-                    .map_err(|error| {
-                        DaemonCoreError::io(
-                            "failed to persist corrupt event-log repair journal",
-                            &path,
-                            error.source,
-                        )
-                    })
-            },
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        open_daemon_state(root)?
-            .write_atomic(EVENT_LOG_REPAIR_JOURNAL_FILE_NAME, &bytes)
-            .map_err(|source| {
-                DaemonCoreError::io(
-                    "failed to persist corrupt event-log repair journal",
-                    path,
-                    source,
-                )
-            })
-    }
-}
-
-/// Inspects admitted task event logs and reports those that fail integrity validation without modifying any state.
+/// Identifies event-log errors that can be safely quarantined during recovery.
 ///
-/// # Errors
-///
-/// Returns an error if registry loading or event-log inspection fails for reasons
-/// other than event-log corruption, including I/O, locking, or lease failures.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::path::Path;
-///
-/// let corrupt_logs = inspect_corrupt_task_event_logs(Path::new("/var/lib/packet28"))?;
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-///
-/// # Returns
-///
-/// The admitted tasks whose event logs require quarantine.
-pub fn inspect_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
-    scan_corrupt_task_event_logs(root)
-}
-
-/// Quarantines corrupt task event logs for offline recovery while the daemon is stopped.
-///
-/// Each affected log is moved to a sibling `*.corrupt-<unix>` file, and the owning
-/// task's event high-water is durably reset to zero through a registry delta. The
-/// operation acquires the task-store writer lease and fails if a daemon is running.
-/// Durable repair intent is recorded before any move, and an interrupted repair is
-/// completed from that journal before new corruption is scanned.
-///
-/// # Errors
-///
-/// Returns an error if scanning, quarantining a log, or resetting task high-water
-/// values fails.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::path::Path;
-///
-/// let quarantined = repair_corrupt_task_event_logs(Path::new("/var/lib/my-daemon"))?;
-/// println!("Quarantined {} event logs", quarantined.len());
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn repair_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
-    let _repair_lease = acquire_task_store_writer_lease(root)?;
-    let mut repaired = resume_pending_event_log_repairs(root)?;
-    let mut corrupt = scan_corrupt_task_event_logs(root)?;
-    if corrupt.is_empty() {
-        return Ok(repaired);
-    }
-    assign_event_log_quarantine_paths(&mut corrupt)?;
-    save_event_log_repair_journal(root, &EventLogRepairJournal::from_records(root, &corrupt)?)?;
-    move_corrupt_event_logs_aside(&mut corrupt)?;
-    reset_quarantined_task_high_waters(root, &corrupt)?;
-    save_event_log_repair_journal(root, &EventLogRepairJournal::empty())?;
-    repaired.extend(corrupt);
-    Ok(repaired)
-}
-
-/// Completes a previously journaled quarantine before discovering new work.
-/// The journal remains intact across move or reset errors and is cleared only
-/// after the high-water reset has committed successfully.
-fn resume_pending_event_log_repairs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
-    let pending = load_event_log_repair_journal(root)?.into_records(root)?;
-    if pending.is_empty() {
-        return Ok(pending);
-    }
-    let mut pending = pending;
-    move_corrupt_event_logs_aside(&mut pending)?;
-    reset_quarantined_task_high_waters(root, &pending)?;
-    save_event_log_repair_journal(root, &EventLogRepairJournal::empty())?;
-    Ok(pending)
-}
-
-/// Durably resets the event high-water values for quarantined tasks whose event logs were cleared.
-///
-/// Tasks with a zero high-water value are skipped, and no registry delta is written when no
-/// resets are needed.
-///
-/// # Examples
-///
-/// ```no_run
-/// let root = std::path::Path::new("/var/lib/example");
-/// let quarantined = Vec::new();
-///
-/// reset_quarantined_task_high_waters(root, &quarantined)?;
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-fn reset_quarantined_task_high_waters(
-    root: &Path,
-    corrupt: &[QuarantinedCorruptTaskEventLog],
-) -> Result<()> {
-    let loaded = load_task_watch_registry_with_deltas(root)?;
-    let mut batch = RegistryDeltaBatch::default();
-    for record in corrupt {
-        if let Some(task) = loaded.tasks.tasks.get(&record.task_id) {
-            if task.last_event_seq != 0 {
-                let mut updated = task.clone();
-                updated.last_event_seq = 0;
-                batch = batch.upsert_task(updated);
-            }
-        }
-    }
-    if batch.is_empty() {
-        return Ok(());
-    }
-    #[cfg(test)]
-    if FAIL_EVENT_LOG_REPAIR_RESET_ONCE.with(|fail| fail.replace(false)) {
-        return Err(DaemonCoreError::io(
-            "failed to reset quarantined task event high-waters",
-            root,
-            std::io::Error::other("injected event-log repair reset failure"),
-        ));
-    }
-    let next = loaded.replayed_revision.checked_next().ok_or_else(|| {
-        DaemonCoreError::InvalidRegistryDeltaBatch {
-            root: root.to_path_buf(),
-            message: "registry revision exhausted while repairing corrupt task event logs"
-                .to_string(),
-        }
-    })?;
-    let revisions = RegistryRevisionRange::single(next).map_err(|error| {
-        DaemonCoreError::InvalidRegistryDeltaBatch {
-            root: root.to_path_buf(),
-            message: error.to_string(),
-        }
-    })?;
-    append_task_watch_registry_delta(root, revisions, &batch)
-}
-
-/// Returns true for durable event-log integrity failures that recovery can
-/// safely quarantine, as opposed to environmental IO, lock, or lease failures
-/// that must still fail closed.
+/// Returns `true` for invalid event frames and authority JSON-limit violations,
+/// and `false` for other errors.
 fn is_recoverable_event_log_corruption(error: &DaemonCoreError) -> bool {
     matches!(
         error,
@@ -1475,194 +1194,285 @@ fn is_recoverable_event_log_corruption(error: &DaemonCoreError) -> bool {
     )
 }
 
-/// Identifies every admitted task whose durable event log fails integrity
-/// validation. Non-corruption errors (IO, lease, lock) propagate unchanged so
-/// only genuine event-log corruption is treated as recoverable.
-fn scan_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
-    let loaded = load_task_watch_registry_with_deltas_read_only(root)?;
-    let mut corrupt = Vec::new();
-    for task_id in loaded.tasks.tasks.keys() {
-        match event_tail::task_event_log_tail_sequence(root, task_id) {
-            Ok(_) => {}
-            Err(error) if is_recoverable_event_log_corruption(&error) => {
-                let storage_id = checked_task_storage_id(root, task_id)?;
-                corrupt.push(QuarantinedCorruptTaskEventLog {
-                    task_id: task_id.clone(),
-                    event_log_path: task_event_log_path(root, &storage_id),
-                    quarantined_path: None,
-                    reason: error.to_string(),
-                });
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(corrupt)
-}
-
-/// Moves each corrupt task event log aside (renaming it to a sibling
-/// `*.corrupt-<unix>` file) so the task's canonical event-log path becomes
-/// absent and its durable tail reads as empty.
+/// Finds admitted tasks whose event logs contain recoverable integrity errors.
 ///
-/// This deliberately does not touch the task registry: mutating the durable
-/// checkpoint here would race the persistence owner that assumes ownership at
-/// startup. The caller resets the quarantined task's event high-water through
-/// the normal persistence path instead. The renamed file is preserved for
-/// inspection. A log already present at its planned quarantine path is treated as
-/// an interrupted move and resumed idempotently.
-fn move_corrupt_event_logs_aside(corrupt: &mut [QuarantinedCorruptTaskEventLog]) -> Result<()> {
-    assign_event_log_quarantine_paths(corrupt)?;
-    for record in corrupt.iter_mut() {
-        let dest = record
-            .quarantined_path
-            .clone()
-            .expect("quarantine paths are assigned before moving logs");
-        if dest.try_exists().map_err(|source| {
-            DaemonCoreError::io(
-                "failed to inspect corrupt task event-log quarantine destination",
-                &dest,
-                source,
-            )
-        })? {
-            if record.event_log_path.try_exists().map_err(|source| {
-                DaemonCoreError::io(
-                    "failed to inspect corrupt task event log",
-                    &record.event_log_path,
-                    source,
-                )
-            })? {
-                return Err(DaemonCoreError::io(
-                    "refusing to replace an existing corrupt task event-log quarantine",
-                    &dest,
-                    std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "both canonical and quarantine event logs exist",
-                    ),
-                ));
-            }
-            continue;
-        }
-        match fs::rename(&record.event_log_path, &dest) {
-            Ok(()) => {
-                sync_event_log_quarantine_parent(&dest)?;
-                record.quarantined_path = Some(dest);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(DaemonCoreError::io(
-                    "failed to resume corrupt task event-log quarantine because both paths are absent",
-                    &record.event_log_path,
-                    error,
-                ));
-            }
-            Err(error) => {
-                return Err(DaemonCoreError::io(
-                    "failed to move a corrupt task event log aside",
-                    &record.event_log_path,
-                    error,
-                ));
-            }
-        }
-    }
-    Ok(())
+/// Non-recoverable errors, including I/O, lease, and lock errors, are propagated.
+///
+fn scan_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    // Keep one authenticated checkpoint+WAL image and registry lock through
+    // admitted event reads. A checkpoint-only admission helper rejects tasks
+    // whose first durable admission is still solely in the WAL.
+    inspect_corrupt_task_event_logs(root)
 }
 
-fn sync_event_log_quarantine_parent(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let parent = path.parent().ok_or_else(|| {
-            DaemonCoreError::io(
-                "failed to resolve corrupt task event-log quarantine directory",
-                path,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "quarantine path has no parent directory",
-                ),
-            )
-        })?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+/// Quarantines corrupt task event logs by renaming them to timestamped sibling files.
+///
+/// The canonical event-log path is left absent so subsequent tail reads are empty.
+/// Missing logs are ignored, and the task registry is left unchanged. Renamed files
+/// are recorded in `corrupt`.
+///
+fn corrupt_event_log_destination_name(file_name: &str, stamp: u64, attempt: usize) -> String {
+    let suffix = if attempt == 0 {
+        format!(".corrupt-{stamp}")
+    } else {
+        format!(".corrupt-{stamp}-{attempt}")
+    };
+    // Leave room for the portable reservation suffix as well as NAME_MAX.
+    if file_name.len() + suffix.len() + ".reserve".len() <= 255 {
+        format!("{file_name}{suffix}")
+    } else {
+        // Storage identifiers are ASCII. Retain a readable prefix and the
+        // complete canonical-name digest so association can be derived from
+        // the unchanged registry even for a maximum-length task identifier.
+        let digest = blake3::hash(file_name.as_bytes());
+        format!("{}-{digest}.events.jsonl{suffix}", &file_name[..96])
+    }
+}
+
+#[cfg(unix)]
+fn move_corrupt_event_log_aside(
+    root: &Path,
+    record: &QuarantinedCorruptTaskEventLog,
+    writer_lease: &crate::task_store_lease::TaskStoreLease,
+) -> Result<Option<PathBuf>> {
+    let storage_id = checked_task_storage_id(root, &record.task_id)?;
+    let file_name = event_log_file_name(&storage_id);
+    let Some(events) = open_task_events_capability_for_read(root)? else {
+        return Ok(None);
+    };
+    validate_anchored_event_namespace_aliases(&events, &file_name, &record.event_log_path)?;
+    let file = match events.open_existing_lock_file(OsStr::new(&file_name)) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(None),
+        Err(source) => {
+            return Err(DaemonCoreError::io(
+                "failed to open a corrupt task event log for quarantine",
+                &record.event_log_path,
+                source,
+            ));
+        }
+    };
+    let mut lock = match AnchoredFileLock::lock_existing(
+        &events,
+        OsStr::new(&file_name),
+        record.event_log_path.clone(),
+        file,
+        AnchoredFileLockMode::Exclusive,
+    ) {
+        Ok(lock) => lock,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(DaemonCoreError::io(
+                "failed to acquire exclusive corrupt task event log lock",
+                &record.event_log_path,
+                source,
+            ));
+        }
+    };
+
+    let result = (|| -> Result<Option<(String, PathBuf)>> {
+        writer_lease.validate_namespace_attachment()?;
+        events
+            .validate_display_path_attachment()
             .map_err(|source| {
                 DaemonCoreError::io(
-                    "failed to synchronize corrupt task event-log quarantine directory",
-                    parent,
+                    "task event namespace is detached during quarantine",
+                    &record.event_log_path,
                     source,
                 )
             })?;
+        validate_anchored_event_namespace_aliases(&events, &file_name, &record.event_log_path)?;
+        lock.validate_attachment().map_err(|source| {
+            DaemonCoreError::io(
+                "corrupt task event log binding changed before quarantine",
+                &record.event_log_path,
+                source,
+            )
+        })?;
+
+        match event_tail::inspect_locked_task_event_tail(
+            lock.file_mut(),
+            &record.event_log_path,
+            &storage_id,
+        ) {
+            Ok(_) => return Ok(None),
+            Err(error) if is_recoverable_event_log_corruption(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        let destination_name = record.reserved_quarantine_name.clone();
+        match events.rename_to_noreplace(
+            OsStr::new(&file_name),
+            &events,
+            OsStr::new(&destination_name),
+        ) {
+            Ok(()) => {
+                let destination = events.display_path().join(&destination_name);
+                Ok(Some((destination_name, destination)))
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            // The durable link names this exact file. Never overwrite it or
+            // silently choose another name the link does not record.
+            Err(source) => Err(DaemonCoreError::io(
+                "failed to move a corrupt task event log to its reserved quarantine name",
+                &record.event_log_path,
+                source,
+            )),
+        }
+    })();
+
+    let finish = match &result {
+        Ok(Some((destination_name, _))) => lock.finish_renamed(OsStr::new(destination_name)),
+        _ => lock.finish(),
+    };
+    match (result, finish) {
+        (Ok(Some((_, destination))), Ok(())) => Ok(Some(destination)),
+        (Ok(None), Ok(())) => Ok(None),
+        (Ok(_), Err(AnchoredFileLockFinishError::Attachment(source))) => Err(DaemonCoreError::io(
+            "corrupt task event log binding changed during quarantine",
+            &record.event_log_path,
+            source,
+        )),
+        (Ok(_), Err(AnchoredFileLockFinishError::Unlock(source))) => Err(DaemonCoreError::io(
+            "failed to unlock corrupt task event log",
+            &record.event_log_path,
+            source,
+        )),
+        (Err(error), _) => Err(error),
     }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
-fn assign_event_log_quarantine_paths(corrupt: &mut [QuarantinedCorruptTaskEventLog]) -> Result<()> {
-    let stamp = now_unix();
-    for record in corrupt {
-        if record.quarantined_path.is_some() {
-            continue;
+#[cfg(not(unix))]
+fn move_corrupt_event_log_aside(
+    root: &Path,
+    record: &QuarantinedCorruptTaskEventLog,
+    _writer_lease: &crate::task_store_lease::TaskStoreLease,
+) -> Result<Option<PathBuf>> {
+    let storage_id = checked_task_storage_id(root, &record.task_id)?;
+    let Some(mut file) = open_task_event_file_for_read(root, &storage_id, &record.event_log_path)?
+    else {
+        return Ok(None);
+    };
+    FileExt::lock_exclusive(&file).map_err(|source| {
+        DaemonCoreError::io(
+            "failed to acquire exclusive corrupt task event log lock",
+            &record.event_log_path,
+            source,
+        )
+    })?;
+    let result = (|| -> Result<Option<PathBuf>> {
+        match event_tail::inspect_locked_task_event_tail(
+            &mut file,
+            &record.event_log_path,
+            &storage_id,
+        ) {
+            Ok(_) => return Ok(None),
+            Err(error) if is_recoverable_event_log_corruption(&error) => {}
+            Err(error) => return Err(error),
         }
-        let mut selected = None;
-        for sequence in 0..=MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS {
-            let mut destination = record.event_log_path.clone().into_os_string();
-            if sequence == 0 {
-                destination.push(format!(".corrupt-{stamp}"));
-            } else {
-                destination.push(format!(".corrupt-{stamp}-{sequence}"));
-            }
-            let destination = PathBuf::from(destination);
-            if !destination.try_exists().map_err(|source| {
+        let destination_name = &record.reserved_quarantine_name;
+        let destination = task_events_dir(root).join(destination_name);
+        let reservation = task_events_dir(root).join(format!("{destination_name}.reserve"));
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&reservation)
+            .map_err(|source| {
                 DaemonCoreError::io(
-                    "failed to inspect corrupt task event-log quarantine destination",
-                    &destination,
+                    "failed to reserve the corrupt task event log quarantine name",
+                    &reservation,
                     source,
                 )
-            })? {
-                selected = Some(destination);
-                break;
+            })?;
+        let existing = fs::symlink_metadata(&destination);
+        let moved = match existing {
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "reserved quarantine name already exists",
+            )),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                fs::rename(&record.event_log_path, &destination)
             }
-        }
-        record.quarantined_path = Some(selected.ok_or_else(|| {
-            DaemonCoreError::io(
-                "failed to allocate corrupt task event-log quarantine destination",
+            Err(source) => Err(source),
+        };
+        let cleanup = fs::remove_file(&reservation);
+        match (moved, cleanup) {
+            (Ok(()), Ok(())) => Ok(Some(destination)),
+            (Err(source), _) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            (Err(source), _) => Err(DaemonCoreError::io(
+                "failed to move a corrupt task event log to its reserved quarantine name",
                 &record.event_log_path,
-                std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "all bounded quarantine destinations already exist",
-                ),
-            )
-        })?);
+                source,
+            )),
+            (Ok(()), Err(source)) => Err(DaemonCoreError::io(
+                "failed to release a corrupt task event log destination reservation",
+                &reservation,
+                source,
+            )),
+        }
+    })();
+    let unlock = FileExt::unlock(&file).map_err(|source| {
+        DaemonCoreError::io(
+            "failed to unlock corrupt task event log",
+            &record.event_log_path,
+            source,
+        )
+    });
+    match (result, unlock) {
+        (Ok(destination), Ok(())) => Ok(destination),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+// Each record carries the exact name reserved by its durable link, so a
+// retry after an interrupted rename targets the same file.
+fn move_corrupt_event_logs_aside(
+    root: &Path,
+    corrupt: &mut [QuarantinedCorruptTaskEventLog],
+    writer_lease: &crate::task_store_lease::TaskStoreLease,
+) -> Result<()> {
+    for record in corrupt.iter_mut() {
+        if let Some(destination) = move_corrupt_event_log_aside(root, record, writer_lease)? {
+            record.quarantined_path = Some(destination);
+        }
     }
     Ok(())
 }
 
-/// Loads the durable task/watch registry and event tails, quarantining any task
-/// whose durable event log fails integrity validation instead of failing the
-/// entire load.
+/// Loads the task/watch registry and event-log tails, quarantining recoverable corrupt logs.
 ///
-/// A single corrupted task event log otherwise takes the whole daemon down at
-/// startup (`packet28d did not become ready`). This wrapper isolates the bad
-/// task: it moves the corrupt event log aside (to a sibling `*.corrupt-<unix>`
-/// file, preserved for inspection) so the task's tail reads as empty, then
-/// returns the registry — the affected task is still present but its returned
-/// tail is `None`.
-///
-/// The registry is intentionally left unmutated so it does not race the
-/// persistence owner that assumes checkpoint ownership at startup. The caller
-/// must reset each quarantined task's event high-water (`last_event_seq` to 0)
-/// through the normal persistence path so reconciliation stays consistent; the
-/// returned vector lists every quarantined task for that purpose and for
-/// reporting.
-///
-/// Only genuine event-log integrity failures are recovered, and at most
-/// [`MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS`] tasks are quarantined before the
-/// load fails closed. All other errors propagate unchanged.
+/// A damaged task keeps its identity and is fenced as a terminal, superseded
+/// record; its work continues under a newly admitted linked task with a fresh
+/// event sequence, so no consumer cursor can observe a reused sequence under
+/// one identity. Before moving any log, one WAL delta durably fences the
+/// damaged task (zero high-water, cancelled lifecycle, `superseded_by` link),
+/// admits its successor (`recovered_from` link) with trusted predecessor
+/// context, and reserves the exact quarantine file name in both links. The log
+/// is then moved to exactly that name without replacement. An interruption
+/// after the delta leaves either a corrupt canonical log that is retried to the
+/// same reserved name without creating another successor, or an absent log
+/// whose bytes are at the recorded name. Startup has not yet created its
+/// persistence owner, so the returned registry includes the new durable
+/// revision. Recovery stops after at most 64 affected
+/// tasks.
 ///
 /// # Errors
 ///
-/// Returns the same errors as
-/// [`load_task_watch_registry_with_deltas_and_event_tails`] for non-recoverable
-/// failures, plus filesystem errors from moving a corrupt log aside.
+/// Returns non-recoverable loading errors and errors encountered while quarantining
+/// corrupt logs.
+///
+/// # Examples
+///
+/// ```no_run
+/// use packet28_daemon_core::storage::load_task_watch_registry_recovering_corrupt_event_logs;
+/// let root = std::path::Path::new("/path/to/workspace");
+/// let recovered = load_task_watch_registry_recovering_corrupt_event_logs(root)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn load_task_watch_registry_recovering_corrupt_event_logs(
     root: &Path,
 ) -> Result<RecoveredTaskWatchRegistry> {
+    let writer_lease = acquire_task_store_writer_lease(root)?;
     let mut quarantined: Vec<QuarantinedCorruptTaskEventLog> = Vec::new();
     loop {
         match load_task_watch_registry_with_deltas_and_event_tails(root) {
@@ -1678,10 +1488,428 @@ pub fn load_task_watch_registry_recovering_corrupt_event_logs(
                 {
                     return Err(error);
                 }
-                move_corrupt_event_logs_aside(&mut corrupt)?;
+                {
+                    let _registry_admission = acquire_registry_writer_admission(&writer_lease)?;
+                    fence_corrupt_tasks_with_linked_successors_admitted(
+                        root,
+                        &mut corrupt,
+                        &writer_lease,
+                        now_unix(),
+                    )?;
+                }
+                move_corrupt_event_logs_aside(root, &mut corrupt, &writer_lease)?;
                 quarantined.extend(corrupt);
             }
         }
+    }
+}
+
+/// Quarantines corrupt event logs and fences their identities using the same
+/// linked recovery transaction as daemon startup.
+///
+/// # Errors
+/// Returns registry, event-log, or filesystem authority errors.
+pub fn repair_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    load_task_watch_registry_recovering_corrupt_event_logs(root).map(|(_, _, records)| records)
+}
+
+/// Reports corrupt admitted event logs. The CLI requires a stopped daemon.
+/// This read path preserves the strict corruption and filesystem checks and
+/// rejects a torn registry WAL without truncating it. Registry and event bytes
+/// are not changed; normal lifecycle/registry lock files may be created.
+///
+/// # Errors
+/// Returns registry, event inspection, or filesystem authority errors.
+pub fn inspect_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    let lease = acquire_task_store_writer_lease(root)?;
+    #[cfg(unix)]
+    {
+        let daemon = lease.daemon_capability()?;
+        with_anchored_task_registry_lock(
+            root,
+            RegistryLockMode::Shared,
+            || Ok(()),
+            |locked| {
+                validate_retained_registry_daemon(root, locked, &daemon)?;
+                let loaded = load_retained_registry_image_under_task_lock(root, &daemon, false)?;
+                inspect_loaded_corrupt_event_logs(root, &loaded.authority.loaded.tasks, &lease)
+            },
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        with_registry_lock(
+            root,
+            &task_registry_path(root),
+            RegistryLockMode::Shared,
+            || {
+                let loaded = load_task_watch_registry_checkpoint_with_delta_revision_portable_under_task_lock(root)?;
+                let path = registry_delta_wal_path(root);
+                let wal = open_daemon_state(root)?
+                    .open_existing(REGISTRY_DELTA_WAL_FILE_NAME, FileAccess::ReadOnly)
+                    .map_err(|source| {
+                        wal_io("failed to inspect registry delta WAL", &path, source)
+                    })?;
+                let loaded = replay_wal_with_admissions(
+                    root,
+                    wal,
+                    loaded.tasks,
+                    loaded.watches,
+                    RegistryRevision::new(loaded.applied_delta_revision),
+                    None,
+                    false,
+                )?;
+                inspect_loaded_corrupt_event_logs(root, &loaded.loaded.tasks, &lease)
+            },
+        )
+    }
+}
+
+// The caller holds the registry lock through the entire inspection so an event
+// read never reloads authority through a WAL-repairing writer path.
+fn inspect_loaded_corrupt_event_logs(
+    root: &Path,
+    tasks: &TaskRegistry,
+    lease: &crate::task_store_lease::TaskStoreLease,
+) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    let mut corrupt = Vec::new();
+    for task_id in tasks.tasks.keys() {
+        let storage_id = checked_task_storage_id(root, task_id)?;
+        #[cfg(unix)]
+        let tail = event_tail::task_event_log_tail_sequence_admitted(root, &storage_id, lease);
+        #[cfg(not(unix))]
+        let tail = {
+            let _ = lease;
+            event_tail::task_event_log_tail_sequence_portable(root, &storage_id)
+        };
+        match tail {
+            Ok(_) => {}
+            Err(error) if is_recoverable_event_log_corruption(&error) => {
+                corrupt.push(QuarantinedCorruptTaskEventLog {
+                    task_id: task_id.clone(),
+                    event_log_path: task_event_log_path(root, &storage_id),
+                    quarantined_path: None,
+                    reason: error.to_string(),
+                    successor_task_id: String::new(),
+                    reserved_quarantine_name: String::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(corrupt)
+}
+
+/// Successor identifiers tried before recovery fails closed.
+const MAX_SUCCESSOR_TASK_ID_ATTEMPTS: u32 = 64;
+
+fn successor_task_id(task_id: &str, ordinal: u32) -> String {
+    let suffix = format!("-recovered-{ordinal}");
+    if task_id.len() + suffix.len() <= MAX_TASK_STORAGE_ID_BYTES {
+        format!("{task_id}{suffix}")
+    } else {
+        // Storage identifiers are ASCII. Keep a readable prefix and the
+        // complete identity digest so long identifiers stay distinguishable.
+        let digest = blake3::hash(task_id.as_bytes()).to_hex();
+        format!("{}-{}{suffix}", &task_id[..96], &digest[..32])
+    }
+}
+
+// A successor must be new to the registry and must not adopt an existing or
+// aliasing artifact directory or event log left by an earlier identity.
+fn choose_successor_task_id(
+    root: &Path,
+    current: &TaskRegistry,
+    reserved: &BTreeSet<String>,
+    task_id: &str,
+) -> Result<String> {
+    let taken_aliases = current
+        .tasks
+        .keys()
+        .chain(reserved)
+        .map(|task_id| task_storage_key_alias_class(task_id))
+        .collect::<BTreeSet<_>>();
+    for ordinal in 1..=MAX_SUCCESSOR_TASK_ID_ATTEMPTS {
+        let candidate = successor_task_id(task_id, ordinal);
+        if taken_aliases.contains(&task_storage_key_alias_class(&candidate)) {
+            continue;
+        }
+        let probe = TaskRegistry {
+            tasks: BTreeMap::from([(
+                candidate.clone(),
+                TaskRecord {
+                    task_id: candidate.clone(),
+                    ..TaskRecord::default()
+                },
+            )]),
+        };
+        match validate_task_registry_namespace_bindings(
+            root,
+            &probe,
+            Some(current),
+            None,
+            &task_registry_path(root),
+        ) {
+            Ok(()) => return Ok(candidate),
+            Err(DaemonCoreError::InvalidTaskRegistry { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(DaemonCoreError::InvalidTaskRegistry {
+        path: task_registry_path(root),
+        message: format!(
+            "no unused successor identifier is available for superseded task {task_id:?}"
+        ),
+    })
+}
+
+// Chooses an unused quarantine name. The fence delta records it before the
+// no-replace rename, so a retry never has to guess which sibling is ours.
+fn choose_quarantine_name(root: &Path, task_id: &str, stamp: u64) -> Result<String> {
+    let storage_id = checked_task_storage_id(root, task_id)?;
+    let file_name = event_log_file_name(&storage_id);
+    #[cfg(unix)]
+    let events = open_task_events_capability_for_read(root)?;
+    for attempt in 0..MAX_TASK_REGISTRY_RECORDS {
+        let name = corrupt_event_log_destination_name(&file_name, stamp, attempt);
+        let probe_error = |source| {
+            DaemonCoreError::io(
+                "failed to inspect a corrupt task event log quarantine name",
+                task_events_dir(root).join(&name),
+                source,
+            )
+        };
+        #[cfg(unix)]
+        let exists = match &events {
+            Some(events) => events
+                .entry_metadata(OsStr::new(&name))
+                .map_err(probe_error)?
+                .is_some(),
+            None => false,
+        };
+        #[cfg(not(unix))]
+        let exists = match fs::symlink_metadata(task_events_dir(root).join(&name)) {
+            Ok(_) => true,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => return Err(probe_error(source)),
+        };
+        if !exists {
+            return Ok(name);
+        }
+    }
+    Err(DaemonCoreError::io(
+        "failed to reserve a unique corrupt task event log destination",
+        task_event_log_path(root, &storage_id),
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "corrupt task event log destination attempts exhausted",
+        ),
+    ))
+}
+
+// Builds the successor from the predecessor's authenticated registry record,
+// never from its quarantined log. It inherits the objective, decisions,
+// questions, and the latest ready or consumed handoff descriptor. The descriptor
+// keeps the predecessor `task_id`, which names the namespace that owns the
+// untouched artifact. Lifecycle, watches, sequence, agent process, hook
+// session, and context-version pointers are not inherited.
+fn successor_record(
+    predecessor: &TaskRecord,
+    successor_task_id: &str,
+    link: TaskHistoryRecovery,
+) -> TaskRecord {
+    let handoff = predecessor
+        .latest_handoff_id
+        .as_ref()
+        .and_then(|handoff_id| {
+            predecessor
+                .handoffs
+                .iter()
+                .find(|handoff| &handoff.handoff_id == handoff_id)
+        })
+        .filter(|handoff| {
+            use packet28_daemon_protocol::broker::BrokerHandoffStatus;
+            matches!(
+                handoff.status,
+                BrokerHandoffStatus::Ready | BrokerHandoffStatus::Consumed
+            )
+        })
+        .cloned();
+    TaskRecord {
+        task_id: successor_task_id.to_string(),
+        latest_broker_request: predecessor
+            .latest_broker_request
+            .clone()
+            .map(|mut request| {
+                request.task_id = successor_task_id.to_string();
+                request.since_version = None;
+                request
+            }),
+        linked_decisions: predecessor.linked_decisions.clone(),
+        resolved_questions: predecessor.resolved_questions.clone(),
+        question_texts: predecessor.question_texts.clone(),
+        latest_handoff_id: handoff.as_ref().map(|handoff| handoff.handoff_id.clone()),
+        latest_handoff_artifact_id: handoff.as_ref().map(|handoff| handoff.artifact_id.clone()),
+        latest_handoff_generated_at_unix: handoff
+            .as_ref()
+            .map(|handoff| handoff.generated_at_unix_ms),
+        latest_handoff_checkpoint_id: handoff
+            .as_ref()
+            .and_then(|handoff| handoff.checkpoint_id.clone()),
+        handoffs: handoff.into_iter().collect(),
+        recovered_from: Some(link),
+        ..TaskRecord::default()
+    }
+}
+
+// Fences each damaged task and admits its linked successor in one WAL frame.
+// A task already superseded by an interrupted earlier attempt keeps its
+// durable link and reserved name; no second successor is created.
+fn fence_corrupt_tasks_with_linked_successors_admitted(
+    root: &Path,
+    corrupt: &mut [QuarantinedCorruptTaskEventLog],
+    lease: &crate::task_store_lease::TaskStoreLease,
+    recovered_at_unix: u64,
+) -> Result<()> {
+    append_recovery_delta_admitted(root, lease, |loaded| {
+        let mut batch = RegistryDeltaBatch::default();
+        let mut reserved = BTreeSet::new();
+        for record in corrupt.iter_mut() {
+            let task = loaded.tasks.tasks.get(&record.task_id).ok_or_else(|| {
+                DaemonCoreError::InvalidTaskRegistry {
+                    path: task_registry_path(root),
+                    message: format!(
+                        "task {:?} with a corrupt event log left the registry during recovery",
+                        record.task_id
+                    ),
+                }
+            })?;
+            if let Some(link) = &task.superseded_by {
+                record.successor_task_id = link.successor_task_id.clone();
+                record.reserved_quarantine_name =
+                    link.quarantined_event_log.clone().ok_or_else(|| {
+                        DaemonCoreError::InvalidTaskRegistry {
+                            path: task_registry_path(root),
+                            message: format!(
+                                "superseded task {:?} has no reserved quarantine name",
+                                record.task_id
+                            ),
+                        }
+                    })?;
+                continue;
+            }
+            let successor_task_id =
+                choose_successor_task_id(root, &loaded.tasks, &reserved, &record.task_id)?;
+            reserved.insert(successor_task_id.clone());
+            let quarantine_name = choose_quarantine_name(root, &record.task_id, recovered_at_unix)?;
+            let link = TaskHistoryRecovery {
+                predecessor_task_id: record.task_id.clone(),
+                successor_task_id: successor_task_id.clone(),
+                reason: record.reason.clone(),
+                prior_last_event_seq: task.last_event_seq,
+                recovered_at_unix,
+                quarantined_event_log: Some(quarantine_name.clone()),
+            };
+            let mut fenced = task.clone();
+            fenced.lifecycle = TaskLifecycle::Cancelled;
+            fenced.last_event_seq = 0;
+            let evidence = format!(
+                "event history failed integrity validation and was quarantined; \
+                 work continues as task {successor_task_id:?}"
+            );
+            fenced.last_error = Some(match fenced.last_error.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing}; {evidence}"),
+                _ => evidence,
+            });
+            fenced.superseded_by = Some(link.clone());
+            let successor = successor_record(task, &successor_task_id, link);
+            batch = batch.upsert_task(fenced).upsert_task(successor);
+            record.successor_task_id = successor_task_id;
+            record.reserved_quarantine_name = quarantine_name;
+        }
+        Ok(batch)
+    })
+}
+
+// Caller retains writer registry admission at startup, or the exclusive
+// maintenance lease plus instance gate offline. No nested shared lifecycle
+// acquisition is allowed here because it would deadlock maintenance.
+fn append_recovery_delta_admitted(
+    root: &Path,
+    lease: &crate::task_store_lease::TaskStoreLease,
+    build: impl FnOnce(&LoadedTaskWatchRegistry) -> Result<RegistryDeltaBatch>,
+) -> Result<()> {
+    let prepare = |loaded: &LoadedTaskWatchRegistry,
+                   batch: RegistryDeltaBatch|
+     -> Result<Option<(RegistryRevisionRange, PreparedRegistryDelta)>> {
+        if batch.is_empty() {
+            return Ok(None);
+        }
+        let next = loaded.replayed_revision.checked_next().ok_or_else(|| {
+            invalid_wal(
+                &registry_delta_wal_path(root),
+                "registry revision exhausted during event repair",
+            )
+        })?;
+        let revisions =
+            RegistryRevisionRange::single(next).map_err(|error| invalid_batch(root, error))?;
+        validate_registry_delta_namespace_admission(root, &loaded.tasks, &batch)?;
+        prepare_registry_delta_candidate(root, &loaded.tasks, &loaded.watches, &batch)?;
+        Ok(Some((
+            revisions,
+            prepare_registry_delta(root, revisions, &batch)?,
+        )))
+    };
+    #[cfg(unix)]
+    {
+        let daemon = lease.daemon_capability()?;
+        lease.validate_namespace_attachment()?;
+        with_anchored_task_registry_lock(
+            root,
+            RegistryLockMode::Exclusive,
+            || Ok(()),
+            |locked| {
+                validate_retained_registry_daemon(root, locked, &daemon)?;
+                let loaded = load_under_task_lock_anchored(root, &daemon)?;
+                let batch = build(&loaded)?;
+                if let Some((revisions, prepared)) = prepare(&loaded, batch)? {
+                    append_under_task_lock(
+                        root,
+                        &daemon,
+                        revisions,
+                        &prepared.header,
+                        &prepared.payload,
+                        &prepared.footer,
+                        || Ok(loaded.checkpoint_revision),
+                    )?;
+                }
+                Ok(())
+            },
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lease;
+        with_registry_lock(
+            root,
+            &task_registry_path(root),
+            RegistryLockMode::Exclusive,
+            || {
+                let loaded = load_under_task_lock_portable(root)?;
+                let batch = build(&loaded)?;
+                if let Some((revisions, prepared)) = prepare(&loaded, batch)? {
+                    append_under_task_lock(
+                        root,
+                        revisions,
+                        &prepared.header,
+                        &prepared.payload,
+                        &prepared.footer,
+                        || Ok(loaded.checkpoint_revision),
+                    )?;
+                }
+                Ok(())
+            },
+        )
     }
 }
 
@@ -1822,26 +2050,6 @@ fn load_under_task_lock_anchored(
 }
 
 #[cfg(unix)]
-fn load_under_task_lock_anchored_read_only(
-    root: &Path,
-    daemon: &CapabilityDir,
-) -> Result<LoadedTaskWatchRegistry> {
-    let loaded =
-        load_task_watch_registry_checkpoint_with_delta_revision_under_task_lock(root, daemon)?;
-    let wal = open_anchored_registry_wal_read_only(daemon, root)?;
-    Ok(replay_wal_with_admissions(
-        root,
-        wal,
-        loaded.tasks,
-        loaded.watches,
-        RegistryRevision::new(loaded.applied_delta_revision),
-        None,
-        false,
-    )?
-    .loaded)
-}
-
-#[cfg(unix)]
 fn load_under_task_lock_anchored_with_admissions(
     root: &Path,
     daemon: &CapabilityDir,
@@ -1863,27 +2071,6 @@ fn load_under_task_lock_anchored_with_admissions(
 #[cfg(not(unix))]
 fn load_under_task_lock_portable(root: &Path) -> Result<LoadedTaskWatchRegistry> {
     Ok(load_under_task_lock_portable_with_admissions(root)?.loaded)
-}
-
-#[cfg(not(unix))]
-fn load_under_task_lock_portable_read_only(root: &Path) -> Result<LoadedTaskWatchRegistry> {
-    let loaded =
-        load_task_watch_registry_checkpoint_with_delta_revision_portable_under_task_lock(root)?;
-    let path = registry_delta_wal_path(root);
-    let state = open_daemon_state(root)?;
-    let wal = state
-        .open_existing(REGISTRY_DELTA_WAL_FILE_NAME, FileAccess::ReadOnly)
-        .map_err(|source| wal_io("failed to open registry delta WAL", &path, source))?;
-    Ok(replay_wal_with_admissions(
-        root,
-        wal,
-        loaded.tasks,
-        loaded.watches,
-        RegistryRevision::new(loaded.applied_delta_revision),
-        None,
-        false,
-    )?
-    .loaded)
 }
 
 #[cfg(not(unix))]
@@ -2381,29 +2568,6 @@ fn open_anchored_registry_wal<'a>(
             source,
         })?;
     Ok(Some(wal))
-}
-
-#[cfg(unix)]
-fn open_anchored_registry_wal_read_only<'a>(
-    daemon: &'a CapabilityDir,
-    root: &Path,
-) -> Result<Option<AnchoredRegistryWal<'a>>> {
-    let name = OsStr::new(REGISTRY_DELTA_WAL_FILE_NAME);
-    let path = registry_delta_wal_path(root);
-    let Some(metadata) = daemon
-        .entry_metadata(name)
-        .map_err(|source| wal_io("failed to inspect registry delta WAL", &path, source))?
-    else {
-        return Ok(None);
-    };
-    let file = daemon
-        .open_regular_file_exact_link_count(name, metadata.identity, 1)
-        .map_err(|source| wal_io("failed to open registry delta WAL read-only", &path, source))?;
-    Ok(Some(AnchoredRegistryWal {
-        daemon,
-        file,
-        identity: metadata.identity,
-    }))
 }
 
 #[cfg(unix)]
@@ -3571,6 +3735,48 @@ mod tests {
     }
 
     #[test]
+    fn recovering_load_reset_is_durable_before_the_daemon_flushes_startup_state() {
+        let root = tempdir().unwrap();
+        let mut bad = task("bad", &[]);
+        bad.last_event_seq = 7;
+        checkpoint(root.path(), [bad, task("healthy", &[])], []);
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        let path = task_event_log_path(
+            root.path(),
+            &checked_task_storage_id(root.path(), "bad").unwrap(),
+        );
+        fs::write(&path, b"not-json\n").unwrap();
+        let (_, _, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+        // Discard the returned startup image as though the process died before
+        // constructing its persistence owner.
+        let (restarted, tails) =
+            load_task_watch_registry_with_deltas_and_event_tails(root.path()).unwrap();
+        let bad = &restarted.tasks.tasks["bad"];
+        assert_eq!(bad.last_event_seq, 0);
+        assert_eq!(bad.lifecycle, TaskLifecycle::Cancelled);
+        let link = bad.superseded_by.as_ref().unwrap();
+        assert_eq!(link.successor_task_id, "bad-recovered-1");
+        assert_eq!(link.prior_last_event_seq, 7);
+        let successor = &restarted.tasks.tasks["bad-recovered-1"];
+        assert_eq!(successor.recovered_from.as_ref(), Some(link));
+        assert_eq!(successor.last_event_seq, 0);
+        assert!(restarted.tasks.tasks["healthy"].superseded_by.is_none());
+        assert_eq!(tails["bad"], None);
+        assert_eq!(tails["bad-recovered-1"], None);
+        assert_eq!(
+            fs::read(quarantined[0].quarantined_path.as_ref().unwrap()).unwrap(),
+            b"not-json\n"
+        );
+        assert!(
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path())
+                .unwrap()
+                .2
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn recovering_load_quarantines_a_corrupt_task_event_log_and_keeps_healthy_tasks() {
         let root = tempdir().unwrap();
         checkpoint(root.path(), [task("bad", &[]), task("good", &[])], []);
@@ -3649,109 +3855,761 @@ mod tests {
     }
 
     #[test]
-    fn repair_quarantines_corrupt_event_log_and_resets_high_water() {
+    fn corrupt_event_log_quarantine_preserves_an_existing_same_stamp_sibling() {
+        for task_id in ["bad".to_string(), "a".repeat(242)] {
+            let task_id = task_id.as_str();
+            let root = tempdir().unwrap();
+            checkpoint(root.path(), [task(task_id, &[])], []);
+            fs::create_dir_all(task_events_dir(root.path())).unwrap();
+
+            let storage_id = checked_task_storage_id(root.path(), task_id).unwrap();
+            let event_log = task_event_log_path(root.path(), &storage_id);
+            fs::write(&event_log, b"not-json\n").unwrap();
+            let file_name = event_log_file_name(&storage_id);
+            let stamp = 42;
+            let earlier_quarantine = task_events_dir(root.path())
+                .join(corrupt_event_log_destination_name(&file_name, stamp, 0));
+            fs::write(&earlier_quarantine, b"earlier quarantine\n").unwrap();
+
+            // Stop after the durable fence and rename, before any later
+            // phase: the link must already name the exact moved file.
+            let writer_lease = acquire_task_store_writer_lease(root.path()).unwrap();
+            let mut corrupt = inspect_corrupt_task_event_logs(root.path()).unwrap();
+            {
+                let _admission = acquire_registry_writer_admission(&writer_lease).unwrap();
+                fence_corrupt_tasks_with_linked_successors_admitted(
+                    root.path(),
+                    &mut corrupt,
+                    &writer_lease,
+                    stamp,
+                )
+                .unwrap();
+            }
+            move_corrupt_event_logs_aside(root.path(), &mut corrupt, &writer_lease).unwrap();
+            drop(writer_lease);
+
+            assert_eq!(
+                fs::read(&earlier_quarantine).unwrap(),
+                b"earlier quarantine\n"
+            );
+            let new_name = corrupt_event_log_destination_name(&file_name, stamp, 1);
+            let new_quarantine = task_events_dir(root.path()).join(&new_name);
+            let loaded = load_task_watch_registry_with_deltas(root.path()).unwrap();
+            assert_eq!(
+                loaded.tasks.tasks[task_id]
+                    .superseded_by
+                    .as_ref()
+                    .unwrap()
+                    .quarantined_event_log
+                    .as_deref(),
+                Some(new_name.as_str())
+            );
+            assert_eq!(
+                corrupt[0]
+                    .quarantined_path
+                    .as_ref()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap(),
+                new_quarantine.canonicalize().unwrap()
+            );
+            assert_eq!(fs::read(new_quarantine).unwrap(), b"not-json\n");
+            assert!(!event_log.exists());
+        }
+    }
+
+    #[test]
+    fn recovering_load_is_a_noop_when_all_event_logs_are_healthy() {
         let root = tempdir().unwrap();
-        checkpoint(root.path(), [task("bad", &[]), task("good", &[])], []);
+        checkpoint(
+            root.path(),
+            [task("with-events", &[]), task("without-events", &[])],
+            [],
+        );
 
         {
             let lease =
                 crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap();
-            let mut authority = load_registry_admission_authority(root.path(), lease).unwrap();
-            for _ in 0..2 {
-                append_next_task_event_with_authority(
-                    root.path(),
-                    &authority,
-                    "bad",
-                    &DaemonEvent {
-                        kind: "seed".to_string(),
-                        occurred_at_unix: 1,
-                        data: serde_json::Value::Null,
-                    },
-                )
-                .unwrap();
-            }
+            let authority = load_registry_admission_authority(root.path(), lease).unwrap();
             append_next_task_event_with_authority(
                 root.path(),
                 &authority,
-                "good",
+                "with-events",
                 &DaemonEvent {
-                    kind: "seed".to_string(),
+                    kind: "healthy".to_string(),
                     occurred_at_unix: 1,
                     data: serde_json::Value::Null,
                 },
             )
             .unwrap();
-            // Record a non-zero durable high-water for "bad" so the reset is
-            // observable.
-            let mut updated = task("bad", &[]);
-            updated.last_event_seq = 2;
-            append_task_watch_registry_delta_with_authority(
+        }
+
+        let (loaded, tails, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        assert_eq!(loaded.tasks.tasks.len(), 2);
+        assert_eq!(tails.get("with-events"), Some(&Some(1)));
+        assert_eq!(tails.get("without-events"), Some(&None));
+        assert!(quarantined.is_empty());
+    }
+
+    #[test]
+    fn recovering_load_quarantines_every_supported_corruption_in_one_pass() {
+        let root = tempdir().unwrap();
+        checkpoint(
+            root.path(),
+            [
+                task("healthy", &[]),
+                task("malformed", &[]),
+                task("oversized", &[]),
+            ],
+            [],
+        );
+
+        {
+            let lease =
+                crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap();
+            let authority = load_registry_admission_authority(root.path(), lease).unwrap();
+            append_next_task_event_with_authority(
                 root.path(),
-                &mut authority,
-                RegistryRevisionRange::single(RegistryRevision::new(1)).unwrap(),
-                &RegistryDeltaBatch::default().upsert_task(updated),
+                &authority,
+                "healthy",
+                &DaemonEvent {
+                    kind: "healthy".to_string(),
+                    occurred_at_unix: 1,
+                    data: serde_json::Value::Null,
+                },
             )
             .unwrap();
         }
 
-        let bad_storage = checked_task_storage_id(root.path(), "bad").unwrap();
-        let bad_log = task_event_log_path(root.path(), &bad_storage);
-        let contents = fs::read_to_string(&bad_log).unwrap();
-        let mut frames = contents.lines().filter(|line| !line.is_empty());
-        let _first = frames.next().expect("first frame present");
-        let second = frames.next().expect("second frame present");
-        fs::write(&bad_log, format!("{second}\n")).unwrap();
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        let malformed_storage = checked_task_storage_id(root.path(), "malformed").unwrap();
+        let malformed_log = task_event_log_path(root.path(), &malformed_storage);
+        let malformed_bytes = b"not-json\n";
+        fs::write(&malformed_log, malformed_bytes).unwrap();
 
-        // Dry-run inspect reports the corruption without changing anything.
-        let found = inspect_corrupt_task_event_logs(root.path()).unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].task_id, "bad");
-        assert!(bad_log.exists());
+        let oversized_storage = checked_task_storage_id(root.path(), "oversized").unwrap();
+        let oversized_log = task_event_log_path(root.path(), &oversized_storage);
+        let oversized_bytes = vec![b'x'; MAX_TASK_EVENT_LINE_BYTES + 1];
+        fs::write(&oversized_log, &oversized_bytes).unwrap();
 
-        // A reset failure leaves the durable intent and moved log available
-        // for the next invocation to complete before it scans for new work.
-        FAIL_EVENT_LOG_REPAIR_RESET_ONCE.with(|fail| fail.set(true));
-        let error = repair_corrupt_task_event_logs(root.path()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("injected event-log repair reset failure"));
-        assert!(!bad_log.exists());
-        let pending = load_event_log_repair_journal(root.path())
-            .unwrap()
-            .into_records(root.path())
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].task_id, "bad");
-        assert!(pending[0].quarantined_path.as_ref().unwrap().exists());
+        let (loaded, tails, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
         assert_eq!(
-            load_task_watch_registry_with_deltas(root.path())
-                .unwrap()
-                .tasks
-                .tasks["bad"]
-                .last_event_seq,
-            2
+            loaded.tasks.tasks.keys().collect::<Vec<_>>(),
+            [
+                "healthy",
+                "malformed",
+                "malformed-recovered-1",
+                "oversized",
+                "oversized-recovered-1"
+            ]
         );
+        assert_eq!(tails.get("healthy"), Some(&Some(1)));
+        assert_eq!(tails.get("malformed"), Some(&None));
+        assert_eq!(tails.get("oversized"), Some(&None));
+        assert_eq!(
+            quarantined
+                .iter()
+                .map(|record| record.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["malformed", "oversized"]
+        );
+        assert!(quarantined[0].reason.contains("invalid task event frame"));
+        assert!(quarantined[1].reason.contains("crash-partial tail bytes"));
+        assert_eq!(
+            fs::read(
+                quarantined[0]
+                    .quarantined_path
+                    .as_ref()
+                    .expect("malformed log should be quarantined"),
+            )
+            .unwrap(),
+            malformed_bytes
+        );
+        assert_eq!(
+            fs::read(
+                quarantined[1]
+                    .quarantined_path
+                    .as_ref()
+                    .expect("oversized log should be quarantined"),
+            )
+            .unwrap(),
+            oversized_bytes
+        );
+        assert!(!malformed_log.exists());
+        assert!(!oversized_log.exists());
+    }
 
-        // Repair resumes the journal, then resets the high-water.
-        let repaired = repair_corrupt_task_event_logs(root.path()).unwrap();
-        assert_eq!(repaired.len(), 1);
-        assert!(repaired[0].quarantined_path.as_ref().unwrap().exists());
-        assert!(!bad_log.exists());
-        assert!(load_event_log_repair_journal(root.path())
+    #[test]
+    fn recovering_load_accepts_the_corrupt_log_quarantine_limit() {
+        let root = tempdir().unwrap();
+        let task_ids = (0..MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS)
+            .map(|ordinal| format!("corrupt-{ordinal:03}"))
+            .collect::<Vec<_>>();
+        checkpoint(
+            root.path(),
+            task_ids.iter().map(|task_id| task(task_id, &[])),
+            [],
+        );
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        for task_id in &task_ids {
+            let storage_id = checked_task_storage_id(root.path(), task_id).unwrap();
+            fs::write(task_event_log_path(root.path(), &storage_id), b"not-json\n").unwrap();
+        }
+
+        let (loaded, tails, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        assert_eq!(loaded.tasks.tasks.len(), 2 * task_ids.len());
+        assert_eq!(quarantined.len(), MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS);
+        assert!(tails.values().all(Option::is_none));
+        assert!(quarantined.iter().all(|record| record
+            .quarantined_path
+            .as_ref()
+            .is_some_and(|path| path.exists())));
+    }
+
+    #[test]
+    fn recovering_load_fails_closed_above_the_corrupt_log_quarantine_limit() {
+        let root = tempdir().unwrap();
+        let task_ids = (0..=MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS)
+            .map(|ordinal| format!("corrupt-{ordinal:03}"))
+            .collect::<Vec<_>>();
+        checkpoint(
+            root.path(),
+            task_ids.iter().map(|task_id| task(task_id, &[])),
+            [],
+        );
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        let event_logs = task_ids
+            .iter()
+            .map(|task_id| {
+                let storage_id = checked_task_storage_id(root.path(), task_id).unwrap();
+                let path = task_event_log_path(root.path(), &storage_id);
+                fs::write(&path, b"not-json\n").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let error =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DaemonCoreError::InvalidTaskEventFrame { .. }
+        ));
+        assert!(event_logs.iter().all(|path| path.exists()));
+        assert!(fs::read_dir(task_events_dir(root.path()))
             .unwrap()
-            .entries
-            .is_empty());
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt-")));
+    }
 
-        // The store now loads cleanly with a reset high-water and empty tail.
+    #[cfg(unix)]
+    #[test]
+    fn recovering_load_propagates_nonrecoverable_errors_without_moving_corrupt_logs() {
+        let root = tempdir().unwrap();
+        checkpoint(
+            root.path(),
+            [task("a-corrupt", &[]), task("z-unreadable", &[])],
+            [],
+        );
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        let corrupt_storage = checked_task_storage_id(root.path(), "a-corrupt").unwrap();
+        let corrupt_log = task_event_log_path(root.path(), &corrupt_storage);
+        fs::write(&corrupt_log, b"not-json\n").unwrap();
+        let unreadable_storage = checked_task_storage_id(root.path(), "z-unreadable").unwrap();
+        let unreadable_log = task_event_log_path(root.path(), &unreadable_storage);
+        fs::create_dir(&unreadable_log).unwrap();
+
+        let error =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap_err();
+
+        assert!(matches!(error, DaemonCoreError::Io { .. }));
+        assert!(corrupt_log.exists());
+        assert!(unreadable_log.is_dir());
+        assert!(fs::read_dir(task_events_dir(root.path()))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt-")));
+    }
+
+    fn write_corrupt_event_log(root: &Path, task_id: &str) -> PathBuf {
+        fs::create_dir_all(task_events_dir(root)).unwrap();
+        let path = task_event_log_path(root, &checked_task_storage_id(root, task_id).unwrap());
+        fs::write(&path, b"not-json\n").unwrap();
+        path
+    }
+
+    fn test_event(kind: &str) -> DaemonEvent {
+        DaemonEvent {
+            kind: kind.to_string(),
+            occurred_at_unix: 1,
+            data: serde_json::Value::Null,
+        }
+    }
+
+    fn assert_superseded(result: Result<DaemonEventFrame>, successor: &str) {
+        match result {
+            Err(DaemonCoreError::TaskSuperseded {
+                task_id,
+                successor_task_id,
+            }) => {
+                assert_eq!(task_id, "bad");
+                assert_eq!(successor_task_id, successor);
+            }
+            other => panic!("expected a superseded-task fence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovered_history_continues_under_a_linked_task_without_reusing_sequences() {
+        let root = tempdir().unwrap();
+        checkpoint(root.path(), [task("bad", &[]), task("good", &[])], []);
+        for _ in 0..3 {
+            append_next_task_event(root.path(), "bad", &test_event("before")).unwrap();
+        }
+        append_next_task_event(root.path(), "good", &test_event("healthy")).unwrap();
+        let mut bad = task("bad", &[]);
+        bad.last_event_seq = 3;
+        let mut good = task("good", &[]);
+        good.last_event_seq = 1;
+        checkpoint(root.path(), [bad, good], []);
+        let bad_log = task_event_log_path(root.path(), &TaskStorageId::try_from("bad").unwrap());
+        OpenOptions::new()
+            .append(true)
+            .open(&bad_log)
+            .unwrap()
+            .write_all(b"not-json\n")
+            .unwrap();
+        let damaged_bytes = fs::read(&bad_log).unwrap();
+
+        let (loaded, tails, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        let fenced = &loaded.tasks.tasks["bad"];
+        let link = fenced.superseded_by.clone().unwrap();
+        assert_eq!(fenced.lifecycle, TaskLifecycle::Cancelled);
+        assert_eq!(fenced.last_event_seq, 0);
+        assert!(fenced
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("\"bad-recovered-1\""));
+        assert_eq!(link.predecessor_task_id, "bad");
+        assert_eq!(link.successor_task_id, "bad-recovered-1");
+        assert_eq!(link.prior_last_event_seq, 3);
+        assert!(link.reason.contains("invalid task event frame"));
+        assert_eq!(
+            loaded.tasks.tasks["bad-recovered-1"].recovered_from,
+            Some(link.clone())
+        );
+        let destination = quarantined[0].quarantined_path.clone().unwrap();
+        assert_eq!(
+            link.quarantined_event_log.as_deref(),
+            destination.file_name().and_then(std::ffi::OsStr::to_str)
+        );
+        assert_eq!(quarantined[0].successor_task_id, "bad-recovered-1");
+        assert_eq!(
+            Some(quarantined[0].reserved_quarantine_name.as_str()),
+            link.quarantined_event_log.as_deref()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), damaged_bytes);
+        assert_eq!(tails["good"], Some(1));
+        assert!(loaded.tasks.tasks["good"].superseded_by.is_none());
+
+        // Every event writer refuses the damaged identity, so a consumer
+        // already past sequence 3 can never miss a reused sequence there.
+        assert_superseded(
+            append_next_task_event(root.path(), "bad", &test_event("late")),
+            "bad-recovered-1",
+        );
+        let legacy = append_task_event(
+            root.path(),
+            &DaemonEventFrame {
+                seq: 1,
+                task_id: "bad".to_string(),
+                event: test_event("late"),
+            },
+        );
+        assert!(matches!(
+            legacy,
+            Err(DaemonCoreError::TaskSuperseded { .. })
+        ));
+        let lease = crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap();
+        let authority = load_registry_admission_authority(root.path(), lease).unwrap();
+        assert_superseded(
+            append_next_task_event_with_authority(
+                root.path(),
+                &authority,
+                "bad",
+                &test_event("late"),
+            ),
+            "bad-recovered-1",
+        );
+        assert!(!bad_log.exists());
+        assert!(load_task_events(root.path(), "bad").unwrap().is_empty());
+
+        let resumed = append_next_task_event_with_authority(
+            root.path(),
+            &authority,
+            "bad-recovered-1",
+            &test_event("resumed"),
+        )
+        .unwrap();
+        assert_eq!(
+            (resumed.task_id.as_str(), resumed.seq),
+            ("bad-recovered-1", 1)
+        );
+        assert_eq!(fs::read(&destination).unwrap(), damaged_bytes);
+    }
+
+    #[test]
+    fn restart_after_fence_before_rename_reuses_the_durable_successor() {
+        let root = tempdir().unwrap();
+        checkpoint(root.path(), [task("bad", &[])], []);
+        let log = write_corrupt_event_log(root.path(), "bad");
+        {
+            let writer_lease = acquire_task_store_writer_lease(root.path()).unwrap();
+            let mut corrupt = inspect_corrupt_task_event_logs(root.path()).unwrap();
+            let _admission = acquire_registry_writer_admission(&writer_lease).unwrap();
+            fence_corrupt_tasks_with_linked_successors_admitted(
+                root.path(),
+                &mut corrupt,
+                &writer_lease,
+                42,
+            )
+            .unwrap();
+        }
+        // The process stopped before the rename: the canonical log is still
+        // corrupt and the strict loader still fails closed on it.
+        assert!(matches!(
+            load_task_watch_registry_with_deltas_and_event_tails(root.path()),
+            Err(DaemonCoreError::InvalidTaskEventFrame { .. })
+        ));
+
+        let (loaded, _, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        assert_eq!(
+            loaded.tasks.tasks.keys().collect::<Vec<_>>(),
+            ["bad", "bad-recovered-1"]
+        );
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].successor_task_id, "bad-recovered-1");
+        let expected_name = corrupt_event_log_destination_name("bad.events.jsonl", 42, 0);
+        assert_eq!(quarantined[0].reserved_quarantine_name, expected_name);
+        let destination = quarantined[0].quarantined_path.clone().unwrap();
+        assert_eq!(destination.file_name().unwrap(), expected_name.as_str());
+        assert_eq!(fs::read(destination).unwrap(), b"not-json\n");
+        assert!(!log.exists());
+        for link in [
+            loaded.tasks.tasks["bad"].superseded_by.as_ref(),
+            loaded.tasks.tasks["bad-recovered-1"]
+                .recovered_from
+                .as_ref(),
+        ] {
+            let link = link.unwrap();
+            assert_eq!(link.recovered_at_unix, 42);
+            assert_eq!(
+                link.quarantined_event_log.as_deref(),
+                Some(expected_name.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn restart_after_rename_keeps_a_consistent_linked_store() {
+        let root = tempdir().unwrap();
+        let mut bad = task("bad", &[]);
+        bad.last_event_seq = 5;
+        checkpoint(root.path(), [bad], []);
+        let log = write_corrupt_event_log(root.path(), "bad");
+        {
+            let writer_lease = acquire_task_store_writer_lease(root.path()).unwrap();
+            let mut corrupt = inspect_corrupt_task_event_logs(root.path()).unwrap();
+            {
+                let _admission = acquire_registry_writer_admission(&writer_lease).unwrap();
+                fence_corrupt_tasks_with_linked_successors_admitted(
+                    root.path(),
+                    &mut corrupt,
+                    &writer_lease,
+                    42,
+                )
+                .unwrap();
+            }
+            move_corrupt_event_logs_aside(root.path(), &mut corrupt, &writer_lease).unwrap();
+        }
+        // The process stopped after the rename. The link reserved the
+        // exact name before the move, so it already names the moved bytes.
         let (loaded, tails) =
             load_task_watch_registry_with_deltas_and_event_tails(root.path()).unwrap();
-        assert_eq!(loaded.tasks.tasks["bad"].last_event_seq, 0);
-        assert_eq!(tails.get("bad"), Some(&None));
+        let link = loaded.tasks.tasks["bad"].superseded_by.clone().unwrap();
+        assert_eq!(link.prior_last_event_seq, 5);
+        assert_eq!(tails["bad"], None);
+        assert!(!log.exists());
+        let recorded = task_events_dir(root.path()).join(link.quarantined_event_log.unwrap());
+        assert_eq!(fs::read(recorded).unwrap(), b"not-json\n");
 
-        // Idempotent: a second repair finds nothing to do.
-        assert!(repair_corrupt_task_event_logs(root.path())
-            .unwrap()
-            .is_empty());
+        let (reloaded, _, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+        assert!(quarantined.is_empty());
+        assert_eq!(reloaded.tasks.tasks.len(), 2);
+    }
+
+    #[test]
+    fn wal_only_supersession_fences_every_event_writer_before_any_checkpoint() {
+        let root = tempdir().unwrap();
+        let mut bad = task("bad", &[]);
+        bad.last_event_seq = 9;
+        checkpoint(root.path(), [bad], []);
+        let checkpoint_bytes = fs::read(task_registry_path(root.path())).unwrap();
+        let log = write_corrupt_event_log(root.path(), "bad");
+        {
+            let writer_lease = acquire_task_store_writer_lease(root.path()).unwrap();
+            let mut corrupt = inspect_corrupt_task_event_logs(root.path()).unwrap();
+            {
+                let _admission = acquire_registry_writer_admission(&writer_lease).unwrap();
+                fence_corrupt_tasks_with_linked_successors_admitted(
+                    root.path(),
+                    &mut corrupt,
+                    &writer_lease,
+                    42,
+                )
+                .unwrap();
+            }
+            move_corrupt_event_logs_aside(root.path(), &mut corrupt, &writer_lease).unwrap();
+        }
+        // The process stopped before any checkpoint: the supersession exists
+        // only in the WAL and the checkpoint still shows an unfenced task.
+        assert_eq!(
+            fs::read(task_registry_path(root.path())).unwrap(),
+            checkpoint_bytes
+        );
+        assert!(load_task_registry(root.path()).unwrap().tasks["bad"]
+            .superseded_by
+            .is_none());
+        assert!(!log.exists());
+
+        assert_superseded(
+            append_next_task_event(root.path(), "bad", &test_event("late")),
+            "bad-recovered-1",
+        );
+        assert!(matches!(
+            append_task_event(
+                root.path(),
+                &DaemonEventFrame {
+                    seq: 1,
+                    task_id: "bad".to_string(),
+                    event: test_event("late"),
+                },
+            ),
+            Err(DaemonCoreError::TaskSuperseded { .. })
+        ));
+        let lease = crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap();
+        let authority = load_registry_admission_authority(root.path(), lease).unwrap();
+        assert_superseded(
+            append_next_task_event_with_authority(
+                root.path(),
+                &authority,
+                "bad",
+                &test_event("late"),
+            ),
+            "bad-recovered-1",
+        );
+        drop(authority);
+        assert!(!log.exists());
+
+        // The WAL-only successor is admitted for the standalone writer too.
+        let resumed =
+            append_next_task_event(root.path(), "bad-recovered-1", &test_event("resumed")).unwrap();
+        assert_eq!(resumed.seq, 1);
+    }
+
+    #[test]
+    fn retry_refuses_to_overwrite_an_occupied_reserved_quarantine_name() {
+        let root = tempdir().unwrap();
+        checkpoint(root.path(), [task("bad", &[])], []);
+        let log = write_corrupt_event_log(root.path(), "bad");
+        let reserved = {
+            let writer_lease = acquire_task_store_writer_lease(root.path()).unwrap();
+            let mut corrupt = inspect_corrupt_task_event_logs(root.path()).unwrap();
+            let _admission = acquire_registry_writer_admission(&writer_lease).unwrap();
+            fence_corrupt_tasks_with_linked_successors_admitted(
+                root.path(),
+                &mut corrupt,
+                &writer_lease,
+                42,
+            )
+            .unwrap();
+            task_events_dir(root.path()).join(&corrupt[0].reserved_quarantine_name)
+        };
+        // Unrelated bytes appeared at the reserved name before the rename.
+        fs::write(&reserved, b"unrelated\n").unwrap();
+
+        let error =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap_err();
+
+        assert!(matches!(error, DaemonCoreError::Io { .. }), "{error:?}");
+        assert_eq!(fs::read(&reserved).unwrap(), b"unrelated\n");
+        assert_eq!(fs::read(&log).unwrap(), b"not-json\n");
+    }
+
+    #[test]
+    fn successor_inherits_trusted_predecessor_context_but_not_execution_ownership() {
+        use packet28_daemon_protocol::broker::{
+            BrokerGetContextRequest, BrokerHandoffDescriptor, BrokerHandoffStatus,
+        };
+        let root = tempdir().unwrap();
+        let handoff = |id: &str, status| BrokerHandoffDescriptor {
+            handoff_id: id.to_string(),
+            task_id: "bad".to_string(),
+            artifact_id: format!("artifact-{id}"),
+            context_version: "4".to_string(),
+            checkpoint_id: Some("checkpoint".to_string()),
+            status,
+            generated_at_unix_ms: 9,
+            ..BrokerHandoffDescriptor::default()
+        };
+        let mut bad = task("bad", &["watch"]);
+        bad.lifecycle = TaskLifecycle::ReplanPending;
+        bad.sequence_present = true;
+        bad.latest_agent_pid = Some(4242);
+        bad.latest_agent_completed_at_unix = Some(1);
+        bad.latest_hook_session_id = Some("session".to_string());
+        bad.latest_context_version = Some("4".to_string());
+        bad.latest_broker_request = Some(BrokerGetContextRequest {
+            task_id: "bad".to_string(),
+            query: Some("finish the auth broker".to_string()),
+            since_version: Some("3".to_string()),
+            ..BrokerGetContextRequest::default()
+        });
+        bad.linked_decisions = BTreeMap::from([("d1".to_string(), "use tokens".to_string())]);
+        bad.resolved_questions = BTreeMap::from([("q1".to_string(), "d1".to_string())]);
+        bad.question_texts = BTreeMap::from([("q2".to_string(), "which store?".to_string())]);
+        bad.handoffs = vec![
+            handoff("old", BrokerHandoffStatus::Superseded),
+            handoff("ready", BrokerHandoffStatus::Ready),
+        ];
+        bad.latest_handoff_id = Some("ready".to_string());
+        checkpoint(root.path(), [bad], [watch("watch", "bad")]);
+        write_corrupt_event_log(root.path(), "bad");
+
+        let (loaded, _, _) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        let successor = &loaded.tasks.tasks["bad-recovered-1"];
+        let request = successor.latest_broker_request.as_ref().unwrap();
+        assert_eq!(request.task_id, "bad-recovered-1");
+        assert_eq!(request.query.as_deref(), Some("finish the auth broker"));
+        assert_eq!(request.since_version, None);
+        assert_eq!(successor.linked_decisions["d1"], "use tokens");
+        assert_eq!(successor.resolved_questions["q1"], "d1");
+        assert_eq!(successor.question_texts["q2"], "which store?");
+        assert_eq!(
+            successor.handoffs,
+            vec![handoff("ready", BrokerHandoffStatus::Ready)]
+        );
+        assert_eq!(successor.latest_handoff_id.as_deref(), Some("ready"));
+        assert_eq!(
+            successor.latest_handoff_artifact_id.as_deref(),
+            Some("artifact-ready")
+        );
+        assert_eq!(successor.latest_handoff_generated_at_unix, Some(9));
+        assert_eq!(
+            successor.latest_handoff_checkpoint_id.as_deref(),
+            Some("checkpoint")
+        );
+        assert_eq!(successor.lifecycle, TaskLifecycle::Idle);
+        assert!(successor.watch_ids.is_empty());
+        assert!(!successor.sequence_present);
+        assert_eq!(successor.latest_agent_pid, None);
+        assert_eq!(successor.latest_hook_session_id, None);
+        assert_eq!(successor.latest_context_version, None);
+        assert_eq!(successor.last_event_seq, 0);
+    }
+
+    #[test]
+    fn successor_identity_skips_registered_and_preexisting_namespaces() {
+        let root = tempdir().unwrap();
+        checkpoint(
+            root.path(),
+            [task("bad", &[]), task("bad-recovered-1", &[])],
+            [],
+        );
+        let stale_artifacts = task_artifacts_dir(root.path()).join("bad-recovered-2");
+        fs::create_dir_all(&stale_artifacts).unwrap();
+        fs::write(stale_artifacts.join("old.json"), b"{}").unwrap();
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        let stale_events = task_events_dir(root.path()).join("bad-recovered-3.events.jsonl");
+        fs::write(&stale_events, b"stale\n").unwrap();
+        write_corrupt_event_log(root.path(), "bad");
+
+        let (loaded, _, quarantined) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        assert_eq!(quarantined[0].successor_task_id, "bad-recovered-4");
+        assert!(loaded.tasks.tasks["bad-recovered-1"]
+            .recovered_from
+            .is_none());
+        assert!(loaded.tasks.tasks["bad-recovered-4"]
+            .recovered_from
+            .is_some());
+        assert_eq!(
+            fs::read(stale_artifacts.join("old.json")).unwrap(),
+            b"{}".as_slice()
+        );
+        assert_eq!(fs::read(stale_events).unwrap(), b"stale\n".as_slice());
+    }
+
+    #[test]
+    fn long_task_identity_gets_a_bounded_linked_successor() {
+        let long = "a".repeat(MAX_TASK_STORAGE_ID_BYTES);
+        let first = successor_task_id(&long, 1);
+        assert!(first.len() <= MAX_TASK_STORAGE_ID_BYTES);
+        assert!(TaskStorageId::try_from(first.as_str()).is_ok());
+        assert_ne!(first, successor_task_id(&long, 2));
+        assert_ne!(
+            first,
+            successor_task_id(
+                &format!("{}b", "a".repeat(MAX_TASK_STORAGE_ID_BYTES - 1)),
+                1
+            )
+        );
+        assert_eq!(successor_task_id("bad", 7), "bad-recovered-7");
+    }
+
+    #[test]
+    fn recovery_keeps_watch_ownership_for_daemon_reconciliation() {
+        let root = tempdir().unwrap();
+        checkpoint(
+            root.path(),
+            [task("bad", &["watch"])],
+            [watch("watch", "bad")],
+        );
+        write_corrupt_event_log(root.path(), "bad");
+
+        let (loaded, _, _) =
+            load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+
+        // The fenced task is terminal; daemon startup reconciliation removes
+        // its watches before any watcher is restored.
+        assert_eq!(
+            loaded.tasks.tasks["bad"].lifecycle,
+            TaskLifecycle::Cancelled
+        );
+        assert_eq!(loaded.tasks.tasks["bad"].watch_ids, ["watch"]);
+        assert!(loaded.tasks.tasks["bad-recovered-1"].watch_ids.is_empty());
+        assert_eq!(loaded.watches.watches.len(), 1);
     }
 
     #[test]
@@ -4109,28 +4967,48 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_event_log_inspection_rejects_torn_wal_without_repairing_it() {
+    fn corrupt_log_inspection_rejects_torn_wal_without_changing_authority_bytes() {
         let root = tempdir().unwrap();
-        checkpoint(root.path(), [task("task", &[])], []);
+        checkpoint(root.path(), [task("bad", &[])], []);
+        let delta = RegistryDeltaBatch::default().upsert_task(task("bad", &[]));
         append_task_watch_registry_delta(
             root.path(),
             RegistryRevisionRange::single(RegistryRevision::new(1)).unwrap(),
-            &RegistryDeltaBatch::default().upsert_task(task("task", &[])),
+            &delta,
         )
         .unwrap();
-        let path = registry_delta_wal_path(root.path());
-        let mut wal = OpenOptions::new().append(true).open(&path).unwrap();
-        wal.write_all(&[0_u8; 7]).unwrap();
+        let frame = encoded_frame(
+            RegistryRevisionRange::single(RegistryRevision::new(2)).unwrap(),
+            &delta,
+        );
+        let wal_path = registry_delta_wal_path(root.path());
+        let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal.write_all(&frame[..FRAME_HEADER_BYTES + 7]).unwrap();
         wal.sync_all().unwrap();
-        let torn_len = fs::metadata(&path).unwrap().len();
+        let event_path = task_event_log_path(root.path(), &TaskStorageId::try_from("bad").unwrap());
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        fs::write(&event_path, b"not-json\n").unwrap();
+        let paths = [
+            wal_path,
+            task_registry_path(root.path()),
+            watch_registry_path(root.path()),
+            event_path,
+        ];
+        let before = paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
 
         let error = inspect_corrupt_task_event_logs(root.path()).unwrap_err();
 
-        assert!(matches!(
-            error,
-            DaemonCoreError::InvalidRegistryDeltaWal { .. }
-        ));
-        assert_eq!(fs::metadata(path).unwrap().len(), torn_len);
+        assert!(error.to_string().contains("torn frame"));
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(
+            fs::read_dir(task_events_dir(root.path())).unwrap().count(),
+            1
+        );
     }
 
     #[test]

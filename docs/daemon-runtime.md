@@ -199,6 +199,14 @@ and removed the child. If the daemon crashes or persistence fails between spawn
 and the ownership barrier, closing the gate pipe makes the shim exit without
 executing delegated work.
 
+A recoverable corrupt task-event log is quarantined before the persistence
+owner starts. Its task is fenced as a terminal `superseded_by` record, and work
+continues under a newly admitted linked successor with a fresh event sequence;
+see [Corrupt event-log recovery](task-store-retention.md#corrupt-event-log-recovery).
+Startup records constant-size recovery links before readiness. Successor snapshots
+read predecessor packets in place using the authenticated registry lineage. Continuation requests and subscriptions that name a
+superseded task are rejected with an error naming its successor.
+
 Detailed retention, journal, corruption, and descriptor-confinement guarantees
 are in [Task-store retention](task-store-retention.md).
 

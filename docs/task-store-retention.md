@@ -402,3 +402,79 @@ capability-relative revalidation use the same aggregation rules. Retention
 keeps candidate selection, authenticated registry snapshots, lease admission,
 and quarantine mutations. A successful scan supplies measurements; it does not
 authorize deletion or replace revalidation under the retention lease.
+
+## Corrupt event-log recovery
+
+Startup quarantines at most 64 corrupt admitted task event logs per attempt.
+The strict event reader still rejects malformed frames, gaps, cross-task frames,
+and oversized frames. Filesystem, namespace, lease, and lock errors still fail
+closed, and healthy tasks are unchanged.
+
+A damaged task never continues under its own identity. Resetting its sequence
+and appending again would restart at 1 and hide the new events from any
+subscriber or MCP session whose cursor was already past the old high-water.
+Instead, one WAL delta, written before any rename:
+
+- fences the damaged task: lifecycle `Cancelled`, high-water 0 (its log is
+  absent after the move), a `last_error` explanation, and a `superseded_by`
+  link;
+- admits a new successor task, `<id>-recovered-<n>` (digest-shortened for long
+  identifiers, skipping registered, aliasing, and pre-existing namespaces),
+  with a `recovered_from` link;
+- reserves an exact unused quarantine name,
+  `*.events.jsonl.corrupt-<timestamp>[-<collision>]`, in both links.
+
+Both links record the predecessor, successor, integrity failure, prior
+high-water, recovery time, and reserved file name, so either record still
+identifies the evidence if retention later removes the other. The log is then
+moved to exactly the reserved name with a no-replace rename. If startup stops
+before the rename, the next attempt reuses the durable link and retries the
+same name without creating another successor. An occupied reserved name fails
+closed rather than being overwritten or replaced by an unrecorded name. The
+quarantined file is an unrecognized event entry, so retention reports and
+protects it and never deletes it.
+
+Every event writer refuses the superseded identity with `TaskSuperseded`. The
+standalone and legacy writers check the replayed checkpoint+WAL image under the
+registry lock, because the link is first durable only in the WAL; a torn final
+WAL frame makes them fail closed until daemon startup repairs it. The daemon
+rejects continuation requests (sequence submission, hooks, broker reads and
+writes, handoff waits, agent launch, and subscriptions) for a superseded task
+with an error that names the successor. Status, task listings, watch listings,
+and idempotent cancellation still show the fenced record and its link. Restart
+reconciliation treats the fenced task as cancelled: it removes its watches,
+restores no replan, and still refuses to start while a persisted agent process
+group is live rather than signal an unauthenticated PID.
+
+The successor is seeded only from trusted state, never from the quarantined log.
+From the predecessor's authenticated registry record it inherits the objective
+request (without a stale `since_version`), linked decisions, resolved
+questions, question texts, and the latest ready or consumed handoff descriptor.
+That descriptor keeps the predecessor `task_id`, which names the namespace
+owning its untouched artifact, and handoff reuse loads the artifact from that
+owner. Startup publishes one constant-size recovery link for each successor.
+Snapshots read predecessor packet-cache events in place using the authenticated
+registry lineage, retaining each artifact owner. No aggregate history copy is
+written, so histories exceeding a cache-record limit cannot block startup.
+Artifact fetches preserve explicit task IDs and can search authenticated
+predecessors; ambiguous inherited handles require the original owner ID.
+Retention protects namespaces referenced by recovery links and handoff
+descriptors. Lifecycle, watches, sequence, agent process, hook session, and
+context-version pointers are not inherited.
+
+Claude Code hooks, MCP sessions (including Codex integrations), the reducer runner, and
+`packet28-agent` resolve a superseded identifier through its links after the
+daemon is ready and adopt the successor as the active task. The daemon
+checkpoints the links before publishing readiness. Wrappers and MCP task
+selection ensure daemon readiness before resolving a continuation, including
+the first cold start. Idle MCP notification sessions deliver a
+`packet28.task_recovered` receipt before transferring tracking to the successor
+with its own sequence and byte cursor. A strict read failure is retried only
+after readiness confirms a reciprocal recovery link to a different identity.
+
+The root cause of the corrupt logs observed so far is not established. One
+unconfirmed candidate is a log written before sequence allocation moved into the
+event log: earlier binaries appended caller-assigned sequences from the
+in-memory registry high-water before persisting the registry. A crash between
+those writes could leave a stale high-water for the next startup. This source
+evidence does not establish the cause of any particular damaged log.
