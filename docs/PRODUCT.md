@@ -163,8 +163,8 @@ MCP tools exposed by the product slice:
 
 | Runtime | Tier | Notes |
 |---|---|---|
-| Claude Code | Hook/MCP support | Setup and tests cover Claude hook config behavior. |
-| Cursor | MCP/rules/hooks support | Setup tests cover Cursor artifacts. |
+| Claude Code | Generated integration preserves native command arguments | Hooks capture/correlate tool activity where supported. Automatic command rewriting is disabled, including stored legacy flags; use explicit Packet28 CLI/MCP reduction. Doctor verifies installed configuration, not live host permission enforcement. |
+| Cursor | Generated integration preserves native command arguments | Hooks capture/correlate tool activity where supported. Automatic command rewriting is disabled, including stored legacy flags; use explicit Packet28 CLI/MCP reduction. Doctor verifies installed configuration, not live host permission enforcement. |
 | Codex | MCP/rules support | Setup writes Codex MCP config without claiming transparent shell interception. |
 | Windsurf | MCP/rules verified, command rewrite guidance-only | Doctor validates config, rules, daemon/index, and MCP initialize/tools-list from generated config. Packet28 does not claim command interception. |
 

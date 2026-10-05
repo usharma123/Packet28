@@ -398,7 +398,7 @@ fn build_copilot_report(root: &Path) -> DoctorReport {
         detail: "GitHub Copilot uses a project PreToolUse hook, not Packet28 MCP setup".to_string(),
     };
     let reducer_round_trip = DoctorCheck {
-        name: "runtime_rewrite_support",
+        name: "runtime_capture_support",
         ok: hook_config.ok,
         required: true,
         detail: hook_config.detail.clone(),
@@ -707,7 +707,7 @@ fn build_gemini_report(root: &Path) -> DoctorReport {
         detail: "Gemini CLI uses a BeforeTool hook, not Packet28 MCP setup".to_string(),
     };
     let reducer_round_trip = DoctorCheck {
-        name: "runtime_rewrite_support",
+        name: "runtime_capture_support",
         ok: hook_config.ok,
         required: true,
         detail: hook_config.detail.clone(),
@@ -825,7 +825,7 @@ fn build_opencode_report(root: &Path) -> DoctorReport {
         detail: "OpenCode uses a local TypeScript plugin, not Packet28 MCP setup".to_string(),
     };
     let reducer_round_trip = DoctorCheck {
-        name: "runtime_rewrite_support",
+        name: "runtime_command_preservation",
         ok: plugin.ok,
         required: true,
         detail: plugin.detail.clone(),
@@ -875,13 +875,15 @@ fn check_opencode_plugin() -> DoctorCheck {
     let result = (|| -> Result<String> {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
-        if !content.contains("Packet28 rewrite") || !content.contains("tool.execute.before") {
+        if !content.contains("Packet28 preserves native command arguments")
+            || !content.contains("tool.execute.before")
+        {
             return Err(anyhow!(
-                "Packet28 OpenCode rewrite plugin is not configured"
+                "Packet28 OpenCode command-preserving plugin is not configured"
             ));
         }
         Ok(format!(
-            "OpenCode rewrite plugin configured at {}",
+            "OpenCode command-preserving plugin configured at {}",
             path.display()
         ))
     })();
@@ -924,7 +926,7 @@ fn build_hermes_report(root: &Path) -> DoctorReport {
         detail: "Hermes uses a local Python plugin, not Packet28 MCP setup".to_string(),
     };
     let reducer_round_trip = DoctorCheck {
-        name: "runtime_rewrite_support",
+        name: "runtime_command_preservation",
         ok: plugin.ok,
         required: true,
         detail: plugin.detail.clone(),
@@ -986,7 +988,9 @@ fn check_hermes_plugin_at(home: &Path) -> DoctorCheck {
             .with_context(|| format!("failed to read '{}'", manifest_path.display()))?;
         let config = fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read '{}'", config_path.display()))?;
-        if !init.contains("Packet28 rewrite") || !manifest.contains("packet28-rewrite") {
+        if !init.contains("Packet28 preserves native command arguments")
+            || !manifest.contains("packet28-rewrite")
+        {
             return Err(anyhow!("Packet28 Hermes plugin files are not configured"));
         }
         let enabled = crate::cmd_setup::setup_plugins::hermes_config_enables_packet28(&config)
@@ -995,7 +999,7 @@ fn check_hermes_plugin_at(home: &Path) -> DoctorCheck {
             return Err(anyhow!("Hermes config does not enable packet28-rewrite"));
         }
         Ok(format!(
-            "Hermes rewrite plugin configured at {}",
+            "Hermes command-preserving plugin configured at {}",
             plugin_dir.display()
         ))
     })();
@@ -1397,7 +1401,11 @@ mod tests {
     fn write_hermes_fixture(home: &Path, config: &str) {
         let plugin_dir = hermes::plugin_dir(home);
         fs::create_dir_all(&plugin_dir).unwrap();
-        fs::write(plugin_dir.join("__init__.py"), "# Packet28 rewrite\n").unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            "# Packet28 preserves native command arguments\n",
+        )
+        .unwrap();
         fs::write(plugin_dir.join("plugin.yaml"), "name: packet28-rewrite\n").unwrap();
         let config_path = hermes::config_path(home);
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();

@@ -40,7 +40,7 @@ fn test_setup_runtime_hooks_copilot_writes_instructions_and_pretool_hook() {
 }
 
 #[test]
-fn test_setup_runtime_hooks_opencode_writes_instructions_and_rewrite_plugin() {
+fn test_setup_runtime_hooks_opencode_writes_command_preserving_plugin() {
     let root = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
 
@@ -54,7 +54,7 @@ fn test_setup_runtime_hooks_opencode_writes_instructions_and_rewrite_plugin() {
         .join("plugins")
         .join("packet28.ts");
     let plugin = fs::read_to_string(plugin_path).unwrap();
-    assert!(plugin.contains("Packet28 rewrite"));
+    assert!(plugin.contains("Packet28 preserves native command arguments"));
     assert!(plugin.contains("tool.execute.before"));
 
     doctor_command(root.path(), home.path(), "opencode")
@@ -79,7 +79,7 @@ fn test_setup_runtime_hooks_hermes_writes_instructions_plugin_and_config() {
     let init = fs::read_to_string(plugin_dir.join("__init__.py")).unwrap();
     let manifest = fs::read_to_string(plugin_dir.join("plugin.yaml")).unwrap();
     let config = fs::read_to_string(home.path().join(".hermes").join("config.yaml")).unwrap();
-    assert!(init.contains("Packet28 rewrite"));
+    assert!(init.contains("Packet28 preserves native command arguments"));
     assert!(manifest.contains("packet28-rewrite"));
     assert!(config.contains("packet28-rewrite"));
 
@@ -111,5 +111,5 @@ fn test_setup_runtime_hooks_gemini_writes_before_tool_hook_and_prompt() {
         .assert()
         .success()
         .stdout(predicate::str::contains("gemini_hook_config"))
-        .stdout(predicate::str::contains("runtime_rewrite_support"));
+        .stdout(predicate::str::contains("runtime_capture_support"));
 }

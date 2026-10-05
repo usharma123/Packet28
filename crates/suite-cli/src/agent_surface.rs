@@ -51,12 +51,12 @@ pub fn render_prompt_fragment(format: AgentPromptFormat, root: Option<&str>) -> 
     let (header, runtime_note, tool_prefix) = match format {
         AgentPromptFormat::Claude => (
             "## Packet28\n",
-            "Let Claude hooks installed by `Packet28 setup` rewrite supported shell commands and capture tool activity.\n",
+            "Claude hooks installed by `Packet28 setup` capture tool activity without changing commands or native permission matching. Use explicit Packet28 CLI/MCP tools for reduced output.\n",
             "packet28.",
         ),
         AgentPromptFormat::Agents => (
             "## Packet28 Guidance\n",
-            "Let runtime hooks installed by `Packet28 setup` rewrite supported shell commands and capture tool activity.\n",
+            "Runtime integrations preserve native command arguments and permission matching. Hooks capture tool activity where supported; use explicit Packet28 CLI/MCP tools for reduced output.\n",
             "packet28.",
         ),
         AgentPromptFormat::Cursor | AgentPromptFormat::CursorRule => (

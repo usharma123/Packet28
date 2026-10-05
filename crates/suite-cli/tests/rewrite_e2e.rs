@@ -68,7 +68,7 @@ fn test_top_level_rewrite_respects_repo_exclude_config() {
 }
 
 #[test]
-fn test_top_level_rewrite_prints_empty_stdout_on_no_rewrite() {
+fn test_top_level_rewrite_prints_empty_stdout_for_legacy_plugins() {
     let root = TempDir::new().unwrap();
     suite_cmd()
         .current_dir(root.path())
@@ -95,7 +95,7 @@ fn test_top_level_rewrite_prints_empty_stdout_on_no_rewrite() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("hook reducer-runner"));
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]
@@ -121,7 +121,8 @@ fn test_top_level_rewrite_handles_compound_commands_like_rtk() {
         .success()
         .stdout(predicate::str::contains("\"route\":\"compound_rewrite\""))
         .stdout(predicate::str::contains("&& htop ||"))
-        .stdout(predicate::str::contains("hook reducer-runner"));
+        .stdout(predicate::str::contains("\"applied\":false"))
+        .stdout(predicate::str::contains("\"rewritten_command\":null"));
 
     suite_cmd()
         .current_dir(root.path())
@@ -144,4 +145,27 @@ fn test_top_level_rewrite_handles_compound_commands_like_rtk() {
         .success()
         .stdout(predicate::str::contains("\"route\":\"compound_rewrite\""))
         .stdout(predicate::str::contains("| grep FAIL &&"));
+}
+
+#[test]
+fn test_compact_rewrite_reports_unsupported_without_executable_wrapper() {
+    let root = TempDir::new().unwrap();
+    suite_cmd()
+        .current_dir(root.path())
+        .args([
+            "compact",
+            "rewrite",
+            "--root",
+            root.path().to_str().unwrap(),
+            "--json",
+            "cat",
+            "protected.txt",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"applied\":false"))
+        .stdout(predicate::str::contains("\"rewritten_command\":null"))
+        .stdout(predicate::str::contains(
+            "automatic_host_rewrite_unsupported",
+        ));
 }

@@ -7,18 +7,19 @@ mod hook_rewrite;
 #[path = "support/process_harness.rs"]
 mod process_harness;
 
-use serde_json::{json, Value};
+use serde_json::json;
 use tempfile::TempDir;
 
 use hook_rewrite::{
-    ensure_packet28d_built, init_repo, run_hook_raw, suite_cmd, write_repo_fixture,
+    ensure_packet28d_built, init_repo, run_hook_raw, suite_cmd, write_repo_fixture, DaemonStopGuard,
 };
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_copilot_runtime_rewrites_vscode_and_denies_cli_with_suggestion() {
+fn test_hook_rewrite_copilot_runtime_preserves_vscode_and_cli_host_commands() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
+    let _daemon = DaemonStopGuard::new(dir.path());
     init_repo(dir.path());
     write_repo_fixture(dir.path());
 
@@ -34,16 +35,7 @@ fn test_hook_rewrite_copilot_runtime_rewrites_vscode_and_denies_cli_with_suggest
         .unwrap(),
     );
     assert_eq!(status, 0);
-    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(rendered["hookSpecificOutput"]
-        .get("permissionDecision")
-        .is_none());
-    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .unwrap();
-    assert!(rewritten.contains("hook reducer-runner"));
-    assert!(rewritten.contains("--family git"));
-    assert!(rewritten.contains("--kind git_status"));
+    assert!(stdout.trim().is_empty());
 
     let tool_args = serde_json::to_string(&json!({
         "command":"git status --short src/alpha.rs"
@@ -59,11 +51,7 @@ fn test_hook_rewrite_copilot_runtime_rewrites_vscode_and_denies_cli_with_suggest
         .unwrap(),
     );
     assert_eq!(status, 0);
-    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(rendered["permissionDecision"].as_str(), Some("deny"));
-    let reason = rendered["permissionDecisionReason"].as_str().unwrap();
-    assert!(reason.contains("hook reducer-runner"));
-    assert!(reason.contains("Packet28"));
+    assert!(stdout.trim().is_empty());
 
     let (status, stdout, _stderr) = run_hook_raw(
         "copilot",
