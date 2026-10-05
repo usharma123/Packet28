@@ -148,6 +148,10 @@ The hook reducer runner executes every explicitly requested command. Cached
 packets never replace execution. Each successfully captured completion records fresh
 `CommandFinished` evidence, even when output repeats.
 The daemon may still reuse derived packets from other capture events.
+Capture is optional. If capture setup fails, the runner executes the original
+command with inherited output streams. If capture fails after execution, it
+returns the original exit code and replays the available captured stdout and stderr bytes
+without executing the command again.
 
 ## Storage ownership
 
