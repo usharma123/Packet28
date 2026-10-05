@@ -191,6 +191,27 @@ impl Drop for McpHarness {
     }
 }
 
+/// Detects whether durable hook ingestion is disabled in the runtime configuration.
+///
+/// # Parameters
+///
+/// * `root` - Root directory containing the hook runtime configuration.
+///
+/// # Returns
+///
+/// The hook runtime configuration path when the configuration parses successfully
+/// and `hooks_enabled` is `false`; otherwise, `None`.
+///
+fn disabled_hook_runtime_config(root: &Path) -> Option<std::path::PathBuf> {
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(root);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let config =
+        serde_json::from_str::<packet28_daemon_protocol::hooks::HookRuntimeConfig>(&raw).ok()?;
+    (!config.hooks_enabled).then_some(path)
+}
+
+/// Runs the selected native hook with a JSON payload and captures its result.
+/// Exit code 2 is an accepted hook result; other unsuccessful exits are errors.
 fn run_hook_with_output(root: &Path, runtime: &str, payload: &Value) -> Result<(i32, String)> {
     let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
     let mut child = Command::new(exe)
@@ -260,6 +281,13 @@ fn wait_for_handoff_ready(
     }
 }
 
+/// Runs the MCP doctor smoke tests for handshake, reducer ingestion, push notifications, and handoff round trips.
+///
+/// `root` identifies the project whose MCP server and hook runtime are tested.
+///
+/// # Returns
+///
+/// The results of the four MCP doctor checks.
 pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
     check_mcp_round_trip_for_runtime(root, "claude")
 }
@@ -355,6 +383,37 @@ pub(super) fn check_mcp_round_trip_for_runtime(root: &Path, runtime: &str) -> Mc
                 tool_names.len()
             ),
         };
+
+        // A durably disabled hook runtime (`hooks_enabled: false`, typically a
+        // stale kill switch from a prior `packet28 uninstall`) makes packet28d
+        // reject every hook ingest with `accepted: false`. Without this early
+        // check the reducer/handoff smoke would fail with an opaque
+        // "reducer ingest missing" dump. Report the real cause explicitly and
+        // skip the dependent hook probes.
+        if let Some(config_path) = disabled_hook_runtime_config(root) {
+            reducer_round_trip = DoctorCheck {
+                name: "reducer_round_trip",
+                ok: false,
+                required: true,
+                detail: format!(
+                    "hook ingest is disabled: {} has hooks_enabled=false, so packet28d rejects every hook ingest. Re-run `packet28 setup` for your agent runtime to re-enable hook ingest.",
+                    config_path.display()
+                ),
+            };
+            push_notifications = DoctorCheck {
+                name: "push_notifications",
+                ok: false,
+                required: true,
+                detail: "skipped because hook ingest is disabled (hooks_enabled=false)".to_string(),
+            };
+            handoff_round_trip = DoctorCheck {
+                name: "handoff_round_trip",
+                ok: false,
+                required: true,
+                detail: "skipped because hook ingest is disabled (hooks_enabled=false)".to_string(),
+            };
+            return Ok(());
+        }
 
         harness.send(&json!({
             "jsonrpc":"2.0",

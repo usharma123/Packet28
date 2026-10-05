@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
+use packet28_daemon_protocol::hooks::HookRuntimeConfig;
+use packet28_daemon_protocol::paths::HOOK_RUNTIME_CONFIG_FILE_NAME;
+use packet28_state_fs::StateDir;
 use serde_json::{json, Value};
 
-use super::setup_commands::{apply_generated_relaunch_command, generated_packet28_hook_command};
+use super::setup_commands::{
+    apply_generated_relaunch_command, generated_packet28_hook_command,
+    is_generated_packet28_hook_command, shell_escape,
+};
 use super::McpConfigStatus;
 
 const PACKET28_CLAUDE_HTTP_HOOK_PATH: &str = "/packet28/claude-hook";
@@ -19,18 +25,63 @@ pub(crate) fn write_claude_hook_config(
     auto_yes: bool,
 ) -> Result<McpConfigStatus> {
     let hook_command = generated_packet28_hook_command("claude", root);
-    let mut config: BTreeMap<String, Value> = if path.exists() {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
-        serde_json::from_str(&content).with_context(|| {
-            format!(
-                "refusing to overwrite invalid JSON in '{}'; fix the file and rerun setup",
-                path.display()
-            )
-        })?
-    } else {
-        BTreeMap::new()
+    // The caller selects a workspace-local settings file. Retain every
+    // descendant beneath that root rather than canonicalizing a linked parent.
+    let relative = path.strip_prefix(root).with_context(|| {
+        format!(
+            "Claude hook config '{}' is outside the workspace",
+            path.display()
+        )
+    })?;
+    let name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Claude hook config must have a UTF-8 file name")?;
+    let components = relative
+        .parent()
+        .context("Claude hook config must have a parent directory")?
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => name
+                .to_str()
+                .context("Claude hook config directory must be UTF-8"),
+            _ => Err(anyhow!(
+                "Claude hook config must use normal workspace descendants"
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let existing_directory = match StateDir::open(root, &components, false) {
+        Ok(directory) => Some(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to open Claude hook config directory"),
     };
+    #[cfg(unix)]
+    let existing_lease = existing_directory
+        .as_ref()
+        .map(StateDir::lock_exclusive)
+        .transpose()
+        .context("failed to lock Claude hook config directory")?;
+    let mut raw = existing_directory
+        .as_ref()
+        .map(|directory| directory.read_bounded(name, u64::MAX))
+        .transpose()
+        .with_context(|| format!("failed to read '{}'", path.display()))?
+        .flatten();
+    let parse_config = |raw: &Option<Vec<u8>>| -> Result<BTreeMap<String, Value>> {
+        Ok(raw
+            .as_deref()
+            .map(|content| {
+                serde_json::from_slice(content).with_context(|| {
+                    format!(
+                        "refusing to overwrite invalid JSON in '{}'; fix the file and rerun setup",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_default())
+    };
+    let mut config = parse_config(&raw)?;
     let mut hooks = json_object_field_or_default(&config, "hooks", path)?;
     if !auto_yes {
         eprint!(
@@ -43,6 +94,28 @@ pub(crate) fn write_claude_hook_config(
         if !trimmed.is_empty() && trimmed != "y" && trimmed != "yes" {
             return Ok(McpConfigStatus::Declined);
         }
+    }
+    let had_directory = existing_directory.is_some();
+    let directory = match existing_directory {
+        Some(directory) => directory,
+        None => StateDir::open(root, &components, true)
+            .context("failed to create Claude hook config directory")?,
+    };
+    #[cfg(unix)]
+    let _directory_lease = match existing_lease {
+        Some(lease) => lease,
+        None => directory
+            .lock_exclusive()
+            .context("failed to lock Claude hook config directory")?,
+    };
+    if !had_directory {
+        // Another setup may have populated a newly created directory while
+        // this call awaited opt-in or the cooperative directory lease.
+        raw = directory
+            .read_bounded(name, u64::MAX)
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        config = parse_config(&raw)?;
+        hooks = json_object_field_or_default(&config, "hooks", path)?;
     }
     let runtime_config = ensure_hook_http_settings_written(root)?;
     let http_url = claude_http_hook_url(&runtime_config)
@@ -66,8 +139,25 @@ pub(crate) fn write_claude_hook_config(
         let new_entries = entries.as_array().cloned().unwrap_or_default();
         let mut merged = existing
             .iter()
-            .filter(|entry| !is_packet28_claude_hook_entry(entry))
-            .cloned()
+            .filter_map(|entry| {
+                let Some(handlers) = entry.get("hooks").and_then(Value::as_array) else {
+                    return Some(entry.clone());
+                };
+                let retained = handlers
+                    .iter()
+                    .filter(|handler| !is_packet28_claude_hook_handler(handler, http_token))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if retained.len() == handlers.len() {
+                    return Some(entry.clone());
+                }
+                if retained.is_empty() {
+                    return None;
+                }
+                let mut preserved = entry.clone();
+                preserved["hooks"] = Value::Array(retained);
+                Some(preserved)
+            })
             .collect::<Vec<_>>();
         merged.extend(new_entries);
         if merged != existing {
@@ -83,18 +173,22 @@ pub(crate) fn write_claude_hook_config(
     if merge_claude_allowed_http_hook_url(&mut config, &http_url) {
         already_configured = false;
     }
-    if already_configured {
-        return Ok(McpConfigStatus::AlreadyConfigured);
-    }
-    config.insert("hooks".to_string(), Value::Object(hooks));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&config)?),
-    )?;
-    Ok(McpConfigStatus::Written)
+    let bytes = if already_configured {
+        // Existing generated settings contain the same bearer token. Publish
+        // their original bytes privately even when no handler merge is needed.
+        raw.context("configured Claude hook settings must already exist")?
+    } else {
+        config.insert("hooks".to_string(), Value::Object(hooks));
+        format!("{}\n", serde_json::to_string_pretty(&config)?).into_bytes()
+    };
+    directory
+        .write_atomic(name, &bytes)
+        .with_context(|| format!("failed to update '{}'", path.display()))?;
+    Ok(if already_configured {
+        McpConfigStatus::AlreadyConfigured
+    } else {
+        McpConfigStatus::Written
+    })
 }
 
 fn build_claude_packet28_hooks(command: &str, http_url: &str, http_token: &str) -> Value {
@@ -114,21 +208,65 @@ fn build_claude_packet28_hooks(command: &str, http_url: &str, http_token: &str) 
     })
 }
 
-fn is_packet28_claude_hook_entry(entry: &Value) -> bool {
-    let Some(hooks) = entry.get("hooks").and_then(Value::as_array) else {
-        return false;
-    };
-    hooks.iter().any(|hook| {
-        if let Some(url) = hook.get("url").and_then(Value::as_str) {
-            return url.contains(PACKET28_CLAUDE_HTTP_HOOK_PATH);
+fn is_packet28_claude_hook_handler(hook: &Value, http_token: &str) -> bool {
+    match hook.get("type").and_then(Value::as_str) {
+        Some("http") => {
+            if hook["headers"][PACKET28_CLAUDE_HTTP_TOKEN_HEADER].as_str() != Some(http_token) {
+                return false;
+            }
+            let Some(port) = hook
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| url.strip_prefix("http://127.0.0.1:"))
+                .and_then(|suffix| suffix.strip_suffix(PACKET28_CLAUDE_HTTP_HOOK_PATH))
+            else {
+                return false;
+            };
+            port.parse::<u16>()
+                .is_ok_and(|parsed| parsed != 0 && parsed.to_string() == port)
         }
-        let command = hook
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        command.contains(" hook claude ")
-            && (command.contains("Packet28") || command.contains("packet28"))
-    })
+        Some("command") => {
+            let Some(command) = hook.get("command").and_then(Value::as_str) else {
+                return false;
+            };
+            let Ok(argv) = shell_words::split(command) else {
+                return false;
+            };
+            if is_generated_packet28_hook_command(command, "claude") {
+                return true;
+            }
+            // Legacy setup wrote a direct Packet28 invocation. Match the
+            // complete argv shape, not a substring in a user's wrapper.
+            if argv.len() != 5
+                || !matches!(
+                    Path::new(&argv[0])
+                        .file_name()
+                        .and_then(|name| name.to_str()),
+                    Some("Packet28" | "packet28")
+                )
+                || argv[1..4] != ["hook", "claude", "--root"]
+                || !is_literal_unquoted_shell_word(&argv[0])
+            {
+                return false;
+            }
+            command
+                == format!(
+                    "{} hook claude --root \"{}\"",
+                    argv[0],
+                    shell_escape(argv[4].clone())
+                )
+                || (is_literal_unquoted_shell_word(&argv[4])
+                    && command == format!("{} hook claude --root {}", argv[0], argv[4]))
+        }
+        _ => false,
+    }
+}
+
+fn is_literal_unquoted_shell_word(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_alphanumeric() || matches!(character, '/' | '_' | '-' | '.' | ':')
+        })
 }
 
 fn claude_command_hook_entry(matcher: Option<&str>, command: &str) -> Value {
@@ -160,29 +298,48 @@ fn claude_http_hook_entry(matcher: Option<&str>, http_url: &str, http_token: &st
 fn ensure_hook_http_settings_written(
     root: &Path,
 ) -> Result<packet28_daemon_protocol::hooks::HookRuntimeConfig> {
-    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(root);
-    let existed = path.exists();
-    let mut config = if existed {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
-        serde_json::from_str::<packet28_daemon_protocol::hooks::HookRuntimeConfig>(&content)
-            .with_context(|| {
-                format!("refusing to overwrite invalid JSON in '{}'", path.display())
-            })?
-    } else {
-        packet28_daemon_protocol::hooks::HookRuntimeConfig::default()
-    };
+    let (directory, existing) = open_hook_runtime_config(root)?;
+    let existed = existing.is_some();
+    let mut config = existing.unwrap_or_default();
     let changed = apply_generated_http_hook_settings(&mut config, root);
     if !existed || changed {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string_pretty(&config)?),
-        )?;
+        persist_hook_runtime_config(&directory, &config)?;
     }
     Ok(config)
+}
+
+fn open_hook_runtime_config(root: &Path) -> Result<(StateDir, Option<HookRuntimeConfig>)> {
+    let directory = StateDir::open(root, &[".packet28", "daemon"], true)
+        .context("failed to open hook runtime configuration directory")?;
+    let path = directory.path().join(HOOK_RUNTIME_CONFIG_FILE_NAME);
+    let raw = directory
+        .read_bounded(HOOK_RUNTIME_CONFIG_FILE_NAME, u64::MAX)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    let config = raw
+        .map(|bytes| {
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!("refusing to overwrite invalid JSON in '{}'", path.display())
+            })
+        })
+        .transpose()?;
+    Ok((directory, config))
+}
+
+fn persist_hook_runtime_config(directory: &StateDir, config: &HookRuntimeConfig) -> Result<()> {
+    let bytes = format!("{}\n", serde_json::to_string_pretty(config)?);
+    // The retained directory publishes a mode-0600 temporary without following
+    // links, even when pre-existing ancestors are traversable by other users.
+    directory
+        .write_atomic(HOOK_RUNTIME_CONFIG_FILE_NAME, bytes.as_bytes())
+        .with_context(|| {
+            format!(
+                "failed to update '{}'",
+                directory
+                    .path()
+                    .join(HOOK_RUNTIME_CONFIG_FILE_NAME)
+                    .display()
+            )
+        })
 }
 
 fn apply_generated_http_hook_settings(
@@ -535,6 +692,11 @@ pub(crate) fn write_windsurf_hook_config(
     Ok(McpConfigStatus::Written)
 }
 
+/// Writes the shared hook runtime configuration when at least one hook has been configured.
+///
+/// Re-enables hook ingestion when it is disabled and reports whether the configuration
+/// was declined, already configured, or written.
+///
 pub(crate) fn write_hook_runtime_config(
     root: &Path,
     any_hooks_configured: bool,
@@ -542,30 +704,25 @@ pub(crate) fn write_hook_runtime_config(
     if !any_hooks_configured {
         return Ok(McpConfigStatus::Declined);
     }
-    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(root);
-    let existed = path.exists();
-    let mut config = if existed {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
-        serde_json::from_str::<packet28_daemon_protocol::hooks::HookRuntimeConfig>(&content)
-            .with_context(|| {
-                format!("refusing to overwrite invalid JSON in '{}'", path.display())
-            })?
-    } else {
-        packet28_daemon_protocol::hooks::HookRuntimeConfig::default()
-    };
+    let (directory, existing) = open_hook_runtime_config(root)?;
+    let existed = existing.is_some();
+    let mut config = existing.unwrap_or_default();
     let mut changed = apply_generated_http_hook_settings(&mut config, root);
     changed |= apply_generated_relaunch_command(&mut config);
+    // Configuring a hook runtime is an explicit opt-in to hook ingest. If a
+    // prior `packet28 uninstall` (or a manual edit) left the kill switch
+    // engaged, re-enable it here. Otherwise setup reports the HTTP hook as
+    // healthy while the daemon keeps rejecting every ingest with
+    // `accepted: false`, which surfaces downstream as confusing doctor
+    // failures instead of an honest "hooks are disabled" signal.
+    if !config.hooks_enabled {
+        config.hooks_enabled = true;
+        changed = true;
+    }
     if existed && !changed {
         return Ok(McpConfigStatus::AlreadyConfigured);
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&config)?),
-    )?;
+    persist_hook_runtime_config(&directory, &config)?;
     Ok(McpConfigStatus::Written)
 }
 
