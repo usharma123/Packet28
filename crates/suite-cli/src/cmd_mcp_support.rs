@@ -215,6 +215,39 @@ pub(crate) fn store_tool_artifact(
     Ok(handle.as_str().to_owned())
 }
 
+/// Search only authenticated predecessor namespaces. A present artifact in
+/// the requested namespace wins; conflicting inherited handles need an owner.
+pub(crate) fn read_lineage_artifact(
+    root: &Path,
+    task_id: &TaskStorageId,
+    locations: &[(artifact_io::ArtifactLocation, artifact_io::ArtifactHandle)],
+) -> Result<Option<(PathBuf, Vec<u8>)>> {
+    let mut found = None;
+    for (index, owner) in crate::task_runtime::artifact_task_lineage(root, task_id.as_str())?
+        .into_iter()
+        .enumerate()
+    {
+        let owner = TaskStorageId::try_from(owner.as_str())?;
+        for (location, handle) in locations {
+            if let Some(artifact) =
+                artifact_io::read_task_artifact(root, &owner, *location, handle)?
+            {
+                if index == 0 {
+                    return Ok(Some(artifact));
+                }
+                if found.is_some() {
+                    return Err(anyhow!(
+                        "artifact handle has multiple recovery owners; supply the original task_id"
+                    ));
+                }
+                found = Some(artifact);
+                break;
+            }
+        }
+    }
+    Ok(found)
+}
+
 pub(crate) fn load_tool_result_artifact(
     root: &Path,
     task_id: &str,
@@ -232,23 +265,18 @@ pub(crate) fn load_tool_result_artifact(
         ));
     };
     let selected_artifact_id = selected_handle.as_str().to_owned();
-    let artifact = artifact_io::read_task_artifact(
+    let hook_handle = selected_handle.json_file_name()?;
+    let artifact = read_lineage_artifact(
         root,
         &task_id,
-        artifact_io::ArtifactLocation::ToolEvidence,
-        &selected_handle,
+        &[
+            (
+                artifact_io::ArtifactLocation::ToolEvidence,
+                selected_handle.clone(),
+            ),
+            (artifact_io::ArtifactLocation::HookArtifacts, hook_handle),
+        ],
     )?;
-    let artifact = if artifact.is_some() {
-        artifact
-    } else {
-        let hook_handle = selected_handle.json_file_name()?;
-        artifact_io::read_task_artifact(
-            root,
-            &task_id,
-            artifact_io::ArtifactLocation::HookArtifacts,
-            &hook_handle,
-        )?
-    };
     let (path, bytes) = artifact.ok_or_else(|| {
         anyhow!(
             "failed to resolve stored artifact handle {:?}",
@@ -267,18 +295,16 @@ pub(crate) fn load_raw_output_artifact(
 ) -> Result<(String, String)> {
     let task_id = TaskStorageId::try_from(task_id)?;
     let handle = artifact_io::ArtifactHandle::try_from(handle)?;
-    let mut artifact = None;
-    for location in [
-        artifact_io::ArtifactLocation::TaskRoot,
-        artifact_io::ArtifactLocation::HookSpool,
-        artifact_io::ArtifactLocation::HookArtifacts,
-        artifact_io::ArtifactLocation::ToolEvidence,
-    ] {
-        artifact = artifact_io::read_task_artifact(root, &task_id, location, &handle)?;
-        if artifact.is_some() {
-            break;
-        }
-    }
+    let artifact = read_lineage_artifact(
+        root,
+        &task_id,
+        &[
+            (artifact_io::ArtifactLocation::TaskRoot, handle.clone()),
+            (artifact_io::ArtifactLocation::HookSpool, handle.clone()),
+            (artifact_io::ArtifactLocation::HookArtifacts, handle.clone()),
+            (artifact_io::ArtifactLocation::ToolEvidence, handle.clone()),
+        ],
+    )?;
     let (path, bytes) = artifact.ok_or_else(|| {
         anyhow!(
             "failed to resolve raw artifact handle {:?}",
@@ -321,6 +347,28 @@ fn session_current_task_id(session: &Arc<Mutex<McpSessionState>>) -> Option<Stri
     })
 }
 
+pub(crate) fn resolve_artifact_task_id(
+    session: &Arc<Mutex<McpSessionState>>,
+    root: &Path,
+    explicit_task_id: &str,
+    _derive_hint: Option<&str>,
+    tool_name: &str,
+) -> Result<String> {
+    let task_id = if !explicit_task_id.is_empty() {
+        explicit_task_id.to_string()
+    } else if let Some(task_id) = session_current_task_id(session) {
+        task_id
+    } else if let Some(task) = crate::task_runtime::load_active_task(root)? {
+        task.task_id
+    } else {
+        return Err(anyhow!(
+            "{tool_name} requires task_id or an active Packet28 session task"
+        ));
+    };
+    validated_task_storage_id(&task_id)?;
+    Ok(task_id)
+}
+
 pub(crate) fn resolve_session_task_id(
     session: &Arc<Mutex<McpSessionState>>,
     root: &Path,
@@ -345,6 +393,8 @@ pub(crate) fn resolve_session_task_id(
         ));
     };
     validated_task_storage_id(&task_id)?;
+    crate::broker_client::ensure_daemon(root)?;
+    let task_id = crate::task_runtime::resolve_task_continuation(root, &task_id)?;
     track_task(session, root, &task_id)?;
     Ok(task_id)
 }
@@ -473,4 +523,119 @@ pub(crate) fn next_task_invocation(
     let sequence = guard.next_invocation_seq;
     let _ = task_id;
     Ok((sequence, format!("tool-invocation-{sequence}")))
+}
+
+#[cfg(test)]
+mod recovery_artifact_tests {
+    use super::*;
+    use packet28_daemon_protocol::task::{TaskHistoryRecovery, TaskRecord, TaskRegistry};
+
+    #[test]
+    fn chained_recovery_keeps_result_raw_and_context_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = TaskRegistry::default();
+        for task_id in ["old", "mid", "new"] {
+            registry.tasks.insert(
+                task_id.to_string(),
+                TaskRecord {
+                    task_id: task_id.to_string(),
+                    ..TaskRecord::default()
+                },
+            );
+        }
+        for (old, new) in [("old", "mid"), ("mid", "new")] {
+            let link = TaskHistoryRecovery {
+                predecessor_task_id: old.to_string(),
+                successor_task_id: new.to_string(),
+                ..TaskHistoryRecovery::default()
+            };
+            registry.tasks.get_mut(old).unwrap().superseded_by = Some(link.clone());
+            registry.tasks.get_mut(new).unwrap().recovered_from = Some(link);
+        }
+        packet28_daemon_core::storage::save_task_registry(root.path(), &registry).unwrap();
+        for owner in ["old", "mid"] {
+            let task_id = TaskStorageId::try_from(owner).unwrap();
+            for (location, name, bytes) in [
+                (
+                    artifact_io::ArtifactLocation::ToolEvidence,
+                    format!("{owner}-result.json"),
+                    br#"{"value":"preserved"}"#.to_vec(),
+                ),
+                (
+                    artifact_io::ArtifactLocation::TaskRoot,
+                    format!("{owner}-raw.log"),
+                    b"raw bytes".to_vec(),
+                ),
+                (
+                    artifact_io::ArtifactLocation::Versions,
+                    format!("{owner}-context.json"),
+                    br#"{"brief":"preserved context"}"#.to_vec(),
+                ),
+            ] {
+                artifact_io::write_task_artifact(
+                    root.path(),
+                    &task_id,
+                    location,
+                    &artifact_io::ArtifactHandle::try_from(name.as_str()).unwrap(),
+                    &bytes,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                load_tool_result_artifact(
+                    root.path(),
+                    "new",
+                    Some(&format!("{owner}-result.json")),
+                    None
+                )
+                .unwrap()
+                .1["value"],
+                "preserved"
+            );
+            assert_eq!(
+                load_raw_output_artifact(root.path(), "new", &format!("{owner}-raw.log"))
+                    .unwrap()
+                    .1,
+                "raw bytes"
+            );
+            assert!(super::super::read_validated_context_artifact(
+                root.path(),
+                "new",
+                &format!("{owner}-context")
+            )
+            .unwrap()
+            .0
+            .to_string_lossy()
+            .contains(owner));
+        }
+        let session = Arc::new(Mutex::new(McpSessionState::default()));
+        assert_eq!(
+            resolve_artifact_task_id(&session, root.path(), "old", None, "fetch").unwrap(),
+            "old"
+        );
+        assert!(session.lock().unwrap().tracked_tasks.is_empty());
+        // Reused names in two predecessor namespaces require an explicit owner.
+        for owner in ["old", "mid"] {
+            store_tool_artifact(
+                root.path(),
+                owner,
+                "shared",
+                "result",
+                &json!({"owner":owner}),
+            )
+            .unwrap();
+        }
+        assert!(
+            load_tool_result_artifact(root.path(), "new", None, Some("shared"))
+                .unwrap_err()
+                .to_string()
+                .contains("multiple recovery owners")
+        );
+        assert_eq!(
+            load_tool_result_artifact(root.path(), "old", None, Some("shared"))
+                .unwrap()
+                .1["owner"],
+            "old"
+        );
+    }
 }

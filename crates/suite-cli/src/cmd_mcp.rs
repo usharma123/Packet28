@@ -130,12 +130,17 @@ fn read_validated_context_artifact(
     let task_id = validated_task_storage_id(task_id)?;
     let context_version = ContextVersionStorageId::try_from(context_version)?;
     let handle = artifact_io::ArtifactHandle::from_json_stem(context_version.as_str())?;
-    read_validated_named_task_artifact(
+    support::read_lineage_artifact(
         root,
-        task_id.as_str(),
-        artifact_io::ArtifactLocation::Versions,
-        handle.as_str(),
-    )
+        &task_id,
+        &[(artifact_io::ArtifactLocation::Versions, handle)],
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "stored context artifact does not exist for task {:?}",
+            task_id.as_str()
+        )
+    })
 }
 
 fn validate_context_artifact_identity(payload: &Value, requested_version: &str) -> Result<()> {

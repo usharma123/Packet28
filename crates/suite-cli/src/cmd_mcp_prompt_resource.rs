@@ -169,8 +169,9 @@ pub(crate) fn resolve_requested_or_current_task_id(
 ) -> Result<String> {
     if let Some(task_id) = requested_task_id {
         validated_task_storage_id(task_id)?;
-        track_task(session, root, task_id)?;
-        return Ok(task_id.to_string());
+        let task_id = crate::task_runtime::resolve_task_continuation(root, task_id)?;
+        track_task(session, root, &task_id)?;
+        return Ok(task_id);
     }
     resolve_current_task_id(root, session)
 }
@@ -179,22 +180,30 @@ pub(crate) fn resolve_current_task_id(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
 ) -> Result<String> {
+    crate::broker_client::ensure_daemon(root)?;
     if let Ok(guard) = session.lock() {
         if let Some(task_id) = guard.current_task_id.clone() {
+            drop(guard);
             validated_task_storage_id(&task_id)?;
-            return Ok(task_id);
+            let resolved = crate::task_runtime::resolve_task_continuation(root, &task_id)?;
+            if resolved != task_id {
+                track_task(session, root, &resolved)?;
+            }
+            return Ok(resolved);
         }
     }
     if let Some(active) = crate::task_runtime::load_active_task(root)? {
         validated_task_storage_id(&active.task_id)?;
-        track_task(session, root, &active.task_id)?;
-        return Ok(active.task_id);
+        let task_id = crate::task_runtime::resolve_task_continuation(root, &active.task_id)?;
+        track_task(session, root, &task_id)?;
+        return Ok(task_id);
     }
     let status = daemon_status(root)?;
     let current = select_current_task(&status.tasks)
         .map(|task| task.task_id.clone())
         .ok_or_else(|| anyhow!("no Packet28 task is available for current-task resources"))?;
     validated_task_storage_id(&current)?;
+    let current = crate::task_runtime::resolve_task_continuation(root, &current)?;
     track_task(session, root, &current)?;
     Ok(current)
 }

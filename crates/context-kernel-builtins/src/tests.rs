@@ -749,6 +749,256 @@ fn agenty_state_snapshot_derives_current_task_state() {
     );
 }
 
+fn cached_agent_entries(root: &Path) -> Vec<context_memory_core::PacketCacheEntry> {
+    CachePersistence::open(PersistConfig::new(root.to_path_buf()))
+        .unwrap()
+        .shared_cache()
+        .lock()
+        .unwrap()
+        .entries()
+}
+
+fn agent_snapshot(kernel: &Kernel, task_id: &str) -> suite_packet_core::AgentSnapshotPayload {
+    let response = kernel
+        .execute(KernelRequest {
+            target: "agenty.state.snapshot".to_string(),
+            reducer_input: json!({ "task_id": task_id }),
+            ..KernelRequest::default()
+        })
+        .unwrap();
+    let envelope: suite_packet_core::EnvelopeV1<suite_packet_core::AgentSnapshotPayload> =
+        serde_json::from_value(response.output_packets[0].body.clone()).unwrap();
+    envelope.payload
+}
+
+fn write_agent_event(kernel: &Kernel, event: Value) {
+    kernel
+        .execute(KernelRequest {
+            target: "agenty.state.write".to_string(),
+            reducer_input: event,
+            ..KernelRequest::default()
+        })
+        .unwrap();
+}
+
+fn recovered_from(task_id: &str, predecessor_task_id: &str) -> Value {
+    json!({
+        "task_id": task_id,
+        "event_id": format!("history-recovery:{predecessor_task_id}"),
+        "occurred_at_unix": 50,
+        "actor": "packet28d",
+        "kind": "recovered_from",
+        "data": {"type": "recovered_from", "predecessor_task_id": predecessor_task_id}
+    })
+}
+
+fn completed_invocation(task_id: &str, sequence: u64, occurred_at_unix: u64) -> Value {
+    json!({
+        "task_id": task_id,
+        "event_id": format!("{task_id}-invocation-{sequence}"),
+        "occurred_at_unix": occurred_at_unix,
+        "actor": "agent",
+        "kind": "tool_invocation_completed",
+        "data": {
+            "type": "tool_invocation_completed",
+            "invocation_id": format!("tool-invocation-{sequence}"),
+            "sequence": sequence,
+            "tool_name": "packet28.search",
+            "operation_kind": "search",
+            "artifact_id": format!("tool-invocation-{sequence}-result")
+        }
+    })
+}
+
+#[test]
+fn agenty_state_snapshot_continues_recovery_predecessors_without_copying_them() {
+    let dir = tempdir().unwrap();
+    let kernel =
+        Kernel::with_v1_reducers_and_persistence(PersistConfig::new(dir.path().to_path_buf()));
+    for event in [
+        json!({
+            "task_id": "old",
+            "event_id": "evt-decision",
+            "occurred_at_unix": 1,
+            "actor": "agent",
+            "kind": "decision_added",
+            "paths": ["src/auth.rs"],
+            "data": {"type": "decision_added", "decision_id": "d1", "text": "Use tokens"}
+        }),
+        json!({
+            "task_id": "old",
+            "event_id": "evt-question",
+            "occurred_at_unix": 2,
+            "actor": "agent",
+            "kind": "question_opened",
+            "data": {"type": "question_opened", "question_id": "q1", "text": "Which store?"}
+        }),
+        completed_invocation("old", 40, 3),
+        json!({
+            "task_id": "unrelated",
+            "event_id": "evt-other",
+            "occurred_at_unix": 3,
+            "actor": "agent",
+            "kind": "decision_added",
+            "data": {"type": "decision_added", "decision_id": "d9", "text": "Other task"}
+        }),
+        recovered_from("mid", "old"),
+        completed_invocation("mid", 1, 60),
+        json!({
+            "task_id": "mid",
+            "event_id": "evt-resolved",
+            "occurred_at_unix": 0,
+            "actor": "agent",
+            "kind": "question_resolved",
+            "data": {"type": "question_resolved", "question_id": "q1"}
+        }),
+        recovered_from("new", "mid"),
+        completed_invocation("new", 1, 70),
+    ] {
+        write_agent_event(&kernel, event);
+    }
+    // Repeating the startup link is a cache hit, not a second link.
+    write_agent_event(&kernel, recovered_from("new", "mid"));
+
+    let new = agent_snapshot(&kernel, "new");
+    assert_eq!(new.task_id, "new");
+    assert_eq!(new.event_count, 6);
+    assert_eq!(new.active_decisions.len(), 1);
+    assert_eq!(new.active_decisions[0].id, "d1");
+    assert!(new.open_questions.is_empty());
+    // Sequences restart per session: the predecessors' invocations order
+    // first even though "old" used sequence 40.
+    assert_eq!(
+        new.recent_tool_invocations
+            .iter()
+            .map(|invocation| (invocation.invocation_id.as_str(), invocation.sequence))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tool-invocation-40", 40),
+            ("tool-invocation-1", 1),
+            ("tool-invocation-1", 1),
+        ]
+    );
+    assert_eq!(
+        new.recent_tool_invocations
+            .iter()
+            .map(|invocation| invocation.owner_task_id.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["old", "mid", "new"]
+    );
+    // Same-named handles from different owners stay distinct references.
+    assert_eq!(
+        new.evidence_artifact_ids,
+        vec![
+            "tool-invocation-1-result".to_string(),
+            "tool-invocation-40-result".to_string()
+        ]
+    );
+
+    // Predecessors keep their own state; the cached events are not rewritten.
+    let old = agent_snapshot(&kernel, "old");
+    assert_eq!(old.event_count, 3);
+    assert_eq!(old.open_questions.len(), 1);
+    let mid = agent_snapshot(&kernel, "mid");
+    assert_eq!(mid.event_count, 5);
+    let events = cached_agent_entries(dir.path())
+        .iter()
+        .flat_map(crate::agenty_runtime::extract_agent_state_events)
+        .filter(|event| event.event_id == "old-invocation-40")
+        .map(|event| event.task_id)
+        .collect::<Vec<_>>();
+    assert_eq!(events, vec!["old".to_string()]);
+}
+
+#[test]
+fn recovery_link_startup_does_not_copy_history_larger_than_one_cache_record() {
+    let dir = tempdir().unwrap();
+    let persistence = PersistConfig::new(dir.path().to_path_buf());
+    {
+        let kernel = Kernel::with_v1_reducers_and_persistence(persistence.clone());
+        // Every individual event is valid, while their aggregate exceeds 64 MiB.
+        let text = "x".repeat(1024 * 1024);
+        for index in 0..65 {
+            write_agent_event(
+                &kernel,
+                json!({
+                    "task_id":"old", "event_id":format!("large-{index}"),
+                    "occurred_at_unix":index + 1, "actor":"agent", "kind":"decision_added",
+                    "data":{"type":"decision_added", "decision_id":format!("d-{index}"), "text":text}
+                }),
+            );
+        }
+        write_agent_event(&kernel, recovered_from("mid", "old"));
+        kernel
+            .flush_cache_persistence(Duration::from_secs(30))
+            .unwrap();
+    }
+    // A restart between linked generations requires only another small record.
+    let kernel = Kernel::with_v1_reducers_and_persistence(persistence);
+    write_agent_event(&kernel, recovered_from("mid", "old"));
+    write_agent_event(&kernel, recovered_from("new", "mid"));
+    let entries = cached_agent_entries(dir.path());
+    let events = entries
+        .iter()
+        .flat_map(crate::agenty_runtime::extract_agent_state_events)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events.iter().filter(|event| event.task_id == "old").count(),
+        65
+    );
+    assert_eq!(
+        events.iter().filter(|event| event.task_id == "mid").count(),
+        1
+    );
+    assert_eq!(
+        events.iter().filter(|event| event.task_id == "new").count(),
+        1
+    );
+}
+
+#[test]
+fn recovery_lineage_never_merges_ambiguous_or_cyclic_links() {
+    let link = |task_id: &str, predecessor: &str| suite_packet_core::AgentStateEventPayload {
+        task_id: task_id.to_string(),
+        event_id: format!("{task_id}-{predecessor}"),
+        actor: "packet28d".to_string(),
+        kind: suite_packet_core::AgentStateEventKind::RecoveredFrom,
+        data: suite_packet_core::AgentStateEventData::RecoveredFrom {
+            predecessor_task_id: predecessor.to_string(),
+        },
+        ..suite_packet_core::AgentStateEventPayload::default()
+    };
+    let lineage = crate::agenty_runtime::recovery_lineage;
+    assert_eq!(lineage(&[], "task"), vec!["task".to_string()]);
+    assert_eq!(
+        lineage(&[link("c", "b"), link("b", "a")], "c"),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+    assert_eq!(
+        lineage(&[link("b", "a"), link("b", "x")], "b"),
+        vec!["b".to_string()]
+    );
+    assert_eq!(
+        lineage(&[link("a", "b"), link("b", "a")], "a"),
+        vec!["a".to_string()]
+    );
+}
+
+#[test]
+fn recovered_from_link_requires_a_distinct_predecessor() {
+    let kernel = Kernel::with_v1_reducers();
+    for predecessor in ["same", " "] {
+        let error = kernel
+            .execute(KernelRequest {
+                target: "agenty.state.write".to_string(),
+                reducer_input: recovered_from("same", predecessor),
+                ..KernelRequest::default()
+            })
+            .unwrap_err();
+        assert!(matches!(error, KernelError::InvalidRequest { .. }));
+    }
+}
+
 #[test]
 fn diffy_analyze_emits_task_state_focus_packets() {
     let _lock = git_test_lock().lock().unwrap();

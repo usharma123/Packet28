@@ -234,6 +234,8 @@ pub struct BrokerGetContextResponse {
     pub discovered_paths: Vec<String>,
     pub discovered_symbols: Vec<String>,
     pub evidence_artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub evidence_artifact_owners: BTreeMap<String, Vec<String>>,
     pub invalidates_since_version: bool,
     pub effective_max_sections: usize,
     pub effective_default_max_items_per_section: usize,

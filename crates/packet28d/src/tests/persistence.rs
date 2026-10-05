@@ -647,6 +647,154 @@ fn completed_rerun_checkpoint_failure_requests_process_recovery() {
     assert!(guard.shutdown.is_requested());
 }
 
+fn superseded_link() -> packet28_daemon_protocol::task::TaskHistoryRecovery {
+    packet28_daemon_protocol::task::TaskHistoryRecovery {
+        predecessor_task_id: "damaged".to_string(),
+        successor_task_id: "damaged-recovered-1".to_string(),
+        prior_last_event_seq: 100,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn superseded_task_is_fenced_while_its_linked_successor_continues() {
+    use crate::server::{continued_task_ids, reject_superseded_tasks};
+    use packet28_daemon_protocol::broker::{BrokerWriteStateBatchRequest, BrokerWriteStateRequest};
+    use packet28_daemon_protocol::commands::TaskSubmitSpec;
+    use packet28_daemon_protocol::hooks::HookIngestRequest;
+
+    let state = super::support::daemon_test_state();
+    super::support::insert_admitted_task_record(
+        &state,
+        TaskRecord {
+            task_id: "damaged".to_string(),
+            lifecycle: TaskLifecycle::Cancelled,
+            superseded_by: Some(superseded_link()),
+            ..TaskRecord::default()
+        },
+    );
+    super::support::insert_admitted_task_record(
+        &state,
+        TaskRecord {
+            task_id: "damaged-recovered-1".to_string(),
+            recovered_from: Some(superseded_link()),
+            ..TaskRecord::default()
+        },
+    );
+
+    let continuation = [
+        DaemonRequest::ExecuteSequence {
+            spec: TaskSubmitSpec {
+                task_id: "damaged".to_string(),
+                ..TaskSubmitSpec::default()
+            },
+        },
+        DaemonRequest::TaskSubscribe {
+            task_id: "damaged".to_string(),
+            replay_last: 0,
+            after_seq: Some(100),
+        },
+        DaemonRequest::HookIngest {
+            request: HookIngestRequest {
+                task_id: "damaged".to_string(),
+                ..HookIngestRequest::default()
+            },
+        },
+        DaemonRequest::BrokerWriteStateBatch {
+            request: BrokerWriteStateBatchRequest {
+                requests: vec![
+                    BrokerWriteStateRequest {
+                        task_id: "damaged-recovered-1".to_string(),
+                        ..BrokerWriteStateRequest::default()
+                    },
+                    BrokerWriteStateRequest {
+                        task_id: "damaged".to_string(),
+                        ..BrokerWriteStateRequest::default()
+                    },
+                ],
+            },
+        },
+    ];
+    for request in &continuation {
+        let error = reject_superseded_tasks(&state, continued_task_ids(request)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("superseded by \"damaged-recovered-1\""),
+            "{error:#}"
+        );
+    }
+    // Status and idempotent cancellation keep the link discoverable.
+    for request in [
+        DaemonRequest::TaskStatus {
+            task_id: "damaged".to_string(),
+        },
+        DaemonRequest::TaskCancel {
+            task_id: "damaged".to_string(),
+        },
+        DaemonRequest::WatchList {
+            task_id: Some("damaged".to_string()),
+        },
+    ] {
+        assert!(continued_task_ids(&request).is_empty());
+    }
+    reject_superseded_tasks(&state, ["damaged-recovered-1"]).unwrap();
+
+    let error = emit_task_event(state.clone(), "damaged", "late", json!({})).unwrap_err();
+    assert!(format!("{error:#}").contains("superseded"), "{error:#}");
+    emit_task_event(state.clone(), "damaged-recovered-1", "resumed", json!({})).unwrap();
+    flush_persistence(&state).unwrap();
+    let root = super::support::daemon_test_root(&state);
+    let resumed =
+        packet28_daemon_core::storage::load_task_events(&root, "damaged-recovered-1").unwrap();
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].seq, 1);
+    assert!(
+        packet28_daemon_core::storage::load_task_events(&root, "damaged")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn restart_reconciliation_retires_work_owned_by_a_superseded_task() {
+    let mut tasks = TaskRegistry::default();
+    tasks.tasks.insert(
+        "damaged".to_string(),
+        TaskRecord {
+            task_id: "damaged".to_string(),
+            lifecycle: TaskLifecycle::Cancelled,
+            watch_ids: vec!["watch".to_string()],
+            superseded_by: Some(superseded_link()),
+            ..TaskRecord::default()
+        },
+    );
+    let mut watches = WatchRegistry {
+        watches: vec![WatchRegistration {
+            watch_id: "watch".to_string(),
+            spec: WatchSpec {
+                task_id: "damaged".to_string(),
+                ..WatchSpec::default()
+            },
+            active: true,
+            ..WatchRegistration::default()
+        }],
+    };
+
+    preflight_restart_recovery(&tasks).unwrap();
+    let reconciliation =
+        reconcile_interrupted_task_lifecycles(&mut tasks, &mut watches, 7).unwrap();
+
+    assert_eq!(
+        reconciliation.removed_watch_ids,
+        BTreeSet::from(["watch".to_string()])
+    );
+    assert!(reconciliation.replan_task_ids.is_empty());
+    assert!(watches.watches.is_empty());
+    let damaged = &tasks.tasks["damaged"];
+    assert!(damaged.watch_ids.is_empty());
+    assert_eq!(damaged.lifecycle, TaskLifecycle::Cancelled);
+    assert_eq!(damaged.superseded_by, Some(superseded_link()));
+}
+
 #[test]
 fn durable_event_io_does_not_hold_the_daemon_state_mutex() {
     let state = super::support::daemon_test_state();
@@ -917,7 +1065,7 @@ fn daemon_startup_checkpoints_replayed_authority_before_readiness() {
 }
 
 #[test]
-fn daemon_startup_persists_quarantined_event_high_water_resets_before_readiness() {
+fn daemon_startup_persists_linked_history_recovery_before_readiness() {
     let source = include_str!("../application.rs");
     let recovering_load = source
         .find("load_task_watch_registry_recovering_corrupt_event_logs(&root)?")
@@ -932,13 +1080,13 @@ fn daemon_startup_persists_quarantined_event_high_water_resets_before_readiness(
     let load = &core_source[core_source
         .find("pub fn load_task_watch_registry_recovering_corrupt_event_logs")
         .unwrap()..];
-    let reset = load
-        .find("reset_corrupt_event_high_waters_admitted(root, &corrupt, &writer_lease)?")
+    let fence = load
+        .find("fence_corrupt_tasks_with_linked_successors_admitted(")
         .unwrap();
     let move_log = load
         .find("move_corrupt_event_logs_aside(root, &mut corrupt, &writer_lease)?")
         .unwrap();
-    assert!(reset < move_log);
+    assert!(fence < move_log);
     assert!(recovering_load < flush);
     assert!(flush < checkpoint);
     assert!(checkpoint < readiness);
