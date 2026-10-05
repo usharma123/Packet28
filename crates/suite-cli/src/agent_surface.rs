@@ -70,7 +70,7 @@ pub fn render_prompt_fragment(format: AgentPromptFormat, root: Option<&str>) -> 
         ),
         AgentPromptFormat::WindsurfRule => (
             "---\ndescription: Packet28 runtime guidance\ntrigger: always_on\n---\n\n# Packet28 Integration\n",
-            "Windsurf command rewrite is not guaranteed; use MCP tools and rules unless `Packet28 doctor --agent windsurf` confirms support.\n",
+            "Windsurf hooks preserve native commands and permissions; use explicit Packet28 CLI/MCP tools for reduced output. Check runtime installation with `Packet28 doctor --agent windsurf`.\n",
             "packet28.",
         ),
     };
@@ -205,15 +205,21 @@ mod tests {
     }
 
     #[test]
-    fn only_hook_backends_recommend_installed_command_rewriting() {
-        for format in [AgentPromptFormat::Claude, AgentPromptFormat::Agents] {
-            assert!(render_prompt_fragment(format, None).contains("`Packet28 setup`"));
+    fn hook_guidance_preserves_native_commands_and_explicit_reduction() {
+        let claude = render_prompt_fragment(AgentPromptFormat::Claude, None);
+        assert!(claude.contains("hooks installed by `Packet28 setup` capture tool activity"));
+        assert!(claude.contains("without changing commands or native permission matching"));
+        let agents = render_prompt_fragment(AgentPromptFormat::Agents, None);
+        assert!(agents.contains("preserve native command arguments and permission matching"));
+        for rendered in [claude, agents] {
+            assert!(rendered.contains("explicit Packet28 CLI/MCP tools for reduced output"));
         }
         for format in [AgentPromptFormat::Cursor, AgentPromptFormat::CursorRule] {
             assert!(!render_prompt_fragment(format, None).contains("`Packet28 setup`"));
         }
         let windsurf = render_prompt_fragment(AgentPromptFormat::WindsurfRule, None);
-        assert!(windsurf.contains("Windsurf command rewrite is not guaranteed"));
+        assert!(windsurf.contains("Windsurf hooks preserve native commands and permissions"));
+        assert!(windsurf.contains("explicit Packet28 CLI/MCP tools for reduced output"));
         assert!(windsurf.contains("Packet28 doctor --agent windsurf"));
     }
 }
