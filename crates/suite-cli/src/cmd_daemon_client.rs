@@ -521,6 +521,21 @@ pub(crate) fn daemon_status_v1(_root: &Path) -> Result<DaemonStatusV1> {
     daemon_not_supported()
 }
 
+/// Stops the daemon for a workspace when its existing endpoint is reachable.
+///
+/// # Errors
+///
+/// Returns the connection or stop-request error if the daemon endpoint remains
+/// reachable after the stop request fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// stop_daemon_if_running(Path::new("."))?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 #[cfg(unix)]
 fn stop_daemon_if_running(root: &Path) -> Result<()> {
     let endpoint = daemon_endpoint(root)?;

@@ -66,6 +66,8 @@ pub enum StorageCommands {
     Inspect(StorageInspectArgs),
     /// Plan bounded retention, or apply it with `--apply`.
     Cleanup(StorageCleanupArgs),
+    /// Report corrupt task event logs, or quarantine them with `--apply`.
+    Repair(StorageRepairArgs),
 }
 
 #[derive(Args)]
@@ -89,6 +91,19 @@ pub struct StorageCleanupArgs {
     #[arg(long)]
     pub max_bytes: Option<u64>,
     /// Apply the plan. Without this flag, cleanup is a dry run.
+    #[arg(long)]
+    pub apply: bool,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub pretty: bool,
+}
+
+#[derive(Args)]
+pub struct StorageRepairArgs {
+    #[arg(long, default_value = ".")]
+    pub root: String,
+    /// Quarantine the corrupt event logs. Without this flag, repair is a dry run.
     #[arg(long)]
     pub apply: bool,
     #[arg(long)]
