@@ -69,13 +69,13 @@ fn continuation_in_registry(registry: &TaskRegistry, task_id: &str) -> Result<St
 pub fn artifact_task_lineage(root: &Path, task_id: &str) -> Result<Vec<String>> {
     let registry = load_task_registry(root)?;
     let mut owners = vec![task_id.to_string()];
+    let mut current = task_id;
     while let Some(link) = registry
         .tasks
-        .get(owners.last().unwrap())
+        .get(current)
         .and_then(|task| task.recovered_from.as_ref())
     {
-        let current = owners.last().unwrap();
-        if &link.successor_task_id != current
+        if link.successor_task_id != current
             || registry
                 .tasks
                 .get(&link.predecessor_task_id)
@@ -86,6 +86,7 @@ pub fn artifact_task_lineage(root: &Path, task_id: &str) -> Result<Vec<String>> 
             return Err(anyhow!("invalid artifact recovery lineage for {task_id:?}"));
         }
         owners.push(link.predecessor_task_id.clone());
+        current = &link.predecessor_task_id;
     }
     Ok(owners)
 }
