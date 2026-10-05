@@ -1268,3 +1268,324 @@ fn relaunch_not_requested_for_legacy_generated_command() {
         "legacy generated `claude --continue` must not be relaunched by the daemon"
     );
 }
+
+fn bootstrap_request(task_id: &str, session: &str, event_kind: HookEventKind) -> HookIngestRequest {
+    HookIngestRequest {
+        task_id: task_id.to_string(),
+        session_id: Some(session.to_string()),
+        event_kind,
+        ..HookIngestRequest::default()
+    }
+}
+
+#[test]
+fn session_bootstrap_deduplicates_delivery_not_general_hook_activity() {
+    let state = test_state();
+    let root = state.lock().unwrap().root.clone();
+    let task_id = "bootstrap";
+    {
+        let mut guard = state.lock().unwrap();
+        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        task.latest_handoff_artifact_id = Some("artifact-one".to_string());
+        task.latest_context_version = Some("version-one".to_string());
+    }
+    let path = task_brief_markdown_path(&root, &task_storage_id(task_id).unwrap());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "trusted objective and decision").unwrap();
+    let first = hook_ingest(
+        state.clone(),
+        bootstrap_request(task_id, "session-a", HookEventKind::SessionStart),
+    )
+    .unwrap();
+    assert_eq!(
+        first.additional_context.as_deref(),
+        Some("trusted objective and decision")
+    );
+    assert!(hook_ingest(
+        state.clone(),
+        bootstrap_request(task_id, "session-a", HookEventKind::SessionStart)
+    )
+    .unwrap()
+    .additional_context
+    .is_none());
+    // An activity event from B updates the general session field before B's
+    // SessionStart. It must not pretend B already received the brief.
+    hook_ingest(
+        state.clone(),
+        bootstrap_request(task_id, "session-b", HookEventKind::Unknown),
+    )
+    .unwrap();
+    assert_eq!(
+        state.lock().unwrap().tasks.tasks[task_id]
+            .latest_hook_session_id
+            .as_deref(),
+        Some("session-b")
+    );
+    assert!(hook_ingest(
+        state.clone(),
+        bootstrap_request(task_id, "session-b", HookEventKind::SessionStart)
+    )
+    .unwrap()
+    .additional_context
+    .is_some());
+    hook_ingest(
+        state.clone(),
+        bootstrap_request(task_id, "session-a", HookEventKind::Unknown),
+    )
+    .unwrap();
+    assert!(hook_ingest(
+        state.clone(),
+        bootstrap_request(task_id, "session-b", HookEventKind::SessionStart)
+    )
+    .unwrap()
+    .additional_context
+    .is_none());
+    state
+        .lock()
+        .unwrap()
+        .tasks
+        .tasks
+        .get_mut(task_id)
+        .unwrap()
+        .latest_context_version = Some("version-two".to_string());
+    fs::write(path, "new trusted context").unwrap();
+    assert_eq!(
+        hook_ingest(
+            state.clone(),
+            bootstrap_request(task_id, "session-b", HookEventKind::SessionStart)
+        )
+        .unwrap()
+        .additional_context
+        .as_deref(),
+        Some("new trusted context")
+    );
+}
+
+#[test]
+fn missing_or_unreadable_bootstrap_does_not_mark_delivery_and_can_retry() {
+    let state = test_state();
+    let root = state.lock().unwrap().root.clone();
+    let task_id = "bootstrap-retry";
+    ensure_task_record_mut(&mut state.lock().unwrap().tasks, task_id).latest_handoff_artifact_id =
+        Some("artifact".to_string());
+    let path = task_brief_markdown_path(&root, &task_storage_id(task_id).unwrap());
+    assert!(
+        hook_task_additional_context(&state, task_id, Some("session"))
+            .unwrap()
+            .is_none()
+    );
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for bytes in [b" \n".as_slice(), &[0xff]] {
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            hook_task_additional_context(&state, task_id, Some("session"))
+                .unwrap()
+                .is_none()
+        );
+        let guard = state.lock().unwrap();
+        let task = &guard.tasks.tasks[task_id];
+        assert!(task.latest_hook_bootstrap_at_unix.is_none());
+        assert!(task.latest_hook_bootstrap_session_id.is_none());
+        assert!(task.latest_hook_bootstrap_artifact_id.is_none());
+    }
+    fs::write(&path, "available after retry").unwrap();
+    assert_eq!(
+        hook_task_additional_context(&state, task_id, Some("session"))
+            .unwrap()
+            .as_deref(),
+        Some("available after retry")
+    );
+    assert!(
+        hook_task_additional_context(&state, task_id, Some("session"))
+            .unwrap()
+            .is_none()
+    );
+    let legacy: TaskRecord = serde_json::from_value(json!({"task_id":"legacy"})).unwrap();
+    assert!(legacy.latest_hook_bootstrap_session_id.is_none());
+    assert!(legacy.latest_hook_bootstrap_owner_task_id.is_none());
+}
+
+#[test]
+fn inherited_bootstrap_authenticates_owner_and_version_without_copying_brief() {
+    use packet28_daemon_protocol::broker::BrokerHandoffDescriptor;
+    use packet28_daemon_protocol::task::TaskHistoryRecovery;
+    let state = test_state();
+    let root = state.lock().unwrap().root.clone();
+    {
+        let mut guard = state.lock().unwrap();
+        for id in ["old", "middle", "new"] {
+            ensure_task_record_mut(&mut guard.tasks, id);
+        }
+        for (old, new) in [("old", "middle"), ("middle", "new")] {
+            let link = TaskHistoryRecovery {
+                predecessor_task_id: old.to_string(),
+                successor_task_id: new.to_string(),
+                ..TaskHistoryRecovery::default()
+            };
+            guard.tasks.tasks.get_mut(old).unwrap().superseded_by = Some(link.clone());
+            guard.tasks.tasks.get_mut(new).unwrap().recovered_from = Some(link);
+        }
+        let successor = guard.tasks.tasks.get_mut("new").unwrap();
+        successor.latest_handoff_id = Some("handoff".to_string());
+        successor.latest_handoff_artifact_id = Some("owned-artifact".to_string());
+        successor.handoffs.push(BrokerHandoffDescriptor {
+            handoff_id: "handoff".to_string(),
+            task_id: "old".to_string(),
+            artifact_id: "owned-artifact".to_string(),
+            context_version: "context-one".to_string(),
+            ..BrokerHandoffDescriptor::default()
+        });
+    }
+    let path = packet28_daemon_protocol::paths::task_version_json_path(
+        &root,
+        &task_storage_id("old").unwrap(),
+        &context_version_storage_id("context-one").unwrap(),
+    );
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let response = BrokerGetContextResponse {
+        context_version: "context-one".to_string(),
+        artifact_id: Some("owned-artifact".to_string()),
+        brief: "trusted objective; preserved decision; owned-artifact".to_string(),
+        ..BrokerGetContextResponse::default()
+    };
+    let bytes = serde_json::to_vec(&response).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let link = state
+        .lock()
+        .unwrap()
+        .tasks
+        .tasks
+        .get_mut("old")
+        .unwrap()
+        .superseded_by
+        .take();
+    assert!(hook_task_additional_context(&state, "new", Some("session")).is_err());
+    assert!(state.lock().unwrap().tasks.tasks["new"]
+        .latest_hook_bootstrap_at_unix
+        .is_none());
+    state
+        .lock()
+        .unwrap()
+        .tasks
+        .tasks
+        .get_mut("old")
+        .unwrap()
+        .superseded_by = link;
+    let mut mismatched = response.clone();
+    mismatched.artifact_id = Some("wrong-artifact".to_string());
+    fs::write(&path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+    assert!(hook_task_additional_context(&state, "new", Some("session")).is_err());
+    assert!(state.lock().unwrap().tasks.tasks["new"]
+        .latest_hook_bootstrap_at_unix
+        .is_none());
+    fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        hook_task_additional_context(&state, "new", Some("session"))
+            .unwrap()
+            .as_deref(),
+        Some(response.brief.as_str())
+    );
+    assert!(hook_task_additional_context(&state, "new", Some("session"))
+        .unwrap()
+        .is_none());
+    assert!(
+        hook_task_additional_context(&state, "new", Some("next-session"))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(!task_brief_markdown_path(&root, &task_storage_id("new").unwrap()).exists());
+    assert_eq!(
+        state.lock().unwrap().tasks.tasks["new"]
+            .latest_hook_bootstrap_owner_task_id
+            .as_deref(),
+        Some("old")
+    );
+}
+
+#[test]
+fn bootstrap_owner_validation_rejects_cycles_and_overlong_chains() {
+    use packet28_daemon_protocol::task::TaskHistoryRecovery;
+    let mut tasks = TaskRegistry::default();
+    for index in 0..65 {
+        let id = format!("task-{index}");
+        ensure_task_record_mut(&mut tasks, &id);
+        if index > 0 {
+            let predecessor = format!("task-{}", index - 1);
+            let link = TaskHistoryRecovery {
+                predecessor_task_id: predecessor.clone(),
+                successor_task_id: id.clone(),
+                ..TaskHistoryRecovery::default()
+            };
+            tasks.tasks.get_mut(&predecessor).unwrap().superseded_by = Some(link.clone());
+            tasks.tasks.get_mut(&id).unwrap().recovered_from = Some(link);
+        }
+    }
+    assert!(validate_hook_brief_owner(&tasks, "task-63", "task-0").is_ok());
+    assert!(validate_hook_brief_owner(&tasks, "task-64", "task-0").is_err());
+    assert!(validate_hook_brief_owner(&tasks, "task-1", "unrelated").is_err());
+    let cycle = TaskHistoryRecovery {
+        predecessor_task_id: "task-1".to_string(),
+        successor_task_id: "task-0".to_string(),
+        ..TaskHistoryRecovery::default()
+    };
+    tasks.tasks.get_mut("task-0").unwrap().recovered_from = Some(cycle.clone());
+    tasks.tasks.get_mut("task-1").unwrap().superseded_by = Some(cycle);
+    // Reaching the requested owner is not enough: its remaining lineage must
+    // also terminate instead of returning into a cycle.
+    assert!(validate_hook_brief_owner(&tasks, "task-0", "task-0").is_err());
+}
+
+#[test]
+fn bootstrap_persistence_rejection_restores_markers_and_allows_retry() {
+    let state = test_state();
+    let root = state.lock().unwrap().root.clone();
+    let task_id = "bootstrap-persistence-retry";
+    {
+        let mut guard = state.lock().unwrap();
+        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        task.latest_handoff_artifact_id = Some("new-artifact".to_string());
+        task.latest_context_version = Some("new-context".to_string());
+        task.latest_hook_bootstrap_context_version = Some("old-context".to_string());
+        task.latest_hook_bootstrap_session_id = Some("old-session".to_string());
+        task.latest_hook_bootstrap_owner_task_id = Some(task_id.to_string());
+        task.latest_hook_bootstrap_artifact_id = Some("old-artifact".to_string());
+        task.latest_hook_bootstrap_at_unix = Some(7);
+        task.latest_agent_handoff_artifact_id = Some("old-agent-handoff".to_string());
+    }
+    let path = task_brief_markdown_path(&root, &task_storage_id(task_id).unwrap());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, "retry this context").unwrap();
+    let before = serde_json::to_value(&state.lock().unwrap().tasks.tasks[task_id]).unwrap();
+    let error = hook_task_additional_context_with_persistence(
+        &state,
+        task_id,
+        Some("new-session"),
+        |candidate, id| {
+            assert_eq!(
+                candidate.tasks.tasks[id]
+                    .latest_hook_bootstrap_session_id
+                    .as_deref(),
+                Some("new-session")
+            );
+            anyhow::bail!("injected persistence rejection")
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("injected persistence rejection"));
+    assert_eq!(
+        serde_json::to_value(&state.lock().unwrap().tasks.tasks[task_id]).unwrap(),
+        before
+    );
+    assert_eq!(
+        hook_task_additional_context(&state, task_id, Some("new-session"))
+            .unwrap()
+            .as_deref(),
+        Some("retry this context")
+    );
+    assert!(
+        hook_task_additional_context(&state, task_id, Some("new-session"))
+            .unwrap()
+            .is_none()
+    );
+}

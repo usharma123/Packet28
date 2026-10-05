@@ -46,39 +46,135 @@ fn store_hook_artifact(root: &Path, task_id: &str, prefix: &str, value: &Value) 
     Ok(id)
 }
 
+// Artifact ownership may traverse recovery generations, but never follows an
+// unreciprocated pointer or an unbounded chain supplied by persisted state.
+fn validate_hook_brief_owner(tasks: &TaskRegistry, task_id: &str, owner: &str) -> Result<()> {
+    let mut current = task_id;
+    let mut visited = BTreeSet::new();
+    let mut owner_seen = false;
+    for _ in 0..64 {
+        if !visited.insert(current) {
+            anyhow::bail!("cyclic hook bootstrap recovery lineage");
+        }
+        let task = tasks
+            .tasks
+            .get(current)
+            .ok_or_else(|| anyhow!("missing hook bootstrap lineage task"))?;
+        if task.task_id != current {
+            anyhow::bail!("invalid hook bootstrap lineage identity");
+        }
+        owner_seen |= current == owner;
+        let Some(link) = task.recovered_from.as_ref() else {
+            if owner_seen {
+                return Ok(());
+            }
+            anyhow::bail!("hook bootstrap owner is outside recovery lineage");
+        };
+        if link.successor_task_id != current
+            || tasks
+                .tasks
+                .get(&link.predecessor_task_id)
+                .and_then(|parent| parent.superseded_by.as_ref())
+                != Some(link)
+        {
+            anyhow::bail!("invalid reciprocal hook bootstrap recovery lineage");
+        }
+        current = &link.predecessor_task_id;
+    }
+    anyhow::bail!("hook bootstrap recovery lineage exceeds 64 tasks")
+}
+
 fn hook_task_additional_context(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
     session_id: Option<&str>,
 ) -> Result<Option<String>> {
-    let root = state.lock().map_err(lock_err)?.root.clone();
-    let task = load_task_record(state, task_id);
-    let Some(task) = task else {
+    hook_task_additional_context_with_persistence(state, task_id, session_id, persist_task)
+}
+
+fn hook_task_additional_context_with_persistence(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    session_id: Option<&str>,
+    persist: impl FnOnce(&DaemonState, &str) -> Result<()>,
+) -> Result<Option<String>> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    let Some(task) = guard.tasks.tasks.get(task_id) else {
         return Ok(None);
     };
-    let latest_context_version = task.latest_context_version.clone();
-    let latest_handoff_artifact_id = task.latest_handoff_artifact_id.clone();
-    if task.latest_handoff_artifact_id.is_none() {
+    let Some(artifact_id) = task.latest_handoff_artifact_id.clone() else {
         return Ok(None);
-    }
-    if task.latest_hook_bootstrap_context_version == latest_context_version
-        && task.latest_hook_session_id.as_deref() == session_id
+    };
+    let descriptor = task.handoffs.iter().find(|handoff| {
+        task.latest_handoff_id.as_deref() == Some(handoff.handoff_id.as_str())
+            && handoff.artifact_id == artifact_id
+    });
+    let owner = descriptor
+        .filter(|handoff| !handoff.task_id.is_empty())
+        .map_or(task_id, |handoff| handoff.task_id.as_str())
+        .to_string();
+    validate_hook_brief_owner(&guard.tasks, task_id, &owner)?;
+    let context_version = if owner == task_id {
+        task.latest_context_version.clone()
+    } else {
+        descriptor.map(|handoff| handoff.context_version.clone())
+    };
+    if task.latest_hook_bootstrap_at_unix.is_some()
+        && task.latest_hook_bootstrap_session_id.as_deref() == session_id
+        && task.latest_hook_bootstrap_context_version == context_version
+        && task.latest_hook_bootstrap_owner_task_id.as_deref() == Some(owner.as_str())
+        && task.latest_hook_bootstrap_artifact_id.as_deref() == Some(artifact_id.as_str())
     {
         return Ok(None);
     }
-    let storage_id = task_storage_id(task_id)?;
-    let path = task_brief_markdown_path(&root, &storage_id);
-    let brief = fs::read_to_string(path).ok();
-    {
-        let mut guard = state.lock().map_err(lock_err)?;
+    let brief = if owner == task_id {
+        let storage_id = task_storage_id(task_id)?;
+        fs::read_to_string(task_brief_markdown_path(&guard.root, &storage_id)).ok()
+    } else if let Some(version) = context_version.as_deref() {
+        match crate::broker::load_versioned_broker_response(&guard.root, &owner, version)? {
+            Some(response)
+                if response.context_version == version
+                    && response.artifact_id.as_deref() == Some(artifact_id.as_str()) =>
+            {
+                Some(response.brief)
+            }
+            Some(_) => anyhow::bail!("inherited hook bootstrap artifact identity mismatch"),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let Some(brief) = brief.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+    let previous = (
+        task.latest_hook_bootstrap_context_version.clone(),
+        task.latest_hook_bootstrap_session_id.clone(),
+        task.latest_hook_bootstrap_owner_task_id.clone(),
+        task.latest_hook_bootstrap_artifact_id.clone(),
+        task.latest_hook_bootstrap_at_unix,
+        task.latest_agent_handoff_artifact_id.clone(),
+    );
+    task.latest_hook_bootstrap_context_version = context_version;
+    task.latest_hook_bootstrap_session_id = session_id.map(ToOwned::to_owned);
+    task.latest_hook_bootstrap_owner_task_id = Some(owner);
+    task.latest_hook_bootstrap_artifact_id = Some(artifact_id.clone());
+    task.latest_hook_bootstrap_at_unix = Some(now_unix());
+    task.latest_agent_handoff_artifact_id = Some(artifact_id);
+    if let Err(error) = persist(&guard, task_id) {
         let task = ensure_task_record_mut(&mut guard.tasks, task_id);
-        task.latest_hook_bootstrap_context_version = latest_context_version;
-        task.latest_hook_bootstrap_at_unix = Some(now_unix());
-        task.latest_hook_session_id = session_id.map(ToOwned::to_owned);
-        task.latest_agent_handoff_artifact_id = latest_handoff_artifact_id;
-        persist_task(&guard, task_id)?;
+        (
+            task.latest_hook_bootstrap_context_version,
+            task.latest_hook_bootstrap_session_id,
+            task.latest_hook_bootstrap_owner_task_id,
+            task.latest_hook_bootstrap_artifact_id,
+            task.latest_hook_bootstrap_at_unix,
+            task.latest_agent_handoff_artifact_id,
+        ) = previous;
+        return Err(error);
     }
-    Ok(brief.filter(|value| !value.trim().is_empty()))
+    Ok(Some(brief))
 }
 
 fn boundary_reason(kind: HookBoundaryKind) -> Option<&'static str> {
@@ -468,19 +564,20 @@ pub(crate) fn hook_ingest(
     let host_budget = request.host_context_budget_tokens;
 
     if matches!(request.event_kind, HookEventKind::SessionStart) {
+        let prepared = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            task_id,
+            HookBoundaryKind::None,
+            host_budget,
+            &config,
+        )?;
         let additional_context =
             hook_task_additional_context(&state, task_id, request.session_id.as_deref())?;
         return Ok(HookIngestResponse {
             task_id: task_id.to_string(),
             accepted: true,
             additional_context,
-            ..maybe_prepare_handoff_from_hooks(
-                state,
-                task_id,
-                HookBoundaryKind::None,
-                host_budget,
-                &config,
-            )?
+            ..prepared
         });
     }
 
