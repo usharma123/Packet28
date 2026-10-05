@@ -220,6 +220,29 @@ impl IndexIngress {
         self.send_with_clear_revision(command, None)
     }
 
+    pub(crate) fn request_shutdown(&self, publish_shutdown: impl FnOnce()) -> Result<()> {
+        let mut pending = self.pending.lock().map_err(lock_err)?;
+        let result = if pending.shutdown_epoch.is_some() {
+            Ok(())
+        } else if let Some(epoch) = pending.next_epoch.checked_add(1) {
+            pending.next_epoch = epoch;
+            pending.shutdown_epoch = Some(epoch);
+            match self.wake.try_send(()) {
+                Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => Ok(()),
+                Err(std::sync::mpsc::TrySendError::Disconnected(())) => {
+                    pending.shutdown_epoch = None;
+                    Err(anyhow!("index worker is not running"))
+                }
+            }
+        } else {
+            Err(anyhow!("index ingress epoch exhausted"))
+        };
+        // Keep batch consumption behind this lock until the daemon's shutdown
+        // intent is visible. Only an accepted shutdown may be repeated safely.
+        publish_shutdown();
+        result
+    }
+
     fn send_clear(&self, revision: u64) -> Result<()> {
         self.send_with_clear_revision(IndexCommand::Clear, Some(revision))
     }
@@ -229,6 +252,9 @@ impl IndexIngress {
         command: IndexCommand,
         clear_revision: Option<u64>,
     ) -> Result<()> {
+        if matches!(command, IndexCommand::Shutdown) {
+            return self.request_shutdown(|| {});
+        }
         {
             let mut pending = self.pending.lock().map_err(lock_err)?;
             if pending.shutdown_epoch.is_some() && !matches!(command, IndexCommand::Shutdown) {
