@@ -699,13 +699,14 @@ pub(crate) fn load_agent_snapshot_for_task(
     let (kernel, lineage) = {
         let guard = state.lock().map_err(lock_err)?;
         let mut lineage = vec![task_id.to_string()];
+        let mut current = task_id;
         while let Some(link) = guard
             .tasks
             .tasks
-            .get(lineage.last().unwrap())
+            .get(current)
             .and_then(|task| task.recovered_from.as_ref())
         {
-            if link.successor_task_id != *lineage.last().unwrap()
+            if link.successor_task_id != current
                 || guard
                     .tasks
                     .tasks
@@ -717,6 +718,7 @@ pub(crate) fn load_agent_snapshot_for_task(
                 anyhow::bail!("invalid recovery lineage for task {task_id:?}");
             }
             lineage.push(link.predecessor_task_id.clone());
+            current = &link.predecessor_task_id;
         }
         lineage.reverse();
         (guard.kernel.clone(), lineage)
