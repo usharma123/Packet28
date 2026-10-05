@@ -1249,3 +1249,352 @@ fn classify_setup_index_status_reports_failure_when_repo_index_claims_ready_with
         other => panic!("expected failed setup classification, got {other:?}"),
     }
 }
+
+#[test]
+fn write_opencode_plugin_installs_packet28_rewrite_plugin() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(".config")
+        .join("opencode")
+        .join("plugins")
+        .join("packet28.ts");
+    let status = setup_plugins::write_opencode_plugin(&path, true).unwrap();
+    assert!(matches!(status, McpConfigStatus::Written));
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("Packet28 rewrite"));
+    assert!(content.contains("tool.execute.before"));
+    assert!(content.contains("args as Record<string, unknown>).command = rewritten"));
+
+    let status = setup_plugins::write_opencode_plugin(&path, true).unwrap();
+    assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
+}
+
+#[test]
+fn opencode_plugin_smoke_rewrites_and_passes_through_empty_stdout() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(".config")
+        .join("opencode")
+        .join("plugins")
+        .join("packet28.ts");
+    setup_plugins::write_opencode_plugin(&path, true).unwrap();
+    let script = r#"
+const fs = require("fs")
+let code = fs.readFileSync(process.argv[1], "utf8")
+code = code.replace(/^import type .*$/m, "")
+code = code.replace("export const Packet28OpenCodePlugin: Plugin =", "const Packet28OpenCodePlugin =")
+code = code.replaceAll("(args as Record<string, unknown>)", "args")
+code += `
+;(async () => {
+  const calls = []
+  function $(strings, ...values) {
+    const rendered = strings.reduce((acc, part, index) => acc + part + (index < values.length ? values[index] : ""), "")
+    calls.push({ rendered, values })
+    return {
+      quiet() { return this },
+      nothrow() {
+        const command = String(values[0] ?? "")
+        if (command === "git status --short") return Promise.resolve({ stdout: "rewritten git status\\n" })
+        return Promise.resolve({ stdout: "" })
+      },
+      then(resolve) { resolve({ stdout: "" }) },
+    }
+  }
+  const plugin = await Packet28OpenCodePlugin({ $ })
+  const rewriteArgs = { command: "git status --short" }
+  const passthroughArgs = { command: "htop" }
+  await plugin["tool.execute.before"]({ tool: "bash" }, { args: rewriteArgs })
+  await plugin["tool.execute.before"]({ tool: "shell" }, { args: passthroughArgs })
+  console.log(rewriteArgs.command)
+  console.log(passthroughArgs.command)
+}
+
+#[test]
+#[cfg(unix)]
+fn hermes_plugin_smoke_rewrites_and_passes_through_empty_stdout() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    setup_plugins::write_hermes_plugin(dir.path(), true).unwrap();
+    let init = crate::runtime_integrations::hermes::plugin_dir(dir.path()).join("__init__.py");
+    let script = r#"
+import importlib.util
+import subprocess
+import sys
+spec = importlib.util.spec_from_file_location("packet28_rewrite", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+class FakeResult:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+def fake_run(argv, **kwargs):
+    assert argv[0:2] == ["Packet28", "rewrite"]
+    if argv[2] == "git status --short":
+        return FakeResult("rewritten git status\n")
+    return FakeResult("")
+mod.subprocess.run = fake_run
+rewrite_args = {"command": "git status --short"}
+mod._pre_tool_call(tool_name="terminal", args=rewrite_args)
+passthrough_args = {"command": "htop"}
+mod._pre_tool_call(tool_name="terminal", args=passthrough_args)
+print(rewrite_args["command"])
+print(passthrough_args["command"])
+"#;
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(init)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "python smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "rewritten git status\nhtop\n"
+    );
+}
+
+#[test]
+fn gitignore_coverage_recognizes_common_spellings() {
+    for spelling in [
+        ".packet28",
+        ".packet28/",
+        "/.packet28",
+        "/.packet28/",
+        ".packet28/*",
+        ".packet28/**",
+    ] {
+        assert!(
+            gitignore_covers_packet28_dir(&format!("target/\n{spelling}\n*.log\n")),
+            "spelling {spelling} should be recognized as covering .packet28"
+        );
+    }
+    assert!(gitignore_covers_packet28_dir(".packet28/  \n"));
+    assert!(!gitignore_covers_packet28_dir("target/\n.packet28x/\n"));
+    assert!(!gitignore_covers_packet28_dir(""));
+}
+
+#[test]
+fn gitignore_coverage_preserves_leading_spaces() {
+    assert!(!gitignore_covers_packet28_dir(" .packet28/\n"));
+}
+
+#[test]
+fn gitignore_coverage_matches_git_trailing_space_semantics() {
+    use std::process::Command;
+
+    for (pattern, expected) in [
+        (".packet28/\t\n", false),
+        (".packet28/\u{a0}\n", false),
+        (".packet28/\\ \n", false),
+        (".packet28/\\  \n", false),
+        (".packet28/ \t \n", false),
+        (".packet28/  \n", true),
+        (".packet28/\r\n", true),
+    ] {
+        let dir = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", dir.path().join("no-global-config"))
+                .status()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet", "--template="]).success());
+        fs::write(dir.path().join(".gitignore"), pattern).unwrap();
+        let check = git(&["check-ignore", "--quiet", ".packet28/daemon/runtime.json"]);
+        assert_eq!(check.code(), Some(if expected { 0 } else { 1 }));
+        assert_eq!(
+            gitignore_covers_packet28_dir(pattern),
+            expected,
+            "{pattern:?}"
+        );
+
+        let updated = ensure_packet28_gitignore(dir.path()).unwrap();
+        assert_eq!(updated.is_none(), expected, "{pattern:?}");
+        assert!(git(&["check-ignore", "--quiet", ".packet28/daemon/runtime.json"]).success());
+        assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_none());
+    }
+}
+
+#[test]
+fn gitignore_coverage_rejects_patterns_that_do_not_ignore_the_runtime_directory() {
+    for pattern in [
+        "!.packet28/",
+        "# .packet28/",
+        "\t.packet28/",
+        ".packet28/cache",
+        "nested/.packet28/",
+        ".packet280/",
+    ] {
+        assert!(
+            !gitignore_covers_packet28_dir(pattern),
+            "pattern {pattern:?} must not be treated as covering .packet28/"
+        );
+    }
+}
+
+#[test]
+fn ensure_gitignore_is_noop_outside_git_repo() {
+    let dir = tempdir().unwrap();
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+    assert!(!dir.path().join(".gitignore").exists());
+}
+
+#[test]
+fn ensure_gitignore_creates_entry_in_git_repo() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+
+    let created = ensure_packet28_gitignore(dir.path()).unwrap();
+    assert_eq!(created, Some(dir.path().join(".gitignore")));
+    let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(
+        content,
+        "# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+
+    // Idempotent: a second run makes no change and reports nothing added.
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        content
+    );
+}
+
+#[test]
+fn ensure_gitignore_appends_and_preserves_existing_content() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    // Existing content without a trailing newline must be preserved intact.
+    fs::write(dir.path().join(".gitignore"), "target/\n/dist").unwrap();
+
+    let created = ensure_packet28_gitignore(dir.path()).unwrap();
+    assert!(created.is_some());
+    let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(
+        content,
+        "target/\n/dist\n\n# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+}
+
+#[test]
+fn ensure_gitignore_respects_preexisting_coverage() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".gitignore"), "/.packet28/\n").unwrap();
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+}
+
+#[test]
+fn ensure_gitignore_supports_git_file_marker_used_by_worktrees() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join(".git"), "gitdir: /tmp/example-worktree\n").unwrap();
+
+    assert_eq!(
+        ensure_packet28_gitignore(dir.path()).unwrap(),
+        Some(dir.path().join(".gitignore"))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+}
+
+#[test]
+fn ensure_gitignore_rejects_invalid_utf8_without_replacing_the_file() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let original = b"target/\n\xff\xfe\n";
+    fs::write(dir.path().join(".gitignore"), original).unwrap();
+
+    let error = ensure_packet28_gitignore(dir.path()).unwrap_err();
+
+    assert!(error.to_string().contains("as UTF-8"));
+    assert_eq!(fs::read(dir.path().join(".gitignore")).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_gitignore_rejects_symlink_without_writing_outside_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let outside_gitignore = outside.path().join("outside.gitignore");
+    fs::write(&outside_gitignore, "outside content\n").unwrap();
+    symlink(&outside_gitignore, dir.path().join(".gitignore")).unwrap();
+
+    assert!(ensure_packet28_gitignore(dir.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(&outside_gitignore).unwrap(),
+        "outside content\n"
+    );
+    assert!(fs::symlink_metadata(dir.path().join(".gitignore"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_gitignore_rejects_hard_link_without_writing_outside_workspace() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let outside_gitignore = outside.path().join("outside.gitignore");
+    fs::write(&outside_gitignore, "outside content\n").unwrap();
+    fs::hard_link(&outside_gitignore, dir.path().join(".gitignore")).unwrap();
+
+    assert!(ensure_packet28_gitignore(dir.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(&outside_gitignore).unwrap(),
+        "outside content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "outside content\n"
+    );
+}
+
+#[test]
+fn gitignore_coverage_respects_later_negations() {
+    assert!(!gitignore_covers_packet28_dir(".packet28/\n!.packet28/\n"));
+    assert!(!gitignore_covers_packet28_dir(
+        ".packet28/**\n!.packet28/task.json\n"
+    ));
+    assert!(!gitignore_covers_packet28_dir(".packet28/*\n!*\n"));
+    assert!(gitignore_covers_packet28_dir("!.packet28/\n.packet28/\n"));
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".gitignore"), ".packet28/\n!.packet28/\n").unwrap();
+    assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_some());
+    assert!(gitignore_covers_packet28_dir(
+        &fs::read_to_string(dir.path().join(".gitignore")).unwrap()
+    ));
+    assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_none());
+}
