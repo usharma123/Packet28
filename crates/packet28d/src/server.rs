@@ -1094,6 +1094,7 @@ fn build_task_list_page(
     };
     let mut collection_bytes = 0_usize;
     let mut has_more = false;
+    let mut last_processed_task_id = None;
     let start = request
         .after_task_id
         .as_ref()
@@ -1113,6 +1114,7 @@ fn build_task_list_page(
                     task_id: task_id.clone(),
                     encoded_bytes,
                 });
+                last_processed_task_id = Some(task_id);
                 continue;
             }
         };
@@ -1132,6 +1134,7 @@ fn build_task_list_page(
                     task_id: task_id.clone(),
                     encoded_bytes: item_bytes as u64,
                 });
+                last_processed_task_id = Some(task_id);
                 continue;
             }
             has_more = true;
@@ -1139,9 +1142,11 @@ fn build_task_list_page(
         }
         collection_bytes = next_bytes;
         page.tasks.push(task.clone());
+        last_processed_task_id = Some(task_id);
     }
     if has_more {
-        page.next_after_task_id = page.tasks.last().map(|task| task.task_id.clone());
+        // Already-reported omissions must not be counted again on the next page.
+        page.next_after_task_id = last_processed_task_id.cloned();
     }
     ensure_registry_page_response_fits(
         &DaemonRegistryResponseV1::TaskListPage { page: page.clone() },
@@ -1793,6 +1798,77 @@ mod tests {
         assert_eq!(page.omitted_oversized[0].task_id, oversized_id);
         assert!(page.omitted_oversized[0].encoded_bytes >= MAX_REGISTRY_PAGE_ITEM_BYTES as u64);
         assert_eq!(page.total, 2);
+    }
+
+    #[test]
+    fn task_registry_cursor_advances_past_omissions_before_the_byte_limit() {
+        let tasks = [
+            ('a', 900_000),
+            ('b', 900_000),
+            ('c', MAX_REGISTRY_PAGE_ITEM_BYTES + 1),
+            ('d', 900_000),
+        ]
+        .into_iter()
+        .map(|(id, bytes)| {
+            let task_id = id.to_string();
+            (
+                task_id.clone(),
+                TaskRecord {
+                    task_id,
+                    last_error: Some("x".repeat(bytes)),
+                    ..TaskRecord::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+        let first = build_task_list_page(
+            &tasks,
+            &registry_revision(7),
+            &TaskListPageRequestV1::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            first
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            first
+                .omitted_oversized
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+        assert_eq!(first.next_after_task_id.as_deref(), Some("c"));
+
+        let second = build_task_list_page(
+            &tasks,
+            &registry_revision(7),
+            &TaskListPageRequestV1 {
+                snapshot_revision: Some(first.snapshot_revision),
+                after_task_id: first.next_after_task_id,
+                ..TaskListPageRequestV1::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            second
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d"]
+        );
+        assert!(second.omitted_oversized.is_empty());
+        assert_eq!(second.next_after_task_id, None);
+        assert_eq!(
+            first.tasks.len() + first.omitted_oversized.len() + second.tasks.len(),
+            second.total
+        );
     }
 
     #[test]
