@@ -122,6 +122,10 @@ JSON output and savings records identify this scope as `rendered_command_body`.
 The estimate excludes the JSON envelope, metrics footer, and provider usage.
 Older savings records retain an unknown scope rather than assuming this one.
 
+Artifact capture and analytics are optional after one-shot command execution.
+If either fails, `Packet28 run` emits the original stdout and stderr bytes and
+returns the original command exit status without running the command again.
+
 ### Persistent task
 
 1. A client authenticates the endpoint from

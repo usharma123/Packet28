@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,76 +96,80 @@ fn run_reducer_aware(root: &std::path::Path, cwd: &std::path::Path, args: &RunAr
         .current_dir(cwd)
         .output()
         .with_context(|| format!("failed to run `{command_text}`"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(1);
-    let reduction = reduce_command_output(&spec, &stdout, &stderr, exit_code)?;
-    let raw_est_tokens = estimate_tokens(&(stdout.clone() + &stderr));
-    let rendered_command_body = render_command_body(&reduction.summary, &reduction.compact_preview);
-    let reduced_est_tokens = estimate_tokens(&rendered_command_body);
-    let raw_artifact_handle =
-        write_run_raw_artifact(root, &command_text, exit_code, &stdout, &stderr)?;
-    let failure_fingerprint = failure_fingerprint(exit_code, &stdout, &stderr);
-    let changed_paths = new_changed_paths(root, &before_changed_paths);
-    let saved = raw_est_tokens.saturating_sub(reduced_est_tokens);
-    let savings_pct = if raw_est_tokens == 0 {
-        0.0
-    } else {
-        (saved as f64 / raw_est_tokens as f64) * 100.0
-    };
-    let payload = json!({
-        "command": {
-            "original": command_text,
-            "cwd": cwd.display().to_string(),
-            "exit_code": exit_code,
-            "timestamp_unix_ms": timestamp_unix_ms(),
-        },
-        "reduction": reduction,
-        "rendered_command_body": rendered_command_body,
-        "estimate_scope": "rendered_command_body",
-        "raw_est_tokens": raw_est_tokens,
-        "reduced_est_tokens": reduced_est_tokens,
-        "savings_percent": savings_pct,
-        "fallback_reason": null,
-        "failure_fingerprint": failure_fingerprint,
-        "raw_artifact": {
-            "available": true,
-            "handle": raw_artifact_handle,
-        },
-        "provenance": {
-            "original_command": command_text,
-            "cwd": cwd.display().to_string(),
-            "exit_code": exit_code,
-            "timestamp_unix_ms": timestamp_unix_ms(),
-        }
-    });
-    record_run_savings(
-        root,
-        &RunSavingsRecord {
-            command: command_text,
-            cwd: cwd.display().to_string(),
-            family: reduction.family.clone(),
-            canonical_kind: reduction.canonical_kind.clone(),
-            exit_code,
-            raw_est_tokens,
-            reduced_est_tokens,
-            estimate_scope: Some("rendered_command_body".to_string()),
-            savings_percent: savings_pct,
-            fallback_reason: None,
-            failure_fingerprint,
-            changed_paths,
-            timestamp_unix_ms: timestamp_unix_ms(),
-        },
-    )?;
-    if args.json {
-        crate::cmd_common::emit_json(&payload, args.pretty)?;
-    } else {
-        print!("{rendered_command_body}");
-        println!(
+    let capture_result = (|| -> Result<i32> {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let exit_code = command_exit_code(output.status);
+        let reduction = reduce_command_output(&spec, &stdout, &stderr, exit_code)?;
+        let raw_est_tokens = estimate_tokens(&(stdout.clone() + &stderr));
+        let rendered_command_body =
+            render_command_body(&reduction.summary, &reduction.compact_preview);
+        let reduced_est_tokens = estimate_tokens(&rendered_command_body);
+        let raw_artifact_handle =
+            write_run_raw_artifact(root, &command_text, exit_code, &stdout, &stderr)?;
+        let failure_fingerprint = failure_fingerprint(exit_code, &stdout, &stderr);
+        let changed_paths = new_changed_paths(root, &before_changed_paths);
+        let saved = raw_est_tokens.saturating_sub(reduced_est_tokens);
+        let savings_pct = if raw_est_tokens == 0 {
+            0.0
+        } else {
+            (saved as f64 / raw_est_tokens as f64) * 100.0
+        };
+        let payload = json!({
+            "command": {
+                "original": command_text,
+                "cwd": cwd.display().to_string(),
+                "exit_code": exit_code,
+                "timestamp_unix_ms": timestamp_unix_ms(),
+            },
+            "reduction": reduction,
+            "rendered_command_body": rendered_command_body,
+            "estimate_scope": "rendered_command_body",
+            "raw_est_tokens": raw_est_tokens,
+            "reduced_est_tokens": reduced_est_tokens,
+            "savings_percent": savings_pct,
+            "fallback_reason": null,
+            "failure_fingerprint": failure_fingerprint,
+            "raw_artifact": {
+                "available": true,
+                "handle": raw_artifact_handle,
+            },
+            "provenance": {
+                "original_command": command_text,
+                "cwd": cwd.display().to_string(),
+                "exit_code": exit_code,
+                "timestamp_unix_ms": timestamp_unix_ms(),
+            }
+        });
+        record_run_savings(
+            root,
+            &RunSavingsRecord {
+                command: command_text,
+                cwd: cwd.display().to_string(),
+                family: reduction.family.clone(),
+                canonical_kind: reduction.canonical_kind.clone(),
+                exit_code,
+                raw_est_tokens,
+                reduced_est_tokens,
+                estimate_scope: Some("rendered_command_body".to_string()),
+                savings_percent: savings_pct,
+                fallback_reason: None,
+                failure_fingerprint,
+                changed_paths,
+                timestamp_unix_ms: timestamp_unix_ms(),
+            },
+        )?;
+        if args.json {
+            crate::cmd_common::emit_json(&payload, args.pretty)?;
+        } else {
+            print!("{rendered_command_body}");
+            println!(
             "tokens: raw={raw_est_tokens} reduced={reduced_est_tokens} saved={saved} ({savings_pct:.1}%)"
         );
-    }
-    Ok(exit_code)
+        }
+        Ok(exit_code)
+    })();
+    Ok(finish_run_capture(&output, capture_result))
 }
 
 fn run_auto_fallback(
@@ -220,77 +225,80 @@ fn run_plain_command(
     let output = build_command(argv)?
         .output()
         .with_context(|| format!("failed to run `{command_text}`"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(1);
-    if let Some(filter) =
-        crate::toml_filters::apply_configured_filter(root, &command_text, &stdout, &stderr)?
-    {
-        return emit_filtered_run(FilteredRun {
+    let capture_result = (|| -> Result<i32> {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let exit_code = command_exit_code(output.status);
+        if let Some(filter) =
+            crate::toml_filters::apply_configured_filter(root, &command_text, &stdout, &stderr)?
+        {
+            return emit_filtered_run(FilteredRun {
+                root,
+                cwd,
+                command_text: &command_text,
+                exit_code,
+                stdout: &stdout,
+                stderr: &stderr,
+                filter,
+                before_changed_paths,
+                json,
+                pretty,
+            });
+        }
+        let raw_est_tokens = estimate_tokens(&(stdout.clone() + &stderr));
+        let raw_artifact_handle =
+            write_run_raw_artifact(root, &command_text, exit_code, &stdout, &stderr)?;
+        let failure_fingerprint = failure_fingerprint(exit_code, &stdout, &stderr);
+        let changed_paths = new_changed_paths(root, &before_changed_paths);
+        record_run_savings(
             root,
-            cwd,
-            command_text: &command_text,
-            exit_code,
-            stdout: &stdout,
-            stderr: &stderr,
-            filter,
-            before_changed_paths,
-            json,
-            pretty,
-        });
-    }
-    let raw_est_tokens = estimate_tokens(&(stdout.clone() + &stderr));
-    let raw_artifact_handle =
-        write_run_raw_artifact(root, &command_text, exit_code, &stdout, &stderr)?;
-    let failure_fingerprint = failure_fingerprint(exit_code, &stdout, &stderr);
-    let changed_paths = new_changed_paths(root, &before_changed_paths);
-    record_run_savings(
-        root,
-        &RunSavingsRecord {
-            command: command_text.clone(),
-            cwd: cwd.display().to_string(),
-            family: "fallback".to_string(),
-            canonical_kind: "raw_passthrough".to_string(),
-            exit_code,
-            raw_est_tokens,
-            reduced_est_tokens: raw_est_tokens,
-            estimate_scope: Some("rendered_command_body".to_string()),
-            savings_percent: 0.0,
-            fallback_reason: Some(fallback_reason.to_string()),
-            failure_fingerprint: failure_fingerprint.clone(),
-            changed_paths,
-            timestamp_unix_ms: timestamp_unix_ms(),
-        },
-    )?;
-    if json {
-        crate::cmd_common::emit_json(
-            &json!({
-                "command": {
-                    "original": command_text,
-                    "exit_code": exit_code,
-                    "timestamp_unix_ms": timestamp_unix_ms(),
-                },
-                "stdout": stdout,
-                "stderr": stderr,
-                "raw_est_tokens": raw_est_tokens,
-                "reduced_est_tokens": raw_est_tokens,
-                "estimate_scope": "rendered_command_body",
-                "rendered_command_body": format!("{stdout}{stderr}"),
-                "savings_percent": 0.0,
-                "fallback_reason": fallback_reason,
-                "failure_fingerprint": failure_fingerprint,
-                "raw_artifact": {
-                    "available": true,
-                    "handle": raw_artifact_handle,
-                },
-            }),
-            pretty,
+            &RunSavingsRecord {
+                command: command_text.clone(),
+                cwd: cwd.display().to_string(),
+                family: "fallback".to_string(),
+                canonical_kind: "raw_passthrough".to_string(),
+                exit_code,
+                raw_est_tokens,
+                reduced_est_tokens: raw_est_tokens,
+                estimate_scope: Some("rendered_command_body".to_string()),
+                savings_percent: 0.0,
+                fallback_reason: Some(fallback_reason.to_string()),
+                failure_fingerprint: failure_fingerprint.clone(),
+                changed_paths,
+                timestamp_unix_ms: timestamp_unix_ms(),
+            },
         )?;
-    } else {
-        print!("{stdout}");
-        eprint!("{stderr}");
-    }
-    Ok(exit_code)
+        if json {
+            crate::cmd_common::emit_json(
+                &json!({
+                    "command": {
+                        "original": command_text,
+                        "exit_code": exit_code,
+                        "timestamp_unix_ms": timestamp_unix_ms(),
+                    },
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "raw_est_tokens": raw_est_tokens,
+                    "reduced_est_tokens": raw_est_tokens,
+                    "estimate_scope": "rendered_command_body",
+                    "rendered_command_body": format!("{stdout}{stderr}"),
+                    "savings_percent": 0.0,
+                    "fallback_reason": fallback_reason,
+                    "failure_fingerprint": failure_fingerprint,
+                    "raw_artifact": {
+                        "available": true,
+                        "handle": raw_artifact_handle,
+                    },
+                }),
+                pretty,
+            )?;
+        } else {
+            print!("{stdout}");
+            eprint!("{stderr}");
+        }
+        Ok(exit_code)
+    })();
+    Ok(finish_run_capture(&output, capture_result))
 }
 
 struct FilteredRun<'a> {
@@ -405,6 +413,30 @@ fn emit_filtered_run(run: FilteredRun<'_>) -> Result<i32> {
 
 fn command_text(argv: &[String]) -> String {
     shell_words::join(argv.iter().map(String::as_str))
+}
+
+fn finish_run_capture(output: &std::process::Output, captured: Result<i32>) -> i32 {
+    if let Ok(exit_code) = captured {
+        return exit_code;
+    }
+    // Execution has finished. Capture failures only replay the original output.
+    let _ = io::stdout().lock().write_all(&output.stdout);
+    let _ = io::stderr().lock().write_all(&output.stderr);
+    command_exit_code(output.status)
+}
+
+fn command_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
 }
 
 fn render_command_body(summary: &str, preview: &str) -> String {
