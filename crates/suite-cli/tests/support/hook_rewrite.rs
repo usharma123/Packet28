@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::process_harness::{HarnessLimits, ProcessHarness};
@@ -49,7 +49,10 @@ pub fn init_repo(root: &Path) {
 }
 
 pub fn run_hook_raw(runtime: &str, root: &Path, stdin_payload: &str) -> (i32, String, String) {
+    let home = root.join("hook-test-home");
+    fs::create_dir_all(&home).unwrap();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_Packet28"));
+    configure_fixture_environment(&mut command, root);
     command
         .current_dir(root)
         .args(["hook", runtime, "--root", root.to_str().unwrap()]);
@@ -65,4 +68,43 @@ pub fn run_hook_raw(runtime: &str, root: &Path, stdin_payload: &str) -> (i32, St
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+fn configure_fixture_environment(command: &mut std::process::Command, root: &Path) {
+    let home = root.join("hook-test-home");
+    command
+        .env("HOME", &home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_STATE_HOME", home.join(".local/state"));
+}
+
+/// Stops only this fixture's daemon, including during an expected red assertion.
+pub struct DaemonStopGuard {
+    root: PathBuf,
+}
+
+impl DaemonStopGuard {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for DaemonStopGuard {
+    fn drop(&mut self) {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_Packet28"));
+        configure_fixture_environment(&mut command, &self.root);
+        command.args(["daemon", "stop", "--root", self.root.to_str().unwrap()]);
+        let _ = ProcessHarness::run(
+            &mut command,
+            &[],
+            Duration::from_secs(5),
+            HarnessLimits::default(),
+        );
+    }
 }
