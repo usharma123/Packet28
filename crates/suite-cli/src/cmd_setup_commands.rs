@@ -36,7 +36,7 @@ pub(super) fn shell_escape(value: String) -> String {
         .replace('`', "\\`")
 }
 
-pub(super) fn generated_packet28_hook_command(runtime: &str, root: &Path) -> String {
+pub(crate) fn generated_packet28_hook_command(runtime: &str, root: &Path) -> String {
     let command = resolve_packet28_cli_command();
     if runtime == "claude" {
         let command_arg = shell_escape(command);
@@ -49,7 +49,31 @@ pub(super) fn generated_packet28_hook_command(runtime: &str, root: &Path) -> Str
     guarded_packet28_hook_command(&command, runtime, root)
 }
 
-pub(super) fn guarded_packet28_hook_command(
+/// Recognizes only a complete command serialized by the setup generator.
+///
+/// `shell_words` recovers argument values but does not parse shell operators.
+/// Reconstructing the complete command rejects appended user shell syntax.
+pub(crate) fn is_generated_packet28_hook_command(command: &str, runtime: &str) -> bool {
+    let Ok(argv) = shell_words::split(command) else {
+        return false;
+    };
+    if argv.len() != 6 {
+        return false;
+    }
+    if command == guarded_packet28_hook_command(&argv[4], runtime, Path::new(&argv[5])) {
+        return true;
+    }
+    runtime == "claude"
+        && argv[5] == "${CLAUDE_PROJECT_DIR}"
+        && command
+            == guarded_packet28_hook_command_with_root_arg(
+                &shell_escape(argv[4].clone()),
+                runtime,
+                "${CLAUDE_PROJECT_DIR}",
+            )
+}
+
+pub(crate) fn guarded_packet28_hook_command(
     packet28_command: &str,
     runtime: &str,
     root: &Path,

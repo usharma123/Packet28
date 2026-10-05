@@ -169,8 +169,8 @@ pub struct ReduceFixtureArgs {
 
 pub fn run(args: HookArgs) -> Result<i32> {
     match args.command {
-        HookCommands::Claude(args) => run_claude(args),
-        HookCommands::Codex(args) => run_claude(args),
+        HookCommands::Claude(args) => run_compatible_hook(args, "claude"),
+        HookCommands::Codex(args) => run_compatible_hook(args, "codex"),
         HookCommands::Copilot(args) => run_runtime_hook(args, ExternalHookRuntime::Copilot),
         HookCommands::Cursor(args) => run_runtime_hook(args, ExternalHookRuntime::Cursor),
         HookCommands::Gemini(args) => run_runtime_hook(args, ExternalHookRuntime::Gemini),
@@ -194,7 +194,7 @@ struct RuntimeHookOutcome {
     body: Option<String>,
 }
 
-fn run_claude(args: ClaudeHookArgs) -> Result<i32> {
+fn run_compatible_hook(args: ClaudeHookArgs, runtime: &str) -> Result<i32> {
     let mut buffer = String::new();
     io::stdin().read_to_string(&mut buffer)?;
     let payload = if buffer.trim().is_empty() {
@@ -209,7 +209,13 @@ fn run_claude(args: ClaudeHookArgs) -> Result<i32> {
         }
     };
     let root = resolve_hook_root(&args, &payload);
-    match process_claude_hook_payload(&root, args.event.as_deref(), &payload, true) {
+    match process_compatible_hook_payload(
+        &root,
+        args.event.as_deref(),
+        &payload,
+        runtime == "claude",
+        runtime,
+    ) {
         Ok(outcome) => {
             if let Some(body) = outcome.body {
                 println!("{body}");
@@ -228,6 +234,24 @@ pub(crate) fn process_claude_hook_payload(
     event_override: Option<&str>,
     payload: &Value,
     bootstrap_http_server: bool,
+) -> Result<ClaudeHookOutcome> {
+    process_compatible_hook_payload(
+        root,
+        event_override,
+        payload,
+        bootstrap_http_server,
+        "claude",
+    )
+}
+
+// Codex uses the same lifecycle JSON envelope and canonical Bash tool name.
+// Keep runtime attribution separate from the shared event ingestion contract.
+fn process_compatible_hook_payload(
+    root: &Path,
+    event_override: Option<&str>,
+    payload: &Value,
+    bootstrap_http_server: bool,
+    runtime: &str,
 ) -> Result<ClaudeHookOutcome> {
     let runtime_config = load_hook_runtime_config(root)?;
     let event_kind = event_override
@@ -254,7 +278,7 @@ pub(crate) fn process_claude_hook_payload(
     let _writer_lease = acquire_task_store_writer_lease(root)?;
 
     let session_id = json_string(payload, "session_id");
-    let task_id = resolve_task_id(root, payload, session_id.as_deref())?;
+    let task_id = resolve_task_id(root, payload, session_id.as_deref(), runtime)?;
     let matcher = json_string(payload, "matcher");
     let source = json_string(payload, "source");
     let reducer_packet = build_reducer_packet(&runtime_config, payload, event_kind);
@@ -275,14 +299,14 @@ pub(crate) fn process_claude_hook_payload(
         },
     )?;
     record_hook_event(HookEventInput {
-        runtime: "claude",
+        runtime,
         event_kind: hook_event_name(event_kind),
         session_id: session_id.as_deref(),
         task_id: Some(&task_id),
         matcher: matcher.as_deref(),
         payload_json: &serde_json::to_string(payload)?,
     })?;
-    let _ = capture_hook_output("claude", root, event_kind, payload, session_id.as_deref());
+    let _ = capture_hook_output(runtime, root, event_kind, payload, session_id.as_deref());
     let additional_context = build_session_start_additional_context(
         root,
         event_kind,
@@ -517,7 +541,12 @@ fn resolve_hook_root(args: &ClaudeHookArgs, payload: &Value) -> PathBuf {
         .unwrap_or_else(|| crate::broker_client::resolve_root("."))
 }
 
-fn resolve_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Result<String> {
+fn resolve_task_id(
+    root: &Path,
+    payload: &Value,
+    session_id: Option<&str>,
+    runtime: &str,
+) -> Result<String> {
     if let Some(task_id) = json_string(payload, "task_id").filter(|value| !value.trim().is_empty())
     {
         crate::task_runtime::store_active_task(
@@ -536,8 +565,10 @@ fn resolve_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Re
         }
     }
     let task_id = session_id
-        .map(crate::task_runtime::derive_claude_task_id)
-        .unwrap_or_else(|| crate::broker_client::derive_task_id("claude-project"));
+        .map(|session| {
+            crate::broker_client::derive_task_id(&format!("{runtime}-session:{session}"))
+        })
+        .unwrap_or_else(|| crate::broker_client::derive_task_id(&format!("{runtime}-project")));
     crate::task_runtime::store_active_task(
         root,
         &ActiveTaskRecord {

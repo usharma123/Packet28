@@ -191,19 +191,19 @@ impl Drop for McpHarness {
     }
 }
 
-fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, String)> {
+fn run_hook_with_output(root: &Path, runtime: &str, payload: &Value) -> Result<(i32, String)> {
     let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
     let mut child = Command::new(exe)
         .current_dir(root)
         .arg("hook")
-        .arg("claude")
+        .arg(runtime)
         .arg("--root")
         .arg(root.to_str().unwrap_or("."))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to start Packet28 Claude hook for doctor")?;
+        .with_context(|| format!("failed to start Packet28 {runtime} hook for doctor"))?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(serde_json::to_string(payload)?.as_bytes())?;
     }
@@ -211,7 +211,7 @@ fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, Str
     let status = output.status;
     if !status.success() && status.code() != Some(2) {
         return Err(anyhow!(
-            "claude hook exited with status {:?}",
+            "{runtime} hook exited with status {:?}",
             status.code()
         ));
     }
@@ -221,8 +221,8 @@ fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, Str
     ))
 }
 
-fn run_claude_hook(root: &Path, payload: &Value) -> Result<i32> {
-    Ok(run_claude_hook_with_output(root, payload)?.0)
+fn run_hook(root: &Path, runtime: &str, payload: &Value) -> Result<i32> {
+    Ok(run_hook_with_output(root, runtime, payload)?.0)
 }
 
 fn wait_for_handoff_ready(
@@ -261,6 +261,10 @@ fn wait_for_handoff_ready(
 }
 
 pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
+    check_mcp_round_trip_for_runtime(root, "claude")
+}
+
+pub(super) fn check_mcp_round_trip_for_runtime(root: &Path, runtime: &str) -> McpRoundTripChecks {
     let timeout = Duration::from_secs(10);
     let task_id = format!(
         "doctor-smoke-task-{}-{}",
@@ -369,8 +373,9 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         if intention["result"]["structuredContent"]["accepted"] != json!(true) {
             return Err(anyhow!("write_intention was not accepted"));
         }
-        let hook_status = run_claude_hook(
+        let hook_status = run_hook(
             root,
+            runtime,
             &json!({
                 "hook_event_name":"PostToolUse",
                 "task_id": task_id,
@@ -378,7 +383,7 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                 "cwd": root.display().to_string(),
                 "tool_name":"Bash",
                 "tool_input":{"command":"git status --short src/lib.rs"},
-                "tool_response":{"stdout":" M src/lib.rs\n","stderr":"","is_error":false}
+                "tool_response": if runtime == "codex" { json!(" M src/lib.rs\n") } else { json!({"stdout":" M src/lib.rs\n","stderr":"","is_error":false}) }
             }),
         )?;
         harness.send(&json!({
@@ -453,8 +458,9 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         }))?;
         let _ = handoff_harness.read_response(1, timeout)?;
 
-        run_claude_hook(
+        run_hook(
             root,
+            runtime,
             &json!({
                 "hook_event_name":"Stop",
                 "task_id":task_id,
@@ -526,8 +532,9 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         }
 
         let resume_session_id = format!("{task_id}-resume");
-        let (resume_status, resume_stdout) = run_claude_hook_with_output(
+        let (resume_status, resume_stdout) = run_hook_with_output(
             root,
+            runtime,
             &json!({
                 "hook_event_name":"SessionStart",
                 "task_id":task_id,

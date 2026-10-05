@@ -156,8 +156,8 @@ fn catalog_paths_formats_and_capabilities_match_contract() {
                 "codex",
                 vec![("R/AGENTS.md".to_string(), AgentPromptFormat::Agents)],
                 Some(vec!["H/.codex/config.toml".to_string()]),
-                None,
-                false,
+                Some(vec!["R/.codex/hooks.json".to_string()]),
+                true,
             ),
             (
                 "Windsurf",
@@ -430,7 +430,7 @@ fn all_configuration_actions_are_idempotent_and_status_consistent() {
         }
     }
 
-    assert_eq!(configured_actions, 11);
+    assert_eq!(configured_actions, 12);
 }
 
 fn write_fixture(path: &Path, content: &str) {

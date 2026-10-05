@@ -55,6 +55,37 @@ Setup may create or update repository-local MCP, hook, and instruction files
 and user-level runtime configuration. Existing valid JSON/TOML is merged;
 invalid configuration is reported and left unchanged.
 
+## Claude Code and Codex continuation
+
+Configure only the host you use:
+
+```bash
+packet28 setup --runtime claude --yes
+packet28 doctor --agent claude --root .
+
+packet28 setup --runtime codex --yes
+packet28 doctor --agent codex --root .
+```
+
+Claude Code setup installs MCP and lifecycle hooks. Codex setup installs MCP,
+`AGENTS.md` guidance, and project-local `.codex/hooks.json`. The user MCP
+configuration honors `CODEX_HOME` when set. In Codex, enable
+lifecycle hooks, trust the project, then review the generated handlers in
+`/hooks`. Setup does not change Codex approval rules or trust decisions.
+
+Codex hooks capture tool results and checkpoint task context without rewriting
+shell commands. This preserves the command identity used by Codex permission
+rules. Use explicit Packet28 CLI/MCP calls when you want reduced output.
+`doctor --agent codex` checks generated configuration and a local Packet28
+MCP round trip; it reports host hook enablement, trust, and execution as
+unverified.
+
+For either host, save the current objective with `packet28.write_intention`,
+prepare the latest handoff with `packet28.prepare_handoff`, and fetch it with
+`packet28.fetch_context` when continuing work. Daemon restarts retain task
+objectives, active decisions, and handoff artifacts. Hosts own model sessions
+and execution; Packet28 does not start a model provider during these checks.
+
 ## Start the daemon
 
 ```bash

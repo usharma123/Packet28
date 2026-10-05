@@ -323,3 +323,55 @@ fn disabled_hooks_never_bootstrap_background_processes() {
         .join(".packet28/daemon/packet28-hook-http.log")
         .exists());
 }
+
+#[test]
+fn codex_pretool_output_preserves_host_permission_and_command_identity() {
+    let body = render_hook_output(
+        HookEventKind::PreToolUse,
+        &packet28_daemon_protocol::hooks::HookIngestResponse::default(),
+        None,
+        &["Review current Alpha before editing".to_string()],
+    )
+    .unwrap()
+    .unwrap();
+    let output: Value = serde_json::from_str(&body).unwrap();
+    let specific = &output["hookSpecificOutput"];
+    assert!(specific.get("updatedInput").is_none());
+    assert!(specific.get("permissionDecision").is_none());
+    assert!(specific["additionalContext"]
+        .as_str()
+        .unwrap()
+        .contains("Review current Alpha"));
+}
+
+#[test]
+fn fresh_claude_and_codex_sessions_use_distinct_task_namespaces() {
+    let claude = tempfile::tempdir().unwrap();
+    let codex = tempfile::tempdir().unwrap();
+    let session = "same-host-session-id";
+    let claude_id = resolve_task_id(claude.path(), &json!({}), Some(session), "claude").unwrap();
+    let codex_id = resolve_task_id(codex.path(), &json!({}), Some(session), "codex").unwrap();
+    assert_ne!(claude_id, codex_id);
+    assert_eq!(
+        claude_id,
+        crate::task_runtime::derive_claude_task_id(session)
+    );
+    assert_eq!(
+        resolve_task_id(codex.path(), &json!({}), Some(session), "codex").unwrap(),
+        codex_id
+    );
+    assert_eq!(
+        resolve_task_id(
+            codex.path(),
+            &json!({"task_id":"explicit-continuation"}),
+            Some(session),
+            "codex"
+        )
+        .unwrap(),
+        "explicit-continuation"
+    );
+    assert_eq!(
+        resolve_task_id(codex.path(), &json!({}), Some(session), "codex").unwrap(),
+        "explicit-continuation"
+    );
+}

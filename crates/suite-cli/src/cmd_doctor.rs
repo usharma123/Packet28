@@ -15,6 +15,8 @@ use crate::runtime_integrations::{
     antigravity, claude, cline, copilot, cursor, gemini, hermes, kilocode, opencode, roo, windsurf,
 };
 
+#[path = "cmd_doctor_codex.rs"]
+mod doctor_codex;
 #[path = "cmd_doctor_mcp.rs"]
 mod doctor_mcp;
 use doctor_mcp::check_mcp_round_trip;
@@ -107,9 +109,17 @@ fn build_report(root: &Path, agent: Option<&str>) -> DoctorReport {
     }
     let daemon = check_daemon(root);
     let index = check_index(root);
-    let mcp_config = collect_mcp_config_checks(root);
+    let mcp_config = if matches!(agent, Some("codex")) {
+        vec![doctor_codex::mcp_config(root, &dirs_home())]
+    } else {
+        collect_mcp_config_checks(root)
+    };
     let mcp_config_summary = summarize_mcp_config(root, &mcp_config);
-    let mcp_round_trip = check_mcp_round_trip(root);
+    let mcp_round_trip = if matches!(agent, Some("codex")) {
+        doctor_mcp::check_mcp_round_trip_for_runtime(root, "codex")
+    } else {
+        check_mcp_round_trip(root)
+    };
     let experiment_manifest = check_experiment_manifest(root);
     let mut checks = vec![
         daemon.clone(),
@@ -124,6 +134,14 @@ fn build_report(root: &Path, agent: Option<&str>) -> DoctorReport {
     if matches!(agent, Some("claude")) {
         checks.insert(2, check_claude_hook_config(root));
         checks.insert(3, check_claude_hook_service(root));
+    }
+    if matches!(agent, Some("codex")) {
+        checks.extend(doctor_codex::hook_checks(root));
+        checks.push(check_instruction_file(
+            "codex",
+            "Codex",
+            &crate::runtime_integrations::codex::prompt_path(root),
+        ));
     }
     let ok = checks
         .iter()
