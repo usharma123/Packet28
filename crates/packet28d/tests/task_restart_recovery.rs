@@ -11,15 +11,18 @@ use std::time::{Duration, Instant};
 use context_kernel_core::{KernelSequenceRequest, KernelStepRequest};
 use notify::{RecursiveMode, Watcher as _};
 use packet28_daemon_core::storage::{
-    load_task_events, load_task_registry, load_watch_registry, save_task_registry,
-    save_task_watch_registry_checkpoint,
+    append_next_task_event, load_task_events, load_task_registry, load_watch_registry,
+    save_task_registry, save_task_watch_registry_checkpoint,
 };
+use packet28_daemon_protocol::broker::{BrokerWriteOp, BrokerWriteStateRequest};
 use packet28_daemon_protocol::commands::WatchSpec;
 use packet28_daemon_protocol::frame::{read_frame, write_frame};
 use packet28_daemon_protocol::message::{
-    DaemonEventFrame, DaemonRequest, DaemonResponse, DaemonRuntimeInfo,
+    DaemonEvent, DaemonEventFrame, DaemonRequest, DaemonResponse, DaemonRuntimeInfo,
 };
-use packet28_daemon_protocol::paths::{ready_path, runtime_path};
+use packet28_daemon_protocol::paths::{
+    ready_path, runtime_path, task_event_log_path, TaskStorageId,
+};
 use packet28_daemon_protocol::task::{
     TaskLifecycle, TaskRecord, TaskRegistry, WatchRegistration, WatchRegistry,
 };
@@ -439,7 +442,7 @@ fn daemon_restart_replays_a_durably_claimed_replan_after_second_crash() {
 }
 
 #[test]
-fn malformed_pending_replan_fails_before_readiness_without_mutating_checkpoint() {
+fn malformed_pending_replan_is_durably_idle_before_readiness() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     let registry = TaskRegistry {
         tasks: BTreeMap::from([(
@@ -455,22 +458,25 @@ fn malformed_pending_replan_fails_before_readiness_without_mutating_checkpoint()
     };
     save_task_watch_registry_checkpoint(workspace.path(), &registry, &WatchRegistry::default())
         .expect("checkpoint malformed pending task");
-    let before = serde_json::to_value(
-        load_task_registry(workspace.path()).expect("load malformed checkpoint"),
-    )
-    .expect("encode malformed checkpoint");
-
     let mut daemon = spawn_daemon(workspace.path());
-    let stderr = wait_for_startup_failure(&mut daemon, workspace.path());
-
-    assert!(stderr.contains("startup replan task 'malformed-pending' has no stored sequence"));
-    assert!(!ready_path(workspace.path()).exists());
+    let runtime = wait_for_ready(&mut daemon, workspace.path());
+    let recovered = load_task_registry(workspace.path()).expect("read ready checkpoint");
     assert_eq!(
-        serde_json::to_value(
-            load_task_registry(workspace.path()).expect("reload malformed checkpoint")
-        )
-        .expect("encode reloaded malformed checkpoint"),
-        before
+        recovered.tasks["malformed-pending"].lifecycle,
+        TaskLifecycle::Idle
+    );
+    assert!(recovered.tasks["malformed-pending"]
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("downgraded to idle"));
+    stop_and_wait(&mut daemon, &runtime);
+    let mut restarted = spawn_daemon(workspace.path());
+    let runtime = wait_for_ready(&mut restarted, workspace.path());
+    stop_and_wait(&mut restarted, &runtime);
+    assert_eq!(
+        load_task_registry(workspace.path()).unwrap().tasks["malformed-pending"].lifecycle,
+        TaskLifecycle::Idle
     );
 }
 
@@ -725,4 +731,105 @@ fn daemon_restart_durably_reconciles_crash_residue_once() {
 
     assert_eq!(durable_after_second, durable_after_first);
     stop_and_wait(&mut second_daemon, &second_runtime);
+}
+
+#[test]
+fn daemon_startup_fences_missing_and_short_history_before_ready_and_accepts_successor_event() {
+    for missing in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let task_id = "lost-history";
+        let mut record = TaskRecord {
+            task_id: task_id.to_string(),
+            ..TaskRecord::default()
+        };
+        save_task_watch_registry_checkpoint(
+            root,
+            &TaskRegistry {
+                tasks: BTreeMap::from([(task_id.to_string(), record.clone())]),
+            },
+            &WatchRegistry::default(),
+        )
+        .unwrap();
+        append_next_task_event(
+            root,
+            task_id,
+            &DaemonEvent {
+                kind: "before-loss".to_string(),
+                occurred_at_unix: 1,
+                data: serde_json::Value::Null,
+            },
+        )
+        .unwrap();
+        record.last_event_seq = 9;
+        save_task_watch_registry_checkpoint(
+            root,
+            &TaskRegistry {
+                tasks: BTreeMap::from([(task_id.to_string(), record)]),
+            },
+            &WatchRegistry::default(),
+        )
+        .unwrap();
+        let canonical = task_event_log_path(root, &TaskStorageId::try_from(task_id).unwrap());
+        let bytes = fs::read(&canonical).unwrap();
+        if missing {
+            fs::remove_file(&canonical).unwrap();
+        }
+        let mut daemon = spawn_daemon(root);
+        let runtime = wait_for_ready(&mut daemon, root);
+        let ready_registry = load_task_registry(root).unwrap();
+        let predecessor = &ready_registry.tasks[task_id];
+        let link = predecessor.superseded_by.as_ref().unwrap();
+        assert_eq!(link.prior_last_event_seq, 9);
+        assert_eq!(predecessor.lifecycle, TaskLifecycle::Cancelled);
+        assert_eq!(
+            ready_registry.tasks[&link.successor_task_id]
+                .recovered_from
+                .as_ref(),
+            Some(link)
+        );
+        assert!(!canonical.exists());
+        if !missing {
+            let quarantine = canonical
+                .parent()
+                .unwrap()
+                .join(link.quarantined_event_log.as_ref().unwrap());
+            assert_eq!(fs::read(quarantine).unwrap(), bytes);
+        }
+        let mut stream = connect_authenticated(&runtime);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write_frame(
+            &mut stream,
+            &DaemonRequest::BrokerWriteState {
+                request: BrokerWriteStateRequest {
+                    task_id: link.successor_task_id.clone(),
+                    op: Some(BrokerWriteOp::Intention),
+                    text: Some("continue after lost history".to_string()),
+                    ..BrokerWriteStateRequest::default()
+                },
+            },
+        )
+        .unwrap();
+        let response: DaemonResponse = read_frame(&mut stream).unwrap();
+        assert!(
+            matches!(response, DaemonResponse::BrokerWriteState { .. }),
+            "{response:?}"
+        );
+        stop_and_wait(&mut daemon, &runtime);
+        let frames = load_task_events(root, &link.successor_task_id).unwrap();
+        assert_eq!(frames.first().unwrap().seq, 1);
+        assert!(append_next_task_event(
+            root,
+            task_id,
+            &DaemonEvent {
+                kind: "late".to_string(),
+                occurred_at_unix: 2,
+                data: serde_json::Value::Null
+            }
+        )
+        .is_err());
+        assert!(!canonical.exists());
+    }
 }
