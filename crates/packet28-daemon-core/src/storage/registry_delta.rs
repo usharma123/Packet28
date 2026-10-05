@@ -1180,6 +1180,94 @@ pub struct QuarantinedCorruptTaskEventLog {
     pub successor_task_id: String,
     /// Exact destination name reserved in the durable link before the move.
     pub reserved_quarantine_name: String,
+    damage: EventLogDamage,
+    #[cfg(unix)]
+    observed_identity: Option<crate::retention::FileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EventLogDamage {
+    Corrupt,
+    Lost { observed_tail: Option<u64> },
+}
+
+fn task_has_lost_history(task: &TaskRecord, tail: Option<u64>, canonical_present: bool) -> bool {
+    match &task.superseded_by {
+        // A completed move leaves no canonical log. An interrupted move keeps
+        // the existing link, never admits a second successor.
+        Some(link) => canonical_present && tail.unwrap_or(0) < link.prior_last_event_seq,
+        None => tail.unwrap_or(0) < task.last_event_seq,
+    }
+}
+
+#[cfg(unix)]
+fn recovery_event_identity(
+    root: &Path,
+    storage_id: &TaskStorageId,
+) -> Result<Option<crate::retention::FileIdentity>> {
+    let Some(events) = open_task_events_capability_for_read(root)? else {
+        return Ok(None);
+    };
+    events
+        .entry_identity(OsStr::new(&event_log_file_name(storage_id)))
+        .map_err(|source| {
+            DaemonCoreError::io(
+                "failed to inspect recovery event identity",
+                task_event_log_path(root, storage_id),
+                source,
+            )
+        })
+}
+
+fn recovery_event_exists(root: &Path, storage_id: &TaskStorageId) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        Ok(recovery_event_identity(root, storage_id)?.is_some())
+    }
+    #[cfg(not(unix))]
+    {
+        match fs::symlink_metadata(task_event_log_path(root, storage_id)) {
+            Ok(_) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(DaemonCoreError::io(
+                "failed to inspect recovery event presence",
+                task_event_log_path(root, storage_id),
+                source,
+            )),
+        }
+    }
+}
+
+fn loaded_history_requires_recovery(
+    root: &Path,
+    tasks: &TaskRegistry,
+    tails: &BTreeMap<String, Option<u64>>,
+) -> Result<bool> {
+    for (task_id, task) in &tasks.tasks {
+        let tail = tails.get(task_id).copied().flatten();
+        // A fenced task with an empty or absent log needs a no-follow presence
+        // lookup to distinguish a pending move from a completed one.
+        let present = if task.superseded_by.is_some() && tail.is_none() {
+            recovery_event_exists(root, &checked_task_storage_id(root, task_id)?)?
+        } else {
+            tail.is_some()
+        };
+        if task_has_lost_history(task, tail, present) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn recovery_evidence_changed(path: &Path) -> DaemonCoreError {
+    DaemonCoreError::io(
+        "event log changed after recovery inspection",
+        path,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refusing to quarantine changed evidence",
+        ),
+    )
 }
 
 /// Identifies event-log errors that can be safely quarantined during recovery.
@@ -1237,6 +1325,9 @@ fn move_corrupt_event_log_aside(
 ) -> Result<Option<PathBuf>> {
     let storage_id = checked_task_storage_id(root, &record.task_id)?;
     let file_name = event_log_file_name(&storage_id);
+    if recovery_event_identity(root, &storage_id)? != record.observed_identity {
+        return Err(recovery_evidence_changed(&record.event_log_path));
+    }
     let Some(events) = open_task_events_capability_for_read(root)? else {
         return Ok(None);
     };
@@ -1290,13 +1381,32 @@ fn move_corrupt_event_log_aside(
             )
         })?;
 
+        if events
+            .entry_identity(OsStr::new(&file_name))
+            .map_err(|source| {
+                DaemonCoreError::io(
+                    "failed to revalidate recovery identity",
+                    &record.event_log_path,
+                    source,
+                )
+            })?
+            != record.observed_identity
+        {
+            return Err(recovery_evidence_changed(&record.event_log_path));
+        }
         match event_tail::inspect_locked_task_event_tail(
             lock.file_mut(),
             &record.event_log_path,
             &storage_id,
         ) {
-            Ok(_) => return Ok(None),
-            Err(error) if is_recoverable_event_log_corruption(&error) => {}
+            Ok(inspection) => match &record.damage {
+                EventLogDamage::Lost { observed_tail }
+                    if inspection.tail.as_ref().map(|frame| frame.seq) == *observed_tail => {}
+                _ => return Err(recovery_evidence_changed(&record.event_log_path)),
+            },
+            Err(error)
+                if is_recoverable_event_log_corruption(&error)
+                    && record.damage == EventLogDamage::Corrupt => {}
             Err(error) => return Err(error),
         }
 
@@ -1366,8 +1476,14 @@ fn move_corrupt_event_log_aside(
             &record.event_log_path,
             &storage_id,
         ) {
-            Ok(_) => return Ok(None),
-            Err(error) if is_recoverable_event_log_corruption(&error) => {}
+            Ok(inspection) => match &record.damage {
+                EventLogDamage::Lost { observed_tail }
+                    if inspection.tail.as_ref().map(|frame| frame.seq) == *observed_tail => {}
+                _ => return Err(recovery_evidence_changed(&record.event_log_path)),
+            },
+            Err(error)
+                if is_recoverable_event_log_corruption(&error)
+                    && record.damage == EventLogDamage::Corrupt => {}
             Err(error) => return Err(error),
         }
         let destination_name = &record.reserved_quarantine_name;
@@ -1439,7 +1555,7 @@ fn move_corrupt_event_logs_aside(
     Ok(())
 }
 
-/// Loads the task/watch registry and event-log tails, quarantining recoverable corrupt logs.
+/// Loads task/watch state, fencing corrupt, missing, or truncated committed histories.
 ///
 /// A damaged task keeps its identity and is fenced as a terminal, superseded
 /// record; its work continues under a newly admitted linked task with a fresh
@@ -1449,9 +1565,10 @@ fn move_corrupt_event_logs_aside(
 /// admits its successor (`recovered_from` link) with trusted predecessor
 /// context, and reserves the exact quarantine file name in both links. The log
 /// is then moved to exactly that name without replacement. An interruption
-/// after the delta leaves either a corrupt canonical log that is retried to the
-/// same reserved name without creating another successor, or an absent log
-/// whose bytes are at the recorded name. Startup has not yet created its
+/// after the delta leaves either a damaged canonical log that is retried to the
+/// same reserved name without creating another successor, or an absent log.
+/// Missing logs have no bytes to move; valid truncated logs keep their exact
+/// bytes in quarantine. Tail-ahead logs remain healthy. Startup has not yet created its
 /// persistence owner, so the returned registry includes the new durable
 /// revision. Recovery stops after at most 64 affected
 /// tasks.
@@ -1475,32 +1592,43 @@ pub fn load_task_watch_registry_recovering_corrupt_event_logs(
     let writer_lease = acquire_task_store_writer_lease(root)?;
     let mut quarantined: Vec<QuarantinedCorruptTaskEventLog> = Vec::new();
     loop {
-        match load_task_watch_registry_with_deltas_and_event_tails(root) {
-            Ok((loaded, tails)) => return Ok((loaded, tails, quarantined)),
-            Err(error) => {
-                if !is_recoverable_event_log_corruption(&error) {
-                    return Err(error);
+        let load_error = match load_task_watch_registry_with_deltas_and_event_tails(root) {
+            Ok((loaded, tails)) => {
+                if !loaded_history_requires_recovery(root, &loaded.tasks, &tails)? {
+                    return Ok((loaded, tails, quarantined));
                 }
-                let mut corrupt = scan_corrupt_task_event_logs(root)?;
-                if corrupt.is_empty()
-                    || quarantined.len().saturating_add(corrupt.len())
-                        > MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS
-                {
-                    return Err(error);
-                }
-                {
-                    let _registry_admission = acquire_registry_writer_admission(&writer_lease)?;
-                    fence_corrupt_tasks_with_linked_successors_admitted(
-                        root,
-                        &mut corrupt,
-                        &writer_lease,
-                        now_unix(),
-                    )?;
-                }
-                move_corrupt_event_logs_aside(root, &mut corrupt, &writer_lease)?;
-                quarantined.extend(corrupt);
+                None
             }
+            Err(error) if is_recoverable_event_log_corruption(&error) => Some(error),
+            Err(error) => return Err(error),
+        };
+        let mut corrupt = scan_corrupt_task_event_logs(root)?;
+        if corrupt.is_empty()
+            || quarantined.len().saturating_add(corrupt.len())
+                > MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS
+        {
+            return Err(load_error.unwrap_or_else(|| {
+                DaemonCoreError::io(
+                    "lost event history exceeds recovery bounds",
+                    task_registry_path(root),
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "cannot authenticate bounded recovery",
+                    ),
+                )
+            }));
         }
+        {
+            let _registry_admission = acquire_registry_writer_admission(&writer_lease)?;
+            fence_corrupt_tasks_with_linked_successors_admitted(
+                root,
+                &mut corrupt,
+                &writer_lease,
+                now_unix(),
+            )?;
+        }
+        move_corrupt_event_logs_aside(root, &mut corrupt, &writer_lease)?;
+        quarantined.extend(corrupt);
     }
 }
 
@@ -1564,8 +1692,10 @@ fn inspect_loaded_corrupt_event_logs(
     lease: &crate::task_store_lease::TaskStoreLease,
 ) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
     let mut corrupt = Vec::new();
-    for task_id in tasks.tasks.keys() {
+    for (task_id, task) in &tasks.tasks {
         let storage_id = checked_task_storage_id(root, task_id)?;
+        #[cfg(unix)]
+        let observed_identity = recovery_event_identity(root, &storage_id)?;
         #[cfg(unix)]
         let tail = event_tail::task_event_log_tail_sequence_admitted(root, &storage_id, lease);
         #[cfg(not(unix))]
@@ -1573,20 +1703,40 @@ fn inspect_loaded_corrupt_event_logs(
             let _ = lease;
             event_tail::task_event_log_tail_sequence_portable(root, &storage_id)
         };
-        match tail {
-            Ok(_) => {}
+        #[cfg(unix)]
+        if recovery_event_identity(root, &storage_id)? != observed_identity {
+            return Err(recovery_evidence_changed(&task_event_log_path(
+                root,
+                &storage_id,
+            )));
+        }
+        let (damage, reason) = match tail {
+            Ok(tail)
+                if task_has_lost_history(task, tail, recovery_event_exists(root, &storage_id)?) =>
+            {
+                let prior = task
+                    .superseded_by
+                    .as_ref()
+                    .map_or(task.last_event_seq, |link| link.prior_last_event_seq);
+                (EventLogDamage::Lost { observed_tail: tail }, format!("committed registry high-water {prior} is ahead of durable event tail {tail:?}"))
+            }
+            Ok(_) => continue,
             Err(error) if is_recoverable_event_log_corruption(&error) => {
-                corrupt.push(QuarantinedCorruptTaskEventLog {
-                    task_id: task_id.clone(),
-                    event_log_path: task_event_log_path(root, &storage_id),
-                    quarantined_path: None,
-                    reason: error.to_string(),
-                    successor_task_id: String::new(),
-                    reserved_quarantine_name: String::new(),
-                });
+                (EventLogDamage::Corrupt, error.to_string())
             }
             Err(error) => return Err(error),
-        }
+        };
+        corrupt.push(QuarantinedCorruptTaskEventLog {
+            task_id: task_id.clone(),
+            event_log_path: task_event_log_path(root, &storage_id),
+            quarantined_path: None,
+            reason,
+            successor_task_id: String::new(),
+            reserved_quarantine_name: String::new(),
+            damage,
+            #[cfg(unix)]
+            observed_identity,
+        });
     }
     Ok(corrupt)
 }
@@ -1805,7 +1955,7 @@ fn fence_corrupt_tasks_with_linked_successors_admitted(
             fenced.lifecycle = TaskLifecycle::Cancelled;
             fenced.last_event_seq = 0;
             let evidence = format!(
-                "event history failed integrity validation and was quarantined; \
+                "event history failed integrity validation and was fenced; \
                  work continues as task {successor_task_id:?}"
             );
             fenced.last_error = Some(match fenced.last_error.take() {
@@ -4159,6 +4309,180 @@ mod tests {
                 assert_eq!(successor_task_id, successor);
             }
             other => panic!("expected a superseded-task fence, got {other:?}"),
+        }
+    }
+
+    fn seed_lost_history(root: &Path, mode: &str) -> PathBuf {
+        checkpoint(root, [task("bad", &[]), task("healthy", &[])], []);
+        append_next_task_event(root, "bad", &test_event("preserved-first-event")).unwrap();
+        let mut admitted = task("bad", &[]);
+        admitted.last_event_seq = 7;
+        append_task_watch_registry_delta(
+            root,
+            RegistryRevisionRange::single(RegistryRevision::new(1)).unwrap(),
+            &RegistryDeltaBatch::default().upsert_task(admitted),
+        )
+        .unwrap();
+        let path = task_event_log_path(root, &TaskStorageId::try_from("bad").unwrap());
+        match mode {
+            "missing" => fs::remove_file(&path).unwrap(),
+            "empty" => fs::write(&path, b"").unwrap(),
+            "short" => {}
+            _ => panic!("unknown loss fixture"),
+        }
+        path
+    }
+
+    #[test]
+    fn lost_history_uses_committed_wal_high_water_and_never_reuses_identity() {
+        for mode in ["missing", "empty", "short"] {
+            let root = tempdir().unwrap();
+            let path = seed_lost_history(root.path(), mode);
+            let before = fs::read(&path).ok();
+            let (loaded, _, repaired) =
+                load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+            assert_eq!(repaired.len(), 1, "{mode}");
+            let predecessor = &loaded.tasks.tasks["bad"];
+            let link = predecessor.superseded_by.as_ref().unwrap();
+            assert_eq!(predecessor.lifecycle, TaskLifecycle::Cancelled);
+            assert_eq!(predecessor.last_event_seq, 0);
+            assert_eq!(link.prior_last_event_seq, 7);
+            assert_eq!(
+                loaded.tasks.tasks[&link.successor_task_id]
+                    .recovered_from
+                    .as_ref(),
+                Some(link)
+            );
+            assert!(loaded.tasks.tasks["healthy"].superseded_by.is_none());
+            assert!(!path.exists());
+            match before {
+                Some(bytes) => assert_eq!(
+                    fs::read(repaired[0].quarantined_path.as_ref().unwrap()).unwrap(),
+                    bytes
+                ),
+                None => assert!(repaired[0].quarantined_path.is_none()),
+            }
+            assert_superseded(
+                append_next_task_event(root.path(), "bad", &test_event("late")),
+                &link.successor_task_id,
+            );
+            assert!(!path.exists());
+            assert_eq!(
+                append_next_task_event(
+                    root.path(),
+                    &link.successor_task_id,
+                    &test_event("continued")
+                )
+                .unwrap()
+                .seq,
+                1
+            );
+            let (restarted, _, repeated) =
+                load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+            assert!(repeated.is_empty());
+            assert_eq!(restarted.tasks.tasks.len(), 3);
+            assert_eq!(
+                restarted.tasks.tasks["bad"].superseded_by.as_ref(),
+                Some(link)
+            );
+        }
+    }
+
+    #[test]
+    fn lost_history_retry_after_fence_moves_same_evidence_without_successor_two() {
+        for mode in ["empty", "short"] {
+            let root = tempdir().unwrap();
+            let path = seed_lost_history(root.path(), mode);
+            let bytes = fs::read(&path).unwrap();
+            let lease = acquire_task_store_writer_lease(root.path()).unwrap();
+            let mut damaged = inspect_corrupt_task_event_logs(root.path()).unwrap();
+            {
+                let _admission = acquire_registry_writer_admission(&lease).unwrap();
+                fence_corrupt_tasks_with_linked_successors_admitted(
+                    root.path(),
+                    &mut damaged,
+                    &lease,
+                    42,
+                )
+                .unwrap();
+            }
+            let successor = damaged[0].successor_task_id.clone();
+            let reserved_name = damaged[0].reserved_quarantine_name.clone();
+            drop(lease);
+            // Restart at the exact crash point after the atomic WAL fence,
+            // before the valid truncated log has moved.
+            let (loaded, _, repaired) =
+                load_task_watch_registry_recovering_corrupt_event_logs(root.path()).unwrap();
+            assert_eq!(loaded.tasks.tasks.len(), 3);
+            let link = loaded.tasks.tasks["bad"].superseded_by.as_ref().unwrap();
+            assert_eq!(link.successor_task_id, successor);
+            assert_eq!(
+                loaded.tasks.tasks[&successor].recovered_from.as_ref(),
+                Some(link)
+            );
+            assert_eq!(repaired[0].reserved_quarantine_name, reserved_name);
+            assert_eq!(
+                fs::read(repaired[0].quarantined_path.as_ref().unwrap()).unwrap(),
+                bytes
+            );
+            assert_superseded(
+                append_next_task_event(root.path(), "bad", &test_event("late")),
+                &successor,
+            );
+            assert_eq!(
+                append_next_task_event(root.path(), &successor, &test_event("continued"))
+                    .unwrap()
+                    .seq,
+                1
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_history_move_refuses_changed_identity_or_tail_without_moving_bytes() {
+        for change in ["identity", "tail", "missing-created"] {
+            let root = tempdir().unwrap();
+            let path = seed_lost_history(
+                root.path(),
+                if change == "missing-created" {
+                    "missing"
+                } else {
+                    "short"
+                },
+            );
+            let lease = acquire_task_store_writer_lease(root.path()).unwrap();
+            let mut damaged = inspect_corrupt_task_event_logs(root.path()).unwrap();
+            {
+                let _admission = acquire_registry_writer_admission(&lease).unwrap();
+                fence_corrupt_tasks_with_linked_successors_admitted(
+                    root.path(),
+                    &mut damaged,
+                    &lease,
+                    42,
+                )
+                .unwrap();
+            }
+            if change == "identity" {
+                let replacement = path.with_extension("replacement");
+                fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+                fs::rename(replacement, &path).unwrap();
+            } else {
+                fs::write(&path, b"").unwrap();
+            }
+            let changed = fs::read(&path).unwrap();
+            let error =
+                move_corrupt_event_logs_aside(root.path(), &mut damaged, &lease).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed after recovery inspection"),
+                "{change}: {error}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), changed);
+            assert!(!task_events_dir(root.path())
+                .join(&damaged[0].reserved_quarantine_name)
+                .exists());
         }
     }
 

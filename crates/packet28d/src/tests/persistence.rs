@@ -47,37 +47,37 @@ fn startup_reconciliation_advances_a_registry_lagging_the_durable_event_log() {
 }
 
 #[test]
-fn startup_reconciliation_heals_a_registry_ahead_of_its_event_log() {
+fn startup_reconciliation_rejects_a_registry_ahead_of_its_event_log() {
     let root = tempfile::tempdir().unwrap();
     ensure_daemon_dir(root.path()).unwrap();
     save_task_registry(root.path(), &registry_with_task("ahead", 0)).unwrap();
     append_next_task_event(root.path(), "ahead", &event("only-event")).unwrap();
     save_task_registry(root.path(), &registry_with_task("ahead", 2)).unwrap();
 
-    // The durable log only reached sequence 1, so a registry high-water of 2 is
-    // trusted down to the log tail instead of failing the daemon closed.
     let (mut loaded, tails) = load_task_registry_with_event_tails(root.path()).unwrap();
-    assert_eq!(
-        reconcile_task_event_high_waters(&mut loaded, &tails).unwrap(),
-        BTreeSet::from(["ahead".to_string()])
+    let error = reconcile_task_event_high_waters(&mut loaded, &tails).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("high-water 2 for 'ahead' is ahead of durable event sequence 1"),
+        "unexpected error: {error:#}"
     );
-    assert_eq!(loaded.tasks["ahead"].last_event_seq, 1);
 }
 
 #[test]
-fn startup_reconciliation_heals_nonzero_high_water_without_an_event_log() {
+fn startup_reconciliation_rejects_nonzero_high_water_without_an_event_log() {
     let root = tempfile::tempdir().unwrap();
     ensure_daemon_dir(root.path()).unwrap();
     save_task_registry(root.path(), &registry_with_task("missing-log", 1)).unwrap();
 
-    // No durable events exist, so the high-water is reset to 0 rather than
-    // bricking startup.
     let (mut loaded, tails) = load_task_registry_with_event_tails(root.path()).unwrap();
-    assert_eq!(
-        reconcile_task_event_high_waters(&mut loaded, &tails).unwrap(),
-        BTreeSet::from(["missing-log".to_string()])
+    let error = reconcile_task_event_high_waters(&mut loaded, &tails).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("high-water 1 for 'missing-log' is ahead of its missing event log"),
+        "unexpected error: {error:#}"
     );
-    assert_eq!(loaded.tasks["missing-log"].last_event_seq, 0);
 }
 
 #[test]
@@ -784,7 +784,7 @@ fn restart_reconciliation_retires_work_owned_by_a_superseded_task() {
         }],
     };
 
-    preflight_restart_recovery(&tasks).unwrap();
+    assert!(preflight_restart_recovery(&mut tasks).unwrap().is_empty());
     let reconciliation =
         reconcile_interrupted_task_lifecycles(&mut tasks, &mut watches, 7).unwrap();
 

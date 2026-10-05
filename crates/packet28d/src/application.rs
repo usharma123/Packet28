@@ -138,7 +138,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "the log was already absent".to_string());
         daemon_log(&format!(
-            "quarantined corrupt event log for task '{}': {}; moved aside to {}; \
+            "recovered damaged event history for task '{}': {}; moved aside to {}; \
              the task is superseded and work continues as linked task '{}'",
             record.task_id, record.reason, moved_to, record.successor_task_id
         ));

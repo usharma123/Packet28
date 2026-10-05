@@ -199,13 +199,27 @@ and removed the child. If the daemon crashes or persistence fails between spawn
 and the ownership barrier, closing the gate pipe makes the shim exit without
 executing delegated work.
 
-A recoverable corrupt task-event log is quarantined before the persistence
-owner starts. Its task is fenced as a terminal `superseded_by` record, and work
+Startup compares the event tail with the committed checkpoint and registry WAL.
+A corrupt log, or a missing or valid truncated log behind that committed high-water,
+fences its task before the persistence owner starts. Existing bytes move to the
+reserved quarantine name after the file identity and observed tail are rechecked
+under an exclusive log lock. A missing log has no evidence file to move. A log
+whose tail is ahead of the registry follows ordinary forward reconciliation.
+The damaged task becomes a terminal `superseded_by` record, and work
 continues under a newly admitted linked successor with a fresh event sequence;
 see [Corrupt event-log recovery](task-store-retention.md#corrupt-event-log-recovery).
 Startup records constant-size recovery links before readiness. Successor snapshots
 read predecessor packets in place using the authenticated registry lineage. Continuation requests and subscriptions that name a
 superseded task are rejected with an error naming its successor.
+
+An interrupted move resumes the existing reciprocal link and reserved quarantine
+name. It does not create another successor or reuse event numbers on the damaged
+identity. Startup still fails if the final reconciliation sees an unexplained
+registry-ahead tail after recovery.
+
+A pending replan without its stored sequence becomes idle with an explanatory
+`last_error`, and that change is durable before readiness. An uncompleted agent
+whose persisted process group is still live continues to block startup.
 
 Detailed retention, journal, corruption, and descriptor-confinement guarantees
 are in [Task-store retention](task-store-retention.md).
