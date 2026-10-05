@@ -777,6 +777,161 @@ fn write_hook_runtime_config_keeps_private_token_in_traversable_directories() {
 
 #[cfg(unix)]
 #[test]
+fn claude_settings_create_private_token_copy_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let parent = dir.path().join(".claude");
+    fs::create_dir(&parent).unwrap();
+    for directory in [dir.path(), parent.as_path()] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = parent.join("settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let runtime: HookRuntimeConfig = serde_json::from_slice(
+        &fs::read(packet28_daemon_protocol::paths::hook_runtime_config_path(
+            dir.path(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["headers"]["X-Packet28-Hook-Token"].as_str(),
+        runtime.http_hook_token.as_deref(),
+    );
+    for directory in [dir.path(), parent.as_path()] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_rewrite_private_and_public_files_without_losing_user_handlers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in [0o600, 0o644] {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join(".claude");
+        fs::create_dir(&parent).unwrap();
+        for directory in [dir.path(), parent.as_path()] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = parent.join("settings.json");
+        let user_handler = json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "user-audit"}]
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "theme": "dark",
+                "hooks": {"PreToolUse": [user_handler.clone()]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["hooks"]["PreToolUse"][0], user_handler);
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_normalize_existing_token_copy_permissions_without_changing_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let original = fs::read(&path).unwrap();
+    for directory in [dir.path(), path.parent().unwrap()] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let status = setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_reject_linked_token_files_before_initializing_runtime() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        let original = br#"{"theme":"dark"}"#;
+        let outside_path = outside.path().join("settings.json");
+        fs::write(&outside_path, original).unwrap();
+        if hard_link {
+            fs::hard_link(&outside_path, &path).unwrap();
+        } else {
+            symlink(&outside_path, &path).unwrap();
+        }
+        assert!(setup_hooks::write_claude_hook_config(&path, dir.path(), true).is_err());
+        assert_eq!(fs::read(&outside_path).unwrap(), original);
+        assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_reject_linked_parent_before_initializing_runtime() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    symlink(outside.path(), dir.path().join(".claude")).unwrap();
+    assert!(setup_hooks::write_claude_hook_config(
+        &dir.path().join(".claude/settings.json"),
+        dir.path(),
+        true,
+    )
+    .is_err());
+    assert!(!outside.path().join("settings.json").exists());
+    assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+}
+
+#[test]
+fn claude_settings_reject_paths_outside_workspace() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let path = outside.path().join("settings.json");
+    let original = br#"{"theme":"dark"}"#;
+    fs::write(&path, original).unwrap();
+    assert!(setup_hooks::write_claude_hook_config(&path, dir.path(), true).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn claude_setup_creates_private_runtime_config_in_traversable_directories() {
     use std::os::unix::fs::PermissionsExt;
 

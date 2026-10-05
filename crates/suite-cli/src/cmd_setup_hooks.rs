@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
@@ -22,18 +22,63 @@ pub(crate) fn write_claude_hook_config(
     auto_yes: bool,
 ) -> Result<McpConfigStatus> {
     let hook_command = generated_packet28_hook_command("claude", root);
-    let mut config: BTreeMap<String, Value> = if path.exists() {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
-        serde_json::from_str(&content).with_context(|| {
-            format!(
-                "refusing to overwrite invalid JSON in '{}'; fix the file and rerun setup",
-                path.display()
-            )
-        })?
-    } else {
-        BTreeMap::new()
+    // The caller selects a workspace-local settings file. Retain every
+    // descendant beneath that root rather than canonicalizing a linked parent.
+    let relative = path.strip_prefix(root).with_context(|| {
+        format!(
+            "Claude hook config '{}' is outside the workspace",
+            path.display()
+        )
+    })?;
+    let name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Claude hook config must have a UTF-8 file name")?;
+    let components = relative
+        .parent()
+        .context("Claude hook config must have a parent directory")?
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => name
+                .to_str()
+                .context("Claude hook config directory must be UTF-8"),
+            _ => Err(anyhow!(
+                "Claude hook config must use normal workspace descendants"
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let existing_directory = match StateDir::open(root, &components, false) {
+        Ok(directory) => Some(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to open Claude hook config directory"),
     };
+    #[cfg(unix)]
+    let existing_lease = existing_directory
+        .as_ref()
+        .map(StateDir::lock_exclusive)
+        .transpose()
+        .context("failed to lock Claude hook config directory")?;
+    let mut raw = existing_directory
+        .as_ref()
+        .map(|directory| directory.read_bounded(name, u64::MAX))
+        .transpose()
+        .with_context(|| format!("failed to read '{}'", path.display()))?
+        .flatten();
+    let parse_config = |raw: &Option<Vec<u8>>| -> Result<BTreeMap<String, Value>> {
+        Ok(raw
+            .as_deref()
+            .map(|content| {
+                serde_json::from_slice(content).with_context(|| {
+                    format!(
+                        "refusing to overwrite invalid JSON in '{}'; fix the file and rerun setup",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_default())
+    };
+    let mut config = parse_config(&raw)?;
     let mut hooks = json_object_field_or_default(&config, "hooks", path)?;
     if !auto_yes {
         eprint!(
@@ -46,6 +91,28 @@ pub(crate) fn write_claude_hook_config(
         if !trimmed.is_empty() && trimmed != "y" && trimmed != "yes" {
             return Ok(McpConfigStatus::Declined);
         }
+    }
+    let had_directory = existing_directory.is_some();
+    let directory = match existing_directory {
+        Some(directory) => directory,
+        None => StateDir::open(root, &components, true)
+            .context("failed to create Claude hook config directory")?,
+    };
+    #[cfg(unix)]
+    let _directory_lease = match existing_lease {
+        Some(lease) => lease,
+        None => directory
+            .lock_exclusive()
+            .context("failed to lock Claude hook config directory")?,
+    };
+    if !had_directory {
+        // Another setup may have populated a newly created directory while
+        // this call awaited opt-in or the cooperative directory lease.
+        raw = directory
+            .read_bounded(name, u64::MAX)
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        config = parse_config(&raw)?;
+        hooks = json_object_field_or_default(&config, "hooks", path)?;
     }
     let runtime_config = ensure_hook_http_settings_written(root)?;
     let http_url = claude_http_hook_url(&runtime_config)
@@ -86,18 +153,22 @@ pub(crate) fn write_claude_hook_config(
     if merge_claude_allowed_http_hook_url(&mut config, &http_url) {
         already_configured = false;
     }
-    if already_configured {
-        return Ok(McpConfigStatus::AlreadyConfigured);
-    }
-    config.insert("hooks".to_string(), Value::Object(hooks));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&config)?),
-    )?;
-    Ok(McpConfigStatus::Written)
+    let bytes = if already_configured {
+        // Existing generated settings contain the same bearer token. Publish
+        // their original bytes privately even when no handler merge is needed.
+        raw.context("configured Claude hook settings must already exist")?
+    } else {
+        config.insert("hooks".to_string(), Value::Object(hooks));
+        format!("{}\n", serde_json::to_string_pretty(&config)?).into_bytes()
+    };
+    directory
+        .write_atomic(name, &bytes)
+        .with_context(|| format!("failed to update '{}'", path.display()))?;
+    Ok(if already_configured {
+        McpConfigStatus::AlreadyConfigured
+    } else {
+        McpConfigStatus::Written
+    })
 }
 
 fn build_claude_packet28_hooks(command: &str, http_url: &str, http_token: &str) -> Value {
