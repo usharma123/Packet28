@@ -100,7 +100,8 @@ fn run_reducer_aware(root: &std::path::Path, cwd: &std::path::Path, args: &RunAr
     let exit_code = output.status.code().unwrap_or(1);
     let reduction = reduce_command_output(&spec, &stdout, &stderr, exit_code)?;
     let raw_est_tokens = estimate_tokens(&(stdout.clone() + &stderr));
-    let reduced_est_tokens = estimate_tokens(&reduction.compact_preview);
+    let rendered_command_body = render_command_body(&reduction.summary, &reduction.compact_preview);
+    let reduced_est_tokens = estimate_tokens(&rendered_command_body);
     let raw_artifact_handle =
         write_run_raw_artifact(root, &command_text, exit_code, &stdout, &stderr)?;
     let failure_fingerprint = failure_fingerprint(exit_code, &stdout, &stderr);
@@ -119,6 +120,8 @@ fn run_reducer_aware(root: &std::path::Path, cwd: &std::path::Path, args: &RunAr
             "timestamp_unix_ms": timestamp_unix_ms(),
         },
         "reduction": reduction,
+        "rendered_command_body": rendered_command_body,
+        "estimate_scope": "rendered_command_body",
         "raw_est_tokens": raw_est_tokens,
         "reduced_est_tokens": reduced_est_tokens,
         "savings_percent": savings_pct,
@@ -145,6 +148,7 @@ fn run_reducer_aware(root: &std::path::Path, cwd: &std::path::Path, args: &RunAr
             exit_code,
             raw_est_tokens,
             reduced_est_tokens,
+            estimate_scope: Some("rendered_command_body".to_string()),
             savings_percent: savings_pct,
             fallback_reason: None,
             failure_fingerprint,
@@ -155,7 +159,7 @@ fn run_reducer_aware(root: &std::path::Path, cwd: &std::path::Path, args: &RunAr
     if args.json {
         crate::cmd_common::emit_json(&payload, args.pretty)?;
     } else {
-        println!("{}", reduction.compact_preview);
+        print!("{rendered_command_body}");
         println!(
             "tokens: raw={raw_est_tokens} reduced={reduced_est_tokens} saved={saved} ({savings_pct:.1}%)"
         );
@@ -250,6 +254,7 @@ fn run_plain_command(
             exit_code,
             raw_est_tokens,
             reduced_est_tokens: raw_est_tokens,
+            estimate_scope: Some("rendered_command_body".to_string()),
             savings_percent: 0.0,
             fallback_reason: Some(fallback_reason.to_string()),
             failure_fingerprint: failure_fingerprint.clone(),
@@ -269,6 +274,8 @@ fn run_plain_command(
                 "stderr": stderr,
                 "raw_est_tokens": raw_est_tokens,
                 "reduced_est_tokens": raw_est_tokens,
+                "estimate_scope": "rendered_command_body",
+                "rendered_command_body": format!("{stdout}{stderr}"),
                 "savings_percent": 0.0,
                 "fallback_reason": fallback_reason,
                 "failure_fingerprint": failure_fingerprint,
@@ -313,7 +320,8 @@ fn emit_filtered_run(run: FilteredRun<'_>) -> Result<i32> {
         pretty,
     } = run;
     let raw_est_tokens = estimate_tokens(&(stdout.to_string() + stderr));
-    let reduced_est_tokens = estimate_tokens(&filter.output);
+    let rendered_command_body = format!("{}\n", filter.output);
+    let reduced_est_tokens = estimate_tokens(&rendered_command_body);
     let saved = raw_est_tokens.saturating_sub(reduced_est_tokens);
     let savings_pct = if raw_est_tokens == 0 {
         0.0
@@ -330,6 +338,8 @@ fn emit_filtered_run(run: FilteredRun<'_>) -> Result<i32> {
             "exit_code": exit_code,
             "timestamp_unix_ms": timestamp_unix_ms(),
         },
+        "estimate_scope": "rendered_command_body",
+        "rendered_command_body": rendered_command_body,
         "reduction": {
             "family": "custom_filter",
             "canonical_kind": filter.name,
@@ -374,6 +384,7 @@ fn emit_filtered_run(run: FilteredRun<'_>) -> Result<i32> {
             exit_code,
             raw_est_tokens,
             reduced_est_tokens,
+            estimate_scope: Some("rendered_command_body".to_string()),
             savings_percent: savings_pct,
             fallback_reason: None,
             failure_fingerprint,
@@ -384,12 +395,7 @@ fn emit_filtered_run(run: FilteredRun<'_>) -> Result<i32> {
     if json {
         crate::cmd_common::emit_json(&payload, pretty)?;
     } else {
-        println!(
-            "{}",
-            payload["reduction"]["compact_preview"]
-                .as_str()
-                .unwrap_or("")
-        );
+        print!("{rendered_command_body}");
         println!(
             "tokens: raw={raw_est_tokens} reduced={reduced_est_tokens} saved={saved} ({savings_pct:.1}%)"
         );
@@ -399,6 +405,19 @@ fn emit_filtered_run(run: FilteredRun<'_>) -> Result<i32> {
 
 fn command_text(argv: &[String]) -> String {
     shell_words::join(argv.iter().map(String::as_str))
+}
+
+fn render_command_body(summary: &str, preview: &str) -> String {
+    let mut body = String::new();
+    if !summary.is_empty() {
+        body.push_str(summary);
+        body.push('\n');
+    }
+    if !preview.is_empty() && preview != summary {
+        body.push_str(preview);
+        body.push('\n');
+    }
+    body
 }
 
 fn estimate_tokens(value: &str) -> u64 {

@@ -116,6 +116,12 @@ the library; protocol DTOs do not depend on runtime or storage.
 
 No daemon is required unless `--via-daemon` is selected.
 
+`Packet28 run` renders the reducer summary and nonempty preview as one command
+body. `reduced_est_tokens` estimates that body, including output newlines.
+JSON output and savings records identify this scope as `rendered_command_body`.
+The estimate excludes the JSON envelope, metrics footer, and provider usage.
+Older savings records retain an unknown scope rather than assuming this one.
+
 ### Persistent task
 
 1. A client authenticates the endpoint from
