@@ -286,6 +286,134 @@ fn generated_packet28_hook_command_exits_zero_when_binary_is_missing() {
 }
 
 #[test]
+fn claude_hook_merge_preserves_mixed_http_handlers_and_entry_metadata() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let generated: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let owned = generated["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+    let endpoint = owned["url"].as_str().unwrap();
+    let token = owned["headers"]["X-Packet28-Hook-Token"].as_str().unwrap();
+    let user_handlers = vec![
+        json!({"type": "command", "command": "user-audit"}),
+        json!({"type": "http", "url": format!("{endpoint}?user=1"), "headers": {"X-Packet28-Hook-Token": token}}),
+        json!({"type": "http", "url": "https://user.example/packet28/claude-hook", "headers": {"X-Packet28-Hook-Token": token}}),
+        json!({"type": "http", "url": endpoint}),
+        json!({"type": "http", "url": endpoint, "headers": {"X-Packet28-Hook-Token": "user-token"}}),
+    ];
+    let mut mixed = user_handlers.clone();
+    mixed.insert(1, owned);
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "env": {"KEEP": "yes"},
+            "allowedHttpHookUrls": ["https://user.example/hooks"],
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "userMetadata": "keep", "hooks": mixed}]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(merged["env"]["KEEP"], "yes");
+    let preserved = &merged["hooks"]["PreToolUse"][0];
+    assert_eq!(preserved["matcher"], "Bash");
+    assert_eq!(preserved["userMetadata"], "keep");
+    assert_eq!(preserved["hooks"], json!(user_handlers));
+    assert!(merged["allowedHttpHookUrls"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("https://user.example/hooks")));
+    assert_eq!(merged["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    let status = setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        merged
+    );
+}
+
+#[test]
+fn claude_hook_merge_preserves_user_wrappers_and_migrates_exact_generated_commands() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    let guarded = super::setup_commands::guarded_packet28_hook_command(
+        "/missing/Packet28",
+        "claude",
+        Path::new("/old/workspace"),
+    );
+    let direct_operator = "Packet28 hook claude --root /old;user-audit";
+    let guarded_operator = format!("{guarded};user-audit");
+    assert_eq!(shell_words::split(direct_operator).unwrap().len(), 5);
+    assert_eq!(shell_words::split(&guarded_operator).unwrap().len(), 6);
+    let user_handlers = vec![
+        json!({"type": "command", "command": direct_operator}),
+        json!({"type": "command", "command": guarded_operator}),
+        json!({"type": "command", "command": "echo Packet28 hook claude --root /user"}),
+        json!({"type": "command", "command": "sh -c 'printf %s \"Packet28 hook claude --root user\"'"}),
+        json!({"type": "command", "command": "user-audit"}),
+    ];
+    let mut mixed = user_handlers.clone();
+    mixed.push(json!({"type": "command", "command": guarded}));
+    mixed.push(json!({"type": "command", "command": "/missing/Packet28 hook claude --root /old/workspace"}));
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "hooks": {"SessionStart": [{"matcher": "user-matcher", "timeout": 42, "hooks": mixed}]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let entries = merged["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["matcher"], "user-matcher");
+    assert_eq!(entries[0]["timeout"], 42);
+    assert_eq!(entries[0]["hooks"], json!(user_handlers));
+    let command = entries[1]["hooks"][0]["command"].as_str().unwrap();
+    assert!(command.contains("${CLAUDE_PROJECT_DIR}"));
+    assert!(!command.contains("/old/workspace"));
+    assert_eq!(entries[2]["hooks"][0]["type"], "http");
+}
+
+#[test]
+fn generated_hook_command_ownership_requires_exact_outer_shell_serialization() {
+    for runtime in ["claude", "codex"] {
+        let guarded = super::setup_commands::guarded_packet28_hook_command(
+            "/missing/Packet28",
+            runtime,
+            Path::new("/old workspace"),
+        );
+        assert!(super::setup_commands::is_generated_packet28_hook_command(
+            &guarded, runtime
+        ));
+        let generated =
+            super::setup_commands::generated_packet28_hook_command(runtime, Path::new("/root"));
+        assert!(super::setup_commands::is_generated_packet28_hook_command(
+            &generated, runtime
+        ));
+        for suffix in [
+            ";user-audit",
+            "&&user-audit",
+            "|user-audit",
+            " >user.log",
+            "$(user-audit)",
+            "`user-audit`",
+        ] {
+            assert!(
+                !super::setup_commands::is_generated_packet28_hook_command(
+                    &format!("{guarded}{suffix}"),
+                    runtime
+                ),
+                "suffix {suffix:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn write_claude_hook_config_replaces_legacy_command_hooks() {
     let dir = tempdir().unwrap();
     let path = dir.path().join(".claude").join("settings.json");

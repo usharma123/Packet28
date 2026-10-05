@@ -10,7 +10,10 @@ use packet28_daemon_protocol::paths::HOOK_RUNTIME_CONFIG_FILE_NAME;
 use packet28_state_fs::StateDir;
 use serde_json::{json, Value};
 
-use super::setup_commands::{apply_generated_relaunch_command, generated_packet28_hook_command};
+use super::setup_commands::{
+    apply_generated_relaunch_command, generated_packet28_hook_command,
+    is_generated_packet28_hook_command, shell_escape,
+};
 use super::McpConfigStatus;
 
 const PACKET28_CLAUDE_HTTP_HOOK_PATH: &str = "/packet28/claude-hook";
@@ -136,8 +139,25 @@ pub(crate) fn write_claude_hook_config(
         let new_entries = entries.as_array().cloned().unwrap_or_default();
         let mut merged = existing
             .iter()
-            .filter(|entry| !is_packet28_claude_hook_entry(entry))
-            .cloned()
+            .filter_map(|entry| {
+                let Some(handlers) = entry.get("hooks").and_then(Value::as_array) else {
+                    return Some(entry.clone());
+                };
+                let retained = handlers
+                    .iter()
+                    .filter(|handler| !is_packet28_claude_hook_handler(handler, http_token))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if retained.len() == handlers.len() {
+                    return Some(entry.clone());
+                }
+                if retained.is_empty() {
+                    return None;
+                }
+                let mut preserved = entry.clone();
+                preserved["hooks"] = Value::Array(retained);
+                Some(preserved)
+            })
             .collect::<Vec<_>>();
         merged.extend(new_entries);
         if merged != existing {
@@ -188,21 +208,65 @@ fn build_claude_packet28_hooks(command: &str, http_url: &str, http_token: &str) 
     })
 }
 
-fn is_packet28_claude_hook_entry(entry: &Value) -> bool {
-    let Some(hooks) = entry.get("hooks").and_then(Value::as_array) else {
-        return false;
-    };
-    hooks.iter().any(|hook| {
-        if let Some(url) = hook.get("url").and_then(Value::as_str) {
-            return url.contains(PACKET28_CLAUDE_HTTP_HOOK_PATH);
+fn is_packet28_claude_hook_handler(hook: &Value, http_token: &str) -> bool {
+    match hook.get("type").and_then(Value::as_str) {
+        Some("http") => {
+            if hook["headers"][PACKET28_CLAUDE_HTTP_TOKEN_HEADER].as_str() != Some(http_token) {
+                return false;
+            }
+            let Some(port) = hook
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| url.strip_prefix("http://127.0.0.1:"))
+                .and_then(|suffix| suffix.strip_suffix(PACKET28_CLAUDE_HTTP_HOOK_PATH))
+            else {
+                return false;
+            };
+            port.parse::<u16>()
+                .is_ok_and(|parsed| parsed != 0 && parsed.to_string() == port)
         }
-        let command = hook
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        command.contains(" hook claude ")
-            && (command.contains("Packet28") || command.contains("packet28"))
-    })
+        Some("command") => {
+            let Some(command) = hook.get("command").and_then(Value::as_str) else {
+                return false;
+            };
+            let Ok(argv) = shell_words::split(command) else {
+                return false;
+            };
+            if is_generated_packet28_hook_command(command, "claude") {
+                return true;
+            }
+            // Legacy setup wrote a direct Packet28 invocation. Match the
+            // complete argv shape, not a substring in a user's wrapper.
+            if argv.len() != 5
+                || !matches!(
+                    Path::new(&argv[0])
+                        .file_name()
+                        .and_then(|name| name.to_str()),
+                    Some("Packet28" | "packet28")
+                )
+                || argv[1..4] != ["hook", "claude", "--root"]
+                || !is_literal_unquoted_shell_word(&argv[0])
+            {
+                return false;
+            }
+            command
+                == format!(
+                    "{} hook claude --root \"{}\"",
+                    argv[0],
+                    shell_escape(argv[4].clone())
+                )
+                || (is_literal_unquoted_shell_word(&argv[4])
+                    && command == format!("{} hook claude --root {}", argv[0], argv[4]))
+        }
+        _ => false,
+    }
+}
+
+fn is_literal_unquoted_shell_word(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_alphanumeric() || matches!(character, '/' | '_' | '-' | '.' | ':')
+        })
 }
 
 fn claude_command_hook_entry(matcher: Option<&str>, command: &str) -> Value {
