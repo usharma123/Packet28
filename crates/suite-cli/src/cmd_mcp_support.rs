@@ -376,6 +376,43 @@ pub(crate) fn resolve_session_task_id(
     derive_hint: Option<&str>,
     tool_name: &str,
 ) -> Result<String> {
+    resolve_session_task_id_with_startup(
+        session,
+        root,
+        explicit_task_id,
+        derive_hint,
+        tool_name,
+        false,
+    )
+}
+
+// Daemon-bound tools must let startup persist any recovery link before choosing
+// their continuation. Local artifact and analysis tools only read known links.
+pub(crate) fn resolve_live_session_task_id(
+    session: &Arc<Mutex<McpSessionState>>,
+    root: &Path,
+    explicit_task_id: &str,
+    derive_hint: Option<&str>,
+    tool_name: &str,
+) -> Result<String> {
+    resolve_session_task_id_with_startup(
+        session,
+        root,
+        explicit_task_id,
+        derive_hint,
+        tool_name,
+        true,
+    )
+}
+
+fn resolve_session_task_id_with_startup(
+    session: &Arc<Mutex<McpSessionState>>,
+    root: &Path,
+    explicit_task_id: &str,
+    derive_hint: Option<&str>,
+    tool_name: &str,
+    start_daemon: bool,
+) -> Result<String> {
     let task_id = if !explicit_task_id.is_empty() {
         validated_task_storage_id(explicit_task_id)?;
         explicit_task_id.to_string()
@@ -393,7 +430,9 @@ pub(crate) fn resolve_session_task_id(
         ));
     };
     validated_task_storage_id(&task_id)?;
-    crate::broker_client::ensure_daemon(root)?;
+    if start_daemon {
+        crate::broker_client::ensure_daemon(root)?;
+    }
     let task_id = crate::task_runtime::resolve_task_continuation(root, &task_id)?;
     track_task(session, root, &task_id)?;
     Ok(task_id)
@@ -461,7 +500,8 @@ pub(crate) fn broker_task_status_via_session(
     session: &Arc<Mutex<McpSessionState>>,
     task_id: &str,
 ) -> Result<BrokerTaskStatusResponse> {
-    let task_id = resolve_session_task_id(session, root, task_id, None, "packet28.task_status")?;
+    let task_id =
+        resolve_live_session_task_id(session, root, task_id, None, "packet28.task_status")?;
     let mut response = match send_daemon_request_via_session(
         root,
         session,
@@ -529,6 +569,48 @@ pub(crate) fn next_task_invocation(
 mod recovery_artifact_tests {
     use super::*;
     use packet28_daemon_protocol::task::{TaskHistoryRecovery, TaskRecord, TaskRegistry};
+
+    #[test]
+    fn local_resolution_uses_known_recovery_without_starting_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let link = TaskHistoryRecovery {
+            predecessor_task_id: "old".to_string(),
+            successor_task_id: "new".to_string(),
+            ..TaskHistoryRecovery::default()
+        };
+        let mut registry = TaskRegistry::default();
+        registry.tasks.insert(
+            "old".to_string(),
+            TaskRecord {
+                task_id: "old".to_string(),
+                superseded_by: Some(link.clone()),
+                ..TaskRecord::default()
+            },
+        );
+        registry.tasks.insert(
+            "new".to_string(),
+            TaskRecord {
+                task_id: "new".to_string(),
+                recovered_from: Some(link),
+                ..TaskRecord::default()
+            },
+        );
+        packet28_daemon_core::storage::save_task_registry(root.path(), &registry).unwrap();
+        let session = Arc::new(Mutex::new(McpSessionState::default()));
+        assert_eq!(
+            resolve_session_task_id(
+                &session,
+                root.path(),
+                "old",
+                None,
+                "packet28.handoff_lint_paths"
+            )
+            .unwrap(),
+            "new"
+        );
+        assert!(!packet28_daemon_protocol::paths::runtime_path(root.path()).exists());
+        assert!(!packet28_daemon_protocol::paths::ready_path(root.path()).exists());
+    }
 
     #[test]
     fn chained_recovery_keeps_result_raw_and_context_owners() {
