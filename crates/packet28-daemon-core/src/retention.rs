@@ -3488,6 +3488,18 @@ fn active_storage_keys(
     if let Some(task_id) = active_task_id {
         active.insert(storage_key_for_task(root, task_id));
     }
+    // A retained successor can still read its predecessors' immutable artifacts.
+    // Protect every referenced namespace until its referring record is removed.
+    for record in registry.tasks.values() {
+        if let Some(link) = &record.recovered_from {
+            active.insert(storage_key_for_task(root, &link.predecessor_task_id));
+        }
+        for handoff in &record.handoffs {
+            if handoff.task_id != record.task_id {
+                active.insert(storage_key_for_task(root, &handoff.task_id));
+            }
+        }
+    }
     active
 }
 
@@ -6854,6 +6866,49 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn retention_preserves_recovery_artifact_owners_across_two_generations() {
+        use packet28_daemon_protocol::task::TaskHistoryRecovery;
+        let root = tempdir().unwrap();
+        let mut records = ["old", "mid", "new"].map(|task_id| TaskRecord {
+            task_id: task_id.to_string(),
+            last_completed_at_unix: Some(1),
+            ..TaskRecord::default()
+        });
+        for index in 0..2 {
+            let link = TaskHistoryRecovery {
+                predecessor_task_id: records[index].task_id.clone(),
+                successor_task_id: records[index + 1].task_id.clone(),
+                ..TaskHistoryRecovery::default()
+            };
+            records[index].superseded_by = Some(link.clone());
+            records[index + 1].recovered_from = Some(link);
+        }
+        records[2].lifecycle = TaskLifecycle::Running;
+        write_paired_registry(root.path(), records);
+        let old = write_artifact(root.path(), "old", b"old evidence", 1);
+        let mid = write_artifact(root.path(), "mid", b"mid evidence", 1);
+        retain_task_store(
+            root.path(),
+            100,
+            RetentionOptions {
+                max_age_seconds: Some(1),
+                max_bytes: Some(0),
+                apply: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(old).unwrap(), b"old evidence");
+        assert_eq!(fs::read(mid).unwrap(), b"mid evidence");
+        assert_eq!(
+            crate::storage::load_task_registry(root.path())
+                .unwrap()
+                .tasks
+                .len(),
+            3
+        );
+    }
 
     fn task_artifact_dir(root: &Path, task_id: &str) -> PathBuf {
         match TaskStorageId::try_from(task_id) {

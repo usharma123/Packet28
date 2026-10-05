@@ -173,7 +173,8 @@ pub fn task_event_log_tail_sequence(root: &Path, task_id: &str) -> Result<Option
 /// # Errors
 ///
 /// Returns [`DaemonCoreError::InvalidTaskRegistry`] when the task is not
-/// admitted, [`DaemonCoreError::InvalidTaskEventFrame`] for malformed,
+/// admitted, [`DaemonCoreError::TaskSuperseded`] when its history was moved to
+/// a linked successor, [`DaemonCoreError::InvalidTaskEventFrame`] for malformed,
 /// conflicting, cross-task, or exhausted sequence authority,
 /// [`DaemonCoreError::AuthorityJsonLimitExceeded`] for an excessive event, or
 /// [`DaemonCoreError::StorageMutationAuthorityLost`] when synchronized bytes
@@ -188,7 +189,7 @@ pub fn append_next_task_event(
 
     let writer_lease = acquire_task_store_writer_lease(root)?;
     let _registry_admission = acquire_registry_writer_admission(&writer_lease)?;
-    with_registered_task_storage_id(root, &task_id, || {
+    registry_delta::with_continuable_task_admission(root, &task_id, &writer_lease, || {
         #[cfg(unix)]
         {
             append_next_task_event_admitted(root, &task_id, &writer_lease, event)
@@ -220,7 +221,7 @@ pub fn append_next_task_event_with_authority(
 ) -> Result<DaemonEventFrame> {
     require_daemon_lifecycle_lease(root, authority.lease())?;
     let task_id = checked_task_storage_id(root, task_id)?;
-    authority.require_task(root, &task_id)?;
+    authority.require_continuable_task(root, &task_id)?;
     preflight_task_event(root, &task_id, event)?;
     #[cfg(unix)]
     {

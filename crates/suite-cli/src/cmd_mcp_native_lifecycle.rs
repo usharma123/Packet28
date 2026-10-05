@@ -445,44 +445,41 @@ fn dispatch_payload(
         "packet28.fetch_tool_result" => {
             let mut request: Packet28FetchToolResultArgs =
                 serde_json::from_value(arguments.clone())?;
-            request.task_id = resolve_session_task_id(
+            request.task_id = crate::cmd_mcp::support::resolve_artifact_task_id(
                 session,
                 root,
                 &request.task_id,
                 None,
                 "packet28.fetch_tool_result",
             )?;
-            track_task(session, root, &request.task_id)?;
             handle_packet28_fetch_tool_result(root, request)?
         }
         "packet28.fetch_raw_output" => {
             let mut request: Packet28FetchRawOutputArgs =
                 serde_json::from_value(arguments.clone())?;
-            request.task_id = resolve_session_task_id(
+            request.task_id = crate::cmd_mcp::support::resolve_artifact_task_id(
                 session,
                 root,
                 &request.task_id,
                 Some(request.handle.as_str()),
                 "packet28.fetch_raw_output",
             )?;
-            track_task(session, root, &request.task_id)?;
             handle_packet28_fetch_raw_output(root, request)?
         }
         "packet28.fetch_context" => {
             let mut request: Packet28FetchContextArgs = serde_json::from_value(arguments.clone())?;
-            request.task_id = resolve_session_task_id(
+            request.task_id = crate::cmd_mcp::support::resolve_artifact_task_id(
                 session,
                 root,
                 &request.task_id,
                 None,
                 "packet28.fetch_context",
             )?;
-            track_task(session, root, &request.task_id)?;
             handle_packet28_fetch_context(root, request)?
         }
         "packet28.verify_handoff" => {
             let mut request: Packet28VerifyHandoffArgs = serde_json::from_value(arguments.clone())?;
-            request.task_id = resolve_session_task_id(
+            request.task_id = crate::cmd_mcp::support::resolve_artifact_task_id(
                 session,
                 root,
                 &request.task_id,
@@ -492,7 +489,6 @@ fn dispatch_payload(
                     .or(request.context_version.as_deref()),
                 name,
             )?;
-            track_task(session, root, &request.task_id)?;
             native_tools::handle_packet28_verify_handoff(root, request)?
         }
         "packet28.prompt_pressure" => {

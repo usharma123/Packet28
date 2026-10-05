@@ -228,6 +228,20 @@ where
             after_seq,
         } = request
         {
+            // A superseded identity never receives another event. Refuse it
+            // explicitly instead of leaving a subscriber silently idle.
+            if let Err(error) = reject_superseded_tasks(&state, [task_id.as_str()]) {
+                let message = format!("{error:#}");
+                daemon_log(&format!("daemon request failed: {message}"));
+                write_async_frame(
+                    &mut stream,
+                    DaemonResponse::Error { message },
+                    config.frame_write_timeout,
+                    &blocking_pool,
+                )
+                .await?;
+                return Ok(());
+            }
             return handle_task_subscribe(
                 state,
                 &mut stream,
@@ -291,12 +305,57 @@ fn request_daemon_stop(
     index_result
 }
 
+/// Returns the tasks a request would continue or mutate.
+///
+/// Status, watch listing, and idempotent cancellation stay available for a
+/// superseded task so its recovery link remains discoverable.
+pub(crate) fn continued_task_ids(request: &DaemonRequest) -> Vec<&str> {
+    match request {
+        DaemonRequest::ExecuteSequence { spec } => vec![spec.task_id.as_str()],
+        DaemonRequest::TaskAwaitHandoff { request } => vec![request.task_id.as_str()],
+        DaemonRequest::TaskMarkHandoffConsumed { request } => vec![request.task_id.as_str()],
+        DaemonRequest::TaskLaunchAgent { request } => vec![request.task_id.as_str()],
+        DaemonRequest::TaskSubscribe { task_id, .. } => vec![task_id.as_str()],
+        DaemonRequest::BrokerGetContext { request } => vec![request.task_id.as_str()],
+        DaemonRequest::BrokerEstimateContext { request } => vec![request.task_id.as_str()],
+        DaemonRequest::BrokerPrepareHandoff { request } => vec![request.task_id.as_str()],
+        DaemonRequest::BrokerValidatePlan { request } => vec![request.task_id.as_str()],
+        DaemonRequest::BrokerDecompose { request } => vec![request.task_id.as_str()],
+        DaemonRequest::BrokerWriteState { request } => vec![request.task_id.as_str()],
+        DaemonRequest::BrokerWriteStateBatch { request } => request
+            .requests
+            .iter()
+            .map(|request| request.task_id.as_str())
+            .collect(),
+        DaemonRequest::HookIngest { request } => vec![request.task_id.as_str()],
+        _ => Vec::new(),
+    }
+}
+
+/// Fails when any named task was superseded by a linked history recovery.
+///
+/// Recovery assigns `superseded_by` only before readiness and no request
+/// clears it, so this check cannot race a concurrent supersession.
+pub(crate) fn reject_superseded_tasks<'a>(
+    state: &Arc<Mutex<DaemonState>>,
+    task_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let guard = state.lock().map_err(lock_err)?;
+    for task_id in task_ids {
+        if let Some(task) = guard.tasks.tasks.get(task_id) {
+            packet28_daemon_core::storage::require_continuable_task(task)?;
+        }
+    }
+    Ok(())
+}
+
 async fn dispatch_request(
     state: Arc<Mutex<DaemonState>>,
     watch_tx: WatchIngress,
     request: DaemonRequest,
     blocking_pool: &BlockingPool,
 ) -> Result<DaemonResponse> {
+    reject_superseded_tasks(&state, continued_task_ids(&request))?;
     match request {
         DaemonRequest::TaskAwaitHandoff { request } => {
             let response = await_task_handoff(state, request, blocking_pool.clone()).await?;
