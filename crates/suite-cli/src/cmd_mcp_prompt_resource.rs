@@ -1,7 +1,7 @@
 use super::*;
 use packet28_daemon_protocol::registry::{
-    DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1, RegistryRevisionV1,
-    TaskListPageRequestV1, WatchListPageRequestV1, MAX_REGISTRY_PAGE_LIMIT,
+    DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1, OversizedTaskRecordV1,
+    RegistryRevisionV1, TaskListPageRequestV1, WatchListPageRequestV1, MAX_REGISTRY_PAGE_LIMIT,
 };
 
 pub(crate) fn prompt_descriptors() -> Vec<Value> {
@@ -202,13 +202,22 @@ pub(crate) fn resolve_current_task_id(
 pub(crate) fn daemon_status(
     root: &Path,
 ) -> Result<packet28_daemon_protocol::message::DaemonStatus> {
+    daemon_status_with_omissions(root).map(|(status, _)| status)
+}
+
+fn daemon_status_with_omissions(
+    root: &Path,
+) -> Result<(
+    packet28_daemon_protocol::message::DaemonStatus,
+    Vec<OversizedTaskRecordV1>,
+)> {
     let mut client = crate::cmd_daemon::PersistentDaemonClient::connect(root)?;
     let status = match client.send_registry_request(&DaemonRegistryRequestV1::Status)? {
         DaemonRegistryResponseV1::Status { status } => *status,
         DaemonRegistryResponseV1::Error { message }
             if registry_extension_is_unsupported(&message) =>
         {
-            return legacy_daemon_status(root);
+            return legacy_daemon_status(root).map(|status| (status, Vec::new()));
         }
         DaemonRegistryResponseV1::Error { message } => return Err(anyhow!(message)),
         other => return Err(anyhow!("unexpected daemon registry response: {other:?}")),
@@ -230,21 +239,24 @@ pub(crate) fn daemon_status(
     } = status;
     let revision =
         registry_revision.ok_or_else(|| anyhow!("daemon registry status omitted its revision"))?;
-    let tasks = load_all_task_pages(&mut client, &revision, task_count)?;
+    let (tasks, omitted_oversized) = load_all_task_pages(&mut client, &revision, task_count)?;
     let watches = load_all_watch_pages(&mut client, &revision, watch_count)?;
-    Ok(packet28_daemon_protocol::message::DaemonStatus {
-        pid,
-        version,
-        socket_path,
-        workspace_root,
-        started_at_unix,
-        ready_at_unix,
-        log_path,
-        uptime_secs,
-        tasks,
-        watches,
-        index,
-    })
+    Ok((
+        packet28_daemon_protocol::message::DaemonStatus {
+            pid,
+            version,
+            socket_path,
+            workspace_root,
+            started_at_unix,
+            ready_at_unix,
+            log_path,
+            uptime_secs,
+            tasks,
+            watches,
+            index,
+        },
+        omitted_oversized,
+    ))
 }
 
 fn legacy_daemon_status(root: &Path) -> Result<packet28_daemon_protocol::message::DaemonStatus> {
@@ -271,12 +283,12 @@ fn registry_extension_is_unsupported(message: &str) -> bool {
 /// Loads all task records from a consistent registry snapshot.
 ///
 /// Oversized records omitted by the daemon are counted for completeness validation
-/// but are not included in the returned collection.
+/// and returned separately from healthy task records for caller diagnostics.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// let tasks = load_all_task_pages(&mut client, &snapshot_revision, expected_total)?;
+/// let (tasks, omissions) = load_all_task_pages(&mut client, &snapshot_revision, expected_total)?;
 /// assert!(tasks.len() <= expected_total);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
@@ -284,13 +296,13 @@ fn load_all_task_pages(
     client: &mut crate::cmd_daemon::PersistentDaemonClient,
     snapshot_revision: &RegistryRevisionV1,
     expected_total: usize,
-) -> Result<Vec<TaskRecord>> {
+) -> Result<(Vec<TaskRecord>, Vec<OversizedTaskRecordV1>)> {
     let mut tasks = Vec::new();
     // Records the daemon skipped because they exceed the per-record pagination
     // bound. They still count toward `total`, so account for them when checking
     // completeness; otherwise a single oversized record would look like the
     // registry changed mid-pagination.
-    let mut omitted_oversized = 0usize;
+    let mut omitted_oversized = Vec::new();
     let mut after_task_id = None;
     loop {
         let response = client.send_registry_request(&DaemonRegistryRequestV1::TaskListPage {
@@ -310,15 +322,15 @@ fn load_all_task_pages(
                 "daemon task registry changed during pagination; retry the request"
             ));
         }
-        omitted_oversized += page.omitted_oversized.len();
+        omitted_oversized.extend(page.omitted_oversized);
         tasks.extend(page.tasks);
         let Some(next) = page.next_after_task_id else {
-            if tasks.len() + omitted_oversized != expected_total {
+            if tasks.len() + omitted_oversized.len() != expected_total {
                 return Err(anyhow!(
                     "daemon task registry changed during pagination; retry the request"
                 ));
             }
-            return Ok(tasks);
+            return Ok((tasks, omitted_oversized));
         };
         if after_task_id
             .as_ref()
@@ -398,7 +410,7 @@ pub(crate) fn handle_resources_list(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
 ) -> Result<Value> {
-    let status = daemon_status(root)?;
+    let (status, omitted_oversized) = daemon_status_with_omissions(root)?;
     let mut resources = Vec::new();
     let current_task_id = session
         .lock()
@@ -440,7 +452,14 @@ pub(crate) fn handle_resources_list(
             "mimeType": "text/markdown"
         }));
     }
-    Ok(json!({ "resources": resources }))
+    let mut result = json!({ "resources": resources });
+    if !omitted_oversized.is_empty() {
+        result["_meta"] = json!({
+            "omitted_oversized_count": omitted_oversized.len(),
+            "omitted_oversized": omitted_oversized,
+        });
+    }
+    Ok(result)
 }
 
 pub(crate) fn handle_resource_read(

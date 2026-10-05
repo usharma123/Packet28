@@ -15,11 +15,9 @@ use process_harness::McpHarness;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-#[test]
 #[cfg(unix)]
-fn test_mcp_resources_list_paginates_past_oversized_records() {
+fn resources_from_seeded_registry(padding: &[(char, usize)]) -> Value {
     use packet28_daemon_core::storage::save_task_registry;
-    use packet28_daemon_protocol::registry::MAX_REGISTRY_PAGE_ITEM_BYTES;
     use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry};
     use process_harness::{HarnessLimits, ProcessHarness};
     use std::process::Command;
@@ -29,25 +27,20 @@ fn test_mcp_resources_list_paginates_past_oversized_records() {
     let dir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     init_repo(dir.path());
-    let tasks = [
-        ('a', 900_000),
-        ('b', 900_000),
-        ('c', MAX_REGISTRY_PAGE_ITEM_BYTES + 1),
-        ('d', 900_000),
-    ]
-    .into_iter()
-    .map(|(id, bytes)| {
-        let task_id = id.to_string();
-        (
-            task_id.clone(),
-            TaskRecord {
-                task_id,
-                last_error: Some("x".repeat(bytes)),
-                ..TaskRecord::default()
-            },
-        )
-    })
-    .collect();
+    let tasks = padding
+        .iter()
+        .map(|&(id, bytes)| {
+            let task_id = id.to_string();
+            (
+                task_id.clone(),
+                TaskRecord {
+                    task_id,
+                    last_error: Some("x".repeat(bytes)),
+                    ..TaskRecord::default()
+                },
+            )
+        })
+        .collect();
     save_task_registry(dir.path(), &TaskRegistry { tasks }).unwrap();
     let daemon_binary = std::path::Path::new(env!("CARGO_BIN_EXE_Packet28"))
         .parent()
@@ -86,6 +79,32 @@ fn test_mcp_resources_list_paginates_past_oversized_records() {
         )
         .unwrap();
     assert!(response.get("error").is_none(), "{response}");
+    stop_mcp_server(server);
+    suite_cmd()
+        .env("HOME", home.path())
+        .timeout(Duration::from_secs(15))
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(daemon
+        .wait(Duration::from_secs(10))
+        .unwrap()
+        .status
+        .success());
+    response
+}
+
+#[test]
+#[cfg(unix)]
+fn test_mcp_resources_list_paginates_past_oversized_records() {
+    use packet28_daemon_protocol::registry::MAX_REGISTRY_PAGE_ITEM_BYTES;
+
+    let response = resources_from_seeded_registry(&[
+        ('a', 900_000),
+        ('b', 900_000),
+        ('c', MAX_REGISTRY_PAGE_ITEM_BYTES + 1),
+        ('d', 900_000),
+    ]);
     let resources = response["result"]["resources"].as_array().unwrap();
     let uris = resources
         .iter()
@@ -101,18 +120,38 @@ fn test_mcp_resources_list_paginates_past_oversized_records() {
         ]
     );
     assert_eq!(resources[0]["description"], "Current task metadata for d");
-    stop_mcp_server(server);
-    suite_cmd()
-        .env("HOME", home.path())
-        .timeout(Duration::from_secs(15))
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .assert()
-        .success();
-    assert!(daemon
-        .wait(Duration::from_secs(10))
-        .unwrap()
-        .status
-        .success());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_mcp_resources_list_reports_omitted_task_identities() {
+    use packet28_daemon_protocol::registry::{
+        MAX_REGISTRY_PAGE_ITEM_BYTES, MAX_REGISTRY_PAGE_RESPONSE_BYTES,
+    };
+
+    let response = resources_from_seeded_registry(&[
+        ('a', 900_000),
+        ('b', 900_000),
+        ('c', MAX_REGISTRY_PAGE_ITEM_BYTES + 1),
+        ('d', 900_000),
+    ]);
+    let metadata = &response["result"]["_meta"];
+    let omissions = metadata["omitted_oversized"]
+        .as_array()
+        .expect("omitted task identities must remain visible to MCP callers");
+    assert_eq!(metadata["omitted_oversized_count"], 1);
+    assert_eq!(omissions.len(), 1);
+    assert_eq!(omissions[0]["task_id"], "c");
+    assert!(omissions[0]["encoded_bytes"].as_u64().unwrap() > MAX_REGISTRY_PAGE_ITEM_BYTES as u64);
+    assert!(serde_json::to_vec(&response).unwrap().len() <= MAX_REGISTRY_PAGE_RESPONSE_BYTES);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_mcp_resources_list_without_omissions_preserves_result_shape() {
+    let response = resources_from_seeded_registry(&[('a', 16)]);
+    let result = response["result"].as_object().unwrap();
+    assert_eq!(result.keys().collect::<Vec<_>>(), vec!["resources"]);
 }
 
 fn write_intention_via_mcp(
