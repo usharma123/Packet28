@@ -142,6 +142,78 @@ impl Drop for IndexFixture {
 }
 
 #[test]
+fn accepted_index_shutdown_is_idempotent_after_worker_exit() {
+    for queue_already_full in [false, true] {
+        let (ingress, receiver) = IndexIngress::new();
+        if queue_already_full {
+            ingress
+                .send(IndexCommand::RebuildFull)
+                .expect("fill wake queue");
+        }
+        ingress
+            .send(IndexCommand::Shutdown)
+            .expect("queue shutdown");
+        let batch = receiver.recv_debounced().expect("receive shutdown");
+        assert!(batch.shutdown_epoch.is_some());
+        drop(receiver);
+
+        ingress
+            .send(IndexCommand::Shutdown)
+            .expect("repeat accepted shutdown");
+        let error = ingress
+            .send(IndexCommand::RebuildFull)
+            .expect_err("shutdown worker accepted new work");
+        assert!(error.to_string().contains("shutting down"));
+    }
+}
+
+#[test]
+fn index_shutdown_preserves_a_worker_dead_before_first_send() {
+    let (ingress, receiver) = IndexIngress::new();
+    drop(receiver);
+
+    for _ in 0..2 {
+        let error = ingress
+            .send(IndexCommand::Shutdown)
+            .expect_err("dead worker was treated as an accepted shutdown");
+        assert!(error.to_string().contains("index worker is not running"));
+        assert!(ingress.pending.lock().unwrap().shutdown_epoch.is_none());
+    }
+}
+
+#[test]
+fn index_shutdown_publishes_daemon_intent_before_batch_consumption() {
+    let (ingress, receiver) = IndexIngress::new();
+    let shutdown = crate::runtime::ShutdownSignal::new();
+    let worker_shutdown = shutdown.clone();
+    let worker = thread::spawn(move || {
+        let batch = receiver.recv_debounced().expect("receive shutdown");
+        assert!(batch.shutdown_epoch.is_some());
+        assert!(
+            worker_shutdown.is_requested(),
+            "index exited before daemon shutdown intent"
+        );
+    });
+
+    ingress
+        .request_shutdown(|| {
+            assert!(
+                matches!(
+                    ingress.pending.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "shutdown batch can be consumed before daemon intent is published"
+            );
+            shutdown.request();
+        })
+        .expect("queue shutdown and publish daemon intent");
+    worker.join().expect("join index worker");
+    ingress
+        .send(IndexCommand::Shutdown)
+        .expect("supervisor repeats shutdown");
+}
+
+#[test]
 fn bounded_index_ingress_promotes_a_path_flood_to_one_full_rebuild() {
     let (ingress, receiver) = IndexIngress::new();
     for index in 0..(MAX_PENDING_INDEX_PATHS + 10_000) {
