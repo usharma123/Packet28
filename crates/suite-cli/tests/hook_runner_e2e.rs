@@ -6,7 +6,7 @@
 mod process_harness;
 
 use assert_cmd::Command;
-use packet28_daemon_core::storage::load_task_registry;
+use packet28_daemon_core::storage::{load_task_events, load_task_registry};
 use packet28_daemon_protocol::hooks::HookRuntimeConfig;
 use packet28_daemon_protocol::paths::{hook_runtime_config_path, task_artifact_dir, TaskStorageId};
 use std::fs;
@@ -111,7 +111,7 @@ fn install_counting_cat(dir: &Path) -> (String, std::path::PathBuf) {
 
 #[test]
 #[cfg(unix)]
-fn test_hook_runner_cli_reuses_cached_summary_without_rerunning_command() {
+fn test_hook_runner_cli_executes_every_explicit_request() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
     let daemon = DaemonStopGuard::new(dir.path());
@@ -176,7 +176,14 @@ fn test_hook_runner_cli_reuses_cached_summary_without_rerunning_command() {
         .unwrap_or_else(|error| panic!("second reducer-runner invocation failed: {error}"));
     assert_process_success("second reducer-runner invocation", &second);
     assert_eq!(first.stdout, second.stdout);
-    assert_eq!(fs::read_to_string(&counter_path).unwrap().trim(), "1");
+    assert_eq!(fs::read_to_string(&counter_path).unwrap().trim(), "2");
+
+    let completions = load_task_events(dir.path(), "task-runner-cache")
+        .unwrap()
+        .into_iter()
+        .filter(|frame| frame.event.data["reason"] == "state_write:tool_result")
+        .count();
+    assert_eq!(completions, 2, "both executions must write fresh evidence");
 
     daemon.stop();
 }
