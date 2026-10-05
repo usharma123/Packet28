@@ -3,10 +3,12 @@ use std::fs;
 
 use assert_cmd::Command;
 use packet28_daemon_core::storage::{
-    load_task_watch_registry_with_deltas_and_event_tails, save_task_watch_registry_checkpoint,
+    append_next_task_event, load_task_watch_registry_with_deltas_and_event_tails,
+    save_task_watch_registry_checkpoint,
 };
+use packet28_daemon_protocol::message::DaemonEvent;
 use packet28_daemon_protocol::paths::{task_event_log_path, task_events_dir, TaskStorageId};
-use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry, WatchRegistry};
+use packet28_daemon_protocol::task::{TaskLifecycle, TaskRecord, TaskRegistry, WatchRegistry};
 use predicates::prelude::*;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -129,6 +131,40 @@ fn storage_repair_apply_repairs_all_logs_and_is_idempotent() {
     assert_eq!(tails.get("alpha"), Some(&None));
     assert_eq!(tails.get("beta"), Some(&None));
     assert_eq!(tails.get("healthy"), Some(&None));
+    for (task_id, prior_seq) in [("alpha", 3), ("beta", 9)] {
+        let predecessor = &loaded.tasks.tasks[task_id];
+        let link = predecessor.superseded_by.as_ref().unwrap();
+        assert_eq!(predecessor.lifecycle, TaskLifecycle::Cancelled);
+        assert_eq!(link.prior_last_event_seq, prior_seq);
+        assert_eq!(
+            loaded.tasks.tasks[&link.successor_task_id]
+                .recovered_from
+                .as_ref(),
+            Some(link)
+        );
+        let reported = report["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["task_id"] == task_id)
+            .unwrap();
+        assert_eq!(reported["successor_task_id"], link.successor_task_id);
+        let event = DaemonEvent {
+            kind: "after-repair".to_string(),
+            occurred_at_unix: 1,
+            data: Value::Null,
+        };
+        assert!(append_next_task_event(root.path(), task_id, &event).is_err());
+        assert!(
+            !task_event_log_path(root.path(), &TaskStorageId::try_from(task_id).unwrap()).exists()
+        );
+        assert_eq!(
+            append_next_task_event(root.path(), &link.successor_task_id, &event)
+                .unwrap()
+                .seq,
+            1
+        );
+    }
 
     let second_report = repair_json(&root, &["--apply"]);
     assert_eq!(second_report["applied"], true);
@@ -152,7 +188,7 @@ fn storage_repair_on_clean_store_does_not_start_a_daemon() {
 }
 
 #[test]
-fn storage_repair_rejects_tampered_journal_paths_without_mutation() {
+fn storage_repair_rejects_legacy_journal_without_mutation() {
     let root = TempDir::new().unwrap();
     seed_task_registry(&root, &[("bad", 4)]);
     let bad_log = corrupt_event_log(&root, "bad");
@@ -186,7 +222,7 @@ fn storage_repair_rejects_tampered_journal_paths_without_mutation() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "repair journal has an invalid path for task \"bad\"",
+            "legacy repair journal requires manual inspection",
         ));
 
     assert_eq!(fs::read(&bad_log).unwrap(), original);
@@ -195,4 +231,37 @@ fn storage_repair_rejects_tampered_journal_paths_without_mutation() {
         journal_path.exists(),
         "failed recovery intent must be retained"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_repair_refuses_daemon_startup_before_a_socket_exists() {
+    let root = TempDir::new().unwrap();
+    seed_task_registry(&root, &[("bad", 4)]);
+    let bad_log = corrupt_event_log(&root, "bad");
+    let _instance =
+        packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease(root.path()).unwrap();
+    for apply in [false, true] {
+        let mut command = suite_cmd();
+        command.args([
+            "daemon",
+            "storage",
+            "repair",
+            "--root",
+            root.path().to_str().unwrap(),
+        ]);
+        if apply {
+            command.arg("--apply");
+        }
+        command
+            .timeout(std::time::Duration::from_secs(5))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("exclusive task-store access"));
+        assert_eq!(fs::read(&bad_log).unwrap(), b"{not-valid-json\n");
+        assert_eq!(
+            fs::read_dir(task_events_dir(root.path())).unwrap().count(),
+            1
+        );
+    }
 }

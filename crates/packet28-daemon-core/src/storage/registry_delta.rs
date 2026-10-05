@@ -1510,10 +1510,103 @@ pub fn load_task_watch_registry_recovering_corrupt_event_logs(
 /// # Errors
 /// Returns registry, event-log, or filesystem authority errors.
 pub fn repair_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
-    load_task_watch_registry_recovering_corrupt_event_logs(root).map(|(_, _, records)| records)
+    inspect_or_repair_offline_task_event_logs(root, true)
 }
 
-/// Reports corrupt admitted event logs. The CLI requires a stopped daemon.
+/// Inspects corrupt event logs under nonblocking offline maintenance admission.
+/// Registry, WAL, and event-log bytes are not changed.
+///
+/// # Errors
+/// Returns a busy error while a daemon or writer owns the store, or an integrity error.
+pub fn inspect_offline_corrupt_task_event_logs(
+    root: &Path,
+) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    inspect_or_repair_offline_task_event_logs(root, false)
+}
+
+fn inspect_or_repair_offline_task_event_logs(
+    root: &Path,
+    apply: bool,
+) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
+    #[cfg(unix)]
+    {
+        use crate::task_store_lease::{
+            try_acquire_task_retention_instance_gate_from, try_acquire_task_store_retention_lease,
+        };
+        let blocked = || {
+            DaemonCoreError::io(
+            "offline event-log repair requires exclusive task-store access; stop the daemon and retry",
+            crate::task_store_lease::daemon_instance_lock_path(root),
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "daemon startup or a task-store writer owns maintenance admission",
+            ),
+        )
+        };
+        let lease = try_acquire_task_store_retention_lease(root)?.ok_or_else(blocked)?;
+        let admission =
+            try_acquire_task_retention_instance_gate_from(&lease)?.ok_or_else(blocked)?;
+        if !admission.authorizes(&lease) {
+            return Err(blocked());
+        }
+        let daemon = lease.daemon_capability()?;
+        if daemon
+            .entry_metadata(OsStr::new("task-event-log-repair-v1.json"))
+            .map_err(|source| {
+                DaemonCoreError::io(
+                    "failed to inspect legacy repair journal",
+                    daemon.display_path(),
+                    source,
+                )
+            })?
+            .is_some()
+        {
+            return Err(DaemonCoreError::io(
+                "legacy repair journal requires manual inspection before linked recovery",
+                daemon.display_path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "legacy intent and evidence were preserved",
+                ),
+            ));
+        }
+        let mut corrupt = inspect_corrupt_task_event_logs_admitted(root, &lease)?;
+        if corrupt.len() > MAX_CORRUPT_EVENT_LOG_QUARANTINE_TASKS {
+            return Err(DaemonCoreError::io(
+                "corrupt event-log repair exceeds the task bound",
+                daemon.display_path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "too many damaged tasks for automatic repair",
+                ),
+            ));
+        }
+        if apply {
+            fence_corrupt_tasks_with_linked_successors_admitted(
+                root,
+                &mut corrupt,
+                &lease,
+                now_unix(),
+            )?;
+            move_corrupt_event_logs_aside(root, &mut corrupt, &lease)?;
+        }
+        Ok(corrupt)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = apply;
+        Err(DaemonCoreError::io(
+            "offline event-log repair is unsupported on this platform",
+            root,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "authenticated maintenance admission requires Unix",
+            ),
+        ))
+    }
+}
+
+/// Reports corrupt admitted event logs under a shared writer lease.
 /// This read path preserves the strict corruption and filesystem checks and
 /// rejects a torn registry WAL without truncating it. Registry and event bytes
 /// are not changed; normal lifecycle/registry lock files may be created.
@@ -1522,6 +1615,13 @@ pub fn repair_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorr
 /// Returns registry, event inspection, or filesystem authority errors.
 pub fn inspect_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
     let lease = acquire_task_store_writer_lease(root)?;
+    inspect_corrupt_task_event_logs_admitted(root, &lease)
+}
+
+fn inspect_corrupt_task_event_logs_admitted(
+    root: &Path,
+    lease: &crate::task_store_lease::TaskStoreLease,
+) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
     #[cfg(unix)]
     {
         let daemon = lease.daemon_capability()?;
@@ -1532,7 +1632,7 @@ pub fn inspect_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCor
             |locked| {
                 validate_retained_registry_daemon(root, locked, &daemon)?;
                 let loaded = load_retained_registry_image_under_task_lock(root, &daemon, false)?;
-                inspect_loaded_corrupt_event_logs(root, &loaded.authority.loaded.tasks, &lease)
+                inspect_loaded_corrupt_event_logs(root, &loaded.authority.loaded.tasks, lease)
             },
         )
     }
@@ -1559,7 +1659,7 @@ pub fn inspect_corrupt_task_event_logs(root: &Path) -> Result<Vec<QuarantinedCor
                     None,
                     false,
                 )?;
-                inspect_loaded_corrupt_event_logs(root, &loaded.loaded.tasks, &lease)
+                inspect_loaded_corrupt_event_logs(root, &loaded.loaded.tasks, lease)
             },
         )
     }
@@ -3734,6 +3834,109 @@ mod tests {
         assert_eq!(tails, BTreeMap::from([("task".to_string(), None)]));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn offline_repair_refuses_instance_startup_and_live_writer_authority() {
+        for owner in ["instance", "daemon", "writer"] {
+            let root = tempdir().unwrap();
+            checkpoint(root.path(), [task("bad", &[])], []);
+            let event_path =
+                task_event_log_path(root.path(), &TaskStorageId::try_from("bad").unwrap());
+            fs::create_dir_all(task_events_dir(root.path())).unwrap();
+            fs::write(&event_path, b"not-json\n").unwrap();
+            let before_registry = fs::read(task_registry_path(root.path())).unwrap();
+            let lease = match owner {
+                "instance" => {
+                    crate::task_store_lease::acquire_daemon_instance_lease(root.path()).unwrap()
+                }
+                "daemon" => {
+                    crate::task_store_lease::acquire_daemon_task_store_lease(root.path()).unwrap()
+                }
+                _ => acquire_task_store_writer_lease(root.path()).unwrap(),
+            };
+            for apply in [false, true] {
+                let error =
+                    inspect_or_repair_offline_task_event_logs(root.path(), apply).unwrap_err();
+                assert!(
+                    error.to_string().contains("exclusive task-store access"),
+                    "{owner}: {error}"
+                );
+                assert_eq!(fs::read(&event_path).unwrap(), b"not-json\n");
+                assert_eq!(
+                    fs::read(task_registry_path(root.path())).unwrap(),
+                    before_registry
+                );
+                assert_eq!(
+                    fs::read_dir(task_events_dir(root.path())).unwrap().count(),
+                    1
+                );
+            }
+            drop(lease);
+            assert_eq!(
+                repair_corrupt_task_event_logs(root.path()).unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_repair_inspects_wal_only_admission_and_persists_link_without_checkpoint() {
+        let root = tempdir().unwrap();
+        checkpoint(root.path(), [], []);
+        let mut admitted = task("bad", &[]);
+        admitted.last_event_seq = 17;
+        append_task_watch_registry_delta(
+            root.path(),
+            RegistryRevisionRange::single(RegistryRevision::new(1)).unwrap(),
+            &RegistryDeltaBatch::default().upsert_task(admitted),
+        )
+        .unwrap();
+        let path = task_event_log_path(root.path(), &TaskStorageId::try_from("bad").unwrap());
+        fs::create_dir_all(task_events_dir(root.path())).unwrap();
+        fs::write(&path, b"not-json\n").unwrap();
+        let checkpoint_before = fs::read(task_registry_path(root.path())).unwrap();
+        let wal_before = fs::read(registry_delta_wal_path(root.path())).unwrap();
+        let records = inspect_offline_corrupt_task_event_logs(root.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            fs::read(registry_delta_wal_path(root.path())).unwrap(),
+            wal_before
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"not-json\n");
+        let repaired = repair_corrupt_task_event_logs(root.path()).unwrap();
+        assert_eq!(
+            fs::read(task_registry_path(root.path())).unwrap(),
+            checkpoint_before
+        );
+        let (reloaded, _) =
+            load_task_watch_registry_with_deltas_and_event_tails(root.path()).unwrap();
+        let link = reloaded.tasks.tasks["bad"].superseded_by.as_ref().unwrap();
+        assert_eq!(link.prior_last_event_seq, 17);
+        assert_eq!(link.successor_task_id, repaired[0].successor_task_id);
+        assert_eq!(
+            reloaded.tasks.tasks[&link.successor_task_id]
+                .recovered_from
+                .as_ref(),
+            Some(link)
+        );
+        assert_superseded(
+            append_next_task_event(root.path(), "bad", &test_event("late")),
+            &link.successor_task_id,
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            append_next_task_event(
+                root.path(),
+                &link.successor_task_id,
+                &test_event("continued")
+            )
+            .unwrap()
+            .seq,
+            1
+        );
+    }
+
     #[test]
     fn recovering_load_reset_is_durable_before_the_daemon_flushes_startup_state() {
         let root = tempdir().unwrap();
@@ -4999,7 +5202,8 @@ mod tests {
             .map(|path| fs::read(path).unwrap())
             .collect::<Vec<_>>();
 
-        let error = inspect_corrupt_task_event_logs(root.path()).unwrap_err();
+        let error = inspect_offline_corrupt_task_event_logs(root.path()).unwrap_err();
+        assert!(repair_corrupt_task_event_logs(root.path()).is_err());
 
         assert!(error.to_string().contains("torn frame"));
         for (path, bytes) in paths.iter().zip(before) {

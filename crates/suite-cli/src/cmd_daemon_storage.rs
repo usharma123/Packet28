@@ -7,14 +7,14 @@ use packet28_daemon_core::retention::{
     RetentionReason, TaskStoreMetrics, TaskStoreReport,
 };
 use packet28_daemon_core::storage::{
-    inspect_corrupt_task_event_logs, now_unix, repair_corrupt_task_event_logs,
+    inspect_offline_corrupt_task_event_logs, now_unix, repair_corrupt_task_event_logs,
     QuarantinedCorruptTaskEventLog,
 };
 use serde_json::{json, Value};
 
 use crate::cmd_daemon::{
-    daemon_is_running, resolve_root_arg, StorageArgs, StorageCleanupArgs, StorageCommands,
-    StorageInspectArgs, StorageRepairArgs,
+    resolve_root_arg, StorageArgs, StorageCleanupArgs, StorageCommands, StorageInspectArgs,
+    StorageRepairArgs,
 };
 
 /// Executes the selected daemon storage operation.
@@ -40,7 +40,8 @@ pub(crate) fn run_storage(args: StorageArgs) -> Result<i32> {
 
 /// Inspects or repairs corrupt task event logs for the selected workspace.
 ///
-/// Repair requires exclusive access to the task store and fails when the daemon is running.
+/// Both modes require nonblocking exclusive task-store access and a daemon-instance
+/// gate. A running or starting daemon, or a writer, makes the command fail busy.
 ///
 /// # Examples
 ///
@@ -54,18 +55,10 @@ pub(crate) fn run_storage(args: StorageArgs) -> Result<i32> {
 /// Returns an error if the daemon is running or if inspection, repair, or report emission fails.
 fn run_repair(args: StorageRepairArgs) -> Result<i32> {
     let root = resolve_root_arg(&args.root);
-    // Repair reads and (with --apply) rewrites the task store under the writer
-    // lease, so it must not race a live daemon.
-    if daemon_is_running(&root) {
-        bail!(
-            "stop the daemon before `daemon storage repair` \
-             (run `packet28 daemon stop`); it needs exclusive access to the task store"
-        );
-    }
     let records = if args.apply {
         repair_corrupt_task_event_logs(&root)?
     } else {
-        inspect_corrupt_task_event_logs(&root)?
+        inspect_offline_corrupt_task_event_logs(&root)?
     };
     emit_repair(&root, &records, args.apply, args.json, args.pretty)?;
     Ok(0)
@@ -101,6 +94,7 @@ fn emit_repair(
             .map(|record| {
                 json!({
                     "task_id": record.task_id,
+                    "successor_task_id": if record.successor_task_id.is_empty() { None } else { Some(record.successor_task_id.as_str()) },
                     "event_log_path": record.event_log_path.display().to_string(),
                     "quarantined_path": record
                         .quarantined_path
@@ -138,6 +132,9 @@ fn emit_repair(
     for record in records {
         println!("  task_id={} reason={}", record.task_id, record.reason);
         println!("    event_log={}", record.event_log_path.display());
+        if !record.successor_task_id.is_empty() {
+            println!("    continue_as={}", record.successor_task_id);
+        }
         if let Some(quarantined) = &record.quarantined_path {
             println!("    moved_to={}", quarantined.display());
         }
