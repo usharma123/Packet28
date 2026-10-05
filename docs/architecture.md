@@ -116,6 +116,16 @@ the library; protocol DTOs do not depend on runtime or storage.
 
 No daemon is required unless `--via-daemon` is selected.
 
+`Packet28 run` renders the reducer summary and nonempty preview as one command
+body. `reduced_est_tokens` estimates that body, including output newlines.
+JSON output and savings records identify this scope as `rendered_command_body`.
+The estimate excludes the JSON envelope, metrics footer, and provider usage.
+Older savings records retain an unknown scope rather than assuming this one.
+
+Artifact capture and analytics are optional after one-shot command execution.
+If either fails, `Packet28 run` emits the original stdout and stderr bytes and
+returns the original command exit status without running the command again.
+
 ### Persistent task
 
 1. A client authenticates the endpoint from
@@ -143,6 +153,15 @@ The detailed contract is [Daemon runtime](daemon-runtime.md).
 
 This separation reduces repeated context without making unsupported claims
 about provider-side cache placement or cost.
+
+The hook reducer runner executes every explicitly requested command. Cached
+packets never replace execution. Each successfully captured completion records fresh
+`CommandFinished` evidence, even when output repeats.
+The daemon may still reuse derived packets from other capture events.
+Capture is optional. If capture setup fails, the runner executes the original
+command with inherited output streams. If capture fails after execution, it
+returns the original exit code and replays the available captured stdout and stderr bytes
+without executing the command again.
 
 ## Storage ownership
 

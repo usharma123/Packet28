@@ -231,6 +231,7 @@ fn context_anomaly_digest_includes_medium_fallback_provenance() {
             exit_code: 0,
             raw_est_tokens: 1200,
             reduced_est_tokens: 200,
+            estimate_scope: None,
             savings_percent: 83.0,
             fallback_reason: Some("fff auto preferred backend failed: launch error".to_string()),
             failure_fingerprint: None,
@@ -268,6 +269,7 @@ fn context_anomaly_digest_includes_changed_path_reread_signal() {
             exit_code: 0,
             raw_est_tokens: 900,
             reduced_est_tokens: 200,
+            estimate_scope: None,
             savings_percent: 77.0,
             fallback_reason: None,
             failure_fingerprint: None,
@@ -353,6 +355,7 @@ fn context_anomaly_digest_reports_hidden_categories_after_cap() {
                 exit_code: 0,
                 raw_est_tokens: 900,
                 reduced_est_tokens: 200,
+                estimate_scope: None,
                 savings_percent: 77.0,
                 fallback_reason: if index == 0 {
                     Some("unsupported_family".to_string())
