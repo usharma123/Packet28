@@ -263,14 +263,6 @@ fn legacy_daemon_status(root: &Path) -> Result<packet28_daemon_protocol::message
 ///
 /// `true` if the message reports an unknown variant and lists expected variants, `false` otherwise.
 ///
-/// # Examples
-///
-/// ```
-/// assert!(registry_extension_is_unsupported(
-///     "unknown variant `tasks`, expected one of `status`, `watch`"
-/// ));
-/// assert!(!registry_extension_is_unsupported("connection failed"));
-/// ```
 fn registry_extension_is_unsupported(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("unknown variant") && lower.contains("expected one of")
@@ -570,6 +562,14 @@ fn materialize_task_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_extension_fallback_only_matches_unknown_variant_errors() {
+        assert!(registry_extension_is_unsupported(
+            "unknown variant `tasks`, expected one of `status`, `watch`"
+        ));
+        assert!(!registry_extension_is_unsupported("connection failed"));
+    }
 
     #[test]
     fn continue_task_prompt_uses_brief_pointer_instead_of_embedded_context() {
