@@ -5,6 +5,9 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
+use packet28_daemon_protocol::hooks::HookRuntimeConfig;
+use packet28_daemon_protocol::paths::HOOK_RUNTIME_CONFIG_FILE_NAME;
+use packet28_state_fs::StateDir;
 use serde_json::{json, Value};
 
 use super::setup_commands::{apply_generated_relaunch_command, generated_packet28_hook_command};
@@ -160,29 +163,48 @@ fn claude_http_hook_entry(matcher: Option<&str>, http_url: &str, http_token: &st
 fn ensure_hook_http_settings_written(
     root: &Path,
 ) -> Result<packet28_daemon_protocol::hooks::HookRuntimeConfig> {
-    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(root);
-    let existed = path.exists();
-    let mut config = if existed {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
-        serde_json::from_str::<packet28_daemon_protocol::hooks::HookRuntimeConfig>(&content)
-            .with_context(|| {
-                format!("refusing to overwrite invalid JSON in '{}'", path.display())
-            })?
-    } else {
-        packet28_daemon_protocol::hooks::HookRuntimeConfig::default()
-    };
+    let (directory, existing) = open_hook_runtime_config(root)?;
+    let existed = existing.is_some();
+    let mut config = existing.unwrap_or_default();
     let changed = apply_generated_http_hook_settings(&mut config, root);
     if !existed || changed {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string_pretty(&config)?),
-        )?;
+        persist_hook_runtime_config(&directory, &config)?;
     }
     Ok(config)
+}
+
+fn open_hook_runtime_config(root: &Path) -> Result<(StateDir, Option<HookRuntimeConfig>)> {
+    let directory = StateDir::open(root, &[".packet28", "daemon"], true)
+        .context("failed to open hook runtime configuration directory")?;
+    let path = directory.path().join(HOOK_RUNTIME_CONFIG_FILE_NAME);
+    let raw = directory
+        .read_bounded(HOOK_RUNTIME_CONFIG_FILE_NAME, u64::MAX)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    let config = raw
+        .map(|bytes| {
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!("refusing to overwrite invalid JSON in '{}'", path.display())
+            })
+        })
+        .transpose()?;
+    Ok((directory, config))
+}
+
+fn persist_hook_runtime_config(directory: &StateDir, config: &HookRuntimeConfig) -> Result<()> {
+    let bytes = format!("{}\n", serde_json::to_string_pretty(config)?);
+    // The retained directory publishes a mode-0600 temporary without following
+    // links, even when pre-existing ancestors are traversable by other users.
+    directory
+        .write_atomic(HOOK_RUNTIME_CONFIG_FILE_NAME, bytes.as_bytes())
+        .with_context(|| {
+            format!(
+                "failed to update '{}'",
+                directory
+                    .path()
+                    .join(HOOK_RUNTIME_CONFIG_FILE_NAME)
+                    .display()
+            )
+        })
 }
 
 fn apply_generated_http_hook_settings(
@@ -547,18 +569,9 @@ pub(crate) fn write_hook_runtime_config(
     if !any_hooks_configured {
         return Ok(McpConfigStatus::Declined);
     }
-    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(root);
-    let existed = path.exists();
-    let mut config = if existed {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read '{}'", path.display()))?;
-        serde_json::from_str::<packet28_daemon_protocol::hooks::HookRuntimeConfig>(&content)
-            .with_context(|| {
-                format!("refusing to overwrite invalid JSON in '{}'", path.display())
-            })?
-    } else {
-        packet28_daemon_protocol::hooks::HookRuntimeConfig::default()
-    };
+    let (directory, existing) = open_hook_runtime_config(root)?;
+    let existed = existing.is_some();
+    let mut config = existing.unwrap_or_default();
     let mut changed = apply_generated_http_hook_settings(&mut config, root);
     changed |= apply_generated_relaunch_command(&mut config);
     // Configuring a hook runtime is an explicit opt-in to hook ingest. If a
@@ -574,29 +587,7 @@ pub(crate) fn write_hook_runtime_config(
     if existed && !changed {
         return Ok(McpConfigStatus::AlreadyConfigured);
     }
-    let bytes = format!("{}\n", serde_json::to_string_pretty(&config)?);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("hook-runtime-v1.json");
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        crate::cmd_hook_support::now_unix_millis()
-    ));
-    fs::write(&temp_path, bytes.as_bytes())
-        .with_context(|| format!("failed to write '{}'", temp_path.display()))?;
-    fs::rename(&temp_path, &path).with_context(|| {
-        format!(
-            "failed to atomically replace '{}' with '{}'",
-            path.display(),
-            temp_path.display()
-        )
-    })?;
+    persist_hook_runtime_config(&directory, &config)?;
     Ok(McpConfigStatus::Written)
 }
 

@@ -732,6 +732,143 @@ fn write_hook_runtime_config_re_enables_stale_kill_switch() {
     assert_eq!(written.http_hook_token.as_deref(), Some("existing-token"));
 }
 
+#[cfg(unix)]
+#[test]
+fn write_hook_runtime_config_keeps_private_token_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join(".packet28");
+    let daemon_dir = state_dir.join("daemon");
+    fs::create_dir_all(&daemon_dir).unwrap();
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    let config = HookRuntimeConfig {
+        hooks_enabled: false,
+        http_hook_port: Some(45123),
+        http_hook_token: Some("synthetic-private-token".to_string()),
+        ..HookRuntimeConfig::default()
+    };
+    fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(matches!(
+        write_hook_runtime_config(dir.path(), true).unwrap(),
+        McpConfigStatus::Written
+    ));
+
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let written: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(written.hooks_enabled);
+    assert_eq!(written.http_hook_token, config.http_hook_token);
+    // Privacy must come from the file, even when existing ancestors are public.
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_setup_creates_private_runtime_config_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join(".packet28");
+    let daemon_dir = state_dir.join("daemon");
+    fs::create_dir_all(&daemon_dir).unwrap();
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let settings = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&settings, dir.path(), true).unwrap();
+
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let written: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(written.http_hook_token.is_some());
+    assert_eq!(
+        fs::metadata(&daemon_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn claude_http_settings_preserve_disabled_ingest_until_hook_opt_in() {
+    let dir = tempdir().unwrap();
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        serde_json::to_vec(&HookRuntimeConfig {
+            hooks_enabled: false,
+            ..HookRuntimeConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    setup_hooks::write_claude_hook_config(
+        &dir.path().join(".claude/settings.json"),
+        dir.path(),
+        true,
+    )
+    .unwrap();
+    let initialized: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(!initialized.hooks_enabled);
+    assert!(initialized.http_hook_token.is_some());
+    let unchanged = fs::read(&path).unwrap();
+    assert!(matches!(
+        write_hook_runtime_config(dir.path(), false).unwrap(),
+        McpConfigStatus::Declined
+    ));
+    assert_eq!(fs::read(&path).unwrap(), unchanged);
+
+    write_hook_runtime_config(dir.path(), true).unwrap();
+    let enabled: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(enabled.hooks_enabled);
+    assert_eq!(enabled.http_hook_token, initialized.http_hook_token);
+    assert_eq!(enabled.http_hook_port, initialized.http_hook_port);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_hook_runtime_config_rejects_linked_token_files() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::to_vec(&HookRuntimeConfig {
+            hooks_enabled: false,
+            ..HookRuntimeConfig::default()
+        })
+        .unwrap();
+        let outside_path = outside.path().join("runtime.json");
+        fs::write(&outside_path, &original).unwrap();
+        if hard_link {
+            fs::hard_link(&outside_path, &path).unwrap();
+        } else {
+            symlink(&outside_path, &path).unwrap();
+        }
+
+        assert!(write_hook_runtime_config(dir.path(), true).is_err());
+        assert_eq!(fs::read(&outside_path).unwrap(), original);
+    }
+}
+
 /// Creates an index-status fixture with the specified manifest and readiness values.
 ///
 /// # Examples
