@@ -442,6 +442,11 @@ pub struct TaskRecord {
     pub latest_hook_event_at_unix: Option<u64>,
     pub latest_hook_boundary_at_unix: Option<u64>,
     pub latest_hook_boundary_kind: Option<String>,
+    /// Session that last received a nonempty bootstrap brief, independent of hook activity.
+    pub latest_hook_bootstrap_session_id: Option<String>,
+    /// Namespace that owns the delivered brief.
+    pub latest_hook_bootstrap_owner_task_id: Option<String>,
+    pub latest_hook_bootstrap_artifact_id: Option<String>,
     pub latest_hook_bootstrap_context_version: Option<String>,
     pub latest_hook_bootstrap_at_unix: Option<u64>,
     pub hook_window_est_tokens: u64,
