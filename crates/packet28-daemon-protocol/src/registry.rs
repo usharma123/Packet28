@@ -192,6 +192,7 @@ impl Default for TaskListPageRequestV1 {
     /// # Examples
     ///
     /// ```
+    /// use packet28_daemon_protocol::registry::TaskListPageRequestV1;
     /// let request = TaskListPageRequestV1::default();
     /// assert!(request.snapshot_revision.is_none());
     /// assert!(request.after_task_id.is_none());

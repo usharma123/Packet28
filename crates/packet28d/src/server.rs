@@ -1288,13 +1288,6 @@ fn validate_registry_snapshot(
 ///
 /// Returns an error if the page limit is outside the supported range or if the
 /// cursor or task filter exceeds the request-size bound.
-///
-/// # Examples
-///
-/// ```
-/// validate_registry_page_request("tasks", 1, None, None)?;
-/// # Ok::<(), anyhow::Error>(())
-/// ```
 fn validate_registry_page_request(
     kind: &str,
     limit: usize,
@@ -1322,14 +1315,6 @@ fn validate_registry_page_request(
 ///
 /// Returns an error if the record cannot be serialized or exceeds the maximum
 /// permitted size for a paginated record.
-///
-/// # Examples
-///
-/// ```
-/// let item = serde_json::json!({ "id": 1 });
-/// let bytes = encoded_registry_page_item_bytes(&item, "task", "1").unwrap();
-/// assert!(bytes > 0);
-/// ```
 fn encoded_registry_page_item_bytes(
     item: &impl Serialize,
     kind: &str,
@@ -1348,19 +1333,6 @@ fn encoded_registry_page_item_bytes(
 }
 
 /// Measures a registry page record and identifies records that exceed the per-record size limit.
-///
-/// # Examples
-///
-/// ```
-/// let result = encoded_registry_page_item_bytes_checked(
-///     &serde_json::json!({ "id": "task-1" }),
-///     "task",
-///     "task-1",
-/// )
-/// .unwrap();
-///
-/// assert!(result.is_ok());
-/// ```
 ///
 /// An inner `Err` contains the encoded byte count for an oversized record. The
 /// outer `Err` indicates a serialization failure.
@@ -1384,15 +1356,6 @@ fn encoded_registry_page_item_bytes_checked(
 ///
 /// Returns an error if the response cannot be serialized or exceeds the maximum
 /// encoded response size.
-///
-/// # Examples
-///
-/// ```
-/// # fn example(response: &DaemonRegistryResponseV1) -> Result<()> {
-/// ensure_registry_page_response_fits(response, "task")?;
-/// # Ok(())
-/// # }
-/// ```
 fn ensure_registry_page_response_fits(
     response: &DaemonRegistryResponseV1,
     kind: &str,
