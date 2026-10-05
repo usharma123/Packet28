@@ -23,7 +23,7 @@ use packet28_daemon_protocol::paths::{
     MAX_TASK_STORAGE_ID_BYTES, PID_FILE_NAME, RUNTIME_FILE_NAME, TASK_ARTIFACTS_DIR_NAME,
     TASK_EVENTS_DIR_NAME, TASK_EVENT_LOG_SUFFIX, TASK_REGISTRY_FILE_NAME, WATCH_REGISTRY_FILE_NAME,
 };
-use packet28_daemon_protocol::task::{TaskRegistry, WatchRegistry};
+use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry, WatchRegistry};
 use unicode_casefold::UnicodeCaseFold as _;
 use unicode_normalization::UnicodeNormalization as _;
 
@@ -1704,11 +1704,17 @@ fn encode_task_registry_preserving_existing(
             .and_then(serde_json::Value::as_object)
             .cloned()
             .unwrap_or_default();
-        // These additive lifecycle markers are known fields even when their
-        // false value is represented by omission. Remove an older true marker
-        // before overlaying the newly serialized record so forward-field
-        // preservation cannot resurrect a completed transition.
-        for known_optional_field in ["cancelled", "recovered_replan"] {
+        // These additive lifecycle markers and history links are known fields
+        // even when their absent value is represented by omission. Remove an
+        // older value before overlaying the newly serialized record so
+        // forward-field preservation cannot resurrect a completed transition
+        // or attach stale provenance to a replaced record.
+        for known_optional_field in [
+            "cancelled",
+            "recovered_replan",
+            "superseded_by",
+            "recovered_from",
+        ] {
             merged.remove(known_optional_field);
         }
         for (field, value) in known {
@@ -3140,7 +3146,9 @@ pub(crate) fn remove_task_registry_records_if_unchanged(
 ///
 /// Returns an error without changing the event namespace when the frame task
 /// identifier is invalid, has not already been admitted by the durable task
-/// registry, or does not continue a fully valid existing log. Returns
+/// registry, was superseded by a linked history recovery
+/// ([`DaemonCoreError::TaskSuperseded`]), or does not continue a fully valid
+/// existing log. Returns
 /// [`DaemonCoreError::Json`] if `frame` cannot be encoded. Returns
 /// [`DaemonCoreError::Io`] if the event directory or log cannot be opened,
 /// locked, appended, synchronized, or unlocked.
@@ -3158,8 +3166,9 @@ pub fn append_task_event(root: &Path, frame: &DaemonEventFrame) -> Result<()> {
 /// # Errors
 ///
 /// Returns [`DaemonCoreError::InvalidTaskRegistry`] if `task_id` has not been
-/// durably admitted, or [`DaemonCoreError::InvalidTaskEventFrame`] if it does
-/// not exactly match `frame.task_id`. Returns
+/// durably admitted, [`DaemonCoreError::TaskSuperseded`] if it was superseded
+/// by a linked history recovery, or [`DaemonCoreError::InvalidTaskEventFrame`]
+/// if it does not exactly match `frame.task_id`. Returns
 /// [`DaemonCoreError::AuthorityJsonLimitExceeded`] if the encoded frame
 /// exceeds structural or line-size budgets. Returns [`DaemonCoreError::Io`]
 /// for capability, lock, append, durability, or unlock failures.
@@ -3174,7 +3183,7 @@ pub fn append_task_event_for(
     let writer_lease = acquire_task_store_writer_lease(root)?;
     let _registry_admission = acquire_registry_writer_admission(&writer_lease)?;
     let file_name = event_log_file_name(task_id);
-    with_registered_task_storage_id(root, task_id, || {
+    registry_delta::with_continuable_task_admission(root, task_id, &writer_lease, || {
         #[cfg(unix)]
         {
             let events = open_task_events_capability_for_write(root)?;
@@ -3614,7 +3623,7 @@ fn event_log_file_name(task_id: &TaskStorageId) -> String {
     format!("{}{TASK_EVENT_LOG_SUFFIX}", task_id.as_str())
 }
 
-fn require_registered_task_storage_id(
+pub(super) fn require_registered_task_storage_id(
     registry: &TaskRegistry,
     registry_path: &Path,
     task_id: &TaskStorageId,
@@ -3633,6 +3642,25 @@ fn require_registered_task_storage_id(
             task_id.as_str()
         ),
     })
+}
+
+/// Requires that `task` was not superseded by a linked history recovery.
+///
+/// A superseded record is a terminal, fenced identity: event appends and
+/// continuation requests must target its successor instead.
+///
+/// # Errors
+///
+/// Returns [`DaemonCoreError::TaskSuperseded`] naming the successor when
+/// `task.superseded_by` is present.
+pub fn require_continuable_task(task: &TaskRecord) -> Result<()> {
+    match &task.superseded_by {
+        Some(link) => Err(DaemonCoreError::TaskSuperseded {
+            task_id: task.task_id.clone(),
+            successor_task_id: link.successor_task_id.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 fn with_registered_task_storage_id<T>(
@@ -8502,6 +8530,40 @@ mod tests {
             load_task_registry(root.path()).unwrap().tasks["recovered"].lifecycle,
             TaskLifecycle::Idle
         );
+    }
+
+    #[test]
+    fn paired_checkpoint_does_not_resurrect_cleared_history_links() {
+        let root = tempdir().unwrap();
+        let link = packet28_daemon_protocol::task::TaskHistoryRecovery {
+            predecessor_task_id: "old".to_string(),
+            successor_task_id: "linked".to_string(),
+            ..Default::default()
+        };
+        let mut registry = TaskRegistry {
+            tasks: BTreeMap::from([(
+                "linked".to_string(),
+                TaskRecord {
+                    task_id: "linked".to_string(),
+                    superseded_by: Some(link.clone()),
+                    recovered_from: Some(link),
+                    ..TaskRecord::default()
+                },
+            )]),
+        };
+        save_task_watch_registry_checkpoint(root.path(), &registry, &WatchRegistry::default())
+            .unwrap();
+
+        let task = registry.tasks.get_mut("linked").unwrap();
+        task.superseded_by = None;
+        task.recovered_from = None;
+        save_task_watch_registry_checkpoint(root.path(), &registry, &WatchRegistry::default())
+            .unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(task_registry_path(root.path())).unwrap()).unwrap();
+        assert!(raw["tasks"]["linked"].get("superseded_by").is_none());
+        assert!(raw["tasks"]["linked"].get("recovered_from").is_none());
     }
 
     #[test]

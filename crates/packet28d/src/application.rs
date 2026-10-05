@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{ErrorKind, Read as _};
 use std::net::TcpListener;
@@ -61,8 +61,9 @@ use crate::{
 ///
 /// Returns an error if workspace resolution, recovery, lease acquisition,
 /// transport startup, runtime operation, persistence shutdown, or runtime-file
-/// cleanup fails. Recoverable corrupt event logs are quarantined during startup;
-/// unrecoverable or conflicting durable state prevents readiness.
+/// cleanup fails. A recoverable corrupt event log is quarantined during
+/// startup; its task is fenced and continues under a linked successor.
+/// Unrecoverable or conflicting durable state prevents readiness.
 ///
 ///
 pub fn serve(root: PathBuf) -> Result<()> {
@@ -137,14 +138,11 @@ pub fn serve(root: PathBuf) -> Result<()> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "the log was already absent".to_string());
         daemon_log(&format!(
-            "quarantined corrupt event log for task '{}': {}; moved aside to {} and reset its event high-water",
-            record.task_id, record.reason, moved_to
+            "quarantined corrupt event log for task '{}': {}; moved aside to {}; \
+             the task is superseded and work continues as linked task '{}'",
+            record.task_id, record.reason, moved_to, record.successor_task_id
         ));
     }
-    let quarantined_task_ids: BTreeSet<String> = quarantined_event_logs
-        .iter()
-        .map(|record| record.task_id.clone())
-        .collect();
     let checkpoint_revision = loaded_registry.checkpoint_revision;
     let replayed_revision = loaded_registry.replayed_revision;
     let durable_tasks = loaded_registry.tasks;
@@ -182,7 +180,6 @@ pub fn serve(root: PathBuf) -> Result<()> {
     for task_id in event_high_water_changes
         .iter()
         .chain(&restart_reconciliation.changed_task_ids)
-        .chain(&quarantined_task_ids)
     {
         let task = tasks
             .tasks
@@ -226,6 +223,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
         changes: StateChangeSignal::new(),
         shutting_down: false,
     }));
+    crate::broker::inherit_recovered_agent_state(&state)?;
     let recovered_replans =
         prepare_recovered_replans(&state, restart_reconciliation.replan_task_ids)?;
 

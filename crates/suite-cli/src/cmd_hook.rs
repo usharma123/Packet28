@@ -541,7 +541,19 @@ fn resolve_hook_root(args: &ClaudeHookArgs, payload: &Value) -> PathBuf {
         .unwrap_or_else(|| crate::broker_client::resolve_root("."))
 }
 
+// Claude Code and Codex hooks share this resolver. Fresh task identities
+// retain their runtime namespace; recovered tasks adopt their linked successor.
 fn resolve_task_id(
+    root: &Path,
+    payload: &Value,
+    session_id: Option<&str>,
+    runtime: &str,
+) -> Result<String> {
+    let task_id = select_task_id(root, payload, session_id, runtime)?;
+    crate::task_runtime::adopt_task_continuation(root, task_id, session_id)
+}
+
+fn select_task_id(
     root: &Path,
     payload: &Value,
     session_id: Option<&str>,
@@ -581,6 +593,16 @@ fn resolve_task_id(
 }
 
 fn resolve_runtime_task_id(
+    root: &Path,
+    payload: &Value,
+    session_id: Option<&str>,
+    runtime: ExternalHookRuntime,
+) -> Result<String> {
+    let task_id = select_runtime_task_id(root, payload, session_id, runtime)?;
+    crate::task_runtime::adopt_task_continuation(root, task_id, session_id)
+}
+
+fn select_runtime_task_id(
     root: &Path,
     payload: &Value,
     session_id: Option<&str>,

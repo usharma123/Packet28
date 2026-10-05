@@ -37,6 +37,22 @@ fn astra_maximum_valid_id_supports_corrupt_event_recovery() {
     assert!(!log.exists());
     let loaded = load_task_watch_registry_with_deltas(root.path()).unwrap();
     assert_eq!(loaded.tasks.tasks[&id].last_event_seq, 0);
+    let successor = &records[0].successor_task_id;
+    assert!(TaskStorageId::try_from(successor.as_str()).is_ok());
+    assert_eq!(
+        loaded.tasks.tasks[&id]
+            .superseded_by
+            .as_ref()
+            .map(|link| &link.successor_task_id),
+        Some(successor)
+    );
+    assert_eq!(
+        loaded.tasks.tasks[successor]
+            .recovered_from
+            .as_ref()
+            .map(|link| link.predecessor_task_id.as_str()),
+        Some(id.as_str())
+    );
     assert!(
         load_task_watch_registry_recovering_corrupt_event_logs(root.path())
             .unwrap()

@@ -18,6 +18,9 @@ pub enum ToolOperationKind {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct ToolInvocationSummary {
+    /// Immutable namespace owning this invocation and its artifact handles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_task_id: Option<String>,
     pub invocation_id: String,
     pub sequence: u64,
     pub tool_name: String,
@@ -64,6 +67,8 @@ pub struct ToolInvocationSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct ToolFailureSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_task_id: Option<String>,
     pub invocation_id: String,
     pub sequence: u64,
     pub tool_name: String,
@@ -157,6 +162,7 @@ pub enum AgentStateEventKind {
     FocusInferred,
     EvidenceCaptured,
     IntentionRecorded,
+    RecoveredFrom,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -307,6 +313,13 @@ pub enum AgentStateEventData {
         #[serde(skip_serializing_if = "Option::is_none")]
         question_id: Option<String>,
     },
+    /// Links a history-recovery successor to the predecessor whose agent
+    /// state it continues. Snapshots of the successor include the
+    /// predecessor's events, which keep their own `task_id` and therefore
+    /// their artifact owner.
+    RecoveredFrom {
+        predecessor_task_id: String,
+    },
 }
 
 impl Default for AgentStateEventData {
@@ -388,6 +401,9 @@ pub struct AgentSnapshotPayload {
     pub search_queries: Vec<SearchQuerySummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_artifact_ids: Vec<String>,
+    /// Original namespaces for inherited evidence; a handle can exist in several owners.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub evidence_artifact_owners: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_successful_tool_by_kind: Vec<ToolKindSuccess>,
     #[serde(skip_serializing_if = "Option::is_none")]
