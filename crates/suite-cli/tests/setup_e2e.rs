@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "support/codex_setup.rs"]
+mod codex_setup;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
@@ -68,6 +72,7 @@ fn test_setup_only_writes_artifacts_for_detected_runtimes() {
     suite_cmd()
         .current_dir(root.path())
         .env("HOME", home.path())
+        .env("CODEX_HOME", home.path().join(".codex"))
         .env(
             "PATH",
             format!("{}:/usr/bin:/bin", bin_dir.path().display()),
@@ -80,7 +85,7 @@ fn test_setup_only_writes_artifacts_for_detected_runtimes() {
         ));
 
     assert!(root.path().join("AGENTS.md").exists());
-    assert!(!root.path().join(".codex").join("hooks.json").exists());
+    codex_setup::assert_native_hook_installation(root.path());
     assert!(!root.path().join("CLAUDE.md").exists());
     assert!(!root.path().join(".cursorrules").exists());
     assert!(home.path().join(".codex").join("config.toml").exists());
@@ -91,7 +96,7 @@ fn test_setup_only_writes_artifacts_for_detected_runtimes() {
 
 #[test]
 #[cfg(unix)]
-fn test_setup_codex_writes_mcp_and_agents_without_hooks() {
+fn test_setup_codex_writes_mcp_agents_and_native_hooks() {
     let root = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let bin_dir = TempDir::new().unwrap();
@@ -101,6 +106,7 @@ fn test_setup_codex_writes_mcp_and_agents_without_hooks() {
     suite_cmd()
         .current_dir(root.path())
         .env("HOME", home.path())
+        .env("CODEX_HOME", home.path().join(".codex"))
         .env(
             "PATH",
             format!("{}:/usr/bin:/bin", bin_dir.path().display()),
@@ -117,7 +123,7 @@ fn test_setup_codex_writes_mcp_and_agents_without_hooks() {
         .success();
 
     assert!(root.path().join("AGENTS.md").exists());
-    assert!(!root.path().join(".codex").join("hooks.json").exists());
+    codex_setup::assert_native_hook_installation(root.path());
     let config = fs::read_to_string(home.path().join(".codex").join("config.toml")).unwrap();
     assert!(config.contains("[mcp_servers.packet28]"));
     assert!(!config.contains("codex_hooks = true"));

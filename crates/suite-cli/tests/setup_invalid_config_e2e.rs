@@ -51,6 +51,7 @@ fn test_setup_refuses_to_overwrite_invalid_codex_toml() {
     suite_cmd()
         .current_dir(root.path())
         .env("HOME", home.path())
+        .env("CODEX_HOME", home.path().join(".codex"))
         .env("PATH", "/usr/bin:/bin")
         .args([
             "setup",

@@ -73,7 +73,7 @@ pub(crate) fn is_generated_packet28_hook_command(command: &str, runtime: &str) -
             )
 }
 
-pub(super) fn guarded_packet28_hook_command(
+pub(crate) fn guarded_packet28_hook_command(
     packet28_command: &str,
     runtime: &str,
     root: &Path,
