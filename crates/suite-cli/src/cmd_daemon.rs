@@ -66,7 +66,8 @@ pub enum StorageCommands {
     Inspect(StorageInspectArgs),
     /// Plan bounded retention, or apply it with `--apply`.
     Cleanup(StorageCleanupArgs),
-    /// Report corrupt task event logs, or quarantine them with `--apply`.
+    /// Report registry/checkpoint mismatches and corrupt task event logs, or
+    /// restore exact checkpoint images and quarantine logs with `--apply`.
     Repair(StorageRepairArgs),
 }
 
@@ -103,7 +104,8 @@ pub struct StorageCleanupArgs {
 pub struct StorageRepairArgs {
     #[arg(long, default_value = ".")]
     pub root: String,
-    /// Quarantine the corrupt event logs. Without this flag, repair is a dry run.
+    /// Restore exact checkpoint registry images and quarantine corrupt event
+    /// logs. Without this flag, repair is a dry run.
     #[arg(long)]
     pub apply: bool,
     #[arg(long)]

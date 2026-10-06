@@ -934,7 +934,7 @@ fn invalid_registry_authority_root(root: &Path) -> DaemonCoreError {
 }
 
 #[cfg(unix)]
-fn validate_retained_registry_daemon(
+pub(super) fn validate_retained_registry_daemon(
     root: &Path,
     locked: &CapabilityDir,
     retained: &CapabilityDir,
@@ -1658,25 +1658,10 @@ fn inspect_or_repair_offline_task_event_logs(
 ) -> Result<Vec<QuarantinedCorruptTaskEventLog>> {
     #[cfg(unix)]
     {
-        use crate::task_store_lease::{
-            try_acquire_task_retention_instance_gate_from, try_acquire_task_store_retention_lease,
-        };
-        let blocked = || {
-            DaemonCoreError::io(
+        let (lease, _admission) = acquire_offline_maintenance_admission(
+            root,
             "offline event-log repair requires exclusive task-store access; stop the daemon and retry",
-            crate::task_store_lease::daemon_instance_lock_path(root),
-            std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "daemon startup or a task-store writer owns maintenance admission",
-            ),
-        )
-        };
-        let lease = try_acquire_task_store_retention_lease(root)?.ok_or_else(blocked)?;
-        let admission =
-            try_acquire_task_retention_instance_gate_from(&lease)?.ok_or_else(blocked)?;
-        if !admission.authorizes(&lease) {
-            return Err(blocked());
-        }
+        )?;
         let daemon = lease.daemon_capability()?;
         if daemon
             .entry_metadata(OsStr::new("task-event-log-repair-v1.json"))
@@ -1732,6 +1717,38 @@ fn inspect_or_repair_offline_task_event_logs(
             ),
         ))
     }
+}
+
+/// Wins nonblocking exclusive task-store retention access plus the shared
+/// daemon-instance gate, so neither a live daemon, a starting daemon, nor a
+/// task-store writer can observe offline maintenance.
+#[cfg(unix)]
+pub(super) fn acquire_offline_maintenance_admission(
+    root: &Path,
+    busy_message: &'static str,
+) -> Result<(
+    crate::task_store_lease::TaskStoreLease,
+    crate::task_store_lease::TaskRetentionAdmission,
+)> {
+    use crate::task_store_lease::{
+        try_acquire_task_retention_instance_gate_from, try_acquire_task_store_retention_lease,
+    };
+    let blocked = || {
+        DaemonCoreError::io(
+            busy_message,
+            crate::task_store_lease::daemon_instance_lock_path(root),
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "daemon startup or a task-store writer owns maintenance admission",
+            ),
+        )
+    };
+    let lease = try_acquire_task_store_retention_lease(root)?.ok_or_else(blocked)?;
+    let admission = try_acquire_task_retention_instance_gate_from(&lease)?.ok_or_else(blocked)?;
+    if !admission.authorizes(&lease) {
+        return Err(blocked());
+    }
+    Ok((lease, admission))
 }
 
 /// Reports corrupt admitted event logs under a shared writer lease.
@@ -2512,28 +2529,121 @@ pub(crate) fn remove_retained_registry_records_under_task_lock(
 fn replay_wal_with_admissions<W: RegistryWalFile>(
     root: &Path,
     wal: Option<W>,
+    tasks: TaskRegistry,
+    watches: WatchRegistry,
+    checkpoint_revision: RegistryRevision,
+    raw_task_records: Option<&mut serde_json::Map<String, serde_json::Value>>,
+    repair_torn_suffix: bool,
+) -> Result<LoadedRegistryAuthority> {
+    let policy = if repair_torn_suffix {
+        TornWalSuffix::Repair
+    } else {
+        TornWalSuffix::Reject
+    };
+    replay_wal_with_policy(
+        root,
+        wal,
+        tasks,
+        watches,
+        checkpoint_revision,
+        raw_task_records,
+        policy,
+    )
+    .map(|(authority, _)| authority)
+}
+
+/// Verifies that every complete WAL frame newer than `checkpoint_revision`
+/// replays onto the supplied checkpoint without changing any WAL byte.
+///
+/// A crash-torn final frame is tolerated and reported, because normal startup
+/// truncates it as ordinary crash recovery; complete-frame corruption,
+/// revision gaps, and a WAL base newer than the checkpoint still fail closed.
+#[cfg(unix)]
+pub(super) fn verify_registry_wal_replay(
+    root: &Path,
+    daemon: &CapabilityDir,
+    tasks: TaskRegistry,
+    watches: WatchRegistry,
+    checkpoint_revision: u64,
+) -> Result<RegistryWalReplayVerification> {
+    let path = registry_delta_wal_path(root);
+    let wal = open_anchored_registry_wal(daemon, root)?;
+    let wal_bytes = wal
+        .as_ref()
+        .map(RegistryWalFile::len)
+        .transpose()
+        .map_err(|source| wal_io("failed to inspect registry delta WAL", &path, source))?;
+    let (authority, inspection) = replay_wal_with_policy(
+        root,
+        wal,
+        tasks,
+        watches,
+        RegistryRevision::new(checkpoint_revision),
+        None,
+        TornWalSuffix::Tolerate,
+    )?;
+    Ok(RegistryWalReplayVerification {
+        present: wal_bytes.is_some(),
+        base_revision: inspection.map(|inspection| inspection.base_revision.get()),
+        checkpoint_revision,
+        replayed_revision: authority.loaded.replayed_revision.get(),
+        torn_suffix_bytes: match (wal_bytes, inspection) {
+            (Some(bytes), Some(inspection)) => bytes.saturating_sub(inspection.complete_len),
+            _ => 0,
+        },
+    })
+}
+
+/// Read-only registry delta WAL replay evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegistryWalReplayVerification {
+    /// Whether a WAL file exists.
+    pub present: bool,
+    /// Revision recorded in the WAL header.
+    pub base_revision: Option<u64>,
+    /// Delta revision recorded by the restored checkpoint.
+    pub checkpoint_revision: u64,
+    /// Highest revision reached by replaying every newer complete frame.
+    pub replayed_revision: u64,
+    /// Bytes of a crash-torn final frame that startup will truncate.
+    pub torn_suffix_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TornWalSuffix {
+    Reject,
+    Repair,
+    Tolerate,
+}
+
+fn replay_wal_with_policy<W: RegistryWalFile>(
+    root: &Path,
+    wal: Option<W>,
     mut tasks: TaskRegistry,
     mut watches: WatchRegistry,
     checkpoint_revision: RegistryRevision,
     mut raw_task_records: Option<&mut serde_json::Map<String, serde_json::Value>>,
-    repair_torn_suffix: bool,
-) -> Result<LoadedRegistryAuthority> {
+    torn_suffix: TornWalSuffix,
+) -> Result<(LoadedRegistryAuthority, Option<WalInspection>)> {
     let checkpoint_task_ids = tasks.tasks.keys().cloned().collect::<BTreeSet<_>>();
     let path = registry_delta_wal_path(root);
     let Some(mut wal) = wal else {
-        return Ok(LoadedRegistryAuthority {
-            loaded: LoadedTaskWatchRegistry {
-                tasks,
-                watches,
-                checkpoint_revision,
-                replayed_revision: checkpoint_revision,
+        return Ok((
+            LoadedRegistryAuthority {
+                loaded: LoadedTaskWatchRegistry {
+                    tasks,
+                    watches,
+                    checkpoint_revision,
+                    replayed_revision: checkpoint_revision,
+                },
+                wal_admitted_task_ids: BTreeSet::new(),
             },
-            wal_admitted_task_ids: BTreeSet::new(),
-        });
+            None,
+        ));
     };
 
     let mut replayed_revision = checkpoint_revision;
-    let inspection = scan_wal(&mut wal, &path, repair_torn_suffix, |revisions, batch| {
+    let inspection = scan_wal_with_policy(&mut wal, &path, torn_suffix, |revisions, batch| {
         if revisions.last <= checkpoint_revision {
             return Ok(());
         }
@@ -2602,15 +2712,18 @@ fn replay_wal_with_admissions<W: RegistryWalFile>(
         .filter(|task_id| !checkpoint_task_ids.contains(*task_id))
         .cloned()
         .collect();
-    Ok(LoadedRegistryAuthority {
-        loaded: LoadedTaskWatchRegistry {
-            tasks,
-            watches,
-            checkpoint_revision,
-            replayed_revision,
+    Ok((
+        LoadedRegistryAuthority {
+            loaded: LoadedTaskWatchRegistry {
+                tasks,
+                watches,
+                checkpoint_revision,
+                replayed_revision,
+            },
+            wal_admitted_task_ids,
         },
-        wal_admitted_task_ids,
-    })
+        Some(inspection),
+    ))
 }
 
 fn append_to_wal(
@@ -3009,6 +3122,20 @@ fn scan_wal(
     wal: &mut impl RegistryWalFile,
     path: &Path,
     repair_torn_suffix: bool,
+    visit: impl FnMut(RegistryRevisionRange, RegistryDeltaBatch) -> Result<()>,
+) -> Result<WalInspection> {
+    let policy = if repair_torn_suffix {
+        TornWalSuffix::Repair
+    } else {
+        TornWalSuffix::Reject
+    };
+    scan_wal_with_policy(wal, path, policy, visit)
+}
+
+fn scan_wal_with_policy(
+    wal: &mut impl RegistryWalFile,
+    path: &Path,
+    torn_suffix: TornWalSuffix,
     mut visit: impl FnMut(RegistryRevisionRange, RegistryDeltaBatch) -> Result<()>,
 ) -> Result<WalInspection> {
     let file_len = wal
@@ -3048,7 +3175,7 @@ fn scan_wal(
             return repair_or_reject_torn_suffix(
                 wal,
                 path,
-                repair_torn_suffix,
+                torn_suffix,
                 offset,
                 base_revision,
                 last_revision,
@@ -3088,7 +3215,7 @@ fn scan_wal(
             return repair_or_reject_torn_suffix(
                 wal,
                 path,
-                repair_torn_suffix,
+                torn_suffix,
                 offset,
                 base_revision,
                 last_revision,
@@ -3216,14 +3343,28 @@ fn payload_len_authenticated_by_final_footer(
 fn repair_or_reject_torn_suffix(
     wal: &mut impl RegistryWalFile,
     path: &Path,
-    repair: bool,
+    torn_suffix: TornWalSuffix,
     complete_len: u64,
     base_revision: RegistryRevision,
     last_revision: RegistryRevision,
     last_frame: Option<FrameTail>,
 ) -> Result<WalInspection> {
-    if !repair {
-        return Err(invalid_wal(path, "registry delta WAL ends in a torn frame"));
+    match torn_suffix {
+        TornWalSuffix::Reject => {
+            return Err(invalid_wal(path, "registry delta WAL ends in a torn frame"));
+        }
+        TornWalSuffix::Tolerate => {
+            wal.validate_attachment().map_err(|source| {
+                wal_io("registry delta WAL detached during read", path, source)
+            })?;
+            return Ok(WalInspection {
+                base_revision,
+                last_revision,
+                complete_len,
+                last_frame,
+            });
+        }
+        TornWalSuffix::Repair => {}
     }
     wal.file_mut()
         .set_len(complete_len)

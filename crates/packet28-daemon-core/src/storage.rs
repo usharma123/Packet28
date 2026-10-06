@@ -40,6 +40,7 @@ use crate::{DaemonCoreError, Result};
 mod checkpoint;
 mod event_tail;
 mod registry_delta;
+mod registry_repair;
 
 pub use event_tail::{
     append_next_task_event, append_next_task_event_with_authority,
@@ -69,6 +70,12 @@ pub use registry_delta::{
 pub(crate) use registry_delta::{
     load_retained_registry_snapshot_under_task_lock,
     remove_retained_registry_records_under_task_lock, REGISTRY_DELTA_WAL_FILE_NAME,
+};
+pub use registry_repair::{
+    inspect_task_watch_registry_checkpoint_repair, repair_task_watch_registry_checkpoint,
+    RegistryArtifactDigest, RegistryCheckpointAuthority, RegistryCheckpointRepairReport,
+    RegistryCheckpointRepairStatus, RegistryRepairCandidateSource, RegistryRepairFileReport,
+    RegistryRepairFileState, RegistryWalReplayVerification, REGISTRY_REPAIR_ARCHIVE_DIR_NAME,
 };
 
 #[cfg(any(not(unix), test))]

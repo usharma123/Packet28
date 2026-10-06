@@ -265,3 +265,151 @@ fn storage_repair_refuses_daemon_startup_before_a_socket_exists() {
         );
     }
 }
+
+fn whitespace_edit_task_registry(root: &TempDir) -> (std::path::PathBuf, Vec<u8>) {
+    let path = root.path().join(".packet28/daemon/task-registry-v1.json");
+    let committed = fs::read(&path).unwrap();
+    fs::write(&path, [committed.as_slice(), b" \n"].concat()).unwrap();
+    (path, committed)
+}
+
+#[test]
+fn storage_repair_restores_a_whitespace_edited_registry_exactly() {
+    let root = TempDir::new().unwrap();
+    seed_task_registry(&root, &[("task", 0), ("healthy", 0)]);
+    let bad_log = corrupt_event_log(&root, "healthy");
+    let (task_path, committed) = whitespace_edit_task_registry(&root);
+    let edited = fs::read(&task_path).unwrap();
+
+    let dry = repair_json(&root, &[]);
+    assert_eq!(dry["registry_checkpoint"]["status"], "repairable");
+    assert_eq!(
+        dry["registry_checkpoint"]["authority"],
+        "committed_manifest"
+    );
+    assert_eq!(
+        dry["registry_checkpoint"]["files"][0]["source"],
+        "canonical_reencoding"
+    );
+    assert!(dry["corrupt_task_event_logs"].is_null());
+    assert_eq!(fs::read(&task_path).unwrap(), edited);
+
+    suite_cmd()
+        .args(["daemon", "storage", "repair", "--root"])
+        .arg(root.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "exact checkpoint restore available (dry run)",
+        ))
+        .stdout(predicate::str::contains(
+            "task event logs were not inspected",
+        ))
+        .stdout(predicate::str::contains("re-run with --apply"));
+
+    let applied = repair_json(&root, &["--apply"]);
+    assert_eq!(applied["registry_checkpoint"]["status"], "repaired");
+    assert_eq!(
+        applied["registry_checkpoint"]["files"][0]["state"],
+        "restored"
+    );
+    let archive = std::path::PathBuf::from(
+        applied["registry_checkpoint"]["archive_path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read(archive.join("original-task-registry-v1.json")).unwrap(),
+        edited
+    );
+    assert_eq!(fs::read(&task_path).unwrap(), committed);
+    // The existing event-log quarantine flow runs once authority is restored.
+    assert_eq!(applied["corrupt_task_event_logs"], 1);
+    assert!(!bad_log.exists());
+    let (loaded, _) = load_task_watch_registry_with_deltas_and_event_tails(root.path()).unwrap();
+    assert!(loaded.tasks.tasks.contains_key("task"));
+
+    let clean = repair_json(&root, &["--apply"]);
+    assert_eq!(clean["registry_checkpoint"]["status"], "clean");
+}
+
+#[test]
+fn storage_repair_reports_no_safe_recovery_and_changes_nothing() {
+    let root = TempDir::new().unwrap();
+    seed_task_registry(&root, &[("task", 0)]);
+    let task_path = root.path().join(".packet28/daemon/task-registry-v1.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&task_path).unwrap()).unwrap();
+    value["tasks"]["task"]["last_event_seq"] = json!(9);
+    let edited = serde_json::to_vec_pretty(&value).unwrap();
+    fs::write(&task_path, &edited).unwrap();
+
+    let output = suite_cmd()
+        .args(["daemon", "storage", "repair", "--apply", "--json", "--root"])
+        .arg(root.path())
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["registry_checkpoint"]["status"], "unrecoverable");
+    assert_eq!(
+        report["registry_checkpoint"]["files"][0]["state"],
+        "unrecoverable"
+    );
+    assert!(report["registry_checkpoint"]["archive_path"].is_null());
+
+    suite_cmd()
+        .args(["daemon", "storage", "repair", "--apply", "--root"])
+        .arg(root.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("NO SAFE RECOVERY"))
+        .stdout(predicate::str::contains(
+            "content differs from the committed checkpoint",
+        ));
+    assert_eq!(fs::read(&task_path).unwrap(), edited);
+    assert!(!root
+        .path()
+        .join(".packet28/daemon/registry-repair")
+        .exists());
+}
+
+#[test]
+fn storage_repair_completes_after_a_process_interruption() {
+    let root = TempDir::new().unwrap();
+    seed_task_registry(&root, &[("task", 0)]);
+    let (task_path, committed) = whitespace_edit_task_registry(&root);
+
+    suite_cmd()
+        .args(["daemon", "storage", "repair", "--apply", "--root"])
+        .arg(root.path())
+        .env("PACKET28_REGISTRY_REPAIR_EXIT_AFTER", "journal")
+        .assert()
+        .code(87);
+    assert!(root
+        .path()
+        .join(".packet28/daemon/.task-watch-checkpoint-v1.repair.json")
+        .exists());
+    assert!(
+        packet28_daemon_core::storage::load_task_registry(root.path())
+            .unwrap_err()
+            .to_string()
+            .contains("interrupted")
+    );
+
+    let pending = repair_json(&root, &[]);
+    assert_eq!(
+        pending["registry_checkpoint"]["status"],
+        "interrupted_repair"
+    );
+    let resumed = repair_json(&root, &["--apply"]);
+    assert_eq!(resumed["registry_checkpoint"]["status"], "resumed");
+    assert_eq!(fs::read(&task_path).unwrap(), committed);
+    assert!(
+        packet28_daemon_core::storage::load_task_registry(root.path())
+            .unwrap()
+            .tasks
+            .contains_key("task")
+    );
+}

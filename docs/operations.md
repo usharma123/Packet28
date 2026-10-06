@@ -160,6 +160,39 @@ When startup reports corruption:
 
 Do not delete or rewrite task registries to make the daemon start.
 
+### Registry bytes that match no checkpoint phase
+
+If startup reports that canonical registry bytes do not match a journaled
+checkpoint publication phase, or that checkpoint generations disagree, stop the
+daemon and classify the state first:
+
+```bash
+packet28 daemon stop --root .
+packet28 daemon storage repair --root . --json --pretty
+packet28 daemon storage repair --root . --apply
+```
+
+Repair restores only bytes the checkpoint already authenticates:
+
+- a committed image whose strict, duplicate-key-rejecting re-encoding has the
+  exact byte length and BLAKE3 digest in the commit manifest, such as a
+  whitespace-only reformat;
+- the retained journal base image while that base is still the committed
+  checkpoint after an interrupted publication, and only when the registry
+  delta WAL replays from the base revision.
+
+Before writing, `--apply` copies every affected registry image and the
+checkpoint manifest, journal, and journal images to an owner-only
+`.packet28/daemon/registry-repair/repair-*` archive with a hashed receipt. A
+durable repair journal makes startup refuse until the repair is complete; rerun
+`--apply` after an interruption. The WAL, manifest, and journal are never
+deleted or rewritten.
+
+A substantive edit, a missing committed image, or unusable checkpoint metadata
+is reported as `NO SAFE RECOVERY` with exit status `1`. Nothing is changed and
+edited content is never adopted; restore the file from a backup instead. Corrupt
+task event logs are inspected only after the registry resolves.
+
 ## Search and index
 
 Setup builds the repository indexes. Check status through:

@@ -131,6 +131,20 @@ pub(super) fn resolve_anchored(
     tasks: Option<Vec<u8>>,
     watches: Option<Vec<u8>>,
 ) -> Result<RegistryRawPair> {
+    let repair_journal = daemon
+        .entry_metadata(OsStr::new(CHECKPOINT_REPAIR_JOURNAL_FILE_NAME))
+        .map_err(|source| {
+            DaemonCoreError::io(
+                "failed to inspect task/watch registry repair journal",
+                daemon
+                    .display_path()
+                    .join(CHECKPOINT_REPAIR_JOURNAL_FILE_NAME),
+                source,
+            )
+        })?;
+    if repair_journal.is_some() {
+        return Err(interrupted_repair(root));
+    }
     resolve_with_reader(root, tasks, watches, |name, max_bytes| {
         let path = daemon.display_path().join(name);
         match daemon.read_file_limited(OsStr::new(name), max_bytes) {
@@ -151,9 +165,29 @@ pub(super) fn resolve_portable(
     tasks: Option<Vec<u8>>,
     watches: Option<Vec<u8>>,
 ) -> Result<RegistryRawPair> {
+    let repair_journal = daemon_dir(root).join(CHECKPOINT_REPAIR_JOURNAL_FILE_NAME);
+    match fs::symlink_metadata(&repair_journal) {
+        Ok(_) => return Err(interrupted_repair(root)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(DaemonCoreError::io(
+                "failed to inspect task/watch registry repair journal",
+                repair_journal,
+                source,
+            ));
+        }
+    }
     resolve_with_reader(root, tasks, watches, |name, max_bytes| {
         read_portable_recovery_file(&daemon_dir(root).join(name), max_bytes)
     })
+}
+
+fn interrupted_repair(root: &Path) -> DaemonCoreError {
+    invalid_checkpoint(
+        root,
+        "an interrupted task/watch registry repair is pending; run \
+         `Packet28 daemon storage repair --apply` to complete it",
+    )
 }
 
 fn resolve_with_reader(
@@ -402,7 +436,8 @@ fn reject_unjournaled_canonical_state<T>(root: &Path, canonical: &RegistryRawPai
     validate_registry_checkpoint_generations(root, task_generation, watch_generation)?;
     Err(invalid_checkpoint(
         root,
-        "canonical registry bytes do not match a journaled checkpoint publication phase",
+        "canonical registry bytes do not match a journaled checkpoint publication phase; \
+         run `Packet28 daemon storage repair` to diagnose exact recovery",
     ))
 }
 
@@ -720,6 +755,326 @@ fn read_portable_recovery_file(path: &Path, max_bytes: usize) -> Result<Option<V
         ));
     }
     Ok(Some(raw))
+}
+
+/// Durable intent for an offline canonical-registry repair.
+///
+/// While present, normal checkpoint resolution fails closed so a partially
+/// applied repair can never be read as committed authority.
+pub(super) const CHECKPOINT_REPAIR_JOURNAL_FILE_NAME: &str =
+    ".task-watch-checkpoint-v1.repair.json";
+pub(super) const CHECKPOINT_REPAIR_JOURNAL_WRITE_TEMP_PREFIX: &str =
+    ".task-watch-checkpoint-v1.repair.packet28-write.";
+pub(super) const MAX_CHECKPOINT_REPAIR_JOURNAL_BYTES: usize = MAX_CHECKPOINT_MANIFEST_BYTES;
+
+/// Checkpoint metadata and images that authorize a canonical repair, in the
+/// order they are archived.
+pub(super) const CHECKPOINT_AUTHORITY_FILE_NAMES: [(&str, usize); 4] = [
+    (CHECKPOINT_MANIFEST_FILE_NAME, MAX_CHECKPOINT_MANIFEST_BYTES),
+    (CHECKPOINT_JOURNAL_FILE_NAME, MAX_CHECKPOINT_MANIFEST_BYTES),
+    (CHECKPOINT_JOURNAL_TASK_FILE_NAME, MAX_TASK_REGISTRY_BYTES),
+    (CHECKPOINT_JOURNAL_WATCH_FILE_NAME, MAX_WATCH_REGISTRY_BYTES),
+];
+
+/// Authority from which a canonical registry image can be restored exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryCheckpointAuthority {
+    /// The manifest names a completed publication; only its digests survive.
+    CommittedManifest,
+    /// A publication stopped before its manifest; the manifest still names the
+    /// journal base, whose images are retained and digest-authenticated.
+    PrecommitJournalBase,
+    /// The first publication stopped before any manifest; the journal base is
+    /// the only committed state.
+    UnpublishedJournalBase,
+}
+
+/// How a restored canonical image was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryRepairCandidateSource {
+    /// Strict canonical re-encoding of the present bytes.
+    CanonicalReencoding,
+    /// The digest-authenticated checkpoint journal base image.
+    JournalBaseImage,
+}
+
+pub(super) enum CanonicalFileAction {
+    Keep,
+    Restore {
+        bytes: Vec<u8>,
+        source: RegistryRepairCandidateSource,
+        /// For journal-base restores: whether the replaced bytes were only a
+        /// re-encoding of the authoritative image.
+        reencoding_matched: Option<bool>,
+    },
+    Unrecoverable {
+        reason: String,
+    },
+}
+
+pub(super) struct CanonicalFilePlan {
+    pub(super) name: &'static str,
+    pub(super) current: Option<Vec<u8>>,
+    pub(super) expected_bytes: u64,
+    pub(super) expected_blake3: String,
+    pub(super) action: CanonicalFileAction,
+}
+
+pub(super) struct CanonicalRepairPlan {
+    pub(super) authority: RegistryCheckpointAuthority,
+    pub(super) generation: Option<u64>,
+    pub(super) applied_delta_revision: u64,
+    pub(super) files: Vec<CanonicalFilePlan>,
+}
+
+pub(super) enum CanonicalRepairAssessment {
+    /// Normal checkpoint resolution accepts the present canonical bytes.
+    Clean,
+    /// Checkpoint metadata itself cannot authorize any exact restore.
+    NoAuthority {
+        startup_error: String,
+        reason: String,
+    },
+    Plan {
+        startup_error: String,
+        plan: CanonicalRepairPlan,
+    },
+}
+
+/// Classifies a canonical registry pair that normal startup rejects.
+///
+/// Only exact authority is ever proposed: a committed manifest digest that a
+/// strict canonical re-encoding reproduces, or a digest-authenticated journal
+/// base image while that base is still the committed checkpoint. Metadata
+/// decode failures are reported as absent authority rather than guessed past.
+pub(super) fn assess_canonical_repair(
+    root: &Path,
+    mut read: impl FnMut(&str, usize) -> Result<Option<Vec<u8>>>,
+) -> Result<CanonicalRepairAssessment> {
+    let tasks = read(TASK_REGISTRY_FILE_NAME, MAX_TASK_REGISTRY_BYTES)?;
+    let watches = read(WATCH_REGISTRY_FILE_NAME, MAX_WATCH_REGISTRY_BYTES)?;
+    let startup_error = match resolve_with_reader(root, tasks.clone(), watches.clone(), &mut read) {
+        Ok(_) => return Ok(CanonicalRepairAssessment::Clean),
+        Err(error) => error.to_string(),
+    };
+    let authority = match read_repair_authority(root, &mut read) {
+        Ok(Some(authority)) => authority,
+        Ok(None) => {
+            return Ok(CanonicalRepairAssessment::NoAuthority {
+                startup_error,
+                reason: "no checkpoint manifest or journal exists to authenticate a restore"
+                    .to_string(),
+            });
+        }
+        Err(error) if is_metadata_error(&error) => {
+            return Ok(CanonicalRepairAssessment::NoAuthority {
+                startup_error,
+                reason: format!("checkpoint authority is not usable: {error}"),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let descriptor = &authority.descriptor;
+    let legacy_absence = authority.images.is_some() && descriptor.generation.is_none();
+    let mut files = Vec::with_capacity(2);
+    for (name, current, expected, profile, image) in [
+        (
+            TASK_REGISTRY_FILE_NAME,
+            tasks,
+            &descriptor.tasks,
+            AuthorityJsonProfile::TaskRegistry,
+            authority.images.as_ref().map(|(tasks, _)| tasks),
+        ),
+        (
+            WATCH_REGISTRY_FILE_NAME,
+            watches,
+            &descriptor.watches,
+            AuthorityJsonProfile::WatchRegistry,
+            authority.images.as_ref().map(|(_, watches)| watches),
+        ),
+    ] {
+        let action = if optional_artifact_matches(current.as_deref(), expected, legacy_absence) {
+            CanonicalFileAction::Keep
+        } else {
+            let reencoded = current
+                .as_deref()
+                .map(|raw| canonical_reencoding(raw, profile))
+                .transpose();
+            match (image, reencoded) {
+                (Some(image), reencoded) => CanonicalFileAction::Restore {
+                    bytes: image.clone(),
+                    source: RegistryRepairCandidateSource::JournalBaseImage,
+                    reencoding_matched: Some(matches!(
+                        reencoded,
+                        Ok(Some(ref candidate)) if candidate == image
+                    )),
+                },
+                (None, Ok(Some(candidate))) if artifact_matches(&candidate, expected) => {
+                    CanonicalFileAction::Restore {
+                        bytes: candidate,
+                        source: RegistryRepairCandidateSource::CanonicalReencoding,
+                        reencoding_matched: None,
+                    }
+                }
+                (None, Ok(Some(candidate))) => CanonicalFileAction::Unrecoverable {
+                    reason: format!(
+                        "content differs from the committed checkpoint: canonical re-encoding is \
+                         {} bytes with blake3 {}, not the committed digest; no retained image can \
+                         restore it",
+                        candidate.len(),
+                        blake3::hash(&candidate).to_hex()
+                    ),
+                },
+                (None, Ok(None)) => CanonicalFileAction::Unrecoverable {
+                    reason: "committed registry image is missing and no retained image can \
+                             restore it"
+                        .to_string(),
+                },
+                (None, Err(reason)) => CanonicalFileAction::Unrecoverable {
+                    reason: format!(
+                        "bytes are not strict registry JSON ({reason}); no retained image can \
+                         restore them"
+                    ),
+                },
+            }
+        };
+        files.push(CanonicalFilePlan {
+            name,
+            current,
+            expected_bytes: expected.bytes,
+            expected_blake3: expected.blake3.clone(),
+            action,
+        });
+    }
+    Ok(CanonicalRepairAssessment::Plan {
+        startup_error,
+        plan: CanonicalRepairPlan {
+            authority: authority.kind,
+            generation: descriptor.generation,
+            applied_delta_revision: descriptor.applied_delta_revision,
+            files,
+        },
+    })
+}
+
+/// Requires the candidate pair to resolve through the unmodified startup
+/// resolver as an exact, already-healed checkpoint: either both images equal
+/// the committed manifest, or both equal the committed journal base. Returns
+/// the decoded authority and its delta revision.
+pub(super) fn verify_canonical_candidate(
+    root: &Path,
+    tasks: Option<Vec<u8>>,
+    watches: Option<Vec<u8>>,
+    read: impl FnMut(&str, usize) -> Result<Option<Vec<u8>>>,
+) -> Result<(TaskRegistry, WatchRegistry, u64)> {
+    let resolved = resolve_with_reader(root, tasks, watches, read)?;
+    if resolved.canonical_recovery() != CanonicalRecovery::None {
+        return Err(invalid_checkpoint(
+            root,
+            "repair candidate still depends on an unfinished publication phase",
+        ));
+    }
+    let applied_delta_revision = resolved.applied_delta_revision();
+    let (tasks, watches) = resolved.materialize(root)?;
+    let (tasks, watches, _, _) = decode_registry_checkpoint_pair(root, &tasks, &watches)?;
+    Ok((tasks, watches, applied_delta_revision))
+}
+
+struct RepairAuthority {
+    kind: RegistryCheckpointAuthority,
+    descriptor: RegistryCheckpointDescriptor,
+    images: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+fn read_repair_authority(
+    root: &Path,
+    read: &mut impl FnMut(&str, usize) -> Result<Option<Vec<u8>>>,
+) -> Result<Option<RepairAuthority>> {
+    let manifest = read(CHECKPOINT_MANIFEST_FILE_NAME, MAX_CHECKPOINT_MANIFEST_BYTES)?
+        .map(|raw| {
+            let manifest: RegistryCheckpointManifest =
+                decode_checkpoint_json(root, CHECKPOINT_MANIFEST_FILE_NAME, &raw)?;
+            validate_schema_version(root, manifest.schema_version, "checkpoint manifest")?;
+            if manifest.checkpoint.generation.is_none() {
+                return Err(invalid_checkpoint(
+                    root,
+                    "checkpoint manifest must name a generated checkpoint",
+                ));
+            }
+            Ok(manifest)
+        })
+        .transpose()?;
+    let journal = read(CHECKPOINT_JOURNAL_FILE_NAME, MAX_CHECKPOINT_MANIFEST_BYTES)?
+        .map(|raw| {
+            let journal: RegistryCheckpointJournal =
+                decode_checkpoint_json(root, CHECKPOINT_JOURNAL_FILE_NAME, &raw)?;
+            validate_journal(root, &journal)?;
+            Ok::<_, DaemonCoreError>(journal)
+        })
+        .transpose()?;
+    match (manifest, journal) {
+        (Some(manifest), Some(journal)) if journal.base == manifest.checkpoint => {
+            let images = journal_base_images(root, read, &journal.base)?;
+            Ok(Some(RepairAuthority {
+                kind: RegistryCheckpointAuthority::PrecommitJournalBase,
+                descriptor: journal.base,
+                images: Some(images),
+            }))
+        }
+        (Some(manifest), _) => Ok(Some(RepairAuthority {
+            kind: RegistryCheckpointAuthority::CommittedManifest,
+            descriptor: manifest.checkpoint,
+            images: None,
+        })),
+        (None, Some(journal)) => {
+            let images = journal_base_images(root, read, &journal.base)?;
+            Ok(Some(RepairAuthority {
+                kind: RegistryCheckpointAuthority::UnpublishedJournalBase,
+                descriptor: journal.base,
+                images: Some(images),
+            }))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn journal_base_images(
+    root: &Path,
+    read: &mut impl FnMut(&str, usize) -> Result<Option<Vec<u8>>>,
+    base: &RegistryCheckpointDescriptor,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let pair = read_journal_pair(root, read)?;
+    validate_pair_descriptor(root, &pair, base, "checkpoint journal base")?;
+    let (Some(tasks), Some(watches)) = (pair.tasks, pair.watches) else {
+        return Err(invalid_checkpoint(
+            root,
+            "checkpoint journal base does not contain both registry images",
+        ));
+    };
+    Ok((tasks, watches))
+}
+
+fn is_metadata_error(error: &DaemonCoreError) -> bool {
+    matches!(
+        error,
+        DaemonCoreError::InvalidTaskWatchRegistry { .. }
+            | DaemonCoreError::RegistryCheckpointGenerationMismatch { .. }
+            | DaemonCoreError::AuthorityJsonLimitExceeded { .. }
+            | DaemonCoreError::Json { .. }
+    )
+}
+
+/// Strict, bounded, duplicate-key-rejecting decode followed by the writer's
+/// canonical encoding. Unknown fields survive because the value is generic.
+fn canonical_reencoding(
+    raw: &[u8],
+    profile: AuthorityJsonProfile,
+) -> std::result::Result<Vec<u8>, String> {
+    let value = decode_json_value_without_duplicate_keys(raw, profile)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())
 }
 
 fn invalid_checkpoint(root: &Path, message: impl Into<String>) -> DaemonCoreError {
