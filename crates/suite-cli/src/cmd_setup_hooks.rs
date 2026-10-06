@@ -556,6 +556,16 @@ pub(crate) fn write_hook_runtime_config(
     };
     let mut changed = apply_generated_http_hook_settings(&mut config, root);
     changed |= apply_generated_relaunch_command(&mut config);
+    // Configuring a hook runtime is an explicit opt-in to hook ingest. If a
+    // prior `packet28 uninstall` (or a manual edit) left the kill switch
+    // engaged, re-enable it here. Otherwise setup reports the HTTP hook as
+    // healthy while the daemon keeps rejecting every ingest with
+    // `accepted: false`, which surfaces downstream as confusing doctor
+    // failures instead of an honest "hooks are disabled" signal.
+    if !config.hooks_enabled {
+        config.hooks_enabled = true;
+        changed = true;
+    }
     if existed && !changed {
         return Ok(McpConfigStatus::AlreadyConfigured);
     }
