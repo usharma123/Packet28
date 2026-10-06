@@ -5,8 +5,8 @@ use anyhow::{anyhow, Context, Result};
 use packet28_daemon_client::runtime_discovery::read_runtime_info_if_present;
 #[cfg(unix)]
 use packet28_daemon_client::transport::{
-    endpoint_accepts_connections, request_status_v1, DaemonClientError, DaemonEndpoint,
-    DaemonStream,
+    endpoint_accepts_connections, request_status_v1, verify_runtime_workspace,
+    workspace_root_matches, DaemonClientError, DaemonEndpoint, DaemonStream,
 };
 #[cfg(unix)]
 use packet28_daemon_core::task_store_lease::{
@@ -329,8 +329,13 @@ pub(crate) fn ensure_daemon(root: &Path) -> Result<()> {
     let root = normalize_daemon_root(root);
     // A starting daemon accepts connections but answers only once ready, so
     // its status is awaited under the startup-readiness deadline below rather
-    // than the unbounded socket timeout of this fast path.
-    if !daemon_runtime_is_starting(&root) && daemon_status_existing(&root).is_ok() {
+    // than the unbounded socket timeout of this fast path. Metadata naming
+    // another workspace is never contacted; the lease-guarded path below
+    // fails closed on it unless this workspace's authority was released.
+    if daemon_fast_path_allowed(&root)
+        && daemon_status_existing(&root)
+            .is_ok_and(|status| workspace_root_matches(&root, &status.workspace_root))
+    {
         return Ok(());
     }
     // Discovery, stale-file cleanup, and bootstrap stay inside one startup
@@ -347,9 +352,16 @@ pub(crate) fn ensure_daemon(root: &Path) -> Result<()> {
     {
         return Ok(());
     }
-    let endpoint = daemon_endpoint(&root)?;
-    if endpoint_may_have_stale_socket(&endpoint) && connect_daemon_endpoint(&endpoint).is_err() {
+    // Authority was released, so metadata naming another workspace is stale
+    // and its endpoint is never contacted.
+    if daemon_runtime_is_foreign(&root) {
         cleanup_unreachable_runtime_files(&root)?;
+    } else {
+        let endpoint = daemon_endpoint(&root)?;
+        if endpoint_may_have_stale_socket(&endpoint) && connect_daemon_endpoint(&endpoint).is_err()
+        {
+            cleanup_unreachable_runtime_files(&root)?;
+        }
     }
     let daemon = start_daemon(&root)?;
     wait_for_spawned_daemon(&root, &daemon)
@@ -518,10 +530,13 @@ fn wait_for_spawned_daemon(root: &Path, daemon: &SpawnedDaemon) -> Result<()> {
         // the child.
         match read_runtime_info_if_present(root) {
             Ok(Some(runtime)) if runtime.pid == daemon.pid => {
+                verify_runtime_workspace(root, &runtime)?;
                 let endpoint = DaemonEndpoint::from_runtime(root, &runtime)?;
                 match request_status_v1(&endpoint, deadline) {
-                    Ok(status) if same_daemon(&status, &runtime) => return Ok(()),
-                    Ok(status) => last_error = Some(identity_mismatch(&status, &runtime)),
+                    Ok(status) if same_daemon(root, &status, &runtime) => return Ok(()),
+                    Ok(status) => {
+                        last_error = Some(identity_mismatch(root, &status, &runtime));
+                    }
                     Err(error) => last_error = Some(error.to_string()),
                 }
             }
@@ -537,15 +552,27 @@ fn wait_for_spawned_daemon(root: &Path, daemon: &SpawnedDaemon) -> Result<()> {
     }
 }
 
-/// Reports whether authenticated runtime metadata names a daemon that has not
-/// published readiness. Any read failure is left to the lease-guarded path,
-/// which fails closed on it.
+/// Reports whether authenticated runtime metadata names another workspace.
 #[cfg(unix)]
-fn daemon_runtime_is_starting(root: &Path) -> bool {
+fn daemon_runtime_is_foreign(root: &Path) -> bool {
     matches!(
         read_runtime_info_if_present(root),
-        Ok(Some(runtime)) if runtime.ready_at_unix.is_none()
+        Ok(Some(runtime)) if !workspace_root_matches(root, &runtime.workspace_root)
     )
+}
+
+/// Reports whether the status fast path may contact the published endpoint:
+/// not when authenticated runtime metadata names a daemon that has not
+/// published readiness, or another workspace. Any read failure is left to the
+/// lease-guarded path, which fails closed on it.
+#[cfg(unix)]
+fn daemon_fast_path_allowed(root: &Path) -> bool {
+    match read_runtime_info_if_present(root) {
+        Ok(Some(runtime)) => {
+            runtime.ready_at_unix.is_some() && workspace_root_matches(root, &runtime.workspace_root)
+        }
+        Ok(None) | Err(_) => true,
+    }
 }
 
 /// A daemon identified by authenticated runtime metadata that has not yet
@@ -567,7 +594,8 @@ enum DaemonOwner {
 /// Classifies the instance-lease owner from authenticated runtime metadata.
 ///
 /// Runtime metadata only selects what to wait for; it never authorizes
-/// cleanup. Unauthentic or malformed metadata fails closed.
+/// cleanup. Unauthentic or malformed metadata, or metadata naming another
+/// workspace, fails closed before its endpoint is used.
 #[cfg(unix)]
 fn observe_daemon_owner(root: &Path, deadline: Instant) -> Result<DaemonOwner> {
     let Some(runtime) = read_runtime_info_if_present(root)
@@ -575,6 +603,7 @@ fn observe_daemon_owner(root: &Path, deadline: Instant) -> Result<DaemonOwner> {
     else {
         return Ok(DaemonOwner::Unavailable);
     };
+    verify_runtime_workspace(root, &runtime)?;
     let endpoint = DaemonEndpoint::from_runtime(root, &runtime)?;
     if runtime.ready_at_unix.is_none() {
         // A daemon binds its listener and publishes runtime metadata before it
@@ -588,7 +617,7 @@ fn observe_daemon_owner(root: &Path, deadline: Instant) -> Result<DaemonOwner> {
         return Ok(DaemonOwner::Unavailable);
     }
     match request_status_v1(&endpoint, deadline) {
-        Ok(status) if same_daemon(&status, &runtime) => Ok(DaemonOwner::Serving),
+        Ok(status) if same_daemon(root, &status, &runtime) => Ok(DaemonOwner::Serving),
         // An older daemon answers the authenticated V1 request with a
         // protocol error; callers reach it through legacy requests.
         Err(DaemonClientError::StatusRejected { message, .. })
@@ -615,10 +644,10 @@ fn wait_for_existing_daemon_startup(
     let deadline = started + DAEMON_STARTUP_TIMEOUT;
     loop {
         let last_error = match request_status_v1(&candidate.endpoint, deadline) {
-            Ok(status) if same_daemon(&status, &candidate.runtime) => {
+            Ok(status) if same_daemon(root, &status, &candidate.runtime) => {
                 return Ok(DaemonAuthority::Serving)
             }
-            Ok(status) => identity_mismatch(&status, &candidate.runtime),
+            Ok(status) => identity_mismatch(root, &status, &candidate.runtime),
             Err(error) => error.to_string(),
         };
         if daemon_instance_released(root)? {
@@ -636,16 +665,24 @@ fn wait_for_existing_daemon_startup(
     }
 }
 
+/// Whether status comes from the published daemon serving `root`.
 #[cfg(unix)]
-fn same_daemon(status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> bool {
-    status.pid == runtime.pid && status.workspace_root == runtime.workspace_root
+fn same_daemon(root: &Path, status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> bool {
+    status.pid == runtime.pid
+        && status.workspace_root == runtime.workspace_root
+        && workspace_root_matches(root, &status.workspace_root)
 }
 
 #[cfg(unix)]
-fn identity_mismatch(status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> String {
+fn identity_mismatch(root: &Path, status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> String {
     format!(
-        "status identity pid {} root '{}' does not match runtime pid {} root '{}'",
-        status.pid, status.workspace_root, runtime.pid, runtime.workspace_root
+        "status identity pid {} root '{}' does not match runtime pid {} root '{}' for \
+         workspace '{}'",
+        status.pid,
+        status.workspace_root,
+        runtime.pid,
+        runtime.workspace_root,
+        root.display()
     )
 }
 
@@ -964,9 +1001,18 @@ fn daemon_authority_timeout(root: &Path, timeout: Duration) -> anyhow::Error {
     )
 }
 
+/// Discovers the endpoint of the daemon published for `root`.
+///
+/// Metadata naming another workspace fails closed, so no request for `root`,
+/// including Stop, reaches another workspace's daemon.
 #[cfg(unix)]
 fn daemon_endpoint(root: &Path) -> Result<DaemonEndpoint> {
-    Ok(packet28_daemon_client::transport::discover_endpoint(root)?)
+    let Some(runtime) = read_runtime_info_if_present(root)? else {
+        return Ok(packet28_daemon_client::transport::discover_endpoint(root)?);
+    };
+    let endpoint = DaemonEndpoint::from_runtime(root, &runtime)?;
+    verify_runtime_workspace(root, &runtime)?;
+    Ok(endpoint)
 }
 
 #[cfg(unix)]

@@ -1192,3 +1192,146 @@ fn start_fails_closed_on_corrupt_runtime_of_a_starting_owner() {
     });
     fixture.close();
 }
+
+/// Another workspace's daemon endpoint that records whether anything
+/// connected, with a harness-owned process standing in for its pid.
+#[cfg(unix)]
+struct ForeignWorkspaceDaemon {
+    dir: TempDir,
+    listener: std::os::unix::net::UnixListener,
+    owner: ProcessHarness,
+}
+
+#[cfg(unix)]
+impl ForeignWorkspaceDaemon {
+    fn start() -> Self {
+        let dir = TempDir::new().unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("foreign.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let owner = ProcessHarness::spawn(
+            std::process::Command::new("sleep").arg("600"),
+            HarnessLimits::default(),
+        )
+        .expect("spawn foreign owner stand-in");
+        Self {
+            dir,
+            listener,
+            owner,
+        }
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.path().canonicalize().unwrap()
+    }
+
+    /// Publishes owner-private runtime metadata in `workspace` copied from
+    /// this daemon, and returns its bytes.
+    fn publish_copied_runtime(&self, workspace: &Path, ready: bool) -> Vec<u8> {
+        let runtime = serde_json::json!({
+            "pid": self.owner.pid(),
+            "version": "0.0.0",
+            "started_at_unix": 1,
+            "ready_at_unix": if ready { Some(2) } else { None },
+            "socket_path": self.root().join("foreign.sock"),
+            "workspace_root": self.root(),
+            "log_path": self.root().join("packet28d.log"),
+        });
+        let bytes = serde_json::to_vec(&runtime).unwrap();
+        let path = workspace.join(".packet28/daemon/runtime.json");
+        let staged = workspace.join(".packet28/daemon/runtime.json.copied");
+        fs::write(&staged, &bytes).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&staged, &path).unwrap();
+        bytes
+    }
+
+    fn assert_never_contacted(&mut self) {
+        match self.listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("a client connected to another workspace's daemon endpoint"),
+            Err(error) => panic!("foreign listener failed: {error}"),
+        }
+        assert!(
+            client_is_running(&mut self.owner),
+            "the foreign owner process was signalled"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn foreign_workspace_runtime_fails_closed_while_its_authority_is_held() {
+    for ready in [true, false] {
+        let fixture = GatedStartupFixture::hold();
+        let root = fixture.root_arg().to_string();
+        let mut foreign = ForeignWorkspaceDaemon::start();
+        let instance =
+            packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease(fixture.root())
+                .expect("hold workspace instance authority");
+        let runtime_path = fixture.root().join(".packet28/daemon/runtime.json");
+        let runtime_before = foreign.publish_copied_runtime(fixture.root(), ready);
+
+        for command in ["start", "status", "stop"] {
+            let started = std::time::Instant::now();
+            let output = run_lifecycle_client(&["daemon", command, "--root", &root], &[]);
+            let elapsed = started.elapsed();
+
+            assert!(
+                !output.status.success(),
+                "daemon {command} accepted another workspace's daemon (ready={ready})"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("refusing to use another workspace's daemon")
+                    && stderr.contains(&foreign.root().to_string_lossy().to_string()),
+                "daemon {command} missing foreign-workspace diagnostic (ready={ready}): {stderr}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "daemon {command} waited {elapsed:?} instead of failing closed (ready={ready})"
+            );
+        }
+        assert_eq!(fs::read(&runtime_path).unwrap(), runtime_before);
+        assert!(!fixture
+            .root()
+            .join(".packet28/daemon/packet28d.log")
+            .exists());
+        foreign.assert_never_contacted();
+        drop(instance);
+        // The fixture's stop must not reach the foreign daemon either; remove
+        // the copied metadata only after its authority was released.
+        fs::rename(&runtime_path, fixture.root().join("runtime.json.foreign")).unwrap();
+        fixture.close();
+        foreign.assert_never_contacted();
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn start_replaces_copied_foreign_runtime_after_authority_release() {
+    let mut fixture = GatedStartupFixture::hold();
+    fixture.release();
+    let root = fixture.root_arg().to_string();
+    let mut foreign = ForeignWorkspaceDaemon::start();
+    foreign.publish_copied_runtime(fixture.root(), true);
+
+    let output = run_lifecycle_client(&["daemon", "start", "--root", &root], &[]);
+
+    assert!(
+        output.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    foreign.assert_never_contacted();
+    let runtime = read_test_runtime(fixture.root()).expect("replacement runtime");
+    assert_eq!(
+        runtime["workspace_root"].as_str().map(PathBuf::from),
+        Some(fixture.root().canonicalize().unwrap())
+    );
+    let pid = runtime["pid"].as_u64().expect("replacement pid");
+    assert_ne!(pid, u64::from(foreign.owner.pid()));
+    fixture.assert_serving(pid);
+    fixture.close();
+    foreign.assert_never_contacted();
+}

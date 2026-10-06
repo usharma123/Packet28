@@ -105,10 +105,18 @@ separate fixed deadlines. An instance-lease owner that is neither serving nor
 starting, such as a stopping daemon, gets 10 s to release authority. A daemon
 that bootstrap spawned, or an owner whose authenticated runtime metadata has no
 readiness time and whose endpoint accepts connections, gets 30 s to answer
-bounded V1 status with the same pid and workspace root. Each status request is
-bounded by the time left in its phase. Runtime metadata only selects what to
-wait for; cleanup and spawn still require the released instance lease, and
-unauthentic or malformed metadata fails closed. A timed-out caller leaves a
+bounded V1 status with the same pid and workspace root. Each status request,
+including the TCP capability exchange, re-arms its socket timeout with the time
+left in its phase before every read and write, so a peer trickling bytes cannot
+extend it, and a response completed after the deadline is rejected. Runtime
+metadata only selects what to wait for; cleanup and spawn still require the
+released instance lease, and unauthentic or malformed metadata fails closed.
+Metadata must name the requested workspace, compared by canonical path so a
+symlinked spelling still matches. While the workspace's instance lease is
+held, metadata naming another workspace fails immediately without contacting
+its endpoint; after release it is stale and is replaced by a new daemon. The
+CLI and `p28` status fast paths never contact such an endpoint, and the CLI
+refuses to send any request, including Stop, through it. A timed-out caller leaves a
 starting daemon running. Startup-lease acquisition precedes both deadlines and
 blocks behind another bootstrap or an explicit stop, so neither phase bounds a
 whole call. Gated-startup process tests in `p28` and the CLI hold a real

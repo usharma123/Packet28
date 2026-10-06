@@ -16,6 +16,10 @@
 //!   has not yet published readiness. It gets [`BOOTSTRAP_STARTUP_TIMEOUT`] to
 //!   answer bounded status with the same identity.
 //!
+//! Published runtime metadata must name the requested workspace before its
+//! endpoint is used, and status must answer with that workspace and the
+//! published pid; stale or copied metadata for another workspace fails closed.
+//!
 //! Neither deadline covers startup-lease acquisition, which blocks behind
 //! another bootstrap or an explicit stop, so the call as a whole has no single
 //! wall-clock bound. A timed-out caller leaves a starting daemon running.
@@ -30,7 +34,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use packet28_daemon_client::runtime_discovery::read_runtime_info_if_present;
 use packet28_daemon_client::transport::{
-    endpoint_accepts_connections, request_status_v1, DaemonEndpoint,
+    endpoint_accepts_connections, request_status_v1, verify_runtime_workspace,
+    workspace_root_matches, DaemonEndpoint,
 };
 use packet28_daemon_core::task_store_lease::{
     acquire_daemon_startup_lease, daemon_instance_lock_path, daemon_instance_released,
@@ -131,7 +136,8 @@ fn wait_for_authority(root: &Path) -> Result<Authority> {
 /// Classifies the instance-lease owner from authenticated runtime metadata.
 ///
 /// Runtime metadata only selects what to wait for; it never authorizes
-/// cleanup. Unauthentic or malformed metadata fails closed.
+/// cleanup. Unauthentic or malformed metadata, or metadata naming another
+/// workspace, fails closed before its endpoint is used.
 fn observe_owner(root: &Path, deadline: Instant) -> Result<Owner> {
     let Some(runtime) = read_runtime_info_if_present(root)
         .context("failed to read packet28d runtime metadata while the daemon owns the workspace")?
@@ -140,6 +146,7 @@ fn observe_owner(root: &Path, deadline: Instant) -> Result<Owner> {
         // during shutdown cleanup.
         return Ok(Owner::Unavailable);
     };
+    verify_runtime_workspace(root, &runtime)?;
     let endpoint = DaemonEndpoint::from_runtime(root, &runtime)?;
     if runtime.ready_at_unix.is_none() {
         // A daemon binds its listener and publishes runtime metadata before it
@@ -153,7 +160,7 @@ fn observe_owner(root: &Path, deadline: Instant) -> Result<Owner> {
         return Ok(Owner::Unavailable);
     }
     match request_status_v1(&endpoint, deadline) {
-        Ok(status) if same_daemon(&status, &runtime) => Ok(Owner::Serving),
+        Ok(status) if same_daemon(root, &status, &runtime) => Ok(Owner::Serving),
         // A stopping daemon withdraws its endpoint before it releases
         // authority; keep waiting within the authority deadline.
         Ok(_) | Err(_) => Ok(Owner::Unavailable),
@@ -169,10 +176,10 @@ fn wait_for_existing_startup(root: &Path, candidate: &StartupCandidate) -> Resul
     let deadline = started + BOOTSTRAP_STARTUP_TIMEOUT;
     loop {
         let last_error = match request_status_v1(&candidate.endpoint, deadline) {
-            Ok(status) if same_daemon(&status, &candidate.runtime) => {
+            Ok(status) if same_daemon(root, &status, &candidate.runtime) => {
                 return Ok(Authority::Serving)
             }
-            Ok(status) => identity_mismatch(&status, &candidate.runtime),
+            Ok(status) => identity_mismatch(root, &status, &candidate.runtime),
             Err(error) => error.to_string(),
         };
         if instance_released(root)? {
@@ -214,10 +221,11 @@ fn wait_for_spawned_daemon(root: &Path, daemon: &mut Child) -> Result<()> {
         // the child.
         match read_runtime_info_if_present(root) {
             Ok(Some(runtime)) if runtime.pid == pid => {
+                verify_runtime_workspace(root, &runtime)?;
                 let endpoint = DaemonEndpoint::from_runtime(root, &runtime)?;
                 match request_status_v1(&endpoint, deadline) {
-                    Ok(status) if same_daemon(&status, &runtime) => return Ok(()),
-                    Ok(status) => last_error = Some(identity_mismatch(&status, &runtime)),
+                    Ok(status) if same_daemon(root, &status, &runtime) => return Ok(()),
+                    Ok(status) => last_error = Some(identity_mismatch(root, &status, &runtime)),
                     Err(error) => last_error = Some(error.to_string()),
                 }
             }
@@ -231,14 +239,22 @@ fn wait_for_spawned_daemon(root: &Path, daemon: &mut Child) -> Result<()> {
     }
 }
 
-fn same_daemon(status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> bool {
-    status.pid == runtime.pid && status.workspace_root == runtime.workspace_root
+/// Whether status comes from the published daemon serving `root`.
+fn same_daemon(root: &Path, status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> bool {
+    status.pid == runtime.pid
+        && status.workspace_root == runtime.workspace_root
+        && workspace_root_matches(root, &status.workspace_root)
 }
 
-fn identity_mismatch(status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> String {
+fn identity_mismatch(root: &Path, status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> String {
     format!(
-        "status identity pid {} root '{}' does not match runtime pid {} root '{}'",
-        status.pid, status.workspace_root, runtime.pid, runtime.workspace_root
+        "status identity pid {} root '{}' does not match runtime pid {} root '{}' for \
+         workspace '{}'",
+        status.pid,
+        status.workspace_root,
+        runtime.pid,
+        runtime.workspace_root,
+        root.display()
     )
 }
 

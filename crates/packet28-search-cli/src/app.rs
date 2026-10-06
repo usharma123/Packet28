@@ -1239,16 +1239,24 @@ impl TransportMode {
 
 #[cfg(unix)]
 fn ensure_daemon(root: &Path) -> Result<()> {
+    use packet28_daemon_client::runtime_discovery::read_runtime_info_if_present;
+    use packet28_daemon_client::transport::workspace_root_matches;
+
     let root = resolve_workspace_root(root);
     // A starting daemon accepts connections but answers only once ready, so
     // `packet28d start` awaits it under its startup-readiness deadline rather
-    // than this fast path's socket timeout. Read failures are left to
+    // than this fast path's socket timeout. Metadata naming another workspace
+    // is never contacted; `packet28d start` fails closed on it unless this
+    // workspace's authority was released. Read failures are left to
     // `packet28d start`, which fails closed on them.
-    let starting = matches!(
-        packet28_daemon_client::runtime_discovery::read_runtime_info_if_present(&root),
-        Ok(Some(runtime)) if runtime.ready_at_unix.is_none()
-    );
-    if !starting && daemon_status_existing(&root).is_ok() {
+    let fast_path = match read_runtime_info_if_present(&root) {
+        Ok(Some(runtime)) => {
+            runtime.ready_at_unix.is_some()
+                && workspace_root_matches(&root, &runtime.workspace_root)
+        }
+        Ok(None) | Err(_) => true,
+    };
+    if fast_path && daemon_status_existing(&root).is_ok() {
         return Ok(());
     }
     // An unreachable endpoint does not mean the previous daemon has exited: a
@@ -1287,27 +1295,53 @@ fn start_daemon(root: &Path) -> Result<()> {
     ))
 }
 
-/// Confirms that the daemon selected by `packet28d start` answers status.
+/// Confirms that the daemon selected by `packet28d start` answers status for
+/// `root` with its published pid.
 ///
 /// Each status request is bounded by the time remaining before `timeout`.
-/// Unauthentic runtime discovery fails immediately.
+/// Unauthentic runtime discovery, or metadata naming another workspace, fails
+/// immediately.
 #[cfg(unix)]
 fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
-    use packet28_daemon_client::transport::{discover_endpoint, request_status_v1};
+    use packet28_daemon_client::runtime_discovery::read_runtime_info_if_present;
+    use packet28_daemon_client::transport::{
+        discover_endpoint, request_status_v1, verify_runtime_workspace, workspace_root_matches,
+        DaemonEndpoint,
+    };
 
     let deadline = StdInstant::now() + timeout;
     let mut last_error = None;
     while StdInstant::now() < deadline {
-        let endpoint = discover_endpoint(root)?;
+        let runtime = read_runtime_info_if_present(root)?;
+        let endpoint = match &runtime {
+            Some(runtime) => {
+                verify_runtime_workspace(root, runtime)?;
+                DaemonEndpoint::from_runtime(root, runtime)?
+            }
+            None => discover_endpoint(root)?,
+        };
         match request_status_v1(&endpoint, deadline) {
-            Ok(_) => return Ok(()),
-            Err(error) => last_error = Some(error),
+            Ok(status)
+                if workspace_root_matches(root, &status.workspace_root)
+                    && runtime
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.pid == status.pid) =>
+            {
+                return Ok(());
+            }
+            Ok(status) => {
+                last_error = Some(format!(
+                    "status identity pid {} root '{}' does not match workspace '{}'",
+                    status.pid,
+                    status.workspace_root,
+                    root.display()
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let last_error = last_error
-        .map(|error| error.to_string())
-        .unwrap_or_else(|| "none".to_string());
+    let last_error = last_error.unwrap_or_else(|| "none".to_string());
     if let Ok(Some(runtime)) =
         packet28_daemon_client::runtime_discovery::read_runtime_info_if_present(root)
     {
@@ -1324,15 +1358,26 @@ fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
     ))
 }
 
+/// Confirms that an existing daemon answers status for `root`.
 #[cfg(unix)]
 fn daemon_status_existing(root: &Path) -> Result<()> {
+    let serves_root = |workspace_root: &str| {
+        if packet28_daemon_client::transport::workspace_root_matches(root, workspace_root) {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "daemon status names workspace '{workspace_root}', not '{}'",
+                root.display()
+            ))
+        }
+    };
     match send_registry_request_existing_daemon(root, &DaemonRegistryRequestV1::Status) {
-        Ok(DaemonRegistryResponseV1::Status { .. }) => Ok(()),
+        Ok(DaemonRegistryResponseV1::Status { status }) => serves_root(&status.workspace_root),
         Ok(DaemonRegistryResponseV1::Error { message })
             if daemon_error_indicates_protocol_mismatch(&message) =>
         {
             match send_request_existing_daemon(root, &DaemonRequest::Status) {
-                Ok(DaemonResponse::Status { .. }) => Ok(()),
+                Ok(DaemonResponse::Status { status }) => serves_root(&status.workspace_root),
                 Ok(DaemonResponse::Error { message }) => Err(anyhow!(message)),
                 Ok(other) => Err(anyhow!(
                     "unexpected legacy daemon status response: {other:?}"

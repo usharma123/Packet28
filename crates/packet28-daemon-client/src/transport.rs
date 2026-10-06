@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use packet28_daemon_protocol::frame::{read_frame, write_frame, FrameError};
 use packet28_daemon_protocol::message::{DaemonResponse, DaemonRuntimeInfo, DaemonTransportAuth};
-use packet28_daemon_protocol::paths::socket_path;
+use packet28_daemon_protocol::paths::{runtime_path, socket_path};
 use packet28_daemon_protocol::registry::{
     DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1,
 };
@@ -188,13 +188,29 @@ pub enum DaemonClientError {
         /// Unexpected response.
         response: Box<DaemonResponse>,
     },
-    /// A bounded request had no time left before its deadline.
-    #[error("deadline elapsed before {operation} '{endpoint}'")]
+    /// A bounded request reached its deadline before it completed.
+    #[error("deadline elapsed while {operation} '{endpoint}'")]
     DeadlineElapsed {
-        /// Operation that could not start.
+        /// Operation that could not start or finish in time.
         operation: &'static str,
         /// Endpoint being accessed.
         endpoint: String,
+    },
+    /// Authenticated runtime metadata names another workspace.
+    #[error(
+        "daemon runtime metadata '{runtime}' names workspace '{published}' (pid {pid}), not the \
+         requested workspace '{requested}'; refusing to use another workspace's daemon and \
+         leaving its files in place"
+    )]
+    ForeignWorkspace {
+        /// Runtime metadata path for the requested workspace.
+        runtime: String,
+        /// Requested, normalized workspace root.
+        requested: String,
+        /// Workspace root the metadata names.
+        published: String,
+        /// Daemon pid the metadata names.
+        pid: u32,
     },
     /// The daemon answered a status request with an error.
     #[error("daemon at '{endpoint}' rejected the status request: {message}")]
@@ -231,6 +247,52 @@ pub fn discover_endpoint(root: &Path) -> Result<DaemonEndpoint, DaemonClientErro
         return Ok(default_endpoint(root));
     };
     DaemonEndpoint::from_runtime(root, &runtime)
+}
+
+/// Reports whether a published workspace root names `root`.
+///
+/// `root` is the caller's normalized workspace root. Identical spellings
+/// match; otherwise both paths must resolve to the same canonical directory,
+/// so a symlinked spelling of one workspace matches but another workspace's
+/// root or an empty value never does.
+pub fn workspace_root_matches(root: &Path, published: &str) -> bool {
+    if published.is_empty() {
+        return false;
+    }
+    let published = Path::new(published);
+    if published == root {
+        return true;
+    }
+    match (published.canonicalize(), root.canonicalize()) {
+        (Ok(published), Ok(root)) => published == root,
+        _ => false,
+    }
+}
+
+/// Verifies that authenticated runtime metadata belongs to `root`.
+///
+/// Runtime discovery authenticates where metadata lives and who owns it, not
+/// the workspace it names. Callers verify this before using the published
+/// endpoint, so stale or copied metadata never directs requests for `root` to
+/// another workspace's daemon.
+///
+/// # Errors
+///
+/// Returns [`DaemonClientError::ForeignWorkspace`] when the metadata names
+/// another workspace.
+pub fn verify_runtime_workspace(
+    root: &Path,
+    runtime: &DaemonRuntimeInfo,
+) -> Result<(), DaemonClientError> {
+    if workspace_root_matches(root, &runtime.workspace_root) {
+        return Ok(());
+    }
+    Err(DaemonClientError::ForeignWorkspace {
+        runtime: runtime_path(root).to_string_lossy().to_string(),
+        requested: root.to_string_lossy().to_string(),
+        published: runtime.workspace_root.clone(),
+        pid: runtime.pid,
+    })
 }
 
 /// Returns whether a discovered endpoint can leave a stale socket artifact.
@@ -329,51 +391,23 @@ pub fn endpoint_accepts_connections(endpoint: &DaemonEndpoint) -> Result<bool, D
 
 /// Requests bounded V1 status from an authenticated endpoint.
 ///
-/// Connection authentication and each socket read or write are bounded by the
-/// time remaining before `deadline`, so a connected daemon that has not begun
-/// serving cannot hold the request past it. Establishing a local connection
+/// Every socket read and write, including the TCP capability exchange, is
+/// bounded by the time remaining before `deadline`, recomputed before each
+/// operating-system call. Partial progress never extends the deadline, and a
+/// response completed after it is rejected. Establishing a local connection
 /// is not separately bounded.
 ///
 /// # Errors
 ///
-/// Returns [`DaemonClientError::DeadlineElapsed`] when no time remains, a
-/// connection, authentication, or framing error, or the daemon's rejection or
-/// unexpected response.
+/// Returns [`DaemonClientError::DeadlineElapsed`] when the deadline passes
+/// before the response is complete, a connection, authentication, or framing
+/// error, or the daemon's rejection or unexpected response.
 pub fn request_status_v1(
     endpoint: &DaemonEndpoint,
     deadline: Instant,
 ) -> Result<DaemonStatusV1, DaemonClientError> {
-    let remaining = |operation| {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(DaemonClientError::DeadlineElapsed {
-                operation,
-                endpoint: endpoint.address.clone(),
-            })
-        } else {
-            Ok(remaining)
-        }
-    };
-    let mut stream = connect_endpoint(endpoint, remaining("connecting to")?)?;
-    stream
-        .set_io_timeout(remaining("requesting status from")?)
-        .map_err(|source| DaemonClientError::Io {
-            operation: "failed to configure status timeout for",
-            endpoint: endpoint.address.clone(),
-            source,
-        })?;
-    write_frame(&mut stream, &DaemonRegistryRequestV1::Status).map_err(|source| {
-        DaemonClientError::Frame {
-            operation: "failed to write status request to",
-            endpoint: endpoint.address.clone(),
-            source,
-        }
-    })?;
-    match read_frame(&mut stream).map_err(|source| DaemonClientError::Frame {
-        operation: "failed to read status response from",
-        endpoint: endpoint.address.clone(),
-        source,
-    })? {
+    let mut stream = connect_endpoint_until(endpoint, deadline)?;
+    match exchange_status(&mut stream, endpoint, deadline)? {
         DaemonRegistryResponseV1::Status { status } => Ok(*status),
         DaemonRegistryResponseV1::Error { message } => Err(DaemonClientError::StatusRejected {
             endpoint: endpoint.address.clone(),
@@ -383,6 +417,182 @@ pub fn request_status_v1(
             endpoint: endpoint.address.clone(),
             response: Box::new(response),
         }),
+    }
+}
+
+/// Sends a status request and reads its response within `deadline`.
+fn exchange_status<S: IoTimeouts + Read + Write>(
+    socket: &mut S,
+    endpoint: &DaemonEndpoint,
+    deadline: Instant,
+) -> Result<DaemonRegistryResponseV1, DaemonClientError> {
+    let mut io = DeadlineIo::new(socket, deadline);
+    write_frame(&mut io, &DaemonRegistryRequestV1::Status).map_err(|source| {
+        deadline_or(
+            DaemonClientError::Frame {
+                operation: "failed to write status request to",
+                endpoint: endpoint.address.clone(),
+                source,
+            },
+            endpoint,
+            deadline,
+            "writing status request to",
+        )
+    })?;
+    let response = read_frame(&mut io).map_err(|source| {
+        deadline_or(
+            DaemonClientError::Frame {
+                operation: "failed to read status response from",
+                endpoint: endpoint.address.clone(),
+                source,
+            },
+            endpoint,
+            deadline,
+            "reading status response from",
+        )
+    })?;
+    // A response completed after the deadline is not accepted.
+    ensure_before(endpoint, deadline, "reading status response from")?;
+    Ok(response)
+}
+
+/// Connects and authenticates within `deadline`.
+fn connect_endpoint_until(
+    endpoint: &DaemonEndpoint,
+    deadline: Instant,
+) -> Result<DaemonStream, DaemonClientError> {
+    let remaining = ensure_before(endpoint, deadline, "connecting to")?;
+    let Some(address) = endpoint.address.strip_prefix("tcp://") else {
+        return connect_unix(Path::new(&endpoint.address), remaining);
+    };
+    let auth = tcp_auth(endpoint)?;
+    let mut stream = open_tcp(address, endpoint, remaining)?;
+    authenticate_tcp(&mut DeadlineIo::new(&mut stream, deadline), auth, endpoint)
+        .map_err(|error| deadline_or(error, endpoint, deadline, "authenticating with"))?;
+    ensure_before(endpoint, deadline, "authenticating with")?;
+    Ok(DaemonStream::Tcp(stream))
+}
+
+/// Returns the time left before `deadline`, or a deadline error.
+fn ensure_before(
+    endpoint: &DaemonEndpoint,
+    deadline: Instant,
+    operation: &'static str,
+) -> Result<Duration, DaemonClientError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(DaemonClientError::DeadlineElapsed {
+            operation,
+            endpoint: endpoint.address.clone(),
+        });
+    }
+    Ok(remaining)
+}
+
+/// Reports `error` as a deadline error once the deadline has passed, since a
+/// deadline-bounded socket then fails with a timeout or truncated frame.
+fn deadline_or(
+    error: DaemonClientError,
+    endpoint: &DaemonEndpoint,
+    deadline: Instant,
+    operation: &'static str,
+) -> DaemonClientError {
+    if Instant::now() >= deadline {
+        return DaemonClientError::DeadlineElapsed {
+            operation,
+            endpoint: endpoint.address.clone(),
+        };
+    }
+    error
+}
+
+/// A socket whose individual reads and writes can be time-bounded.
+trait IoTimeouts {
+    fn set_io_timeouts(&self, timeout: Duration) -> std::io::Result<()>;
+}
+
+impl IoTimeouts for TcpStream {
+    fn set_io_timeouts(&self, timeout: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(timeout))?;
+        self.set_write_timeout(Some(timeout))
+    }
+}
+
+impl IoTimeouts for DaemonStream {
+    fn set_io_timeouts(&self, timeout: Duration) -> std::io::Result<()> {
+        self.set_io_timeout(timeout)
+    }
+}
+
+/// Bounds every read and write on a socket by one absolute deadline.
+///
+/// Socket timeouts apply per system call, so a peer sending one byte at a
+/// time would otherwise restart them indefinitely. The remaining time is
+/// recomputed and armed before every call instead.
+struct DeadlineIo<'a, S> {
+    socket: &'a mut S,
+    deadline: Instant,
+}
+
+impl<'a, S: IoTimeouts> DeadlineIo<'a, S> {
+    fn new(socket: &'a mut S, deadline: Instant) -> Self {
+        Self { socket, deadline }
+    }
+
+    /// Arms the socket timeouts with the remaining time.
+    fn arm(&self) -> std::io::Result<()> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request deadline elapsed",
+            ));
+        }
+        match self.socket.set_io_timeouts(remaining) {
+            // macOS rejects socket options once the peer has closed the
+            // connection. Calls then return buffered data, EOF, or an error
+            // without blocking, and the timeout armed earlier still applies.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            result => result,
+        }
+    }
+}
+
+/// Reports whether a socket call stopped at its armed timeout.
+fn socket_timed_out(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+impl<S: IoTimeouts + Read> Read for DeadlineIo<'_, S> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            self.arm()?;
+            match self.socket.read(buffer) {
+                // A timeout firing early re-arms with whatever time is left.
+                Err(error) if socket_timed_out(&error) => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+impl<S: IoTimeouts + Write> Write for DeadlineIo<'_, S> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        loop {
+            self.arm()?;
+            match self.socket.write(buffer) {
+                Err(error) if socket_timed_out(&error) => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.arm()?;
+        self.socket.flush()
     }
 }
 
@@ -427,12 +637,27 @@ fn connect_tcp(
     endpoint: &DaemonEndpoint,
     timeout: Duration,
 ) -> Result<DaemonStream, DaemonClientError> {
-    let auth = endpoint.transport_auth.as_ref().ok_or_else(|| {
-        DaemonClientError::LegacyUnauthenticatedTcp {
+    let auth = tcp_auth(endpoint)?;
+    let mut stream = open_tcp(address, endpoint, timeout)?;
+    authenticate_tcp(&mut stream, auth, endpoint)?;
+    Ok(DaemonStream::Tcp(stream))
+}
+
+fn tcp_auth(endpoint: &DaemonEndpoint) -> Result<&DaemonTransportAuth, DaemonClientError> {
+    endpoint
+        .transport_auth
+        .as_ref()
+        .ok_or_else(|| DaemonClientError::LegacyUnauthenticatedTcp {
             endpoint: endpoint.address.clone(),
-        }
-    })?;
-    let mut stream = TcpStream::connect(address).map_err(|source| DaemonClientError::Io {
+        })
+}
+
+fn open_tcp(
+    address: &str,
+    endpoint: &DaemonEndpoint,
+    timeout: Duration,
+) -> Result<TcpStream, DaemonClientError> {
+    let stream = TcpStream::connect(address).map_err(|source| DaemonClientError::Io {
         operation: "failed to connect to daemon endpoint",
         endpoint: endpoint.address.clone(),
         source,
@@ -451,19 +676,26 @@ fn connect_tcp(
             endpoint: endpoint.address.clone(),
             source,
         })?;
-    write_frame(&mut stream, auth).map_err(|source| DaemonClientError::Frame {
+    Ok(stream)
+}
+
+/// Performs the TCP capability prelude before any request is sent.
+fn authenticate_tcp<S: Read + Write>(
+    stream: &mut S,
+    auth: &DaemonTransportAuth,
+    endpoint: &DaemonEndpoint,
+) -> Result<(), DaemonClientError> {
+    write_frame(stream, auth).map_err(|source| DaemonClientError::Frame {
         operation: "failed to write authentication prelude to",
         endpoint: endpoint.address.clone(),
         source,
     })?;
-    match read_frame(&mut stream).map_err(|source| DaemonClientError::Frame {
+    match read_frame(stream).map_err(|source| DaemonClientError::Frame {
         operation: "failed to read authentication response from",
         endpoint: endpoint.address.clone(),
         source,
     })? {
-        DaemonResponse::Ack { message } if message == "authenticated" => {
-            Ok(DaemonStream::Tcp(stream))
-        }
+        DaemonResponse::Ack { message } if message == "authenticated" => Ok(()),
         DaemonResponse::Error { message } => Err(DaemonClientError::AuthenticationRejected {
             endpoint: endpoint.address.clone(),
             message,
@@ -564,9 +796,12 @@ fn effective_uid() -> u32 {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Cursor;
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
 
     use packet28_daemon_protocol::message::DAEMON_TRANSPORT_SECRET_BYTES;
@@ -676,7 +911,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            matches!(error, DaemonClientError::Frame { .. }),
+            matches!(error, DaemonClientError::DeadlineElapsed { .. }),
             "unexpected error: {error}"
         );
         assert!(
@@ -702,7 +937,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            matches!(error, DaemonClientError::Frame { .. }),
+            matches!(error, DaemonClientError::DeadlineElapsed { .. }),
             "unexpected error: {error}"
         );
         assert!(
@@ -775,6 +1010,385 @@ mod tests {
 
         assert_eq!(status.pid, 4242);
         server.join().unwrap();
+    }
+
+    /// Interval between bytes a trickling peer sends.
+    const DRIBBLE_INTERVAL: Duration = Duration::from_millis(35);
+
+    fn status_response_wire() -> Vec<u8> {
+        let mut wire = Vec::new();
+        write_frame(
+            &mut wire,
+            &DaemonRegistryResponseV1::Status {
+                status: Box::new(DaemonStatusV1 {
+                    pid: 4242,
+                    ..DaemonStatusV1::default()
+                }),
+            },
+        )
+        .unwrap();
+        wire
+    }
+
+    fn ack_wire() -> Vec<u8> {
+        let mut wire = Vec::new();
+        write_frame(
+            &mut wire,
+            &DaemonResponse::Ack {
+                message: "authenticated".to_string(),
+            },
+        )
+        .unwrap();
+        wire
+    }
+
+    /// Writes the first `burst` bytes of `wire` at once, then one byte per
+    /// `interval` until done, the client hangs up, or `stop` is set. Returns
+    /// the number of bytes written.
+    fn dribble(
+        stream: &mut impl Write,
+        wire: &[u8],
+        burst: usize,
+        interval: Duration,
+        stop: &AtomicBool,
+    ) -> usize {
+        if stream.write_all(&wire[..burst]).is_err() {
+            return 0;
+        }
+        let mut sent = burst;
+        for byte in &wire[burst..] {
+            if stop.load(Ordering::SeqCst) || stream.write_all(&[*byte]).is_err() {
+                break;
+            }
+            sent += 1;
+            thread::sleep(interval);
+        }
+        sent
+    }
+
+    /// Asserts a dribbled response ended at its deadline: not before it, not
+    /// meaningfully after it, and after the peer made partial progress.
+    fn assert_ended_at_deadline(
+        error: &DaemonClientError,
+        operation: &str,
+        elapsed: Duration,
+        budget: Duration,
+        sent: usize,
+        total: usize,
+    ) {
+        assert!(
+            matches!(
+                error,
+                DaemonClientError::DeadlineElapsed { operation: actual, .. } if *actual == operation
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(
+            elapsed >= budget,
+            "request ended before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < budget + DEADLINE_SLACK,
+            "partial progress extended the deadline: {elapsed:?}"
+        );
+        assert!(sent >= 2, "peer made no partial progress: {sent} bytes");
+        assert!(
+            sent < total,
+            "the full response was sent: {sent} of {total} bytes"
+        );
+    }
+
+    fn dribbled_unix_status(burst: usize) {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("dribble.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let wire = status_response_wire();
+        let total = wire.len();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _: DaemonRegistryRequestV1 = read_frame(&mut stream).unwrap();
+            dribble(&mut stream, &wire, burst, DRIBBLE_INTERVAL, &server_stop)
+        });
+
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let error = request_status_v1(&unix_endpoint(&socket), started + budget).unwrap_err();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        let sent = server.join().unwrap();
+
+        assert_ended_at_deadline(
+            &error,
+            "reading status response from",
+            elapsed,
+            budget,
+            sent,
+            total,
+        );
+    }
+
+    #[test]
+    fn dribbled_unix_status_header_does_not_extend_the_deadline() {
+        dribbled_unix_status(0);
+    }
+
+    #[test]
+    fn dribbled_unix_status_body_does_not_extend_the_deadline() {
+        dribbled_unix_status(8);
+    }
+
+    fn tcp_endpoint(listener: &TcpListener, auth: &DaemonTransportAuth) -> DaemonEndpoint {
+        DaemonEndpoint {
+            address: format!("tcp://{}", listener.local_addr().unwrap()),
+            transport_auth: Some(auth.clone()),
+        }
+    }
+
+    #[test]
+    fn dribbled_tcp_authentication_does_not_extend_the_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let auth = DaemonTransportAuth::from_secret_bytes([0x61; DAEMON_TRANSPORT_SECRET_BYTES]);
+        let endpoint = tcp_endpoint(&listener, &auth);
+        let wire = ack_wire();
+        let total = wire.len();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let received: DaemonTransportAuth = read_frame(&mut stream).unwrap();
+            assert!(auth.authenticates(&received));
+            dribble(&mut stream, &wire, 0, DRIBBLE_INTERVAL, &server_stop)
+        });
+
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let error = request_status_v1(&endpoint, started + budget).unwrap_err();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        let sent = server.join().unwrap();
+
+        assert_ended_at_deadline(&error, "authenticating with", elapsed, budget, sent, total);
+    }
+
+    #[test]
+    fn dribbled_tcp_status_does_not_extend_the_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let auth = DaemonTransportAuth::from_secret_bytes([0x62; DAEMON_TRANSPORT_SECRET_BYTES]);
+        let endpoint = tcp_endpoint(&listener, &auth);
+        let wire = status_response_wire();
+        let total = wire.len();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let received: DaemonTransportAuth = read_frame(&mut stream).unwrap();
+            assert!(auth.authenticates(&received));
+            stream.write_all(&ack_wire()).unwrap();
+            let _: DaemonRegistryRequestV1 = read_frame(&mut stream).unwrap();
+            dribble(&mut stream, &wire, 0, DRIBBLE_INTERVAL, &server_stop)
+        });
+
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let error = request_status_v1(&endpoint, started + budget).unwrap_err();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        let sent = server.join().unwrap();
+
+        assert_ended_at_deadline(
+            &error,
+            "reading status response from",
+            elapsed,
+            budget,
+            sent,
+            total,
+        );
+    }
+
+    #[test]
+    fn partial_tcp_responses_completed_before_the_deadline_are_accepted() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let auth = DaemonTransportAuth::from_secret_bytes([0x63; DAEMON_TRANSPORT_SECRET_BYTES]);
+        let endpoint = tcp_endpoint(&listener, &auth);
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _: DaemonTransportAuth = read_frame(&mut stream).unwrap();
+            let interval = Duration::from_millis(1);
+            let ack = ack_wire();
+            assert_eq!(
+                dribble(&mut stream, &ack, 0, interval, &server_stop),
+                ack.len()
+            );
+            let _: DaemonRegistryRequestV1 = read_frame(&mut stream).unwrap();
+            let status = status_response_wire();
+            assert_eq!(
+                dribble(&mut stream, &status, 0, interval, &server_stop),
+                status.len()
+            );
+        });
+
+        let status = request_status_v1(&endpoint, Instant::now() + Duration::from_secs(30));
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(status.unwrap().pid, 4242);
+    }
+
+    #[test]
+    fn status_peer_eof_and_oversized_frames_fail_before_the_deadline() {
+        let oversized = (packet28_daemon_protocol::frame::MAX_SOCKET_MESSAGE_BYTES as u64 + 1)
+            .to_be_bytes()
+            .to_vec();
+        for (reply, expected) in [(vec![0_u8; 3], "eof"), (oversized, "too large")] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("short.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _: DaemonRegistryRequestV1 = read_frame(&mut stream).unwrap();
+                stream.write_all(&reply).unwrap();
+            });
+
+            let budget = Duration::from_secs(10);
+            let started = Instant::now();
+            let error = request_status_v1(&unix_endpoint(&socket), started + budget).unwrap_err();
+            server.join().unwrap();
+
+            assert!(
+                started.elapsed() < budget / 2,
+                "{expected} waited for the deadline"
+            );
+            match (&error, expected) {
+                (
+                    DaemonClientError::Frame {
+                        source: FrameError::Io(source),
+                        ..
+                    },
+                    "eof",
+                ) => assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof),
+                (
+                    DaemonClientError::Frame {
+                        source: FrameError::TooLarge { .. },
+                        ..
+                    },
+                    "too large",
+                ) => {}
+                _ => panic!("unexpected {expected} error: {error}"),
+            }
+        }
+    }
+
+    /// A socket whose final read returns the rest of a complete response
+    /// only after `delay`, as when the client is descheduled at the deadline.
+    struct LateSocket {
+        reply: Cursor<Vec<u8>>,
+        delay: Duration,
+    }
+
+    impl IoTimeouts for LateSocket {
+        fn set_io_timeouts(&self, _timeout: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Read for LateSocket {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = self.reply.get_ref().len() as u64 - self.reply.position();
+            if buffer.len() as u64 >= remaining {
+                thread::sleep(self.delay);
+            }
+            self.reply.read(buffer)
+        }
+    }
+
+    impl Write for LateSocket {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn complete_status_response_after_the_deadline_is_rejected() {
+        let endpoint = unix_endpoint(Path::new("late.sock"));
+        let mut on_time = LateSocket {
+            reply: Cursor::new(status_response_wire()),
+            delay: Duration::ZERO,
+        };
+        let response = exchange_status(
+            &mut on_time,
+            &endpoint,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            DaemonRegistryResponseV1::Status { status } if status.pid == 4242
+        ));
+
+        let mut late = LateSocket {
+            reply: Cursor::new(status_response_wire()),
+            delay: Duration::from_millis(200),
+        };
+        let error = exchange_status(
+            &mut late,
+            &endpoint,
+            Instant::now() + Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DaemonClientError::DeadlineElapsed {
+                    operation: "reading status response from",
+                    ..
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(late.reply.position(), late.reply.get_ref().len() as u64);
+    }
+
+    #[test]
+    fn runtime_workspace_must_name_the_requested_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let runtime = |workspace_root: &Path| DaemonRuntimeInfo {
+            pid: 4242,
+            workspace_root: workspace_root.to_string_lossy().to_string(),
+            ..DaemonRuntimeInfo::default()
+        };
+
+        verify_runtime_workspace(root, &runtime(root)).unwrap();
+        // Another spelling of the same directory still names it.
+        let alias = other.path().join("alias");
+        std::os::unix::fs::symlink(root, &alias).unwrap();
+        verify_runtime_workspace(&alias, &runtime(root)).unwrap();
+        verify_runtime_workspace(root, &runtime(&alias)).unwrap();
+        verify_runtime_workspace(&root.canonicalize().unwrap(), &runtime(root)).unwrap();
+
+        for published in [other.path(), Path::new(""), &root.join("missing")] {
+            let error = verify_runtime_workspace(root, &runtime(published)).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    DaemonClientError::ForeignWorkspace { pid: 4242, requested, .. }
+                        if requested == &root.to_string_lossy()
+                ),
+                "unexpected error: {error}"
+            );
+            assert!(error
+                .to_string()
+                .contains("refusing to use another workspace's daemon"));
+        }
     }
 
     #[test]
