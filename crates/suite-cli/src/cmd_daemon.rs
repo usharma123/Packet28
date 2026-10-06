@@ -69,6 +69,46 @@ pub enum StorageCommands {
     /// Report registry/checkpoint mismatches and corrupt task event logs, or
     /// restore exact checkpoint images and quarantine logs with `--apply`.
     Repair(StorageRepairArgs),
+    /// Plan, or with `--apply` perform, evidence-preserving archival of
+    /// oversized dormant task records through the running daemon.
+    ArchiveRecord(StorageArchiveRecordArgs),
+    /// Retrieve and verify the complete original of an archived task record.
+    ShowArchivedRecord(StorageShowArchivedRecordArgs),
+}
+
+#[derive(Args)]
+pub struct StorageArchiveRecordArgs {
+    #[arg(long, default_value = ".")]
+    pub root: String,
+    /// Exact task whose record to archive.
+    #[arg(
+        long,
+        conflicts_with = "min_record_bytes",
+        required_unless_present = "min_record_bytes"
+    )]
+    pub task_id: Option<String>,
+    /// Select every record at least this many compact-JSON bytes (minimum 65536).
+    #[arg(long)]
+    pub min_record_bytes: Option<u64>,
+    /// Archive the selected records. Without this flag, archival is a dry run.
+    #[arg(long)]
+    pub apply: bool,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub pretty: bool,
+}
+
+#[derive(Args)]
+pub struct StorageShowArchivedRecordArgs {
+    #[arg(long, default_value = ".")]
+    pub root: String,
+    /// Archived task whose original record to retrieve.
+    #[arg(long)]
+    pub task_id: String,
+    /// Write the verified record to this new file instead of standard output.
+    #[arg(long)]
+    pub output: Option<String>,
 }
 
 #[derive(Args)]

@@ -61,6 +61,8 @@ pub(crate) fn daemon_test_state_with_persistence_debounce(
         shutdown: ShutdownSignal::new(),
         changes: StateChangeSignal::new(),
         shutting_down: false,
+        task_maintenance: Default::default(),
+        record_sizes: Default::default(),
     }));
     TestDaemonState {
         state,

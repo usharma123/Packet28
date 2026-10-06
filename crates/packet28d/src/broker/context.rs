@@ -364,7 +364,7 @@ pub(crate) fn broker_get_context(
     }
     {
         let mut guard = state.lock().map_err(lock_err)?;
-        let task = ensure_task_record_mut(&mut guard.tasks, &request.task_id);
+        let task = ensure_task_record_mut(&mut guard, &request.task_id)?;
         ensure_context_version(task);
         let mut session_request = request.clone();
         session_request.since_version = None;

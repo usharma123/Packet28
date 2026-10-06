@@ -67,6 +67,67 @@ size-based candidate is selected when managed bytes equal the size limit.
 Size cleanup selects the oldest eligible candidates first. Applying an
 age-based plan may also bring the store below a configured size bound.
 
+## Oversized task records
+
+A task record whose compact JSON exceeds 1 MiB cannot be carried by a registry
+page: listings omit it (`omitted_oversized`) so the rest of the store stays
+available, but the record itself becomes hard to inspect. Packet28 warns
+before that point. Every record at or above 512 KiB is reported:
+
+- by `daemon storage inspect` as `record_size_warnings` (largest first, with
+  `warning` or `over_page_limit` levels), with or without a running daemon;
+- by the daemon's bounded status (`record_size_warning_count` and up to 32
+  `record_size_warnings`), refreshed on every task write;
+- in `packet28d.log` once per threshold crossing, with the command to plan
+  archival.
+
+`cleanup --max-bytes` is a whole-task, oldest-first deletion bound and requires
+a stopped daemon, so it can select older healthy tasks before the oversized one
+and cannot run beside a live daemon. Targeted record archival is the online,
+evidence-preserving alternative:
+
+```console
+# Plan (no changes) for one exact task, or every record of at least 64 KiB.
+Packet28 daemon storage archive-record --root . --task-id task-big
+Packet28 daemon storage archive-record --root . --min-record-bytes 524288 --json
+
+# Archive while packet28d keeps serving every other task.
+Packet28 daemon storage archive-record --root . --task-id task-big --apply
+
+# Retrieve and verify the complete original record.
+Packet28 daemon storage show-archived-record --root . --task-id task-big \
+  --output task-big.record.json
+```
+
+Archival never deletes evidence. The serving daemon writes the complete
+original record to `.packet28/task/<task-id>/record-archive/<blake3>.task-record.json`
+(owner-only, synchronized, read back, never replaced), then replaces the
+registry record with a compact tombstone through the registry WAL. The
+tombstone keeps the task identity, lifecycle, event high-water, watch
+relationships, recovery links, and every top-level value of at most 4 KiB; an
+`archived` pointer records the blake3 digest and exact length of the archive,
+the omitted field names and sizes, the reason, and the inspection command. The
+event log and task artifacts are untouched, and unselected records are not
+rewritten.
+
+Size selection never goes below 64 KiB, and exact targeting refuses records
+below that floor. Archival refuses running, cancelling, replan-pending, and
+agent-active tasks; the agent's active task; tasks with active watches or
+in-progress daemon work; recovery predecessors and successors; and tasks named
+by another record's handoff or bootstrap ownership. A per-task maintenance
+fence is admitted only when no client request names the task and blocks every
+later mutation of it; the daemon lock is never held across archive I/O. An
+archived task is terminal: continuation, event appends (including standalone
+writers), and re-registration of its identity are rejected; status, listing,
+and idempotent cancellation still return the tombstone.
+
+A crash before the tombstone is durable leaves the original record
+authoritative and at most an unreferenced archive, which a retry reuses. Once
+the tombstone is durable, its pointer is the only authority for the original.
+Whole-task retention removes an archive together with the task's registry
+record, event log, and artifacts, because the archive lives in that task's
+artifact namespace.
+
 ## Safety model
 
 Retention resolves the workspace and requires `.packet28` to be a real

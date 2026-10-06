@@ -274,6 +274,17 @@ pub enum DaemonCoreError {
         successor_task_id: String,
     },
 
+    /// A task record is an archived tombstone and cannot be continued.
+    #[error(
+        "task {task_id:?} is an archived record tombstone; its original record is preserved by {archive_file:?}"
+    )]
+    TaskArchived {
+        /// Fenced task identifier that was addressed.
+        task_id: String,
+        /// Digest-named archive file relative to the workspace state directory.
+        archive_file: String,
+    },
+
     /// A durable mutation completed before its storage authority was lost.
     ///
     /// The mutation must not be retried blindly: its bytes may already be
@@ -455,6 +466,9 @@ impl DaemonCoreError {
             }
             Self::TaskSuperseded { .. } => {
                 "Continue with the successor task; the superseded task keeps its quarantined history for inspection."
+            }
+            Self::TaskArchived { .. } => {
+                "Start a new task; inspect the archived original with `Packet28 daemon storage show-archived-record`."
             }
             Self::StorageMutationAuthorityLost { .. } => {
                 "Do not retry blindly; inspect the canonical file and registry under an authenticated lock first."

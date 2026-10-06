@@ -50,6 +50,6 @@ pub(crate) mod testing {
     };
     pub(crate) use super::support::{
         broker_default_budget_tokens, build_repo_map_envelope, emit_task_event,
-        emit_task_event_for_generation, inherit_broker_request_defaults,
+        emit_task_event_for_generation, inherit_broker_request_defaults, set_context_reason,
     };
 }

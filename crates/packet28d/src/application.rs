@@ -194,6 +194,12 @@ pub fn serve(root: PathBuf) -> Result<()> {
     }
     persistence.stage_and_flush(startup_delta)?;
     persistence.checkpoint_current()?;
+    // Size every record once so near-limit and unlistable records are logged
+    // and reported by status from the first request.
+    let record_sizes = crate::task_maintenance::RecordSizeIndex::default();
+    for task in tasks.tasks.values() {
+        record_sizes.observe(task);
+    }
     let manifest = load_index_manifest_file(&root);
     let interactive_index = load_index_runtime_files(&root, manifest);
     let (index_tx, index_rx) = IndexIngress::new();
@@ -223,6 +229,8 @@ pub fn serve(root: PathBuf) -> Result<()> {
         shutdown: shutdown.clone(),
         changes: StateChangeSignal::new(),
         shutting_down: false,
+        task_maintenance: Default::default(),
+        record_sizes,
     }));
     crate::broker::inherit_recovered_agent_state(&state)?;
     let recovered_replans =

@@ -315,6 +315,7 @@ pub(crate) fn mark_handoff_consumed(
     handoff_id: &str,
 ) -> Result<Option<BrokerHandoffDescriptor>> {
     let mut guard = state.lock().map_err(lock_err)?;
+    guard.require_task_mutable(task_id)?;
     let Some(task) = guard.tasks.tasks.get_mut(task_id) else {
         return Ok(None);
     };
@@ -599,7 +600,7 @@ pub(crate) fn write_broker_artifacts(
     let generated_at = now_unix_millis();
     {
         let mut guard = state.lock().map_err(lock_err)?;
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id)?;
         task.latest_brief_path = Some(brief_md_path.to_string_lossy().to_string());
         task.latest_brief_hash = Some(hash.clone());
         task.latest_brief_generated_at_unix = Some(generated_at);
@@ -899,7 +900,7 @@ pub(crate) fn broker_prepare_handoff(
     };
     {
         let mut guard = state.lock().map_err(lock_err)?;
-        let task = ensure_task_record_mut(&mut guard.tasks, &request.task_id);
+        let task = ensure_task_record_mut(&mut guard, &request.task_id)?;
         promote_new_ready_handoff(task, handoff.clone());
         persist_task(&guard, &request.task_id)?;
     }

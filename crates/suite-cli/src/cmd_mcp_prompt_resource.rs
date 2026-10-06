@@ -245,6 +245,8 @@ fn daemon_status_with_omissions(
         registry_revision,
         index_truncated: _,
         index,
+        record_size_warning_count: _,
+        record_size_warnings: _,
     } = status;
     let revision =
         registry_revision.ok_or_else(|| anyhow!("daemon registry status omitted its revision"))?;

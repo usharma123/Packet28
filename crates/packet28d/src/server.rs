@@ -228,20 +228,28 @@ where
             after_seq,
         } = request
         {
-            // A superseded identity never receives another event. Refuse it
-            // explicitly instead of leaving a subscriber silently idle.
-            if let Err(error) = reject_superseded_tasks(&state, [task_id.as_str()]) {
-                let message = format!("{error:#}");
-                daemon_log(&format!("daemon request failed: {message}"));
-                write_async_frame(
-                    &mut stream,
-                    DaemonResponse::Error { message },
-                    config.frame_write_timeout,
-                    &blocking_pool,
-                )
-                .await?;
-                return Ok(());
-            }
+            // A superseded or archived identity never receives another
+            // event. Refuse it explicitly instead of leaving a subscriber
+            // silently idle. The admission also keeps record maintenance off
+            // the task for the subscription's lifetime.
+            let admission =
+                match crate::task_maintenance::admit_task_request(&state, &[], &[task_id.as_str()])
+                {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        daemon_log(&format!("daemon request failed: {message}"));
+                        write_async_frame(
+                            &mut stream,
+                            DaemonResponse::Error { message },
+                            config.frame_write_timeout,
+                            &blocking_pool,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let _admission = admission;
             return handle_task_subscribe(
                 state,
                 &mut stream,
@@ -327,10 +335,27 @@ pub(crate) fn continued_task_ids(request: &DaemonRequest) -> Vec<&str> {
     }
 }
 
-/// Fails when any named task was superseded by a linked history recovery.
+/// Returns tasks a request may mutate without continuing them.
+///
+/// Cancellation and broker status stay available for superseded and archived
+/// identities, but they still count as in flight so record maintenance cannot
+/// be admitted underneath them.
+pub(crate) fn maintained_task_ids(request: &DaemonRequest) -> Vec<&str> {
+    match request {
+        DaemonRequest::TaskCancel { task_id } => vec![task_id.as_str()],
+        DaemonRequest::BrokerTaskStatus { request } => vec![request.task_id.as_str()],
+        _ => Vec::new(),
+    }
+}
+
+/// Fails when any named task was superseded by a linked history recovery or
+/// archived into a record tombstone.
 ///
 /// Recovery assigns `superseded_by` only before readiness and no request
-/// clears it, so this check cannot race a concurrent supersession.
+/// clears it. Archival happens while serving, so request dispatch uses
+/// [`crate::task_maintenance::admit_task_request`], which performs this check
+/// and the maintenance-fence check in one critical section.
+#[cfg(test)]
 pub(crate) fn reject_superseded_tasks<'a>(
     state: &Arc<Mutex<DaemonState>>,
     task_ids: impl IntoIterator<Item = &'a str>,
@@ -350,7 +375,11 @@ async fn dispatch_request(
     request: DaemonRequest,
     blocking_pool: &BlockingPool,
 ) -> Result<DaemonResponse> {
-    reject_superseded_tasks(&state, continued_task_ids(&request))?;
+    let _admission = crate::task_maintenance::admit_task_request(
+        &state,
+        &maintained_task_ids(&request),
+        &continued_task_ids(&request),
+    )?;
     match request {
         DaemonRequest::TaskAwaitHandoff { request } => {
             let response = await_task_handoff(state, request, blocking_pool.clone()).await?;
@@ -1025,6 +1054,7 @@ fn handle_registry_request_v1(
     state: Arc<Mutex<DaemonState>>,
     request: DaemonRegistryRequestV1,
 ) -> Result<DaemonRegistryResponseV1> {
+    let state_handle = state.clone();
     let mut state = state.lock().map_err(lock_err)?;
     match request {
         DaemonRegistryRequestV1::Status => Ok(DaemonRegistryResponseV1::Status {
@@ -1034,6 +1064,12 @@ fn handle_registry_request_v1(
             let revision = state.registry_revision();
             Ok(DaemonRegistryResponseV1::TaskListPage {
                 page: build_task_list_page(&state.tasks.tasks, &revision, &request)?,
+            })
+        }
+        DaemonRegistryRequestV1::TaskRecordArchive { request } => {
+            drop(state);
+            Ok(DaemonRegistryResponseV1::TaskRecordArchive {
+                report: crate::task_archive::archive_task_records(state_handle, request)?,
             })
         }
         DaemonRegistryRequestV1::WatchListPage { request } => {

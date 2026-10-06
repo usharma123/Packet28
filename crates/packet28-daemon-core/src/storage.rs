@@ -39,6 +39,7 @@ use crate::{DaemonCoreError, Result};
 
 mod checkpoint;
 mod event_tail;
+pub mod record_archive;
 mod registry_delta;
 mod registry_repair;
 
@@ -1703,21 +1704,31 @@ fn encode_task_registry_preserving_existing(
                 ),
             ));
         };
-        let mut merged = existing_tasks
-            .get(task_id)
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        // These additive lifecycle markers and history links are known fields
-        // even when their absent value is represented by omission. Remove an
-        // older value before overlaying the newly serialized record so
-        // forward-field preservation cannot resurrect a completed transition
-        // or attach stale provenance to a replaced record.
+        // An archived tombstone deliberately sheds the original's large
+        // values; its archive holds them. Forward-field preservation must not
+        // copy them back from the previous checkpoint.
+        let mut merged = if record.archived.is_some() {
+            serde_json::Map::new()
+        } else {
+            existing_tasks
+                .get(task_id)
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+        };
+        // These additive lifecycle markers, history links, and omitted-when-
+        // empty collections are known fields even when their absent value is
+        // represented by omission. Remove an older value before overlaying the
+        // newly serialized record so forward-field preservation cannot
+        // resurrect a completed transition, stale provenance, or discarded
+        // handoff descriptors on a replaced record.
         for known_optional_field in [
             "cancelled",
             "recovered_replan",
             "superseded_by",
             "recovered_from",
+            "handoffs",
+            "archived",
         ] {
             merged.remove(known_optional_field);
         }
@@ -3670,14 +3681,23 @@ pub(super) fn require_registered_task_storage_id(
 ///
 /// Returns [`DaemonCoreError::TaskSuperseded`] naming the successor when
 /// `task.superseded_by` is present.
+///
+/// An archived record tombstone is equally terminal and returns
+/// [`DaemonCoreError::TaskArchived`].
 pub fn require_continuable_task(task: &TaskRecord) -> Result<()> {
-    match &task.superseded_by {
-        Some(link) => Err(DaemonCoreError::TaskSuperseded {
+    if let Some(link) = &task.superseded_by {
+        return Err(DaemonCoreError::TaskSuperseded {
             task_id: task.task_id.clone(),
             successor_task_id: link.successor_task_id.clone(),
-        }),
-        None => Ok(()),
+        });
     }
+    if let Some(archive) = &task.archived {
+        return Err(DaemonCoreError::TaskArchived {
+            task_id: task.task_id.clone(),
+            archive_file: archive.archive_file.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn with_registered_task_storage_id<T>(

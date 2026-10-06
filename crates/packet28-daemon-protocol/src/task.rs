@@ -476,6 +476,64 @@ pub struct TaskRecord {
     /// Present on the new task created to continue a superseded task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovered_from: Option<TaskHistoryRecovery>,
+    /// Present on a compact tombstone whose complete original record was moved
+    /// to an immutable, digest-authenticated archive.
+    ///
+    /// The record keeps its identity, lifecycle, event high-water, watch
+    /// relationships, and history links. It is terminal and fenced: no
+    /// mutation, event append, or continuation may target it. Absent fields
+    /// keep the legacy encoding unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<TaskRecordArchive>,
+}
+
+/// Current schema of [`TaskRecordArchive`] pointers.
+pub const TASK_RECORD_ARCHIVE_SCHEMA_VERSION: u32 = 1;
+
+/// Durable pointer from a compact tombstone to its archived original record.
+///
+/// The pointer lives in the authenticated task registry, so the digest and
+/// byte length authenticate the archive file. `archive_file` is display
+/// metadata relative to the workspace state directory, not path authority.
+///
+/// # Examples
+///
+/// ```
+/// use packet28_daemon_protocol::task::{TaskRecord, TaskRecordArchive};
+///
+/// let tombstone = TaskRecord {
+///     task_id: "task-big".to_string(),
+///     archived: Some(TaskRecordArchive {
+///         digest: "blake3:00".to_string(),
+///         original_encoded_bytes: 2_000_000,
+///         ..TaskRecordArchive::default()
+///     }),
+///     ..TaskRecord::default()
+/// };
+/// assert!(tombstone.archived.is_some());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TaskRecordArchive {
+    /// Pointer schema version.
+    pub schema_version: u32,
+    /// `blake3:<hex>` digest of the exact archived compact-JSON record bytes.
+    pub digest: String,
+    /// Exact byte length of the archived record.
+    pub original_encoded_bytes: u64,
+    /// Compact-JSON size of the tombstone written in place of the original.
+    pub tombstone_encoded_bytes: u64,
+    /// Archive commit time.
+    pub archived_at_unix: u64,
+    /// Why the record was archived.
+    pub reason: String,
+    /// Archive file relative to the workspace `.packet28` directory.
+    pub archive_file: String,
+    /// Top-level fields omitted from the tombstone, with their original
+    /// compact-JSON value sizes. Every omitted value remains in the archive.
+    pub omitted_fields: BTreeMap<String, u64>,
+    /// Command that retrieves and verifies the complete original record.
+    pub inspect_command: String,
 }
 
 /// Durable provenance linking a damaged task identity to its continuation.

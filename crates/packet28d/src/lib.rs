@@ -99,6 +99,8 @@ mod runtime_files;
 mod runtime_files_unix;
 mod server;
 mod state;
+mod task_archive;
+mod task_maintenance;
 mod watch;
 
 use crate::commands::{
@@ -148,12 +150,14 @@ fn persist_task(state: &DaemonState, task_id: &str) -> Result<()> {
 }
 
 fn mark_task_dirty(state: &DaemonState, task_id: &str) -> Result<u64> {
+    state.require_task_mutable(task_id)?;
     let task = state
         .tasks
         .tasks
         .get(task_id)
         .cloned()
         .ok_or_else(|| anyhow!("cannot persist missing task '{task_id}'"))?;
+    state.record_sizes.observe(&task);
     state
         .persistence
         .stage(RegistryDelta::default().upsert_task(task))

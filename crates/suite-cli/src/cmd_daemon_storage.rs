@@ -15,8 +15,8 @@ use packet28_daemon_core::storage::{
 use serde_json::{json, Value};
 
 use crate::cmd_daemon::{
-    resolve_root_arg, StorageArgs, StorageCleanupArgs, StorageCommands, StorageInspectArgs,
-    StorageRepairArgs,
+    resolve_root_arg, StorageArchiveRecordArgs, StorageArgs, StorageCleanupArgs, StorageCommands,
+    StorageInspectArgs, StorageRepairArgs, StorageShowArchivedRecordArgs,
 };
 
 /// Executes the selected daemon storage operation.
@@ -36,7 +36,170 @@ pub(crate) fn run_storage(args: StorageArgs) -> Result<i32> {
         StorageCommands::Inspect(args) => run_inspect(args),
         StorageCommands::Cleanup(args) => run_cleanup(args),
         StorageCommands::Repair(args) => run_repair(args),
+        StorageCommands::ArchiveRecord(args) => run_archive_record(args),
+        StorageCommands::ShowArchivedRecord(args) => run_show_archived_record(args),
     }
+}
+
+/// Plans or applies archival of oversized dormant records via the daemon.
+///
+/// Archival runs inside the serving daemon so other tasks stay available. A
+/// dry run is the default; `--apply` is required to change state.
+///
+/// # Errors
+///
+/// Returns an error when the daemon cannot be reached or rejects the selector.
+#[cfg(unix)]
+fn run_archive_record(args: StorageArchiveRecordArgs) -> Result<i32> {
+    use packet28_daemon_protocol::registry::{
+        DaemonRegistryRequestV1, DaemonRegistryResponseV1, TaskRecordArchiveOutcome,
+        TaskRecordArchiveRequestV1,
+    };
+
+    let root = resolve_root_arg(&args.root);
+    let mut client = crate::cmd_daemon::PersistentDaemonClient::connect(&root)?;
+    let request = DaemonRegistryRequestV1::TaskRecordArchive {
+        request: TaskRecordArchiveRequestV1 {
+            task_id: args.task_id,
+            min_record_bytes: args.min_record_bytes,
+            apply: args.apply,
+        },
+    };
+    let report = match client.send_registry_request(&request)? {
+        DaemonRegistryResponseV1::TaskRecordArchive { report } => report,
+        DaemonRegistryResponseV1::Error { message } if message.contains("unknown variant") => {
+            bail!(
+                "the running daemon does not support record archival; restart it with this                  Packet28 version ({message})"
+            )
+        }
+        DaemonRegistryResponseV1::Error { message } => bail!(message),
+        other => bail!("unexpected daemon registry response: {other:?}"),
+    };
+    if args.json {
+        let rendered = if args.pretty {
+            serde_json::to_string_pretty(&report)?
+        } else {
+            serde_json::to_string(&report)?
+        };
+        println!("{rendered}");
+    } else {
+        println!(
+            "mode={} daemon_pid={} candidates={} remaining_candidates={}",
+            if report.apply { "apply" } else { "dry_run" },
+            report.daemon_pid,
+            report.candidates.len(),
+            report.remaining_candidates
+        );
+        for candidate in &report.candidates {
+            println!(
+                "task_id={} encoded_bytes={} outcome={}",
+                candidate.task_id,
+                candidate.encoded_bytes,
+                serde_json::to_value(candidate.outcome)?
+                    .as_str()
+                    .unwrap_or("unknown")
+            );
+            if let Some(reason) = &candidate.reason {
+                println!("  reason={reason}");
+            }
+            if let Some(archive) = &candidate.archive {
+                println!(
+                    "  archive={} digest={} tombstone_bytes={}",
+                    archive.archive_file, archive.digest, archive.tombstone_encoded_bytes
+                );
+                let omitted = archive
+                    .omitted_fields
+                    .iter()
+                    .map(|(field, bytes)| format!("{field}:{bytes}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!("  omitted_fields=[{omitted}]");
+                println!("  inspect: {}", archive.inspect_command);
+            }
+        }
+        if !report.apply
+            && report
+                .candidates
+                .iter()
+                .any(|candidate| candidate.outcome == TaskRecordArchiveOutcome::WouldArchive)
+        {
+            println!("re-run with --apply to archive (the daemon keeps serving other tasks)");
+        }
+    }
+    let unsuccessful = report.candidates.iter().any(|candidate| {
+        matches!(
+            candidate.outcome,
+            TaskRecordArchiveOutcome::Refused | TaskRecordArchiveOutcome::Failed
+        )
+    });
+    Ok(i32::from(unsuccessful))
+}
+
+#[cfg(not(unix))]
+fn run_archive_record(_args: StorageArchiveRecordArgs) -> Result<i32> {
+    bail!("task record archival requires the Unix daemon")
+}
+
+/// Retrieves the archived original of a task record and verifies its digest,
+/// length, and identity before emitting it.
+///
+/// The tombstone is read from the daemon; the archive itself is read locally
+/// and bounded by the recorded length, never sent over the daemon socket.
+///
+/// # Errors
+///
+/// Returns an error when the task is not archived or the archive does not
+/// authenticate.
+#[cfg(unix)]
+fn run_show_archived_record(args: StorageShowArchivedRecordArgs) -> Result<i32> {
+    use packet28_daemon_protocol::message::{DaemonRequest, DaemonResponse};
+    use std::io::Write as _;
+
+    let root = resolve_root_arg(&args.root);
+    let tombstone = match crate::cmd_daemon::send_request(
+        &root,
+        &DaemonRequest::TaskStatus {
+            task_id: args.task_id.clone(),
+        },
+    )? {
+        DaemonResponse::TaskStatus { task: Some(task) } => task,
+        DaemonResponse::TaskStatus { task: None } => bail!("task '{}' not found", args.task_id),
+        DaemonResponse::Error { message } => bail!(message),
+        other => bail!("unexpected daemon response: {other:?}"),
+    };
+    if tombstone.archived.is_none() {
+        bail!("task '{}' is not an archived record", args.task_id);
+    }
+    let bytes =
+        packet28_daemon_core::storage::record_archive::read_task_record_archive(&root, &tombstone)?;
+    match args.output {
+        Some(output) => {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&output)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            eprintln!(
+                "wrote verified archived record task_id={} bytes={} to {output}",
+                args.task_id,
+                bytes.len()
+            );
+        }
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&bytes)?;
+            stdout.write_all(b"\n")?;
+        }
+    }
+    Ok(0)
+}
+
+#[cfg(not(unix))]
+fn run_show_archived_record(_args: StorageShowArchivedRecordArgs) -> Result<i32> {
+    bail!("task record archival requires the Unix daemon")
 }
 
 /// Inspects or repairs canonical task/watch registry images and corrupt task
@@ -462,6 +625,28 @@ fn render_text(report: &TaskStoreReport) -> Result<String> {
             quoted(&issue.message)?
         );
     }
+    if !report.record_size_warnings.is_empty() {
+        let _ = writeln!(
+            output,
+            "record_size_warnings={}",
+            report.record_size_warnings.len()
+        );
+        for warning in &report.record_size_warnings {
+            let _ = writeln!(
+                output,
+                "record_size_warning task_id={} encoded_bytes={} level={} hint={}",
+                quoted(&warning.task_id)?,
+                warning.encoded_bytes,
+                serde_json::to_value(warning.level)?
+                    .as_str()
+                    .unwrap_or("unknown"),
+                quoted(&format!(
+                    "Packet28 daemon storage archive-record --task-id {}",
+                    warning.task_id
+                ))?
+            );
+        }
+    }
     Ok(output)
 }
 
@@ -709,6 +894,7 @@ mod tests {
                 path: "/fixture/workspace/.packet28/unknown".to_string(),
                 message: "unsupported special file".to_string(),
             }],
+            record_size_warnings: Vec::new(),
         }
     }
 

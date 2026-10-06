@@ -189,6 +189,8 @@ fn test_state() -> TestDaemonState {
         shutdown: ShutdownSignal::new(),
         changes: StateChangeSignal::new(),
         shutting_down: false,
+        task_maintenance: Default::default(),
+        record_sizes: Default::default(),
     }));
     TestDaemonState {
         state,
@@ -348,7 +350,7 @@ fn invalid_utf8_hook_runtime_config_rejects_handoff_without_state_or_byte_mutati
     let task_id = "task-invalid-utf8-handoff";
     {
         let mut guard = state.lock().unwrap();
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id).unwrap();
         task.hook_window_est_tokens = 10;
         task.hook_window_est_bytes = 40;
     }
@@ -1443,7 +1445,7 @@ fn session_bootstrap_deduplicates_delivery_not_general_hook_activity() {
     let task_id = "bootstrap";
     {
         let mut guard = state.lock().unwrap();
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id).unwrap();
         task.latest_handoff_artifact_id = Some("artifact-one".to_string());
         task.latest_context_version = Some("version-one".to_string());
     }
@@ -1524,8 +1526,9 @@ fn missing_or_unreadable_bootstrap_does_not_mark_delivery_and_can_retry() {
     let state = test_state();
     let root = state.lock().unwrap().root.clone();
     let task_id = "bootstrap-retry";
-    ensure_task_record_mut(&mut state.lock().unwrap().tasks, task_id).latest_handoff_artifact_id =
-        Some("artifact".to_string());
+    ensure_task_record_mut(&mut state.lock().unwrap(), task_id)
+        .unwrap()
+        .latest_handoff_artifact_id = Some("artifact".to_string());
     let path = task_brief_markdown_path(&root, &task_storage_id(task_id).unwrap());
     assert!(
         hook_task_additional_context(&state, task_id, Some("session"))
@@ -1572,7 +1575,7 @@ fn inherited_bootstrap_authenticates_owner_and_version_without_copying_brief() {
     {
         let mut guard = state.lock().unwrap();
         for id in ["old", "middle", "new"] {
-            ensure_task_record_mut(&mut guard.tasks, id);
+            ensure_task_record_mut(&mut guard, id).unwrap();
         }
         for (old, new) in [("old", "middle"), ("middle", "new")] {
             let link = TaskHistoryRecovery {
@@ -1667,7 +1670,10 @@ fn bootstrap_owner_validation_rejects_cycles_and_overlong_chains() {
     let mut tasks = TaskRegistry::default();
     for index in 0..65 {
         let id = format!("task-{index}");
-        ensure_task_record_mut(&mut tasks, &id);
+        tasks.tasks.entry(id.clone()).or_insert_with(|| TaskRecord {
+            task_id: id.clone(),
+            ..TaskRecord::default()
+        });
         if index > 0 {
             let predecessor = format!("task-{}", index - 1);
             let link = TaskHistoryRecovery {
@@ -1701,7 +1707,7 @@ fn bootstrap_persistence_rejection_restores_markers_and_allows_retry() {
     let task_id = "bootstrap-persistence-retry";
     {
         let mut guard = state.lock().unwrap();
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id).unwrap();
         task.latest_handoff_artifact_id = Some("new-artifact".to_string());
         task.latest_context_version = Some("new-context".to_string());
         task.latest_hook_bootstrap_context_version = Some("old-context".to_string());

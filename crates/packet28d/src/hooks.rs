@@ -147,7 +147,7 @@ fn hook_task_additional_context_with_persistence(
     let Some(brief) = brief.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
     };
-    let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+    let task = ensure_task_record_mut(&mut guard, task_id)?;
     let previous = (
         task.latest_hook_bootstrap_context_version.clone(),
         task.latest_hook_bootstrap_session_id.clone(),
@@ -163,7 +163,7 @@ fn hook_task_additional_context_with_persistence(
     task.latest_hook_bootstrap_at_unix = Some(now_unix());
     task.latest_agent_handoff_artifact_id = Some(artifact_id);
     if let Err(error) = persist(&guard, task_id) {
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id)?;
         (
             task.latest_hook_bootstrap_context_version,
             task.latest_hook_bootstrap_session_id,
@@ -197,7 +197,7 @@ fn maybe_prepare_handoff_from_hooks(
     let effective_budget = config.effective_budget(host_budget);
     if boundary_kind != HookBoundaryKind::None {
         let mut guard = state.lock().map_err(lock_err)?;
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id)?;
         task.latest_hook_boundary_at_unix = Some(now_unix_millis());
         task.latest_hook_boundary_kind = Some(format!("{boundary_kind:?}").to_ascii_lowercase());
         task.hook_soft_threshold_tokens = config
@@ -270,7 +270,7 @@ fn maybe_prepare_handoff_from_hooks(
             .or(status.latest_context_version);
         if prepared.handoff_ready {
             let mut guard = state.lock().map_err(lock_err)?;
-            let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+            let task = ensure_task_record_mut(&mut guard, task_id)?;
             task.latest_hook_handoff_reason = response.handoff_reason.clone();
             task.hook_threshold_exceeded = false;
             task.hook_window_est_tokens = 0;
@@ -602,7 +602,7 @@ pub(crate) fn hook_ingest(
 
     {
         let mut guard = state.lock().map_err(lock_err)?;
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id)?;
         task.latest_hook_session_id = request.session_id.clone();
         task.latest_hook_event_at_unix = Some(now_unix());
         task.hook_soft_threshold_tokens = prepare_threshold;
@@ -642,7 +642,7 @@ pub(crate) fn hook_ingest(
         };
         {
             let mut guard = state.lock().map_err(lock_err)?;
-            let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+            let task = ensure_task_record_mut(&mut guard, task_id)?;
             // Each completed execution is fresh evidence, even when output repeats.
             cache_hit = !matches!(request.event_kind, HookEventKind::CommandFinished)
                 && cache_hit_for_packet(task, packet);
@@ -728,7 +728,7 @@ pub(crate) fn hook_ingest(
                 broker_write_state_batch(state.clone(), BrokerWriteStateBatchRequest { requests })?;
             {
                 let mut guard = state.lock().map_err(lock_err)?;
-                let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+                let task = ensure_task_record_mut(&mut guard, task_id)?;
                 task.hook_window_est_tokens = task
                     .hook_window_est_tokens
                     .saturating_add(packet.est_tokens);
