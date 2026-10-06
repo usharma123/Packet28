@@ -25,13 +25,33 @@ use serde::Serialize;
 
 const SEEDED_TASKS: usize = 5_000;
 
-struct DaemonChild(Child);
+struct DaemonChild {
+    process: Child,
+    // An unmanaged daemon does not create the log path, so retain its stdio
+    // (panics and startup errors) outside the indexed workspace for failures.
+    stdio: tempfile::NamedTempFile,
+}
 
 impl Drop for DaemonChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.process.kill();
+        let _ = self.process.wait();
     }
+}
+
+fn spawn_daemon(root: &std::path::Path) -> DaemonChild {
+    let stdio = tempfile::NamedTempFile::new().expect("daemon stdio capture");
+    let stdout = stdio.reopen().expect("reopen daemon stdout capture");
+    let stderr = stdio.reopen().expect("reopen daemon stderr capture");
+    let process = Command::new(env!("CARGO_BIN_EXE_packet28d"))
+        .args(["serve", "--root"])
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn packet28d");
+    DaemonChild { process, stdio }
 }
 
 trait ReadWrite: Read + Write {}
@@ -90,24 +110,67 @@ where
     read_frame(&mut *stream).expect("read daemon response")
 }
 
-fn wait_for_ready(daemon: &mut Child, root: &std::path::Path) -> DaemonRuntimeInfo {
-    let deadline = Instant::now() + Duration::from_secs(30);
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DIAGNOSTIC_LOG_BYTES: usize = 64 * 1024;
+
+fn file_tail(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(log) if log.is_empty() => "<empty>".to_string(),
+        Ok(log) => {
+            let start = log.len().saturating_sub(MAX_DIAGNOSTIC_LOG_BYTES);
+            let omitted = if start > 0 {
+                format!("<{start} earlier bytes omitted>\n")
+            } else {
+                String::new()
+            };
+            format!("{omitted}{}", String::from_utf8_lossy(&log[start..]))
+        }
+        Err(error) => format!("<failed to read {}: {error}>", path.display()),
+    }
+}
+
+fn daemon_diagnostics(daemon: &DaemonChild, root: &std::path::Path) -> String {
+    format!(
+        "daemon log:\n{}\ndaemon stdio:\n{}",
+        file_tail(&log_path(root)),
+        file_tail(daemon.stdio.path())
+    )
+}
+
+fn wait_for_ready(daemon: &mut DaemonChild, root: &std::path::Path) -> DaemonRuntimeInfo {
+    let started = Instant::now();
     loop {
         if ready_path(root).exists() {
+            eprintln!("daemon_ready_elapsed={:?}", started.elapsed());
             return serde_json::from_slice(
                 &std::fs::read(runtime_path(root)).expect("read runtime metadata"),
             )
             .expect("decode runtime metadata");
         }
-        if let Some(status) = daemon.try_wait().expect("probe daemon") {
-            let log = std::fs::read_to_string(log_path(root))
-                .unwrap_or_else(|error| format!("<failed to read daemon log: {error}>"));
-            panic!("daemon exited before readiness with {status}; log:\n{log}");
+        if let Some(status) = daemon.process.try_wait().expect("probe daemon") {
+            panic!(
+                "daemon pid {} exited before readiness with {status} after {:?}; {}",
+                daemon.process.id(),
+                started.elapsed(),
+                daemon_diagnostics(daemon, root)
+            );
         }
-        assert!(
-            Instant::now() < deadline,
-            "daemon did not become ready before timeout"
-        );
+        if started.elapsed() >= READINESS_TIMEOUT {
+            let runtime_metadata_present = runtime_path(root).exists();
+            let _ = daemon.process.kill();
+            let status = daemon
+                .process
+                .wait()
+                .map_or_else(|error| format!("<wait failed: {error}>"), |s| s.to_string());
+            panic!(
+                "daemon pid {} did not become ready within {READINESS_TIMEOUT:?} \
+                 (elapsed {:?}, runtime metadata present: {runtime_metadata_present}, \
+                 status after kill: {status}); {}",
+                daemon.process.id(),
+                started.elapsed(),
+                daemon_diagnostics(daemon, root)
+            );
+        }
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -148,17 +211,8 @@ fn seeded_five_thousand_task_daemon_keeps_status_live_and_pages_every_task() {
         .expect("seed task/watch checkpoint");
     drop(tasks);
 
-    let mut daemon = DaemonChild(
-        Command::new(env!("CARGO_BIN_EXE_packet28d"))
-            .args(["serve", "--root"])
-            .arg(workspace.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn packet28d"),
-    );
-    let runtime = wait_for_ready(&mut daemon.0, workspace.path());
+    let mut daemon = spawn_daemon(workspace.path());
+    let runtime = wait_for_ready(&mut daemon, workspace.path());
     let mut stream = connect(&runtime);
     let requests_started = Instant::now();
 
@@ -242,7 +296,7 @@ fn seeded_five_thousand_task_daemon_keeps_status_live_and_pages_every_task() {
         DaemonResponse::Ack { ref message } if message == "stopping"
     ));
     assert!(
-        daemon.0.wait().expect("join daemon").success(),
+        daemon.process.wait().expect("join daemon").success(),
         "daemon did not shut down cleanly"
     );
 }
@@ -287,17 +341,8 @@ fn oversized_records_before_between_and_after_healthy_pages_are_all_reported() {
     save_task_watch_registry_checkpoint(workspace.path(), &tasks, &WatchRegistry::default())
         .expect("seed oversized task/watch checkpoint");
 
-    let mut daemon = DaemonChild(
-        Command::new(env!("CARGO_BIN_EXE_packet28d"))
-            .args(["serve", "--root"])
-            .arg(workspace.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn packet28d"),
-    );
-    let runtime = wait_for_ready(&mut daemon.0, workspace.path());
+    let mut daemon = spawn_daemon(workspace.path());
+    let runtime = wait_for_ready(&mut daemon, workspace.path());
     let mut stream = connect(&runtime);
     let status: DaemonRegistryResponseV1 = exchange(&mut stream, &DaemonRegistryRequestV1::Status);
     let revision = match status {
@@ -366,5 +411,5 @@ fn oversized_records_before_between_and_after_healthy_pages_are_all_reported() {
         exchange::<_, DaemonResponse>(&mut stream, &DaemonRequest::Stop),
         DaemonResponse::Ack { ref message } if message == "stopping"
     ));
-    assert!(daemon.0.wait().expect("join daemon").success());
+    assert!(daemon.process.wait().expect("join daemon").success());
 }

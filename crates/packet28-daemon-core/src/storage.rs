@@ -1654,8 +1654,12 @@ fn encode_task_registry_preserving_existing(
     // A present authority must be strict and supported before it can influence
     // a replacement. This prevents a normal save from laundering corrupt or
     // legacy-ambiguous state into a newly trusted registry.
-    let existing_registry = decode_task_registry(path, existing_raw)?;
-    let _ = registry_checkpoint_generation(path, existing_raw, AuthorityJsonProfile::TaskRegistry)?;
+    // The typed registry, generation and unknown-field preservation all read one
+    // guarded decode of the same bytes; errors keep the previous precedence.
+    let existing_value = decode_task_registry_value(path, existing_raw)?;
+    let existing_generation = registry_checkpoint_generation_from_value(path, &existing_value);
+    let existing_registry = task_registry_from_value(path, existing_value.clone())?;
+    existing_generation?;
     validate_task_registry_namespace_bindings(
         root,
         registry,
@@ -1663,16 +1667,7 @@ fn encode_task_registry_preserving_existing(
         wal_admitted_task_ids,
         path,
     )?;
-    let mut root =
-        decode_json_value_without_duplicate_keys(existing_raw, AuthorityJsonProfile::TaskRegistry)
-            .map_err(|error| {
-                map_authority_json_error(
-                    path,
-                    AuthorityJsonProfile::TaskRegistry,
-                    "failed to decode task registry before preserving unknown fields from",
-                    error,
-                )
-            })?;
+    let mut root = existing_value;
     let root_object = root.as_object_mut().ok_or_else(|| {
         DaemonCoreError::json(
             "failed to preserve task registry root from",
@@ -1982,9 +1977,13 @@ pub(super) fn decode_task_registry_with_checkpoint_generation(
     path: &Path,
     raw: &[u8],
 ) -> Result<(TaskRegistry, Option<u64>)> {
-    let registry = decode_task_registry(path, raw)?;
-    let generation = registry_checkpoint_generation(path, raw, AuthorityJsonProfile::TaskRegistry)?;
-    Ok((registry, generation))
+    let value = decode_task_registry_value(path, raw)?;
+    // Read the generation from the same guarded value instead of validating and
+    // parsing the raw bytes a second time. Its error is reported only after the
+    // typed record decode, preserving the previous error precedence.
+    let generation = registry_checkpoint_generation_from_value(path, &value);
+    let registry = task_registry_from_value(path, value)?;
+    Ok((registry, generation?))
 }
 
 fn registry_checkpoint_generation(
@@ -2333,6 +2332,11 @@ fn validate_task_registry_namespace_bindings(
 }
 
 fn decode_task_registry(path: &Path, raw: &[u8]) -> Result<TaskRegistry> {
+    let value = decode_task_registry_value(path, raw)?;
+    task_registry_from_value(path, value)
+}
+
+fn decode_task_registry_value(path: &Path, raw: &[u8]) -> Result<serde_json::Value> {
     let value = decode_json_value_without_duplicate_keys(raw, AuthorityJsonProfile::TaskRegistry)
         .map_err(|error| {
         map_authority_json_error(
@@ -2350,6 +2354,10 @@ fn decode_task_registry(path: &Path, raw: &[u8]) -> Result<TaskRegistry> {
             source,
         ));
     }
+    Ok(value)
+}
+
+fn task_registry_from_value(path: &Path, value: serde_json::Value) -> Result<TaskRegistry> {
     let registry = serde_json::from_value(value).map_err(|source| {
         DaemonCoreError::json("failed to decode task registry from", path, source)
     })?;
@@ -5423,6 +5431,122 @@ mod tests {
                 ..
             } if task_generation == generation
         ));
+    }
+
+    /// The pre-optimization composition: a full guarded task decode followed by
+    /// a second, independent guarded generation decode of the same bytes.
+    fn decode_task_registry_with_checkpoint_generation_reference(
+        path: &Path,
+        raw: &[u8],
+    ) -> Result<(TaskRegistry, Option<u64>)> {
+        let registry = decode_task_registry(path, raw)?;
+        let generation =
+            registry_checkpoint_generation(path, raw, AuthorityJsonProfile::TaskRegistry)?;
+        Ok((registry, generation))
+    }
+
+    fn assert_task_registry_generation_decode_parity(path: &Path, raw: &[u8]) {
+        let actual = decode_task_registry_with_checkpoint_generation(path, raw);
+        let expected = decode_task_registry_with_checkpoint_generation_reference(path, raw);
+        match (actual, expected) {
+            (Ok((actual, actual_generation)), Ok((expected, expected_generation))) => {
+                assert_eq!(actual_generation, expected_generation);
+                assert_eq!(
+                    serde_json::to_value(&actual).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+            }
+            (Err(actual), Err(expected)) => {
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                assert_eq!(actual.to_string(), expected.to_string());
+            }
+            (actual, expected) => panic!(
+                "decode parity diverged for {}: actual={:?}, expected={:?}",
+                String::from_utf8_lossy(raw),
+                actual.map(|(_, generation)| generation),
+                expected.map(|(_, generation)| generation)
+            ),
+        }
+    }
+
+    #[test]
+    fn shared_task_registry_generation_decode_matches_the_two_pass_decode() {
+        let root = tempdir().unwrap();
+        let path = task_registry_path(root.path());
+        let nested_depth = format!(
+            r#"{{"tasks":{{}},"extension":{}0{}}}"#,
+            "[".repeat(MAX_AUTHORITY_JSON_DEPTH + 1),
+            "]".repeat(MAX_AUTHORITY_JSON_DEPTH + 1)
+        );
+        let cases: Vec<&[u8]> = vec![
+            br#"{"tasks":{}}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":7}"#,
+            br#"{"tasks":{"a":{"task_id":"a","future_field":{"kept":[1,2]}}},"future_root":true,"task_watch_checkpoint_generation":18446744073709551615}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":-1}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":1.5}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":"7"}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":18446744073709551616}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":null}"#,
+            br#"{"task_watch_checkpoint_generation":"bad"}"#,
+            br#"{"tasks":[],"task_watch_checkpoint_generation":"bad"}"#,
+            br#"{"tasks":{"a":{"task_id":7}},"task_watch_checkpoint_generation":"bad"}"#,
+            br#"{"tasks":{"a":{"task_id":"b"}},"task_watch_checkpoint_generation":"bad"}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":1,"task_watch_checkpoint_generation":1}"#,
+            br#"{"tasks":{"a":{"task_id":"a","last_error":"x","last_error":"y"}}}"#,
+            br#"{"tasks":{}} trailing"#,
+            br#"{"tasks":{"a":{"task_id":"\ud800"}}}"#,
+            br#"[]"#,
+            br#"7"#,
+            b"",
+            nested_depth.as_bytes(),
+        ];
+        for raw in &cases {
+            assert_task_registry_generation_decode_parity(&path, raw);
+        }
+
+        // A replacement save validates the present authority through the same
+        // shared decode and must reject it with the two-pass decode's error.
+        let replacement = TaskRegistry::default();
+        for raw in &cases {
+            let Err(expected) =
+                decode_task_registry_with_checkpoint_generation_reference(&path, raw)
+            else {
+                continue;
+            };
+            let actual = encode_task_registry_preserving_existing(
+                root.path(),
+                &path,
+                &replacement,
+                Some(raw),
+                encode_task_registry(&path, &replacement).unwrap(),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
+
+        let tasks = TaskRegistry {
+            tasks: (0..5_000)
+                .map(|index| {
+                    let task_id = format!("seed-task-{index:04}");
+                    (
+                        task_id.clone(),
+                        TaskRecord {
+                            task_id,
+                            ..TaskRecord::default()
+                        },
+                    )
+                })
+                .collect(),
+        };
+        save_task_watch_registry_checkpoint(root.path(), &tasks, &WatchRegistry::default())
+            .unwrap();
+        let raw = fs::read(&path).unwrap();
+        assert_task_registry_generation_decode_parity(&path, &raw);
+        let (decoded, generation) =
+            decode_task_registry_with_checkpoint_generation(&path, &raw).unwrap();
+        assert_eq!(decoded.tasks.len(), 5_000);
+        assert!(generation.is_some());
     }
 
     #[test]
