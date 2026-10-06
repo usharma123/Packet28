@@ -41,6 +41,37 @@ use crate::{
     reconcile_task_event_high_waters, resolve_root, TASK_PERSISTENCE_DEBOUNCE_MS,
 };
 
+/// Runs [`serve`] as a background daemon that owns its workspace log.
+///
+/// The size-rotated `packet28d.log` for the resolved workspace root is opened
+/// before any startup work. Daemon diagnostics, panics, and the terminal error
+/// are recorded there instead of stderr, and the file is rotated in-process
+/// while the daemon runs. Logging failures never stop the daemon. Launchers
+/// select this mode with `packet28d serve --managed-log` and detach stdout and
+/// stderr; output written directly to those streams is not captured.
+///
+/// # Errors
+///
+/// Returns the same errors as [`serve`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use packet28d::serve_with_managed_log;
+/// let root = std::env::current_dir()?;
+/// serve_with_managed_log(root)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn serve_with_managed_log(root: PathBuf) -> Result<()> {
+    let root = resolve_root(&root);
+    crate::logging::install_managed_log(&root);
+    let result = serve(root);
+    if let Err(error) = &result {
+        daemon_log(&format!("packet28d exited with error: {error:#}"));
+    }
+    result
+}
+
 /// Runs one Packet28 daemon instance for `root` until shutdown completes.
 ///
 /// Resolves the workspace root, acquires lifecycle leases, initializes the daemon,

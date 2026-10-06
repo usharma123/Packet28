@@ -143,6 +143,7 @@ PACKET28D_PUBLIC_DOC_INVENTORY = (
     ("packet28-daemon-protocol", "frame", "covered", "protocol-frame-runnable"),
     ("packet28-daemon-protocol", "hooks", "excluded", "hook-ingest-json-tests"),
     ("packet28-daemon-protocol", "index", "excluded", "index-state-process-tests"),
+    ("packet28-daemon-protocol", "logging", "excluded", "runtime-log-rotation-process-tests"),
     ("packet28-daemon-protocol", "message", "excluded", "request-response-json-tests"),
     ("packet28-daemon-protocol", "paths", "excluded", "path-endpoint-tests"),
     ("packet28-daemon-protocol", "process", "excluded", "session-detach-process-tests"),
@@ -173,6 +174,10 @@ PACKET28D_PUBLIC_DOC_INVENTORY = (
         "exact-182-name-frozen-v0-inventory",
     ),
     ("packet28d", "serve", "excluded", "non-hermetic-process-lifecycle-owner"),
+    (
+        "packet28d", "serve_with_managed_log", "excluded",
+        "non-hermetic-process-lifecycle-owner",
+    ),
     ("packet28d", "shared_repository_scan", "covered", "packet28d-shared-scan-no_run+feature-shared-repository-scan"),
 )
 

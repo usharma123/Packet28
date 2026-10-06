@@ -215,6 +215,24 @@ The workspace daemon log is normally:
 .packet28/daemon/packet28d.log
 ```
 
+The Claude HTTP hook server writes `.packet28/daemon/packet28-hook-http.log`.
+
+A background daemon or hook server started by Packet28 owns its log file and
+rotates it by size while it runs: when the next record would push the active
+file past the threshold, the process renames it to `<log>.1`, shifts older
+generations up to `<log>.3`, drops the oldest, and reopens a fresh file. The
+threshold defaults to 16 MiB and can be changed with
+`PACKET28_DAEMON_LOG_MAX_BYTES`, read from the launching environment. One record
+is capped at 64 KiB and marked `[truncated]`, so retained logs stay within four
+times the threshold even for a crash-looping or misbehaving process. Rotation
+failures truncate the active file in place and record why; logging failures
+never stop the daemon. Panics are recorded in the log. Other output a
+background process writes directly to stdout or stderr is discarded. A daemon
+run in the foreground (`packet28d serve`) keeps ordinary stderr diagnostics.
+When the resolved `packet28d` binary predates managed logs, the launcher keeps
+the earlier behavior: it rotates `packet28d.log` once at start and appends the
+child's stdout and stderr to it.
+
 Useful checks:
 
 ```bash

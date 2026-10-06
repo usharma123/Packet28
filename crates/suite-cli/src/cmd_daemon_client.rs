@@ -19,6 +19,7 @@ use packet28_daemon_protocol::{
         ContextStoreStatsResponse,
     },
     frame::{read_frame, write_frame},
+    logging::{runtime_log_max_bytes, MANAGED_LOG_FLAG, RUNTIME_LOG_BACKUPS},
     message::{ContextResolveRequest, ContextResolveResponse, DaemonRequest, DaemonResponse},
     paths::{log_path, ready_path, resolve_workspace_root, socket_path, workspace_socket_path},
     registry::{DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1},
@@ -355,32 +356,6 @@ pub(crate) fn resolve_root_arg(root: &str) -> PathBuf {
     resolve_workspace_root(&cwd)
 }
 
-/// Default size ceiling for `packet28d.log` before it is rotated on the next
-/// daemon start. Kept intentionally modest so a crash-loop cannot balloon the
-/// active log into the gigabytes observed in long-lived workspaces.
-#[cfg(unix)]
-const DAEMON_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Number of rotated `packet28d.log.N` generations retained. Total on-disk log
-/// archives retain their original size. Rotation occurs only at startup; a
-/// single running daemon can exceed the threshold before its next restart.
-#[cfg(unix)]
-const DAEMON_LOG_MAX_BACKUPS: usize = 3;
-
-/// Environment override for the rotation threshold, in bytes. A non-positive or
-/// unparsable value falls back to [`DAEMON_LOG_MAX_BYTES`].
-#[cfg(unix)]
-const DAEMON_LOG_MAX_BYTES_ENV: &str = "PACKET28_DAEMON_LOG_MAX_BYTES";
-
-#[cfg(unix)]
-fn daemon_log_max_bytes() -> u64 {
-    std::env::var(DAEMON_LOG_MAX_BYTES_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DAEMON_LOG_MAX_BYTES)
-}
-
 #[cfg(unix)]
 fn daemon_log_backup_path(log_path: &Path, index: usize) -> PathBuf {
     let mut name = log_path.file_name().unwrap_or_default().to_os_string();
@@ -391,11 +366,11 @@ fn daemon_log_backup_path(log_path: &Path, index: usize) -> PathBuf {
 /// Rotates `log_path` when it has grown past `max_bytes`, keeping up to
 /// `max_backups` numbered generations (`packet28d.log.1` .. `.max_backups`).
 ///
-/// This runs on every daemon (re)start. A healthy daemon logs sparsely, but a
-/// crash-loop restarts repeatedly and each restart previously reopened the same
-/// file in append mode, which is how a multi-gigabyte `packet28d.log` was
-/// observed. Rotation is best-effort: any filesystem error is ignored so a
-/// rotation problem can never block the daemon from starting.
+/// This is the start-time fallback for a `packet28d` binary that predates
+/// managed logs and therefore inherits an appended log file as stdout/stderr.
+/// Such a daemon can still exceed the threshold before its next restart.
+/// Rotation is best-effort: any filesystem error is ignored so a rotation
+/// problem can never block the daemon from starting.
 #[cfg(unix)]
 fn rotate_daemon_log_if_needed(log_path: &Path, max_bytes: u64, max_backups: usize) {
     if max_bytes == 0 || max_backups == 0 {
@@ -418,36 +393,61 @@ fn rotate_daemon_log_if_needed(log_path: &Path, max_bytes: u64, max_backups: usi
     let _ = std::fs::rename(log_path, daemon_log_backup_path(log_path, 1));
 }
 
+/// Returns whether `binary` accepts the managed-log flag on `serve`.
+///
+/// A daemon that owns its log rotates it while running; an older binary needs
+/// the launcher to supply an appended log file instead.
+#[cfg(unix)]
+fn daemon_supports_managed_log(binary: &Path) -> bool {
+    Command::new(binary)
+        .args(["serve", "--help"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(MANAGED_LOG_FLAG)
+        })
+}
+
 #[cfg(unix)]
 fn start_daemon(root: &Path) -> Result<()> {
     let binary = packet28d_binary()?;
     ensure_executable(&binary)?;
-    let root_arg = root.to_string_lossy().to_string();
-    let log_path = log_path(root);
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create daemon log dir '{}'", parent.display()))?;
-    }
-    rotate_daemon_log_if_needed(&log_path, daemon_log_max_bytes(), DAEMON_LOG_MAX_BACKUPS);
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
-    let mut child = Command::new(binary)
+    let mut command = Command::new(&binary);
+    command
         .arg("serve")
         .arg("--root")
-        .arg(root_arg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("failed to spawn packet28d")?;
+        .arg(root.as_os_str())
+        .stdin(Stdio::null());
+    if daemon_supports_managed_log(&binary) {
+        // The daemon owns, writes, and rotates its log; it never depends on
+        // this launcher or on inherited descriptors staying alive.
+        command
+            .arg(MANAGED_LOG_FLAG)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else {
+        let log_path = log_path(root);
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create daemon log dir '{}'", parent.display())
+            })?;
+        }
+        rotate_daemon_log_if_needed(&log_path, runtime_log_max_bytes(), RUNTIME_LOG_BACKUPS);
+        let stdout = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
+        let stderr = stdout
+            .try_clone()
+            .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
+        command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+    }
+    let mut child = command.spawn().context("failed to spawn packet28d")?;
     let pid = child.id();
     thread::Builder::new()
         .name(format!("packet28d-reaper-{pid}"))
@@ -475,7 +475,10 @@ fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
             runtime.log_path
         ));
     }
-    Err(anyhow!("packet28d did not become ready"))
+    Err(anyhow!(
+        "packet28d did not become ready (log: {})",
+        log_path(root).display()
+    ))
 }
 
 /// Stop the workspace daemon if it is running and wait for its socket to go
@@ -811,18 +814,6 @@ mod tests {
             !daemon_log_backup_path(&log, 3).exists(),
             "backups beyond max_backups must be pruned"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn daemon_log_max_bytes_env_override_is_respected() {
-        let default = super::DAEMON_LOG_MAX_BYTES;
-        std::env::set_var(super::DAEMON_LOG_MAX_BYTES_ENV, "4096");
-        assert_eq!(daemon_log_max_bytes(), 4096);
-        std::env::set_var(super::DAEMON_LOG_MAX_BYTES_ENV, "not-a-number");
-        assert_eq!(daemon_log_max_bytes(), default);
-        std::env::remove_var(super::DAEMON_LOG_MAX_BYTES_ENV);
-        assert_eq!(daemon_log_max_bytes(), default);
     }
 
     #[cfg(unix)]

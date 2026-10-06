@@ -91,6 +91,7 @@ mod index;
 mod instruction_files;
 mod kernel_registry;
 mod launch;
+mod logging;
 mod persistence;
 mod planning;
 mod runtime;
@@ -137,6 +138,7 @@ use crate::watch::{
 use crate::watch::{rollback_failed_task_admission, run_sequence_for_task, WatchIngress};
 
 pub use application::serve;
+pub use application::serve_with_managed_log;
 
 #[cfg(feature = "shared-repository-scan")]
 pub mod shared_repository_scan;
@@ -438,10 +440,7 @@ fn reconcile_interrupted_task_lifecycles(
 }
 
 fn daemon_log(message: &str) {
-    eprintln!(
-        "[packet28d {}] {message}",
-        packet28_daemon_core::storage::now_unix()
-    );
+    logging::daemon_log(message);
 }
 
 fn resolve_root(path: &Path) -> PathBuf {

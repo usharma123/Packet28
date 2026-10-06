@@ -41,6 +41,7 @@ pub mod context_store;
 pub mod frame;
 pub mod hooks;
 pub mod index;
+pub mod logging;
 pub mod message;
 pub mod paths;
 pub mod process;

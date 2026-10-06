@@ -40,6 +40,7 @@ deliberate coverage, not an undocumented omission.
 | packet28-daemon-protocol | frame | covered | protocol-frame-runnable |
 | packet28-daemon-protocol | hooks | excluded | hook-ingest-json-tests |
 | packet28-daemon-protocol | index | excluded | index-state-process-tests |
+| packet28-daemon-protocol | logging | excluded | runtime-log-rotation-process-tests |
 | packet28-daemon-protocol | message | excluded | request-response-json-tests |
 | packet28-daemon-protocol | paths | excluded | path-endpoint-tests |
 | packet28-daemon-protocol | process | excluded | session-detach-process-tests |
@@ -55,6 +56,7 @@ deliberate coverage, not an undocumented omission.
 | packet28-daemon-core | trust | excluded | trust-platform-tests |
 | packet28-daemon-core | root_compatibility | excluded | exact-182-name-frozen-v0-inventory |
 | packet28d | serve | excluded | non-hermetic-process-lifecycle-owner |
+| packet28d | serve_with_managed_log | excluded | non-hermetic-process-lifecycle-owner |
 | packet28d | shared_repository_scan | covered | packet28d-shared-scan-no_run+feature-shared-repository-scan |
 
 <!-- packet28d-public owner=packet28-daemon-protocol item=broker classification=excluded evidence=wire-dto-json-compat-tests -->
@@ -63,6 +65,7 @@ deliberate coverage, not an undocumented omission.
 <!-- packet28d-public owner=packet28-daemon-protocol item=frame classification=covered evidence=protocol-frame-runnable -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=hooks classification=excluded evidence=hook-ingest-json-tests -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=index classification=excluded evidence=index-state-process-tests -->
+<!-- packet28d-public owner=packet28-daemon-protocol item=logging classification=excluded evidence=runtime-log-rotation-process-tests -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=message classification=excluded evidence=request-response-json-tests -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=paths classification=excluded evidence=path-endpoint-tests -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=process classification=excluded evidence=session-detach-process-tests -->
@@ -78,13 +81,16 @@ deliberate coverage, not an undocumented omission.
 <!-- packet28d-public owner=packet28-daemon-core item=trust classification=excluded evidence=trust-platform-tests -->
 <!-- packet28d-public owner=packet28-daemon-core item=root_compatibility classification=excluded evidence=exact-182-name-frozen-v0-inventory -->
 <!-- packet28d-public owner=packet28d item=serve classification=excluded evidence=non-hermetic-process-lifecycle-owner -->
+<!-- packet28d-public owner=packet28d item=serve_with_managed_log classification=excluded evidence=non-hermetic-process-lifecycle-owner -->
 <!-- packet28d-public owner=packet28d item=shared_repository_scan classification=covered evidence=packet28d-shared-scan-no_run+feature-shared-repository-scan -->
 
-`packet28d::serve` is intentionally excluded from a runnable happy-path
-doctest. It changes the process working directory, acquires workspace leases,
-publishes runtime files, binds a listener, and blocks until shutdown, so a
-runnable doctest would not be hermetic. Lifecycle and process tests cover that
-boundary instead.
+`packet28d::serve` and `packet28d::serve_with_managed_log` are intentionally
+excluded from a runnable happy-path doctest. They change the process working
+directory, acquire workspace leases, publish runtime files, bind a listener,
+and block until shutdown, so a runnable doctest would not be hermetic.
+Lifecycle and process tests cover that boundary instead. The managed-log
+variant additionally owns the size-rotated workspace log described in
+[operations](operations.md#logs-and-troubleshooting).
 
 The checker also requires each source anchor below to resolve to exactly one
 Rustdoc fence of the declared kind and to contain the relevant API operations.

@@ -129,6 +129,10 @@ pub struct HookHttpServerArgs {
     pub port: u16,
     #[arg(long)]
     pub token: String,
+    /// Own the workspace hook log and rotate it by size while running,
+    /// instead of writing diagnostics to stderr
+    #[arg(long)]
+    pub managed_log: bool,
 }
 
 #[derive(Args, Clone)]
@@ -741,13 +745,13 @@ fn render_hook_output(
             if response.relaunch_requested {
                 // Daemon is handling relaunch — allow the stop to proceed.
                 // The next session will bootstrap from the handoff artifact.
-                eprintln!(
+                crate::runtime_log::diagnostic(&format!(
                     "packet28: context threshold reached, daemon relaunch queued (artifact={})",
                     response
                         .latest_handoff_artifact_id
                         .as_deref()
                         .unwrap_or("pending")
-                );
+                ));
             } else if response.block_stop {
                 return Ok(Some(serde_json::to_string(&json!({
                     "decision": "block",

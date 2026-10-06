@@ -1688,6 +1688,7 @@ dependencies = [
  "packet28-daemon-protocol",
  "packet28-reducer-core",
  "packet28-search-core",
+ "packet28-state-fs",
  "serde",
  "serde_json",
  "suite-foundation-core",
