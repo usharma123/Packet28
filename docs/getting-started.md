@@ -55,6 +55,16 @@ Setup may create or update repository-local MCP, hook, and instruction files
 and user-level runtime configuration. Existing valid JSON/TOML is merged;
 invalid configuration is reported and left unchanged.
 
+Setup adds `.packet28/` to the repository's `.gitignore` when needed. This does
+not untrack runtime files that were already committed. The full regex index
+requires a clean Git working tree, so setup can complete with indexing deferred
+until you commit or stash its configuration and instruction changes. Then run:
+
+```bash
+packet28 daemon index rebuild --root .
+packet28 daemon index status --root . --json
+```
+
 ## Start the daemon
 
 ```bash
