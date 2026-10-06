@@ -286,6 +286,134 @@ fn generated_packet28_hook_command_exits_zero_when_binary_is_missing() {
 }
 
 #[test]
+fn claude_hook_merge_preserves_mixed_http_handlers_and_entry_metadata() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let generated: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let owned = generated["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+    let endpoint = owned["url"].as_str().unwrap();
+    let token = owned["headers"]["X-Packet28-Hook-Token"].as_str().unwrap();
+    let user_handlers = vec![
+        json!({"type": "command", "command": "user-audit"}),
+        json!({"type": "http", "url": format!("{endpoint}?user=1"), "headers": {"X-Packet28-Hook-Token": token}}),
+        json!({"type": "http", "url": "https://user.example/packet28/claude-hook", "headers": {"X-Packet28-Hook-Token": token}}),
+        json!({"type": "http", "url": endpoint}),
+        json!({"type": "http", "url": endpoint, "headers": {"X-Packet28-Hook-Token": "user-token"}}),
+    ];
+    let mut mixed = user_handlers.clone();
+    mixed.insert(1, owned);
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "env": {"KEEP": "yes"},
+            "allowedHttpHookUrls": ["https://user.example/hooks"],
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "userMetadata": "keep", "hooks": mixed}]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(merged["env"]["KEEP"], "yes");
+    let preserved = &merged["hooks"]["PreToolUse"][0];
+    assert_eq!(preserved["matcher"], "Bash");
+    assert_eq!(preserved["userMetadata"], "keep");
+    assert_eq!(preserved["hooks"], json!(user_handlers));
+    assert!(merged["allowedHttpHookUrls"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("https://user.example/hooks")));
+    assert_eq!(merged["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    let status = setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        merged
+    );
+}
+
+#[test]
+fn claude_hook_merge_preserves_user_wrappers_and_migrates_exact_generated_commands() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    let guarded = super::setup_commands::guarded_packet28_hook_command(
+        "/missing/Packet28",
+        "claude",
+        Path::new("/old/workspace"),
+    );
+    let direct_operator = "Packet28 hook claude --root /old;user-audit";
+    let guarded_operator = format!("{guarded};user-audit");
+    assert_eq!(shell_words::split(direct_operator).unwrap().len(), 5);
+    assert_eq!(shell_words::split(&guarded_operator).unwrap().len(), 6);
+    let user_handlers = vec![
+        json!({"type": "command", "command": direct_operator}),
+        json!({"type": "command", "command": guarded_operator}),
+        json!({"type": "command", "command": "echo Packet28 hook claude --root /user"}),
+        json!({"type": "command", "command": "sh -c 'printf %s \"Packet28 hook claude --root user\"'"}),
+        json!({"type": "command", "command": "user-audit"}),
+    ];
+    let mut mixed = user_handlers.clone();
+    mixed.push(json!({"type": "command", "command": guarded}));
+    mixed.push(json!({"type": "command", "command": "/missing/Packet28 hook claude --root /old/workspace"}));
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "hooks": {"SessionStart": [{"matcher": "user-matcher", "timeout": 42, "hooks": mixed}]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let entries = merged["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["matcher"], "user-matcher");
+    assert_eq!(entries[0]["timeout"], 42);
+    assert_eq!(entries[0]["hooks"], json!(user_handlers));
+    let command = entries[1]["hooks"][0]["command"].as_str().unwrap();
+    assert!(command.contains("${CLAUDE_PROJECT_DIR}"));
+    assert!(!command.contains("/old/workspace"));
+    assert_eq!(entries[2]["hooks"][0]["type"], "http");
+}
+
+#[test]
+fn generated_hook_command_ownership_requires_exact_outer_shell_serialization() {
+    for runtime in ["claude", "codex"] {
+        let guarded = super::setup_commands::guarded_packet28_hook_command(
+            "/missing/Packet28",
+            runtime,
+            Path::new("/old workspace"),
+        );
+        assert!(super::setup_commands::is_generated_packet28_hook_command(
+            &guarded, runtime
+        ));
+        let generated =
+            super::setup_commands::generated_packet28_hook_command(runtime, Path::new("/root"));
+        assert!(super::setup_commands::is_generated_packet28_hook_command(
+            &generated, runtime
+        ));
+        for suffix in [
+            ";user-audit",
+            "&&user-audit",
+            "|user-audit",
+            " >user.log",
+            "$(user-audit)",
+            "`user-audit`",
+        ] {
+            assert!(
+                !super::setup_commands::is_generated_packet28_hook_command(
+                    &format!("{guarded}{suffix}"),
+                    runtime
+                ),
+                "suffix {suffix:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn write_claude_hook_config_replaces_legacy_command_hooks() {
     let dir = tempdir().unwrap();
     let path = dir.path().join(".claude").join("settings.json");
@@ -698,6 +826,347 @@ fn setup_never_enables_daemon_managed_relaunch_by_default() {
     assert!(!config.daemon_relaunch_enabled());
 }
 
+#[test]
+fn write_hook_runtime_config_re_enables_stale_kill_switch() {
+    let dir = tempdir().unwrap();
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Simulate the kill switch left engaged by a prior `packet28 uninstall`,
+    // while HTTP hook settings are already present so only `hooks_enabled`
+    // needs fixing.
+    let disabled = HookRuntimeConfig {
+        hooks_enabled: false,
+        http_hook_port: Some(45123),
+        http_hook_token: Some("existing-token".to_string()),
+        ..HookRuntimeConfig::default()
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&disabled).unwrap()),
+    )
+    .unwrap();
+
+    let status = write_hook_runtime_config(dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::Written));
+
+    let written: HookRuntimeConfig =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        written.hooks_enabled,
+        "setup must re-enable hook ingest when configuring a hook runtime"
+    );
+    // Existing HTTP settings are preserved rather than regenerated.
+    assert_eq!(written.http_hook_port, Some(45123));
+    assert_eq!(written.http_hook_token.as_deref(), Some("existing-token"));
+}
+
+#[cfg(unix)]
+#[test]
+fn write_hook_runtime_config_keeps_private_token_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join(".packet28");
+    let daemon_dir = state_dir.join("daemon");
+    fs::create_dir_all(&daemon_dir).unwrap();
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    let config = HookRuntimeConfig {
+        hooks_enabled: false,
+        http_hook_port: Some(45123),
+        http_hook_token: Some("synthetic-private-token".to_string()),
+        ..HookRuntimeConfig::default()
+    };
+    fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(matches!(
+        write_hook_runtime_config(dir.path(), true).unwrap(),
+        McpConfigStatus::Written
+    ));
+
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let written: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(written.hooks_enabled);
+    assert_eq!(written.http_hook_token, config.http_hook_token);
+    // Privacy must come from the file, even when existing ancestors are public.
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_create_private_token_copy_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let parent = dir.path().join(".claude");
+    fs::create_dir(&parent).unwrap();
+    for directory in [dir.path(), parent.as_path()] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = parent.join("settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let runtime: HookRuntimeConfig = serde_json::from_slice(
+        &fs::read(packet28_daemon_protocol::paths::hook_runtime_config_path(
+            dir.path(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["headers"]["X-Packet28-Hook-Token"].as_str(),
+        runtime.http_hook_token.as_deref(),
+    );
+    for directory in [dir.path(), parent.as_path()] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_rewrite_private_and_public_files_without_losing_user_handlers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in [0o600, 0o644] {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join(".claude");
+        fs::create_dir(&parent).unwrap();
+        for directory in [dir.path(), parent.as_path()] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = parent.join("settings.json");
+        let user_handler = json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "user-audit"}]
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "theme": "dark",
+                "hooks": {"PreToolUse": [user_handler.clone()]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["hooks"]["PreToolUse"][0], user_handler);
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_normalize_existing_token_copy_permissions_without_changing_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let original = fs::read(&path).unwrap();
+    for directory in [dir.path(), path.parent().unwrap()] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let status = setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_reject_linked_token_files_before_initializing_runtime() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        let original = br#"{"theme":"dark"}"#;
+        let outside_path = outside.path().join("settings.json");
+        fs::write(&outside_path, original).unwrap();
+        if hard_link {
+            fs::hard_link(&outside_path, &path).unwrap();
+        } else {
+            symlink(&outside_path, &path).unwrap();
+        }
+        assert!(setup_hooks::write_claude_hook_config(&path, dir.path(), true).is_err());
+        assert_eq!(fs::read(&outside_path).unwrap(), original);
+        assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_reject_linked_parent_before_initializing_runtime() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    symlink(outside.path(), dir.path().join(".claude")).unwrap();
+    assert!(setup_hooks::write_claude_hook_config(
+        &dir.path().join(".claude/settings.json"),
+        dir.path(),
+        true,
+    )
+    .is_err());
+    assert!(!outside.path().join("settings.json").exists());
+    assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+}
+
+#[test]
+fn claude_settings_reject_paths_outside_workspace() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let path = outside.path().join("settings.json");
+    let original = br#"{"theme":"dark"}"#;
+    fs::write(&path, original).unwrap();
+    assert!(setup_hooks::write_claude_hook_config(&path, dir.path(), true).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_setup_creates_private_runtime_config_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join(".packet28");
+    let daemon_dir = state_dir.join("daemon");
+    fs::create_dir_all(&daemon_dir).unwrap();
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let settings = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&settings, dir.path(), true).unwrap();
+
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let written: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(written.http_hook_token.is_some());
+    assert_eq!(
+        fs::metadata(&daemon_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn claude_http_settings_preserve_disabled_ingest_until_hook_opt_in() {
+    let dir = tempdir().unwrap();
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        serde_json::to_vec(&HookRuntimeConfig {
+            hooks_enabled: false,
+            ..HookRuntimeConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    setup_hooks::write_claude_hook_config(
+        &dir.path().join(".claude/settings.json"),
+        dir.path(),
+        true,
+    )
+    .unwrap();
+    let initialized: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(!initialized.hooks_enabled);
+    assert!(initialized.http_hook_token.is_some());
+    let unchanged = fs::read(&path).unwrap();
+    assert!(matches!(
+        write_hook_runtime_config(dir.path(), false).unwrap(),
+        McpConfigStatus::Declined
+    ));
+    assert_eq!(fs::read(&path).unwrap(), unchanged);
+
+    write_hook_runtime_config(dir.path(), true).unwrap();
+    let enabled: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(enabled.hooks_enabled);
+    assert_eq!(enabled.http_hook_token, initialized.http_hook_token);
+    assert_eq!(enabled.http_hook_port, initialized.http_hook_port);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_hook_runtime_config_rejects_linked_token_files() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::to_vec(&HookRuntimeConfig {
+            hooks_enabled: false,
+            ..HookRuntimeConfig::default()
+        })
+        .unwrap();
+        let outside_path = outside.path().join("runtime.json");
+        fs::write(&outside_path, &original).unwrap();
+        if hard_link {
+            fs::hard_link(&outside_path, &path).unwrap();
+        } else {
+            symlink(&outside_path, &path).unwrap();
+        }
+
+        assert!(write_hook_runtime_config(dir.path(), true).is_err());
+        assert_eq!(fs::read(&outside_path).unwrap(), original);
+    }
+}
+
+/// Creates an index-status fixture with the specified manifest and readiness values.
+///
+/// # Examples
+///
+/// ```
+/// let status = setup_index_status("ready", None, true);
+/// assert!(status.ready);
+/// assert!(status.manifest.regex_status.is_none());
+/// ```
+///
+/// # Arguments
+///
+/// * `status` - Manifest status to parse into the fixture.
+/// * `regex_status` - Optional regex index status and associated metadata.
+/// * `ready` - Whether the overall index is ready.
 fn setup_index_status(
     status: &str,
     regex_status: Option<&str>,
