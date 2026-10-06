@@ -113,20 +113,43 @@ where
         poll_interval,
         |root, task_id, offset| async move {
             let read_task_id = task_id.clone();
-            match tokio::task::spawn_blocking(move || {
-                load_task_events_from_offset(&root, &read_task_id, offset)
-            })
-            .await
-            {
-                Ok(Ok(read)) => Ok(Some(read)),
-                Ok(Err(error)) => Err(anyhow!(
-                    "MCP notification event-log read failed for task {task_id:?} at offset {offset}: {error}"
+            let pending = tokio::task::spawn_blocking(move || {
+                read_notification_events_with_recovery(&root, &read_task_id, offset, || {
+                    crate::broker_client::ensure_daemon(&root)
+                })
+            });
+            match tokio::time::timeout(Duration::from_secs(12), pending).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(anyhow!("MCP notification reader task failed: {error}")),
+                Err(_) => Err(anyhow!(
+                    "MCP notification recovery readiness timed out for task {task_id:?}"
                 )),
-                Err(error) => Err(anyhow!("MCP notification reader task failed: {error}")),
             }
         },
         deliver,
     )
+}
+
+fn read_notification_events_with_recovery(
+    root: &Path,
+    task_id: &str,
+    offset: u64,
+    ensure_ready: impl FnOnce() -> Result<()>,
+) -> Result<Option<TaskEventLogRead>> {
+    match load_task_events_from_offset(root, task_id, offset) {
+        Ok(read) => Ok(Some(read)),
+        Err(error) => {
+            // Recovery publishes its checkpoint before readiness. A failed
+            // strict read during startup must wait for that authority before
+            // deciding whether this identity has a verified successor.
+            if ensure_ready().is_ok()
+                && crate::task_runtime::resolve_task_continuation(root, task_id)? != task_id
+            {
+                return Ok(None);
+            }
+            Err(anyhow!("MCP notification event-log read failed for task {task_id:?} at offset {offset}: {error}"))
+        }
+    }
 }
 
 fn start_notification_task_with_reader<Read, ReadFuture, Deliver, DeliveryFuture>(
@@ -198,6 +221,16 @@ where
     }
 }
 
+async fn resolve_notification_task(root: &Path, task_id: &str) -> Result<String> {
+    let root = root.to_path_buf();
+    let task_id = task_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::task_runtime::resolve_task_continuation(&root, &task_id)
+    })
+    .await
+    .map_err(|error| anyhow!("MCP recovery resolution task failed: {error}"))?
+}
+
 async fn run_notification_pass<Read, ReadFuture, Deliver, DeliveryFuture>(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
@@ -210,11 +243,10 @@ where
     Deliver: FnMut(Value, McpMessageFraming) -> DeliveryFuture,
     DeliveryFuture: Future<Output = Result<NotificationDelivery>>,
 {
-    let (initialized, tracked_tasks, tracked_task_offsets, framing) = match session.lock() {
+    let (initialized, tracked_tasks, framing) = match session.lock() {
         Ok(guard) => (
             guard.initialized,
             guard.tracked_tasks.clone(),
-            guard.tracked_task_offsets.clone(),
             guard.framing,
         ),
         Err(_) => return Err(anyhow!("MCP notification session lock is poisoned")),
@@ -223,12 +255,69 @@ where
         return Ok(());
     };
 
-    for (task_id, last_seen_seq) in tracked_tasks {
-        let previous_offset = tracked_task_offsets.get(&task_id).copied().unwrap_or(0);
+    for (original_task_id, original_last_seen_seq) in tracked_tasks {
+        let task_id = resolve_notification_task(root, &original_task_id).await?;
+        let (last_seen_seq, previous_offset) = if task_id != original_task_id {
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/packet28.task_recovered",
+                "params": {
+                    "predecessor_task_id": original_task_id,
+                    "successor_task_id": task_id,
+                    "prior_event_seq": original_last_seen_seq,
+                },
+            });
+            match deliver(notification, framing).await? {
+                NotificationDelivery::Backpressured => continue,
+                NotificationDelivery::Delivered => {}
+            }
+            let mut guard = session
+                .lock()
+                .map_err(|_| anyhow!("MCP notification session lock is poisoned"))?;
+            guard.tracked_tasks.remove(&original_task_id);
+            guard.tracked_task_offsets.remove(&original_task_id);
+            // Independent identity, independent cursor. If already tracked,
+            // preserve its delivered cursor rather than replaying duplicates.
+            let seq = *guard.tracked_tasks.entry(task_id.clone()).or_insert(0);
+            let offset = *guard
+                .tracked_task_offsets
+                .entry(task_id.clone())
+                .or_insert(0);
+            if guard.current_task_id.as_deref() == Some(original_task_id.as_str()) {
+                guard.current_task_id = Some(task_id.clone());
+            }
+            if guard.proxy_task_id.as_deref() == Some(original_task_id.as_str()) {
+                guard.proxy_task_id = Some(task_id.clone());
+            }
+            (seq, offset)
+        } else {
+            // Another predecessor may already have transferred tracking to
+            // this task during this pass; always use the current cursor.
+            let guard = session
+                .lock()
+                .map_err(|_| anyhow!("MCP notification session lock is poisoned"))?;
+            let Some(seq) = guard.tracked_tasks.get(&task_id).copied() else {
+                continue;
+            };
+            (
+                seq,
+                guard
+                    .tracked_task_offsets
+                    .get(&task_id)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        };
         let read = match read(root.to_path_buf(), task_id.clone(), previous_offset).await {
             Ok(Some(read)) => read,
             Ok(None) => continue,
             Err(error) => {
+                // Startup may have checkpointed a verified recovery while
+                // this read was in flight. Retry only that durable transition;
+                // all other read/integrity failures retain their fatal behavior.
+                if resolve_notification_task(root, &task_id).await? != task_id {
+                    continue;
+                }
                 return Err(error);
             }
         };
@@ -597,21 +686,26 @@ mod tests {
         let (root, session, event_log_len) = fixture(event_count, true);
         let (output, mut receiver) = proxy_output_channel();
         let notification_output = output.clone();
-        let task = start_deterministic_notification_task(
-            root.path().to_path_buf(),
-            session.clone(),
-            move |notification, framing| {
-                let output = notification_output.clone();
-                async move {
-                    Ok(if output.try_send(notification, framing)? {
-                        NotificationDelivery::Delivered
-                    } else {
-                        NotificationDelivery::Backpressured
-                    })
-                }
-            },
-        );
-        tokio::task::yield_now().await;
+        let mut read = |root: PathBuf, task_id: String, offset| async move {
+            load_task_events_from_offset(&root, &task_id, offset)
+                .map(Some)
+                .map_err(anyhow::Error::from)
+        };
+        let mut deliver = move |notification, framing| {
+            let output = notification_output.clone();
+            async move {
+                Ok(if output.try_send(notification, framing)? {
+                    NotificationDelivery::Delivered
+                } else {
+                    NotificationDelivery::Backpressured
+                })
+            }
+        };
+        // Await each pass explicitly: registry resolution runs on a blocking
+        // worker and cannot be synchronized by one executor yield.
+        run_notification_pass(root.path(), &session, &mut read, &mut deliver)
+            .await
+            .unwrap();
 
         let first_pass_seq = session.lock().unwrap().tracked_tasks[TASK_ID];
         assert_eq!(
@@ -628,8 +722,9 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        tokio::time::advance(super::super::MCP_NOTIFICATION_POLL_INTERVAL).await;
-        tokio::task::yield_now().await;
+        run_notification_pass(root.path(), &session, &mut read, &mut deliver)
+            .await
+            .unwrap();
         let replay = receiver.try_recv().unwrap();
         assert_eq!(replay.value["params"]["event_seq"], event_count);
         assert_eq!(session.lock().unwrap().tracked_tasks[TASK_ID], event_count);
@@ -637,7 +732,6 @@ mod tests {
             session.lock().unwrap().tracked_task_offsets[TASK_ID],
             event_log_len
         );
-        task.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -680,6 +774,145 @@ mod tests {
         task.shutdown(Duration::from_secs(1)).await.unwrap();
 
         assert_eq!(tokio::time::Instant::now(), started_at);
+    }
+
+    #[test]
+    fn strict_read_waits_for_recovery_authority_and_keeps_unchanged_identity_fatal() {
+        use packet28_daemon_protocol::task::TaskHistoryRecovery;
+        let (root, _, _) = fixture(0, true);
+        let path = task_event_log_path(root.path(), &TaskStorageId::try_from(TASK_ID).unwrap());
+        std::fs::write(path, b"{damaged history}\n").unwrap();
+        let unchanged = read_notification_events_with_recovery(root.path(), TASK_ID, 0, || Ok(()));
+        assert!(unchanged
+            .unwrap_err()
+            .to_string()
+            .contains("event-log read failed"));
+        let recovered = read_notification_events_with_recovery(root.path(), TASK_ID, 0, || {
+            // The old checkpoint is still authoritative when readiness starts.
+            assert_eq!(
+                crate::task_runtime::resolve_task_continuation(root.path(), TASK_ID)?,
+                TASK_ID
+            );
+            let link = TaskHistoryRecovery {
+                predecessor_task_id: TASK_ID.to_string(),
+                successor_task_id: "successor".to_string(),
+                ..TaskHistoryRecovery::default()
+            };
+            let mut registry = TaskRegistry::default();
+            registry.tasks.insert(
+                TASK_ID.to_string(),
+                TaskRecord {
+                    task_id: TASK_ID.to_string(),
+                    superseded_by: Some(link.clone()),
+                    ..TaskRecord::default()
+                },
+            );
+            registry.tasks.insert(
+                "successor".to_string(),
+                TaskRecord {
+                    task_id: "successor".to_string(),
+                    recovered_from: Some(link),
+                    ..TaskRecord::default()
+                },
+            );
+            save_task_registry(root.path(), &registry)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(recovered.is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_notification_session_follows_recovery_with_independent_cursor_and_backpressure() {
+        use packet28_daemon_protocol::task::TaskHistoryRecovery;
+        let (root, session, _) = fixture(0, true);
+        session
+            .lock()
+            .unwrap()
+            .tracked_tasks
+            .insert(TASK_ID.to_string(), 100);
+        session.lock().unwrap().current_task_id = Some(TASK_ID.to_string());
+        let link = TaskHistoryRecovery {
+            predecessor_task_id: TASK_ID.to_string(),
+            successor_task_id: "successor".to_string(),
+            ..TaskHistoryRecovery::default()
+        };
+        let mut registry = TaskRegistry::default();
+        registry.tasks.insert(
+            TASK_ID.to_string(),
+            TaskRecord {
+                task_id: TASK_ID.to_string(),
+                superseded_by: Some(link.clone()),
+                ..TaskRecord::default()
+            },
+        );
+        registry.tasks.insert(
+            "successor".to_string(),
+            TaskRecord {
+                task_id: "successor".to_string(),
+                recovered_from: Some(link),
+                ..TaskRecord::default()
+            },
+        );
+        save_task_registry(root.path(), &registry).unwrap();
+        let mut read = |_: PathBuf, task: String, offset: u64| async move {
+            assert_eq!(task, "successor");
+            assert_eq!(offset, 0);
+            Ok(Some(TaskEventLogRead {
+                events: vec![DaemonEventFrame {
+                    seq: 1,
+                    task_id: task,
+                    event: DaemonEvent {
+                        kind: "context_updated".to_string(),
+                        occurred_at_unix: 1,
+                        data: json!({"context_version":"ctx-1"}),
+                    },
+                }],
+                next_offset: 42,
+            }))
+        };
+        let mut blocked =
+            |_: Value, _: McpMessageFraming| async { Ok(NotificationDelivery::Backpressured) };
+        run_notification_pass(root.path(), &session, &mut read, &mut blocked)
+            .await
+            .unwrap();
+        assert_eq!(session.lock().unwrap().tracked_tasks[TASK_ID], 100);
+        let mut messages = Vec::new();
+        let mut calls = 0;
+        let mut deliver = |message: Value, _: McpMessageFraming| {
+            calls += 1;
+            messages.push(message);
+            let result = if calls == 1 {
+                NotificationDelivery::Delivered
+            } else {
+                NotificationDelivery::Backpressured
+            };
+            async move { Ok(result) }
+        };
+        run_notification_pass(root.path(), &session, &mut read, &mut deliver)
+            .await
+            .unwrap();
+        assert_eq!(
+            messages[0]["method"],
+            "notifications/packet28.task_recovered"
+        );
+        assert_eq!(session.lock().unwrap().tracked_tasks["successor"], 0);
+        assert_eq!(session.lock().unwrap().tracked_task_offsets["successor"], 0);
+        let mut delivered = Vec::new();
+        let mut deliver = |message: Value, _: McpMessageFraming| {
+            delivered.push(message);
+            async { Ok(NotificationDelivery::Delivered) }
+        };
+        run_notification_pass(root.path(), &session, &mut read, &mut deliver)
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0]["params"]["event_seq"], 1);
+        let guard = session.lock().unwrap();
+        assert!(!guard.tracked_tasks.contains_key(TASK_ID));
+        assert_eq!(guard.tracked_tasks["successor"], 1);
+        assert_eq!(guard.tracked_task_offsets["successor"], 42);
+        assert_eq!(guard.current_task_id.as_deref(), Some("successor"));
     }
 
     #[test]

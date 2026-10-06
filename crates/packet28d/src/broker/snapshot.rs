@@ -378,6 +378,20 @@ pub(crate) fn apply_agent_snapshot_event_to_cache(
     event: &suite_packet_core::AgentStateEventPayload,
 ) -> Result<()> {
     let mut guard = state.lock().map_err(lock_err)?;
+    if matches!(
+        event.data,
+        suite_packet_core::AgentStateEventData::RecoveredFrom { .. }
+    ) || guard
+        .tasks
+        .tasks
+        .get(&event.task_id)
+        .is_some_and(|task| task.recovered_from.is_some())
+    {
+        // A lineage link changes which cached events the snapshot includes;
+        // derive it again rather than patching it incrementally.
+        guard.agent_snapshots.remove(&event.task_id);
+        return Ok(());
+    }
     let snapshot = guard
         .agent_snapshots
         .entry(event.task_id.clone())
@@ -396,6 +410,26 @@ fn apply_agent_snapshot_event(
     snapshot.task_id = event.task_id.clone();
     snapshot.event_count = snapshot.event_count.saturating_add(1);
     snapshot.last_event_at_unix = Some(event.occurred_at_unix);
+
+    let artifact = match &event.data {
+        suite_packet_core::AgentStateEventData::DecisionAdded { artifact_id, .. }
+        | suite_packet_core::AgentStateEventData::ToolInvocationCompleted { artifact_id, .. } => {
+            artifact_id.as_ref()
+        }
+        suite_packet_core::AgentStateEventData::EvidenceCaptured { artifact_id, .. } => {
+            Some(artifact_id)
+        }
+        _ => None,
+    };
+    if let Some(artifact) = artifact {
+        insert_sorted_unique(
+            snapshot
+                .evidence_artifact_owners
+                .entry(artifact.clone())
+                .or_default(),
+            event.task_id.clone(),
+        );
+    }
 
     match &event.data {
         suite_packet_core::AgentStateEventData::FocusSet { .. }
@@ -592,6 +626,7 @@ fn apply_agent_snapshot_event(
             snapshot
                 .recent_tool_invocations
                 .push(suite_packet_core::ToolInvocationSummary {
+                    owner_task_id: Some(event.task_id.clone()),
                     invocation_id: invocation_id.clone(),
                     sequence: *sequence,
                     tool_name: tool_name.clone(),
@@ -662,6 +697,7 @@ fn apply_agent_snapshot_event(
             snapshot
                 .tool_failures
                 .push(suite_packet_core::ToolFailureSummary {
+                    owner_task_id: Some(event.task_id.clone()),
                     invocation_id: invocation_id.clone(),
                     sequence: *sequence,
                     tool_name: tool_name.clone(),
@@ -692,6 +728,7 @@ fn apply_agent_snapshot_event(
         suite_packet_core::AgentStateEventData::EvidenceCaptured { artifact_id, .. } => {
             insert_sorted_unique(&mut snapshot.evidence_artifact_ids, artifact_id.clone());
         }
+        suite_packet_core::AgentStateEventData::RecoveredFrom { .. } => {}
     }
 }
 

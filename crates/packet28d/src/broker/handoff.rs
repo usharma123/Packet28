@@ -447,6 +447,7 @@ pub(crate) fn slim_broker_response(
         discovered_paths: Vec::new(),
         discovered_symbols: Vec::new(),
         evidence_artifact_ids: Vec::new(),
+        evidence_artifact_owners: BTreeMap::new(),
         invalidates_since_version: response.invalidates_since_version,
         effective_max_sections: response.effective_max_sections,
         effective_default_max_items_per_section: response.effective_default_max_items_per_section,
@@ -778,17 +779,26 @@ pub(crate) fn broker_prepare_handoff(
     );
     if !handoff_ready {
         if let Some(existing_handoff) = latest_ready_handoff.as_ref() {
-            if let Some(existing_context_version) = task
-                .as_ref()
-                .and_then(|task| task.latest_context_version.as_deref())
-                .or(Some(existing_handoff.context_version.as_str()))
+            // A handoff inherited by a recovery successor keeps the
+            // predecessor as its owner; its artifact stays in that namespace.
+            let owner_task_id = if existing_handoff.task_id.is_empty() {
+                request.task_id.as_str()
+            } else {
+                existing_handoff.task_id.as_str()
+            };
+            let owner_context_version = if owner_task_id == request.task_id {
+                task.as_ref()
+                    .and_then(|task| task.latest_context_version.as_deref())
+            } else {
+                None
+            };
+            if let Some(existing_context_version) =
+                owner_context_version.or(Some(existing_handoff.context_version.as_str()))
             {
                 let root = state.lock().map_err(lock_err)?.root.clone();
-                if let Some(existing_context) = load_versioned_broker_response(
-                    &root,
-                    &request.task_id,
-                    existing_context_version,
-                )? {
+                if let Some(existing_context) =
+                    load_versioned_broker_response(&root, owner_task_id, existing_context_version)?
+                {
                     if existing_context.artifact_id.as_deref()
                         == Some(existing_handoff.artifact_id.as_str())
                     {

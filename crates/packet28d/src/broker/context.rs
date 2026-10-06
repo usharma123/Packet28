@@ -267,6 +267,7 @@ pub(crate) fn compute_broker_response(
         discovered_paths,
         discovered_symbols,
         evidence_artifact_ids: snapshot.evidence_artifact_ids.clone(),
+        evidence_artifact_owners: snapshot.evidence_artifact_owners.clone(),
         effective_max_sections: effective_limits.max_sections,
         effective_default_max_items_per_section: effective_limits.default_max_items_per_section,
         effective_section_item_limits: effective_limits.section_item_limits,

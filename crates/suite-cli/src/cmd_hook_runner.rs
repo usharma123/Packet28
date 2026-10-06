@@ -38,6 +38,7 @@ pub(crate) fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
     } else {
         crate::broker_client::derive_task_id("claude-hook-runner")
     };
+    let task_id = crate::task_runtime::resolve_task_continuation(&root, &task_id)?;
     let task_storage_id = TaskStorageId::try_from(task_id.as_str())?;
     crate::task_runtime::store_active_task(
         &root,

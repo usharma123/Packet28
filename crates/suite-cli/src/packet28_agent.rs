@@ -259,6 +259,8 @@ fn prepare_bootstrap(
                 "packet28-agent requires a checkpointed task via --task-id or a derivable --task"
             )
         })?;
+    crate::broker_client::ensure_daemon(root)?;
+    let task_id = crate::task_runtime::resolve_task_continuation(root, &task_id)?;
     TaskStorageId::try_from(task_id.as_str())?;
     {
         let _writer_lease = acquire_task_store_writer_lease(root)?;
@@ -317,6 +319,7 @@ fn prepare_fresh_bootstrap(task_id: String, bootstrap_path: &std::path::Path) ->
         discovered_paths: Vec::new(),
         discovered_symbols: Vec::new(),
         evidence_artifact_ids: Vec::new(),
+        evidence_artifact_owners: Default::default(),
         invalidates_since_version: false,
         effective_max_sections: 0,
         effective_default_max_items_per_section: 0,

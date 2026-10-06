@@ -637,6 +637,52 @@ pub(crate) fn update_broker_link_state(
     Ok(())
 }
 
+/// Publishes constant-size recovery links from the trusted registry.
+/// Historical packets retain their original owner and are read at snapshot time.
+/// Repeating the exact write is idempotent, including after interrupted startup.
+pub(crate) fn inherit_recovered_agent_state(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
+    let (kernel, links) = {
+        let guard = state.lock().map_err(lock_err)?;
+        let links = guard
+            .tasks
+            .tasks
+            .values()
+            .filter_map(|task| {
+                task.recovered_from
+                    .as_ref()
+                    .map(|link| (task.task_id.clone(), link.predecessor_task_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        (guard.kernel.clone(), links)
+    };
+    for (task_id, predecessor_task_id) in links {
+        kernel
+            .execute(KernelRequest {
+                target: "agenty.state.write".to_string(),
+                reducer_input: json!({
+                    "task_id": task_id,
+                    "event_id": format!("history-recovery:{predecessor_task_id}"),
+                    "occurred_at_unix": 0,
+                    "actor": "packet28d",
+                    "kind": "recovered_from",
+                    "data": {"type": "recovered_from", "predecessor_task_id": predecessor_task_id},
+                }),
+                ..KernelRequest::default()
+            })
+            .with_context(|| {
+                format!(
+                    "failed to inherit agent state from '{predecessor_task_id}' for '{task_id}'"
+                )
+            })?;
+        state
+            .lock()
+            .map_err(lock_err)?
+            .agent_snapshots
+            .remove(&task_id);
+    }
+    Ok(())
+}
+
 pub(crate) fn load_agent_snapshot_for_task(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
@@ -650,10 +696,36 @@ pub(crate) fn load_agent_snapshot_for_task(
     {
         return Ok(snapshot);
     }
-    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    let (kernel, lineage) = {
+        let guard = state.lock().map_err(lock_err)?;
+        let mut lineage = vec![task_id.to_string()];
+        let mut current = task_id;
+        while let Some(link) = guard
+            .tasks
+            .tasks
+            .get(current)
+            .and_then(|task| task.recovered_from.as_ref())
+        {
+            if link.successor_task_id != current
+                || guard
+                    .tasks
+                    .tasks
+                    .get(&link.predecessor_task_id)
+                    .and_then(|task| task.superseded_by.as_ref())
+                    != Some(link)
+                || lineage.contains(&link.predecessor_task_id)
+            {
+                anyhow::bail!("invalid recovery lineage for task {task_id:?}");
+            }
+            lineage.push(link.predecessor_task_id.clone());
+            current = &link.predecessor_task_id;
+        }
+        lineage.reverse();
+        (guard.kernel.clone(), lineage)
+    };
     let response = kernel.execute(KernelRequest {
         target: "agenty.state.snapshot".to_string(),
-        reducer_input: json!({ "task_id": task_id }),
+        reducer_input: json!({ "task_id": task_id, "recovery_lineage": lineage }),
         ..KernelRequest::default()
     })?;
     let packet = response

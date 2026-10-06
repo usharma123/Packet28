@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use crate::cmd_mcp::native_tools::{handle_packet28_write_intention, Packet28WriteIntentionArgs};
 use crate::cmd_mcp::response::capabilities_payload;
 use crate::cmd_mcp::support::{
-    broker_task_status_via_session, resolve_session_task_id, track_task,
+    broker_task_status_via_session, resolve_live_session_task_id, resolve_session_task_id,
+    track_task,
 };
 use crate::cmd_mcp::tool_args::*;
 use crate::cmd_mcp::McpSessionState;
@@ -54,7 +55,7 @@ pub(super) fn handle_core_tool_call(
         }
         "packet28.hypothesis_add" => {
             let mut request: HypothesisAddToolArgs = serde_json::from_value(arguments.clone())?;
-            request.task_id = Some(resolve_session_task_id(
+            request.task_id = Some(resolve_live_session_task_id(
                 session,
                 root,
                 request.task_id.as_deref().unwrap_or_default(),
@@ -88,7 +89,7 @@ pub(super) fn handle_core_tool_call(
         }
         "packet28.hypothesis_resolve" => {
             let mut request: HypothesisResolveToolArgs = serde_json::from_value(arguments.clone())?;
-            request.task_id = Some(resolve_session_task_id(
+            request.task_id = Some(resolve_live_session_task_id(
                 session,
                 root,
                 request.task_id.as_deref().unwrap_or_default(),
@@ -129,7 +130,7 @@ pub(super) fn handle_core_tool_call(
         "packet28.write_intention" => {
             let mut request: Packet28WriteIntentionArgs =
                 serde_json::from_value(arguments.clone())?;
-            request.task_id = resolve_session_task_id(
+            request.task_id = resolve_live_session_task_id(
                 session,
                 root,
                 &request.task_id,
@@ -148,7 +149,7 @@ pub(super) fn handle_core_tool_call(
             handle_packet28_write_intention(root, session, request)?
         }
         "packet28.task_status" => {
-            let task_id = resolve_session_task_id(
+            let task_id = resolve_live_session_task_id(
                 session,
                 root,
                 arguments

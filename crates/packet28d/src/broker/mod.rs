@@ -15,12 +15,12 @@ pub(crate) use context::{
 pub(crate) use handoff::{broker_prepare_handoff, mark_handoff_consumed};
 pub(crate) use limits::estimate_text_cost;
 pub(crate) use ops::{broker_task_status, broker_write_state, broker_write_state_batch};
-pub(crate) use render::load_task_record;
+pub(crate) use render::{load_task_record, load_versioned_broker_response};
 pub(crate) use snapshot::insert_sorted_unique;
 pub(crate) use support::{
     build_registry_status_v1, build_status, complete_task_cancellation_for_generation,
-    emit_task_event_for_generation, ensure_task_record_mut, kernel_for_context_root,
-    kernel_for_request, load_agent_snapshot_for_task, now_unix_millis,
+    emit_task_event_for_generation, ensure_task_record_mut, inherit_recovered_agent_state,
+    kernel_for_context_root, kernel_for_request, load_agent_snapshot_for_task, now_unix_millis,
     refresh_task_context_summary_for_generation, set_context_reason_for_generation,
 };
 
