@@ -473,12 +473,26 @@ fn idle_mcp_recovers_offline_corrupt_task_without_another_tool_call() {
     // fixture waits for shutdown and installs offline damage.
     let startup_lease =
         packet28_daemon_core::task_store_lease::acquire_daemon_startup_lease(dir.path()).unwrap();
-    let stop = mcp_cmd()
-        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(stop.status.success());
-    // Stop acknowledges the request before runtime cleanup and lease release.
+    // CLI stop takes the startup lease held above, so send the protocol Stop
+    // directly. The daemon acknowledges before runtime cleanup and lease
+    // release; the instance-lease wait below observes the actual release.
+    let mut stop_stream =
+        packet28_daemon_client::transport::connect(dir.path(), MCP_IO_TIMEOUT).unwrap();
+    packet28_daemon_protocol::frame::write_frame(
+        &mut stop_stream,
+        &packet28_daemon_protocol::message::DaemonRequest::Stop,
+    )
+    .unwrap();
+    let stop_ack: packet28_daemon_protocol::message::DaemonResponse =
+        packet28_daemon_protocol::frame::read_frame(&mut stop_stream).unwrap();
+    assert!(
+        matches!(
+            stop_ack,
+            packet28_daemon_protocol::message::DaemonResponse::Ack { .. }
+        ),
+        "{stop_ack:?}"
+    );
+    drop(stop_stream);
     let deadline = Instant::now() + MCP_SHUTDOWN_TIMEOUT;
     let stopped_lease = loop {
         match packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease(dir.path()) {

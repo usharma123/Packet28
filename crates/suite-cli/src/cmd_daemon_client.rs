@@ -5,7 +5,11 @@ use anyhow::{anyhow, Context, Result};
 use packet28_daemon_client::transport::{DaemonEndpoint, DaemonStream};
 use packet28_daemon_core::storage::read_runtime_info;
 #[cfg(unix)]
-use packet28_daemon_core::task_store_lease::acquire_daemon_startup_lease;
+use packet28_daemon_core::task_store_lease::{
+    acquire_daemon_instance_lease, acquire_daemon_startup_lease, daemon_instance_lock_path,
+};
+#[cfg(unix)]
+use packet28_daemon_core::DaemonCoreError;
 use packet28_daemon_protocol::{
     commands::{
         CoverCheckRequest, CoverCheckResponse, PacketFetchRequest, PacketFetchResponse,
@@ -21,7 +25,10 @@ use packet28_daemon_protocol::{
     frame::{read_frame, write_frame},
     logging::{runtime_log_max_bytes, MANAGED_LOG_FLAG, RUNTIME_LOG_BACKUPS},
     message::{ContextResolveRequest, ContextResolveResponse, DaemonRequest, DaemonResponse},
-    paths::{log_path, ready_path, resolve_workspace_root, socket_path, workspace_socket_path},
+    paths::{
+        daemon_dir, log_path, ready_path, resolve_workspace_root, socket_path,
+        workspace_socket_path,
+    },
     registry::{DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1},
 };
 
@@ -279,23 +286,6 @@ pub fn send_request(_root: &Path, _request: &DaemonRequest) -> Result<DaemonResp
 }
 
 #[cfg(unix)]
-pub(crate) fn send_request_without_start(
-    root: &Path,
-    request: &DaemonRequest,
-) -> Result<DaemonResponse> {
-    let root = normalize_daemon_root(root);
-    send_request_existing_daemon(&root, request)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn send_request_without_start(
-    _root: &Path,
-    _request: &DaemonRequest,
-) -> Result<DaemonResponse> {
-    daemon_not_supported()
-}
-
-#[cfg(unix)]
 impl PersistentDaemonClient {
     pub fn connect(root: &Path) -> Result<Self> {
         let root = normalize_daemon_root(root);
@@ -334,8 +324,18 @@ pub(crate) fn ensure_daemon(root: &Path) -> Result<()> {
     if daemon_status_existing(&root).is_ok() {
         return Ok(());
     }
+    // Discovery, stale-file cleanup, and bootstrap stay inside one startup
+    // lease so a concurrent client cannot replace the runtime between the
+    // authority probe and cleanup.
     let _startup_lease = acquire_daemon_startup_lease(&root)?;
     if daemon_status_existing(&root).is_ok() {
+        return Ok(());
+    }
+    // An unreachable endpoint does not mean the previous daemon has exited: a
+    // stopping daemon withdraws its endpoint before it finishes persistence and
+    // cleanup. Leave its runtime files alone and do not spawn a replacement
+    // until it releases the instance lease.
+    if wait_for_daemon_authority(&root, daemon_stop_timeout())? == DaemonAuthority::Serving {
         return Ok(());
     }
     let endpoint = daemon_endpoint(&root)?;
@@ -481,28 +481,78 @@ fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
     ))
 }
 
-/// Stop the workspace daemon if it is running and wait for its socket to go
-/// away. Returns `Ok(true)` when a daemon was reachable and asked to stop.
+/// Default bound for a stopping daemon to release workspace authority. It
+/// exceeds the daemon's default shutdown grace so normal persistence and
+/// cleanup complete before a client gives up.
 #[cfg(unix)]
-pub(crate) fn stop_daemon_and_wait(root: &Path) -> Result<bool> {
+const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment override for [`DAEMON_STOP_TIMEOUT`], in milliseconds. A
+/// non-positive or unparsable value falls back to the default.
+#[cfg(unix)]
+const DAEMON_STOP_TIMEOUT_ENV: &str = "PACKET28_DAEMON_STOP_TIMEOUT_MS";
+
+#[cfg(unix)]
+fn daemon_stop_timeout() -> Duration {
+    std::env::var(DAEMON_STOP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DAEMON_STOP_TIMEOUT)
+}
+
+/// Stops the workspace daemon and waits until it releases workspace authority.
+///
+/// Returns the daemon's stop acknowledgement when one was reachable. The
+/// startup lease is held from the stop request through stale-file cleanup, so
+/// a concurrent client starts its replacement only after the stopping daemon
+/// has released its instance lease and finished cleanup.
+///
+/// # Errors
+///
+/// Returns the daemon's stop error, an instance-lock integrity or I/O error,
+/// or a timeout when the daemon keeps owning the workspace. A timed-out stop
+/// leaves the live daemon's runtime files in place.
+#[cfg(unix)]
+pub(crate) fn stop_daemon_and_wait(root: &Path) -> Result<Option<String>> {
     let root = normalize_daemon_root(root);
-    let was_running = daemon_status_existing(&root).is_ok();
-    stop_daemon_if_running(&root)?;
-    wait_for_daemon_shutdown(&root, Duration::from_secs(5))?;
+    match std::fs::symlink_metadata(daemon_dir(&root)) {
+        Ok(_) => {}
+        // Without daemon state no daemon owns this workspace's lease or
+        // runtime files. Do not create state merely to stop.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let acknowledgement = request_daemon_stop(&root)?;
+            wait_for_daemon_shutdown(&root, daemon_stop_timeout())?;
+            return Ok(acknowledgement);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect daemon state directory '{}'",
+                    daemon_dir(&root).display()
+                )
+            })
+        }
+    }
+    let _startup_lease = acquire_daemon_startup_lease(&root)?;
+    let acknowledgement = request_daemon_stop(&root)?;
+    wait_for_daemon_shutdown(&root, daemon_stop_timeout())?;
     cleanup_unreachable_runtime_files(&root)?;
-    Ok(was_running)
+    Ok(acknowledgement)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn stop_daemon_and_wait(_root: &Path) -> Result<bool> {
-    Ok(false)
+pub(crate) fn stop_daemon_and_wait(_root: &Path) -> Result<Option<String>> {
+    Ok(None)
 }
 
 #[cfg(unix)]
 pub(crate) fn restart_daemon(root: &Path) -> Result<()> {
     let root = normalize_daemon_root(root);
-    stop_daemon_if_running(&root)?;
-    wait_for_daemon_shutdown(&root, Duration::from_secs(5))?;
+    let _startup_lease = acquire_daemon_startup_lease(&root)?;
+    request_daemon_stop(&root)?;
+    wait_for_daemon_shutdown(&root, daemon_stop_timeout())?;
     cleanup_unreachable_runtime_files(&root)?;
     start_daemon(&root)?;
     wait_for_daemon(&root, Duration::from_secs(10))
@@ -588,25 +638,29 @@ pub(crate) fn daemon_status_v1(_root: &Path) -> Result<DaemonStatusV1> {
     daemon_not_supported()
 }
 
-/// Stops the daemon for a workspace when its existing endpoint is reachable.
+/// Asks the daemon for a workspace to stop when its existing endpoint is
+/// reachable, returning its acknowledgement.
 ///
 /// # Errors
 ///
-/// Returns the connection or stop-request error if the daemon endpoint remains
-/// reachable after the stop request fails.
+/// Returns a daemon error or unexpected response, or the connection or
+/// stop-request error if the daemon endpoint remains reachable after the stop
+/// request fails.
 #[cfg(unix)]
-fn stop_daemon_if_running(root: &Path) -> Result<()> {
+fn request_daemon_stop(root: &Path) -> Result<Option<String>> {
     let endpoint = daemon_endpoint(root)?;
     if !endpoint_may_have_stale_socket(&endpoint) {
-        return Ok(());
+        return Ok(None);
     }
     match send_request_existing_daemon(root, &DaemonRequest::Stop) {
-        Ok(_) => Ok(()),
+        Ok(DaemonResponse::Ack { message }) => Ok(Some(message)),
+        Ok(DaemonResponse::Error { message }) => Err(anyhow!(message)),
+        Ok(other) => Err(anyhow!("unexpected daemon response: {other:?}")),
         Err(err) => {
             if connect_daemon_endpoint(&endpoint).is_ok() {
                 Err(err)
             } else {
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -628,21 +682,107 @@ fn cleanup_unreachable_runtime_files(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Waits until the daemon endpoint is unreachable and no daemon owns the
+/// workspace instance lease.
+///
+/// The endpoint closes before shutdown persistence and runtime-file cleanup
+/// finish; only the instance lease release marks the end of daemon authority.
+/// Runtime metadata is read only after that release, because the stopping
+/// daemon unlinks it during cleanup.
 #[cfg(unix)]
 fn wait_for_daemon_shutdown(root: &Path, timeout: Duration) -> Result<()> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        let endpoint = daemon_endpoint(root)?;
-        if !endpoint_may_have_stale_socket(&endpoint) || connect_daemon_endpoint(&endpoint).is_err()
-        {
-            return Ok(());
+    let deadline = Instant::now() + timeout;
+    loop {
+        if daemon_instance_released(root)? {
+            // A daemon without an instance lease may still serve the endpoint.
+            let endpoint = daemon_endpoint(root)?;
+            if !endpoint_may_have_stale_socket(&endpoint)
+                || connect_daemon_endpoint(&endpoint).is_err()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "packet28d did not stop; socket still reachable at '{}'",
+                    endpoint.address()
+                ));
+            }
+        } else if Instant::now() >= deadline {
+            return Err(daemon_authority_timeout(root, timeout));
         }
         thread::sleep(Duration::from_millis(10));
     }
-    Err(anyhow!(
-        "packet28d did not stop; socket still reachable at '{}'",
-        daemon_endpoint(root)?.address()
-    ))
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonAuthority {
+    Serving,
+    Released,
+}
+
+/// Waits until a daemon answers status or no daemon owns the workspace
+/// instance lease.
+#[cfg(unix)]
+fn wait_for_daemon_authority(root: &Path, timeout: Duration) -> Result<DaemonAuthority> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if daemon_status_existing(root).is_ok() {
+            return Ok(DaemonAuthority::Serving);
+        }
+        if daemon_instance_released(root)? {
+            return Ok(DaemonAuthority::Released);
+        }
+        if Instant::now() >= deadline {
+            return Err(daemon_authority_timeout(root, timeout));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Probes the authenticated daemon instance lease without blocking.
+///
+/// Only [`DaemonCoreError::DaemonInstanceAlreadyRunning`] means a daemon still
+/// owns the workspace. Any other lock failure is an integrity or I/O error and
+/// is never treated as a stopped daemon.
+#[cfg(unix)]
+fn daemon_instance_released(root: &Path) -> Result<bool> {
+    let path = daemon_instance_lock_path(root);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        // No daemon has created an instance lock for this workspace.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect packet28d instance authority '{}'",
+                    path.display()
+                )
+            })
+        }
+    }
+    match acquire_daemon_instance_lease(root) {
+        Ok(lease) => {
+            drop(lease);
+            Ok(true)
+        }
+        Err(DaemonCoreError::DaemonInstanceAlreadyRunning { .. }) => Ok(false),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "failed to probe packet28d instance authority '{}'",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn daemon_authority_timeout(root: &Path, timeout: Duration) -> anyhow::Error {
+    anyhow!(
+        "packet28d did not release workspace authority '{}' within {} ms; its runtime files \
+         were left in place (log: {})",
+        daemon_instance_lock_path(root).display(),
+        timeout.as_millis(),
+        log_path(root).display()
+    )
 }
 
 #[cfg(unix)]

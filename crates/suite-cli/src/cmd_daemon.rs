@@ -13,7 +13,7 @@ pub use crate::cmd_daemon_client::{
     send_packet_fetch, send_request, via_daemon_env_enabled, PersistentDaemonClient,
 };
 pub(crate) use crate::cmd_daemon_client::{
-    daemon_status_v1, ensure_daemon, resolve_root_arg, restart_daemon, send_request_without_start,
+    daemon_status_v1, ensure_daemon, resolve_root_arg, restart_daemon, stop_daemon_and_wait,
 };
 pub(crate) use crate::cmd_daemon_commands::{
     run_index, run_start, run_status, run_stop, run_task, run_watch,

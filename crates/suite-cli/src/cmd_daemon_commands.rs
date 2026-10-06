@@ -19,7 +19,7 @@ use std::io::BufReader;
 #[cfg(not(unix))]
 use crate::cmd_daemon::daemon_not_supported;
 use crate::cmd_daemon::{
-    daemon_status_v1, ensure_daemon, resolve_root_arg, send_request, send_request_without_start,
+    daemon_status_v1, ensure_daemon, resolve_root_arg, send_request, stop_daemon_and_wait,
     subscribe_task, IndexArgs, IndexCommands, JsonRootArgs, PersistentDaemonClient, StatusRootArgs,
     TaskArgs, TaskCommands, WatchArgs, WatchCommands,
 };
@@ -33,18 +33,11 @@ pub(crate) fn run_start(args: StatusRootArgs) -> Result<i32> {
 
 pub(crate) fn run_stop(args: StatusRootArgs) -> Result<i32> {
     let root = resolve_root_arg(&args.root);
-    match send_request_without_start(&root, &DaemonRequest::Stop) {
-        Ok(DaemonResponse::Ack { message }) => {
-            println!("{message}");
-            Ok(0)
-        }
-        Ok(DaemonResponse::Error { message }) => Err(anyhow!(message)),
-        Ok(other) => Err(anyhow!("unexpected daemon response: {other:?}")),
-        Err(_) => {
-            println!("stopping");
-            Ok(0)
-        }
-    }
+    // Completion means the daemon released workspace authority and finished
+    // cleanup, so an immediate start cannot race the stopping instance.
+    let acknowledgement = stop_daemon_and_wait(&root)?;
+    println!("{}", acknowledgement.as_deref().unwrap_or("stopping"));
+    Ok(0)
 }
 
 pub(crate) fn run_status(args: JsonRootArgs) -> Result<i32> {
