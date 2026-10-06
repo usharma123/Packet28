@@ -533,9 +533,10 @@ pub(crate) async fn supervise_daemon_tasks(
     let deadline = Instant::now() + grace;
     let (first_task, mut result) = match trigger {
         DaemonRuntimeTrigger::Shutdown => (None, Ok(())),
-        DaemonRuntimeTrigger::TaskExit(task, exit) => {
-            (Some(task), classify_first_runtime_exit(task, exit))
-        }
+        DaemonRuntimeTrigger::TaskExit(task, exit) => (
+            Some(task),
+            classify_first_runtime_exit(task, exit, shutdown.is_requested()),
+        ),
     };
 
     shutdown.request();
@@ -665,8 +666,14 @@ fn begin_daemon_shutdown(state: &Arc<Mutex<DaemonState>>) -> DaemonShutdownStart
 fn classify_first_runtime_exit(
     task: DaemonRuntimeTask,
     exit: std::result::Result<Result<()>, tokio::task::JoinError>,
+    shutdown_requested: bool,
 ) -> Result<()> {
     classify_runtime_join(task.name(), exit)?;
+    // select! may observe the worker after polling the shutdown arm Pending.
+    // An accepted Stop permits a clean exit, but never hides worker errors.
+    if shutdown_requested {
+        return Ok(());
+    }
     anyhow::bail!("{} exited before daemon shutdown", task.name())
 }
 
@@ -1382,4 +1389,39 @@ fn read_daemon_random_bytes(purpose: &str) -> Result<[u8; DAEMON_TRANSPORT_SECRE
             format!("failed to read daemon {purpose} from operating-system random source")
         })?;
     Ok(secret)
+}
+
+#[cfg(test)]
+mod shutdown_race_tests {
+    use super::*;
+
+    #[test]
+    fn worker_exit_after_stop_wins_selection_is_clean() {
+        // A worker can finish after the select's shutdown arm was polled Pending
+        // but before its own JoinHandle is polled Ready. Classify the completed
+        // worker using the shutdown state at that boundary.
+        for task in [
+            DaemonRuntimeTask::Transport,
+            DaemonRuntimeTask::Watch,
+            DaemonRuntimeTask::Background,
+            DaemonRuntimeTask::Index,
+        ] {
+            classify_first_runtime_exit(task, Ok(Ok(())), true)
+                .expect("accepted Stop must permit a successful worker exit");
+        }
+    }
+
+    #[test]
+    fn stop_race_preserves_worker_failures_and_unrequested_exits() {
+        let error = classify_first_runtime_exit(
+            DaemonRuntimeTask::Index,
+            Ok(Err(anyhow!("injected worker failure"))),
+            true,
+        )
+        .expect_err("Stop must not hide a worker failure");
+        assert!(format!("{error:#}").contains("injected worker failure"));
+        let error = classify_first_runtime_exit(DaemonRuntimeTask::Index, Ok(Ok(())), false)
+            .expect_err("an unexpected successful exit must remain fatal");
+        assert!(error.to_string().contains("exited before daemon shutdown"));
+    }
 }
