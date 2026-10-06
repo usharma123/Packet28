@@ -1146,6 +1146,110 @@ fn write_hook_runtime_config_rejects_linked_token_files() {
     }
 }
 
+/// Creates an index-status fixture with the specified manifest and readiness values.
+///
+/// # Examples
+///
+/// ```
+/// let status = setup_index_status("ready", None, true);
+/// assert!(status.ready);
+/// assert!(status.manifest.regex_status.is_none());
+/// ```
+///
+/// # Arguments
+///
+/// * `status` - Manifest status to parse into the fixture.
+/// * `regex_status` - Optional regex index status and associated metadata.
+/// * `ready` - Whether the overall index is ready.
+fn setup_index_status(
+    status: &str,
+    regex_status: Option<&str>,
+    ready: bool,
+) -> DaemonIndexStatusResponse {
+    DaemonIndexStatusResponse {
+        manifest: DaemonIndexManifest {
+            status: status.parse().unwrap(),
+            generation: 7,
+            regex_generation: regex_status.map(|_| 7),
+            regex_status: regex_status.map(str::to_string),
+            regex_weight_table_version: regex_status.map(|_| 1),
+            ..DaemonIndexManifest::default()
+        },
+        ready,
+        ..DaemonIndexStatusResponse::default()
+    }
+}
+
+#[test]
+fn classify_setup_index_status_reports_ready_when_regex_index_is_usable() {
+    let dir = tempdir().unwrap();
+    let regex_dir = dir.path().join(".packet28").join("index").join("regex-v1");
+    fs::create_dir_all(&regex_dir).unwrap();
+    fs::write(regex_dir.join("manifest.json"), "{}").unwrap();
+    let response = setup_index_status("ready", Some("ready"), true);
+
+    assert!(matches!(
+        classify_setup_index_status(dir.path(), &response, false),
+        SetupIndexVerification::Ready(_)
+    ));
+}
+
+#[test]
+fn classify_setup_index_status_reports_building_while_index_is_in_progress() {
+    let dir = tempdir().unwrap();
+    let response = setup_index_status("building", Some("building"), false);
+
+    assert!(matches!(
+        classify_setup_index_status(dir.path(), &response, false),
+        SetupIndexVerification::Building(_)
+    ));
+}
+
+#[test]
+fn setup_defers_dirty_git_index_without_masking_corruption() {
+    let dir = tempdir().unwrap();
+    let mut response = setup_index_status("queued", Some("building"), false);
+    response.manifest.last_error = Some(
+        "index publication failed: full regex index rebuild requires a clean Git working tree"
+            .to_string(),
+    );
+    assert!(matches!(
+        classify_setup_index_status(dir.path(), &response, true),
+        SetupIndexVerification::Deferred
+    ));
+    response.manifest.regex_status = Some("corrupt".to_string());
+    assert!(matches!(
+        classify_setup_index_status(dir.path(), &response, false),
+        SetupIndexVerification::Failed { .. }
+    ));
+}
+
+#[test]
+fn classify_setup_index_status_reports_failure_when_regex_artifacts_are_missing_after_timeout() {
+    let dir = tempdir().unwrap();
+    let response = setup_index_status("building", Some("building"), false);
+
+    match classify_setup_index_status(dir.path(), &response, true) {
+        SetupIndexVerification::Failed { reason, .. } => {
+            assert!(reason.contains("regex trigram index artifacts are missing"));
+        }
+        other => panic!("expected failed setup classification, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_setup_index_status_reports_failure_when_repo_index_claims_ready_without_regex() {
+    let dir = tempdir().unwrap();
+    let response = setup_index_status("ready", Some("building"), false);
+
+    match classify_setup_index_status(dir.path(), &response, false) {
+        SetupIndexVerification::Failed { reason, .. } => {
+            assert!(reason.contains("regex trigram index is not ready"));
+        }
+        other => panic!("expected failed setup classification, got {other:?}"),
+    }
+}
+
 #[test]
 fn gitignore_coverage_recognizes_common_spellings() {
     for spelling in [
@@ -1352,106 +1456,20 @@ fn ensure_gitignore_rejects_hard_link_without_writing_outside_workspace() {
     );
 }
 
-/// Creates an index-status fixture with the specified manifest and readiness values.
-///
-/// # Examples
-///
-/// ```
-/// let status = setup_index_status("ready", None, true);
-/// assert!(status.ready);
-/// assert!(status.manifest.regex_status.is_none());
-/// ```
-///
-/// # Arguments
-///
-/// * `status` - Manifest status to parse into the fixture.
-/// * `regex_status` - Optional regex index status and associated metadata.
-/// * `ready` - Whether the overall index is ready.
-fn setup_index_status(
-    status: &str,
-    regex_status: Option<&str>,
-    ready: bool,
-) -> DaemonIndexStatusResponse {
-    DaemonIndexStatusResponse {
-        manifest: DaemonIndexManifest {
-            status: status.parse().unwrap(),
-            generation: 7,
-            regex_generation: regex_status.map(|_| 7),
-            regex_status: regex_status.map(str::to_string),
-            regex_weight_table_version: regex_status.map(|_| 1),
-            ..DaemonIndexManifest::default()
-        },
-        ready,
-        ..DaemonIndexStatusResponse::default()
-    }
-}
-
 #[test]
-fn classify_setup_index_status_reports_ready_when_regex_index_is_usable() {
-    let dir = tempdir().unwrap();
-    let regex_dir = dir.path().join(".packet28").join("index").join("regex-v1");
-    fs::create_dir_all(&regex_dir).unwrap();
-    fs::write(regex_dir.join("manifest.json"), "{}").unwrap();
-    let response = setup_index_status("ready", Some("ready"), true);
-
-    assert!(matches!(
-        classify_setup_index_status(dir.path(), &response, false),
-        SetupIndexVerification::Ready(_)
+fn gitignore_coverage_respects_later_negations() {
+    assert!(!gitignore_covers_packet28_dir(".packet28/\n!.packet28/\n"));
+    assert!(!gitignore_covers_packet28_dir(
+        ".packet28/**\n!.packet28/task.json\n"
     ));
-}
-
-#[test]
-fn classify_setup_index_status_reports_building_while_index_is_in_progress() {
+    assert!(!gitignore_covers_packet28_dir(".packet28/*\n!*\n"));
+    assert!(gitignore_covers_packet28_dir("!.packet28/\n.packet28/\n"));
     let dir = tempdir().unwrap();
-    let response = setup_index_status("building", Some("building"), false);
-
-    assert!(matches!(
-        classify_setup_index_status(dir.path(), &response, false),
-        SetupIndexVerification::Building(_)
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".gitignore"), ".packet28/\n!.packet28/\n").unwrap();
+    assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_some());
+    assert!(gitignore_covers_packet28_dir(
+        &fs::read_to_string(dir.path().join(".gitignore")).unwrap()
     ));
-}
-
-#[test]
-fn setup_defers_dirty_git_index_without_masking_corruption() {
-    let dir = tempdir().unwrap();
-    let mut response = setup_index_status("queued", Some("building"), false);
-    response.manifest.last_error = Some(
-        "index publication failed: full regex index rebuild requires a clean Git working tree"
-            .to_string(),
-    );
-    assert!(matches!(
-        classify_setup_index_status(dir.path(), &response, true),
-        SetupIndexVerification::Deferred
-    ));
-    response.manifest.regex_status = Some("corrupt".to_string());
-    assert!(matches!(
-        classify_setup_index_status(dir.path(), &response, false),
-        SetupIndexVerification::Failed { .. }
-    ));
-}
-
-#[test]
-fn classify_setup_index_status_reports_failure_when_regex_artifacts_are_missing_after_timeout() {
-    let dir = tempdir().unwrap();
-    let response = setup_index_status("building", Some("building"), false);
-
-    match classify_setup_index_status(dir.path(), &response, true) {
-        SetupIndexVerification::Failed { reason, .. } => {
-            assert!(reason.contains("regex trigram index artifacts are missing"));
-        }
-        other => panic!("expected failed setup classification, got {other:?}"),
-    }
-}
-
-#[test]
-fn classify_setup_index_status_reports_failure_when_repo_index_claims_ready_without_regex() {
-    let dir = tempdir().unwrap();
-    let response = setup_index_status("ready", Some("building"), false);
-
-    match classify_setup_index_status(dir.path(), &response, false) {
-        SetupIndexVerification::Failed { reason, .. } => {
-            assert!(reason.contains("regex trigram index is not ready"));
-        }
-        other => panic!("expected failed setup classification, got {other:?}"),
-    }
+    assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_none());
 }

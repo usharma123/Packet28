@@ -5,6 +5,13 @@
 #[path = "support/process_harness.rs"]
 mod process_harness;
 
+#[expect(
+    dead_code,
+    reason = "this binary uses packet wrapper parsing from the shared support"
+)]
+#[path = "support/context_packet.rs"]
+mod context_packet;
+
 use process_harness::{HarnessLimits, McpHarness, ProcessHarness};
 use serde_json::{json, Value};
 use std::fs;
@@ -83,6 +90,12 @@ fn hook(root: &Path, home: &Path, runtime: &str, payload: Value) -> Value {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if !output.stderr.is_empty() {
+        eprintln!(
+            "{runtime} hook diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     if output.stdout.is_empty() {
         Value::Null
     } else {
@@ -446,4 +459,256 @@ fn claude_original_repeated_requests_execute_twice_with_the_requested_environmen
 #[cfg(unix)]
 fn codex_native_capture_hooks_preserve_host_commands_and_requested_environment() {
     repeated_host_commands_execute_each_request("codex");
+}
+
+fn append_trusted_state_event(root: &Path, home: &Path, task_id: &str, event: Value) {
+    let input = root.join(format!("{}.json", event["event_id"].as_str().unwrap()));
+    fs::write(&input, serde_json::to_vec(&event).unwrap()).unwrap();
+    let mut child = command(root, home);
+    child.args([
+        "--via-daemon",
+        "--daemon-root",
+        root.to_str().unwrap(),
+        "context",
+        "state",
+        "append",
+        "--task-id",
+        task_id,
+        "--input",
+        input.to_str().unwrap(),
+        "--root",
+        root.to_str().unwrap(),
+        "--json",
+    ]);
+    let output =
+        ProcessHarness::run(&mut child, &[], IO_TIMEOUT, HarnessLimits::default()).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn linked_recovery_preserves_trusted_continuation(runtime: &str) {
+    use packet28_daemon_protocol::paths::{
+        task_event_log_path, task_events_dir, task_registry_path, TaskStorageId,
+    };
+    use packet28_daemon_protocol::task::{TaskLifecycle, TaskRegistry};
+    process_harness::ensure_packet28d_built();
+    let root = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let _daemon = FixtureDaemonGuard {
+        root: root.path(),
+        home: home.path(),
+    };
+    process_harness::run_git(root.path(), &["init"]);
+    let predecessor = format!("task-{runtime}-damaged");
+    let mut initial = start_mcp(root.path(), home.path(), runtime);
+    tool(
+        &mut initial,
+        2,
+        "packet28.write_intention",
+        json!({
+            "task_id":predecessor, "text":"Keep the latest trusted objective after damaged history"
+        }),
+    );
+    for event in [
+        json!({"event_id":"trusted-decision","occurred_at_unix":1,"actor":"agent","kind":"decision_added","data":{"type":"decision_added","decision_id":"d1","text":"Keep the approved storage decision"}}),
+        json!({"event_id":"trusted-question","occurred_at_unix":2,"actor":"agent","kind":"question_opened","data":{"type":"question_opened","question_id":"q1","text":"This question was already resolved"}}),
+        json!({"event_id":"trusted-resolution","occurred_at_unix":3,"actor":"agent","kind":"question_resolved","data":{"type":"question_resolved","question_id":"q1"}}),
+    ] {
+        append_trusted_state_event(root.path(), home.path(), &predecessor, event);
+    }
+    hook(
+        root.path(),
+        home.path(),
+        runtime,
+        json!({
+            "hook_event_name":"Stop", "task_id":predecessor,
+            "session_id":format!("session-{runtime}-damaged"), "stop_hook_active":false,
+        }),
+    );
+    let before = tool(
+        &mut initial,
+        3,
+        "packet28.prepare_handoff",
+        json!({"task_id":predecessor,"response_mode":"full"}),
+    );
+    assert!(before["handoff_ready"].as_bool().unwrap());
+    let artifact_id = before["context"]["artifact_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    stop_daemon(root.path(), home.path());
+    initial.finish(IO_TIMEOUT).unwrap();
+    let predecessor_id = TaskStorageId::try_from(predecessor.as_str()).unwrap();
+    let original_path = task_event_log_path(root.path(), &predecessor_id);
+    let mut damaged_bytes = fs::read(&original_path).unwrap();
+    let prior_high_water = damaged_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<Value>(line).unwrap()["seq"]
+                .as_u64()
+                .unwrap()
+        })
+        .max()
+        .unwrap();
+    damaged_bytes.extend_from_slice(b"{broken-json-history\n");
+    fs::write(&original_path, &damaged_bytes).unwrap();
+
+    let mut resumed = start_mcp(root.path(), home.path(), runtime);
+    let registry: TaskRegistry =
+        serde_json::from_slice(&fs::read(task_registry_path(root.path())).unwrap()).unwrap();
+    let old = &registry.tasks[&predecessor];
+    let link = old.superseded_by.as_ref().unwrap();
+    let successor = &link.successor_task_id;
+    assert_ne!(successor, &predecessor);
+    assert_eq!(old.lifecycle, TaskLifecycle::Cancelled);
+    assert_eq!(old.last_event_seq, 0);
+    assert_eq!(link.prior_last_event_seq, prior_high_water);
+    assert_eq!(
+        registry.tasks[successor].recovered_from.as_ref(),
+        Some(link)
+    );
+    let quarantine =
+        task_events_dir(root.path()).join(link.quarantined_event_log.as_ref().unwrap());
+    assert_eq!(fs::read(&quarantine).unwrap(), damaged_bytes);
+    assert!(!original_path.exists());
+
+    let output = hook(
+        root.path(),
+        home.path(),
+        runtime,
+        json!({
+            "hook_event_name":"SessionStart", "session_id":format!("session-{runtime}-damaged-resume"),
+            "task_id":predecessor, "source":"resume", "cwd":root.path().to_str().unwrap()
+        }),
+    );
+    let context = output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing linked SessionStart context for {runtime}: {output}"));
+    assert!(
+        context.contains("Keep the latest trusted objective"),
+        "{context}"
+    );
+    let repeated = hook(
+        root.path(),
+        home.path(),
+        runtime,
+        json!({
+            "hook_event_name":"SessionStart", "session_id":format!("session-{runtime}-damaged-resume"),
+            "task_id":predecessor, "source":"resume", "cwd":root.path().to_str().unwrap()
+        }),
+    );
+    assert!(
+        repeated["hookSpecificOutput"]["additionalContext"].is_null(),
+        "same session must not receive duplicate context: {repeated}"
+    );
+    let fresh_session = hook(
+        root.path(),
+        home.path(),
+        runtime,
+        json!({
+            "hook_event_name":"SessionStart", "session_id":format!("session-{runtime}-new-worker"),
+            "task_id":predecessor, "source":"resume", "cwd":root.path().to_str().unwrap()
+        }),
+    );
+    assert!(
+        fresh_session["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|value| value.contains("Keep the latest trusted objective")),
+        "new session must receive the existing context: {fresh_session}"
+    );
+
+    let fetched = tool(
+        &mut resumed,
+        2,
+        "packet28.fetch_context",
+        json!({"task_id":successor,"artifact_id":artifact_id}),
+    );
+    assert_eq!(
+        fetched["latest_intention"]["text"],
+        "Keep the latest trusted objective after damaged history"
+    );
+
+    let predecessor_fetched = tool(
+        &mut resumed,
+        20,
+        "packet28.fetch_context",
+        json!({"task_id":predecessor,"artifact_id":artifact_id}),
+    );
+    assert_eq!(
+        predecessor_fetched["latest_intention"],
+        fetched["latest_intention"]
+    );
+
+    let mut snapshot_command = command(root.path(), home.path());
+    snapshot_command.args([
+        "--via-daemon",
+        "--daemon-root",
+        root.path().to_str().unwrap(),
+        "context",
+        "state",
+        "snapshot",
+        "--task-id",
+        successor,
+        "--root",
+        root.path().to_str().unwrap(),
+        "--json",
+    ]);
+    let snapshot_output = ProcessHarness::run(
+        &mut snapshot_command,
+        &[],
+        IO_TIMEOUT,
+        HarnessLimits::default(),
+    )
+    .unwrap();
+    assert!(
+        snapshot_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&snapshot_output.stderr)
+    );
+    // Use shared support/context_packet.rs packet wrapper helpers here.
+    let wrapper =
+        context_packet::parse_packet_wrapper(&snapshot_output.stdout, "suite.agent.snapshot.v1");
+    let snapshot = context_packet::packet_payload(&wrapper);
+    assert_eq!(snapshot["task_id"], *successor);
+    assert_eq!(
+        snapshot["active_decisions"][0]["text"],
+        "Keep the approved storage decision"
+    );
+    assert!(snapshot["open_questions"].as_array().unwrap().is_empty());
+
+    let latest = tool(
+        &mut resumed,
+        3,
+        "packet28.write_intention",
+        json!({"task_id":predecessor,"text":"Verify the linked successor"}),
+    );
+    assert!(latest["accepted"].as_bool().unwrap());
+    let successor_id = TaskStorageId::try_from(successor.as_str()).unwrap();
+    let events = fs::read_to_string(task_event_log_path(root.path(), &successor_id)).unwrap();
+    let frames: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(frames.first().unwrap()["seq"], 1);
+    assert!(frames.iter().all(|frame| frame["task_id"] == *successor));
+    assert_eq!(fs::read(quarantine).unwrap(), damaged_bytes);
+    assert!(!original_path.exists());
+    stop_daemon(root.path(), home.path());
+    resumed.finish(IO_TIMEOUT).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_linked_recovery_preserves_trusted_context_and_damaged_bytes() {
+    linked_recovery_preserves_trusted_continuation("claude");
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_linked_recovery_preserves_trusted_context_and_damaged_bytes() {
+    linked_recovery_preserves_trusted_continuation("codex");
 }
