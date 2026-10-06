@@ -469,15 +469,33 @@ fn idle_mcp_recovers_offline_corrupt_task_without_another_tool_call() {
         )
         .unwrap();
     assert_ne!(result["result"]["isError"], true, "{result}");
+    // Keep the idle notification reader from restarting the daemon while the
+    // fixture waits for shutdown and installs offline damage.
+    let startup_lease =
+        packet28_daemon_core::task_store_lease::acquire_daemon_startup_lease(dir.path()).unwrap();
     let stop = mcp_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
     assert!(stop.status.success());
+    // Stop acknowledges the request before runtime cleanup and lease release.
+    let deadline = Instant::now() + MCP_SHUTDOWN_TIMEOUT;
+    let stopped_lease = loop {
+        match packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease(dir.path()) {
+            Ok(lease) => break lease,
+            Err(packet28_daemon_core::DaemonCoreError::DaemonInstanceAlreadyRunning { .. }) => {
+                assert!(Instant::now() < deadline, "fixture daemon did not stop");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("fixture daemon authority check failed: {error}"),
+        }
+    };
     assert!(!ready_path(dir.path()).exists());
     let path = task_event_log_path(dir.path(), &TaskStorageId::try_from(task_id).unwrap());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, b"{damaged history}\n").unwrap();
+    drop(stopped_lease);
+    drop(startup_lease);
     // No new MCP tool, CLI status, or explicit restart. The notification
     // reader encounters the old checkpoint and waits for recovery readiness.
     let receipt = server.receive(Duration::from_secs(15)).unwrap();
