@@ -5,29 +5,36 @@
 //! 1. under the state mutex, checks eligibility and installs a per-task
 //!    maintenance fence, which requires that no admitted request names the
 //!    task and blocks every later mutation of it;
-//! 2. without the state mutex, encodes the complete record, publishes it as an
-//!    immutable owner-only archive named by its blake3 digest, and reads it
-//!    back;
-//! 3. under the state mutex, rechecks the fence and that the record's exact
+//! 2. without the state mutex, reloads the record's forward fields from the
+//!    committed raw registry authority, encodes the complete persisted record
+//!    (known and forward fields), publishes it as an immutable owner-only
+//!    archive named by its blake3 digest, and reads it back;
+//! 3. reloads the forward fields again and requires them unchanged, then, under
+//!    the state mutex, rechecks the fence and that the record's exact known
 //!    bytes are unchanged, replaces it with a compact tombstone, and stages the
 //!    tombstone in the registry WAL;
 //! 4. waits for the WAL barrier, then releases the fence.
 //!
 //! A crash before step 3 is durable leaves the original record authoritative
 //! and, at most, an unreferenced archive. Once the tombstone is durable its
-//! pointer is the only authority for the original. Event logs and artifacts
-//! are never touched. Other tasks, status, and pagination are served
+//! pointer is the only authority for the original. Forward fields that a newer
+//! build persisted are part of the archive; small ones stay in the tombstone
+//! through checkpoint forward-field preservation, and shed ones are listed in
+//! the pointer and never carried back. When the raw authority cannot be read,
+//! nothing is archived. Event logs and artifacts are never touched. Other tasks, status, and pagination are served
 //! throughout; the mutex is never held across archive I/O.
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use packet28_daemon_core::storage::load_active_task_record;
+use std::collections::BTreeMap;
+
 use packet28_daemon_core::storage::record_archive::{
     encode_task_record_compact, prepare_task_record_archive, publish_task_record_archive,
-    task_record_archive_refusal, task_record_encoded_len, PreparedTaskRecordArchive,
-    TASK_RECORD_ARCHIVE_REASON_OVERSIZED,
+    task_record_archive_refusal, task_record_full_encoded_len, PreparedTaskRecordArchive,
+    TaskRecordForwardFields, TASK_RECORD_ARCHIVE_REASON_OVERSIZED,
 };
+use packet28_daemon_core::storage::{load_active_task_record, load_task_record_forward_fields};
 use packet28_daemon_protocol::paths::TaskStorageId;
 use packet28_daemon_protocol::registry::{
     TaskRecordArchiveCandidateV1, TaskRecordArchiveOutcome, TaskRecordArchiveReportV1,
@@ -53,9 +60,12 @@ pub(crate) fn archive_task_records(
     let selector = Selector::from_request(&request)?;
     let root = state.lock().map_err(lock_err)?.root.clone();
     let active_task_id = active_task_id(&root);
+    // Sizing and planning must see the complete persisted records, including
+    // forward fields that only the raw authority holds.
+    let forward_fields = load_forward_fields(&root)?;
     let (daemon_pid, selected, remaining_candidates) = {
         let guard = state.lock().map_err(lock_err)?;
-        let (selected, remaining) = selector.select(&guard)?;
+        let (selected, remaining) = selector.select(&guard, &forward_fields)?;
         (guard.runtime.pid, selected, remaining)
     };
     let mut report = TaskRecordArchiveReportV1 {
@@ -72,13 +82,40 @@ pub(crate) fn archive_task_records(
                 &task_id,
                 encoded_bytes,
                 active_task_id.as_deref(),
+                forward_fields.get(&task_id).cloned().unwrap_or_default(),
             )
         } else {
-            plan_one(&state, &task_id, encoded_bytes, active_task_id.as_deref())
+            plan_one(
+                &state,
+                &task_id,
+                encoded_bytes,
+                active_task_id.as_deref(),
+                forward_fields.get(&task_id).cloned().unwrap_or_default(),
+            )
         };
         report.candidates.push(candidate);
     }
     Ok(report)
+}
+
+fn load_forward_fields(
+    root: &std::path::Path,
+) -> Result<BTreeMap<String, TaskRecordForwardFields>> {
+    load_task_record_forward_fields(root).map_err(|error| {
+        anyhow!(
+            "cannot read the raw task-registry authority, so a complete record archive cannot be \
+             built; nothing was changed: {error}"
+        )
+    })
+}
+
+fn load_task_forward_fields(
+    root: &std::path::Path,
+    task_id: &str,
+) -> Result<TaskRecordForwardFields> {
+    Ok(load_forward_fields(root)?
+        .remove(task_id)
+        .unwrap_or_default())
 }
 
 enum Selector {
@@ -109,11 +146,15 @@ impl Selector {
 
     /// Returns selected `(task_id, encoded_bytes)` in identifier order and
     /// the number of matches beyond the per-request bound.
-    fn select(&self, state: &DaemonState) -> Result<(Vec<(String, u64)>, usize)> {
+    fn select(
+        &self,
+        state: &DaemonState,
+        forward_fields: &BTreeMap<String, TaskRecordForwardFields>,
+    ) -> Result<(Vec<(String, u64)>, usize)> {
         match self {
             Self::Exact(task_id) => {
                 let encoded = match state.tasks.tasks.get(task_id) {
-                    Some(task) => task_record_encoded_len(task)?,
+                    Some(task) => task_record_full_encoded_len(task, forward_fields.get(task_id))?,
                     None => 0,
                 };
                 Ok((vec![(task_id.clone(), encoded)], 0))
@@ -125,7 +166,7 @@ impl Selector {
                     if task.archived.is_some() {
                         continue;
                     }
-                    let encoded = task_record_encoded_len(task)?;
+                    let encoded = task_record_full_encoded_len(task, forward_fields.get(task_id))?;
                     if encoded < *min {
                         continue;
                     }
@@ -157,7 +198,12 @@ fn active_task_id(root: &std::path::Path) -> Option<String> {
 
 /// Returns why `task_id` cannot be archived now, including daemon-runtime
 /// state that the registry record alone does not show.
-fn refusal(state: &DaemonState, task_id: &str, active_task_id: Option<&str>) -> Option<String> {
+fn refusal(
+    state: &DaemonState,
+    task_id: &str,
+    active_task_id: Option<&str>,
+    forward_fields: &TaskRecordForwardFields,
+) -> Option<String> {
     if active_task_id == Some("") {
         return Some("the agent active-task pointer is unreadable".to_string());
     }
@@ -168,7 +214,7 @@ fn refusal(state: &DaemonState, task_id: &str, active_task_id: Option<&str>) -> 
         .tasks
         .tasks
         .get(task_id)
-        .map(task_record_encoded_len)
+        .map(|task| task_record_full_encoded_len(task, Some(forward_fields)))
         .transpose()
         .ok()
         .flatten()
@@ -213,10 +259,11 @@ fn candidate(task_id: &str, encoded_bytes: u64) -> TaskRecordArchiveCandidateV1 
 fn already_archived(state: &DaemonState, task_id: &str) -> Option<TaskRecordArchiveCandidateV1> {
     let task = state.tasks.tasks.get(task_id)?;
     let archive = task.archived.clone()?;
+    let encoded_bytes = archive.tombstone_encoded_bytes;
     Some(TaskRecordArchiveCandidateV1 {
         outcome: TaskRecordArchiveOutcome::AlreadyArchived,
         archive: Some(archive),
-        ..candidate(task_id, task_record_encoded_len(task).unwrap_or(0))
+        ..candidate(task_id, encoded_bytes)
     })
 }
 
@@ -241,6 +288,7 @@ fn plan_one(
     task_id: &str,
     encoded_bytes: u64,
     active_task_id: Option<&str>,
+    forward_fields: TaskRecordForwardFields,
 ) -> TaskRecordArchiveCandidateV1 {
     let snapshot = {
         let guard = match state.lock().map_err(lock_err) {
@@ -250,7 +298,7 @@ fn plan_one(
         if let Some(archived) = already_archived(&guard, task_id) {
             return archived;
         }
-        if let Some(reason) = refusal(&guard, task_id, active_task_id) {
+        if let Some(reason) = refusal(&guard, task_id, active_task_id, &forward_fields) {
             return refused(task_id, encoded_bytes, reason);
         }
         guard.tasks.tasks.get(task_id).cloned()
@@ -264,6 +312,7 @@ fn plan_one(
     };
     match prepare_task_record_archive(
         &original,
+        &forward_fields,
         TASK_RECORD_ARCHIVE_REASON_OVERSIZED,
         packet28_daemon_core::storage::now_unix(),
     ) {
@@ -294,12 +343,15 @@ impl Drop for FenceRelease<'_> {
     }
 }
 
+/// `forward_fields` sizes the record for the eligibility floor; the archive
+/// itself binds forward fields reloaded under the fence.
 fn archive_one(
     state: &Arc<Mutex<DaemonState>>,
     root: &std::path::Path,
     task_id: &str,
     encoded_bytes: u64,
     active_task_id: Option<&str>,
+    forward_fields: TaskRecordForwardFields,
 ) -> TaskRecordArchiveCandidateV1 {
     // Phase 1: eligibility and fence, atomically with the record snapshot.
     let (lease, original) = {
@@ -310,7 +362,7 @@ fn archive_one(
         if let Some(archived) = already_archived(&guard, task_id) {
             return archived;
         }
-        if let Some(reason) = refusal(&guard, task_id, active_task_id) {
+        if let Some(reason) = refusal(&guard, task_id, active_task_id, &forward_fields) {
             return refused(task_id, encoded_bytes, reason);
         }
         let Some(original) = guard.tasks.tasks.get(task_id).cloned() else {
@@ -331,8 +383,12 @@ fn archive_one(
         lease,
     };
 
-    // Phase 2: archive publication without the state mutex.
-    let prepared = match prepare_and_publish(root, &original) {
+    // Phase 2: archive publication without the state mutex. The forward
+    // fields are reloaded under the fence so the archive binds the raw
+    // authority as of the fenced snapshot.
+    let prepared = match load_task_forward_fields(root, task_id)
+        .and_then(|forward_fields| prepare_and_publish(root, &original, &forward_fields))
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             return failed(
@@ -344,8 +400,16 @@ fn archive_one(
     };
     maybe_exit_after_archive_phase("archive_published");
 
-    // Phase 3: exact-bytes recheck and tombstone staging under the mutex.
+    // Phase 3: the forward fields and the exact known bytes must both be
+    // unchanged; then the tombstone is staged under the mutex. The fenced
+    // record's forward fields change only through checkpoint encoding of this
+    // tombstone or removal of the record, both of which the fence excludes,
+    // so the raw authority is rechecked once without holding the mutex.
     let staged = (|| -> Result<(u64, crate::persistence::PersistenceHandle)> {
+        if load_task_forward_fields(root, task_id)? != prepared.forward_fields {
+            anyhow::bail!("task record forward fields changed after archive preparation");
+        }
+        let original_known_bytes = encode_task_record_compact(&original)?;
         let mut guard = state.lock().map_err(lock_err)?;
         if !guard.task_maintenance.holds(task_id, lease) {
             anyhow::bail!("the record maintenance fence was lost before commit");
@@ -355,7 +419,7 @@ fn archive_one(
             .tasks
             .get(task_id)
             .ok_or_else(|| anyhow!("task disappeared before archive commit"))?;
-        if encode_task_record_compact(current)? != prepared.bytes {
+        if encode_task_record_compact(current)? != original_known_bytes {
             anyhow::bail!("task record changed after archive preparation");
         }
         if guard
@@ -432,9 +496,11 @@ fn archive_one(
 fn prepare_and_publish(
     root: &std::path::Path,
     original: &TaskRecord,
+    forward_fields: &TaskRecordForwardFields,
 ) -> Result<PreparedTaskRecordArchive> {
     let prepared = prepare_task_record_archive(
         original,
+        forward_fields,
         TASK_RECORD_ARCHIVE_REASON_OVERSIZED,
         packet28_daemon_core::storage::now_unix(),
     )?;
@@ -455,6 +521,20 @@ fn prepare_and_publish(
 fn maybe_exit_after_archive_phase(phase: &str) {
     if std::env::var("PACKET28_TASK_RECORD_ARCHIVE_EXIT_AFTER").as_deref() == Ok(phase) {
         std::process::exit(87);
+    }
+    // Test-only rendezvous: announce the boundary with `<file>.paused`, then
+    // wait, bounded, for the test to create `<file>`.
+    if std::env::var("PACKET28_TASK_RECORD_ARCHIVE_PAUSE_AFTER").as_deref() == Ok(phase) {
+        if let Some(release) = std::env::var_os("PACKET28_TASK_RECORD_ARCHIVE_PAUSE_FILE") {
+            let release = std::path::PathBuf::from(release);
+            let mut paused = release.clone().into_os_string();
+            paused.push(".paused");
+            let _ = std::fs::write(paused, phase);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !release.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 }
 

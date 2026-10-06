@@ -1061,6 +1061,79 @@ pub fn load_task_registry(root: &Path) -> Result<TaskRegistry> {
     load_task_registry_portable(root)
 }
 
+/// Returns the forward fields of every committed task record that carries any.
+///
+/// Forward fields are top-level record values that a newer build persisted and
+/// this build does not model. The committed task-registry checkpoint is their
+/// only authority: registry deltas carry typed records, and checkpoint encoding
+/// carries forward fields over from the previous checkpoint. They are read here
+/// under the shared registry lock, through the same journal-aware resolution
+/// as [`load_task_registry`]. Records without forward fields are absent.
+///
+/// # Errors
+///
+/// Returns the same locking, read, and authority-decoding errors as
+/// [`load_task_registry`].
+pub fn load_task_record_forward_fields(
+    root: &Path,
+) -> Result<BTreeMap<String, record_archive::TaskRecordForwardFields>> {
+    let path = task_registry_path(root);
+    #[cfg(unix)]
+    let task_bytes = with_anchored_task_registry_lock(
+        root,
+        RegistryLockMode::Shared,
+        || Ok(()),
+        |daemon| {
+            Ok(
+                load_task_watch_registry_checkpoint_with_delta_revision_under_task_lock(
+                    root, daemon,
+                )?
+                .task_bytes,
+            )
+        },
+    )?;
+    #[cfg(not(unix))]
+    let task_bytes = with_registry_lock(root, &path, RegistryLockMode::Shared, || {
+        Ok(
+            load_task_watch_registry_checkpoint_with_delta_revision_portable_under_task_lock(root)?
+                .task_bytes,
+        )
+    })?;
+    let value =
+        decode_json_value_without_duplicate_keys(&task_bytes, AuthorityJsonProfile::TaskRegistry)
+            .map_err(|error| {
+            map_authority_json_error(
+                &path,
+                AuthorityJsonProfile::TaskRegistry,
+                "failed to decode task registry forward fields from",
+                error,
+            )
+        })?;
+    let tasks = value
+        .get("tasks")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            DaemonCoreError::json(
+                "failed to decode task registry forward fields from",
+                &path,
+                <serde_json::Error as serde::de::Error>::custom(
+                    "persisted task registry must contain an object-valued tasks field",
+                ),
+            )
+        })?;
+    let mut forward = BTreeMap::new();
+    for (task_id, record) in tasks {
+        let Some(record) = record.as_object() else {
+            continue;
+        };
+        let fields = record_archive::task_record_forward_fields(record);
+        if !fields.is_empty() {
+            forward.insert(task_id.clone(), fields);
+        }
+    }
+    Ok(forward)
+}
+
 #[cfg(unix)]
 fn task_registry_read_error(
     daemon: &CapabilityDir,
@@ -1634,6 +1707,19 @@ fn validate_encoded_task_registry(
     Ok(())
 }
 
+/// Known task-record fields whose absent value is represented by omission.
+/// Every other known field is always serialized, so any persisted top-level
+/// key outside the serialized schema and this list is a forward field written
+/// by a newer build, which checkpoint encoding preserves.
+pub(crate) const KNOWN_OPTIONAL_TASK_RECORD_FIELDS: &[&str] = &[
+    "cancelled",
+    "recovered_replan",
+    "superseded_by",
+    "recovered_from",
+    "handoffs",
+    "archived",
+];
+
 fn encode_task_registry_preserving_existing(
     root: &Path,
     path: &Path,
@@ -1704,33 +1790,28 @@ fn encode_task_registry_preserving_existing(
                 ),
             ));
         };
+        let mut merged = existing_tasks
+            .get(task_id)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         // An archived tombstone deliberately sheds the original's large
-        // values; its archive holds them. Forward-field preservation must not
-        // copy them back from the previous checkpoint.
-        let mut merged = if record.archived.is_some() {
-            serde_json::Map::new()
-        } else {
-            existing_tasks
-                .get(task_id)
-                .and_then(serde_json::Value::as_object)
-                .cloned()
-                .unwrap_or_default()
-        };
+        // values, known or forward; its archive holds them. Forward-field
+        // preservation keeps every retained forward field but must not copy a
+        // shed one back from the previous checkpoint.
+        if let Some(archive) = &record.archived {
+            for omitted in archive.omitted_fields.keys() {
+                merged.remove(omitted);
+            }
+        }
         // These additive lifecycle markers, history links, and omitted-when-
         // empty collections are known fields even when their absent value is
         // represented by omission. Remove an older value before overlaying the
         // newly serialized record so forward-field preservation cannot
         // resurrect a completed transition, stale provenance, or discarded
         // handoff descriptors on a replaced record.
-        for known_optional_field in [
-            "cancelled",
-            "recovered_replan",
-            "superseded_by",
-            "recovered_from",
-            "handoffs",
-            "archived",
-        ] {
-            merged.remove(known_optional_field);
+        for known_optional_field in KNOWN_OPTIONAL_TASK_RECORD_FIELDS {
+            merged.remove(*known_optional_field);
         }
         for (field, value) in known {
             merged.insert(field, value);

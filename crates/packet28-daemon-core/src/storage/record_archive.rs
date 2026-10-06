@@ -64,13 +64,24 @@ const PROTECTED_TOMBSTONE_FIELDS: &[&str] = &[
     "archived",
 ];
 
+/// Top-level task-record values that a newer build persisted and this build
+/// does not model, keyed by field name. Keys never name a known field.
+pub type TaskRecordForwardFields = BTreeMap<String, serde_json::Value>;
+
 /// Prepared archive bytes and the tombstone that will replace the original.
 #[derive(Debug, Clone)]
 pub struct PreparedTaskRecordArchive {
-    /// Exact compact-JSON bytes of the complete original record.
+    /// Exact compact-JSON bytes of the complete original record, including
+    /// every forward field.
     pub bytes: Vec<u8>,
     /// Compact replacement carrying the archive pointer.
     pub tombstone: TaskRecord,
+    /// Forward fields of the original that the archive includes.
+    pub forward_fields: TaskRecordForwardFields,
+    /// Forward fields small enough to stay in the tombstone. Checkpoint
+    /// encoding keeps them from the raw authority; every other forward field
+    /// is listed in the pointer's `omitted_fields` and is not carried over.
+    pub retained_forward_fields: TaskRecordForwardFields,
 }
 
 impl PreparedTaskRecordArchive {
@@ -123,6 +134,121 @@ pub fn task_record_encoded_len(record: &TaskRecord) -> Result<u64> {
         )
     })?;
     Ok(counter.0)
+}
+
+/// Returns whether `field` is a top-level key of the known task-record schema.
+pub fn is_known_task_record_field(field: &str) -> bool {
+    static KNOWN: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    KNOWN
+        .get_or_init(|| {
+            let mut known = match serde_json::to_value(TaskRecord::default()) {
+                Ok(serde_json::Value::Object(fields)) => fields.keys().cloned().collect(),
+                _ => std::collections::BTreeSet::new(),
+            };
+            known.extend(
+                crate::storage::KNOWN_OPTIONAL_TASK_RECORD_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_string()),
+            );
+            known
+        })
+        .contains(field)
+}
+
+/// Returns the forward fields of one persisted task-record object: every
+/// top-level value outside the known schema, exactly the values that
+/// checkpoint encoding preserves when it replaces the record.
+pub fn task_record_forward_fields(
+    record: &serde_json::Map<String, serde_json::Value>,
+) -> TaskRecordForwardFields {
+    record
+        .iter()
+        .filter(|(field, _)| !is_known_task_record_field(field))
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect()
+}
+
+/// Encodes `record` with its `forward` fields as one compact JSON object.
+///
+/// The known fields keep their [`encode_task_record_compact`] encoding and
+/// order; forward fields follow in key order. Without forward fields the bytes
+/// equal [`encode_task_record_compact`].
+///
+/// # Errors
+///
+/// Returns [`DaemonCoreError::InvalidTaskRegistry`] if a forward key names a
+/// known field, and [`DaemonCoreError::Json`] for encoding failures.
+pub fn encode_task_record_with_forward_fields(
+    record: &TaskRecord,
+    forward: &TaskRecordForwardFields,
+) -> Result<Vec<u8>> {
+    let mut bytes = encode_task_record_compact(record)?;
+    if forward.is_empty() {
+        return Ok(bytes);
+    }
+    if let Some(field) = forward
+        .keys()
+        .find(|field| is_known_task_record_field(field))
+    {
+        return Err(DaemonCoreError::InvalidTaskRegistry {
+            path: Path::new(&record.task_id).to_path_buf(),
+            message: format!("forward task-record field {field:?} names a known field"),
+        });
+    }
+    if bytes.pop() != Some(b'}') {
+        return Err(DaemonCoreError::InvalidTaskRegistry {
+            path: Path::new(&record.task_id).to_path_buf(),
+            message: "task record did not encode as a JSON object".to_string(),
+        });
+    }
+    for (field, value) in forward {
+        bytes.push(b',');
+        bytes.extend(encode_forward_value(
+            &record.task_id,
+            &serde_json::json!(field),
+        )?);
+        bytes.push(b':');
+        bytes.extend(encode_forward_value(&record.task_id, value)?);
+    }
+    bytes.push(b'}');
+    Ok(bytes)
+}
+
+fn encode_forward_value(task_id: &str, value: &serde_json::Value) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|source| {
+        DaemonCoreError::json(
+            "failed to encode forward task-record field of",
+            Path::new(task_id),
+            source,
+        )
+    })
+}
+
+/// Returns the compact size of `record` together with its `forward` fields,
+/// the size that the registry persists and archival copies.
+///
+/// # Errors
+///
+/// Returns [`DaemonCoreError::Json`] if the record cannot be encoded.
+pub fn task_record_full_encoded_len(
+    record: &TaskRecord,
+    forward: Option<&TaskRecordForwardFields>,
+) -> Result<u64> {
+    let mut len = task_record_encoded_len(record)?;
+    for (field, value) in forward.into_iter().flatten() {
+        if is_known_task_record_field(field) {
+            continue;
+        }
+        // `,"field":value`
+        len = len
+            .saturating_add(2)
+            .saturating_add(
+                encode_forward_value(&record.task_id, &serde_json::json!(field))?.len() as u64,
+            )
+            .saturating_add(encode_forward_value(&record.task_id, value)?.len() as u64);
+    }
+    Ok(len)
 }
 
 /// Returns the `blake3:<hex>` digest that names and authenticates `bytes`.
@@ -243,9 +369,11 @@ fn normalize_timestamp_seconds(value: u64) -> u64 {
     }
 }
 
-/// Builds the archive bytes and compact tombstone for `original`.
+/// Builds the archive bytes and compact tombstone for `original` and the
+/// `forward_fields` that its committed raw record carries.
 ///
-/// Every protected field is kept. Other top-level values larger than
+/// The archive is the complete persisted record: the known fields together
+/// with every forward field. Every protected field is kept. Other top-level values larger than
 /// [`MAX_TASK_RECORD_TOMBSTONE_FIELD_BYTES`] are omitted, then the largest
 /// remaining unprotected values are omitted until the tombstone fits
 /// [`MAX_TASK_RECORD_TOMBSTONE_BYTES`]. Each omitted field and its size is
@@ -258,6 +386,7 @@ fn normalize_timestamp_seconds(value: u64) -> u64 {
 /// not fit a tombstone, and [`DaemonCoreError::Json`] for encoding failures.
 pub fn prepare_task_record_archive(
     original: &TaskRecord,
+    forward_fields: &TaskRecordForwardFields,
     reason: &str,
     archived_at_unix: u64,
 ) -> Result<PreparedTaskRecordArchive> {
@@ -268,7 +397,7 @@ pub fn prepare_task_record_archive(
     if original.archived.is_some() {
         return Err(invalid("task record is already archived".to_string()));
     }
-    let bytes = encode_task_record_compact(original)?;
+    let bytes = encode_task_record_with_forward_fields(original, forward_fields)?;
     if bytes.len() > MAX_TASK_REGISTRY_BYTES {
         return Err(invalid(format!(
             "task record is {} bytes, above the {MAX_TASK_REGISTRY_BYTES}-byte registry bound",
@@ -289,6 +418,11 @@ pub fn prepare_task_record_archive(
             "task record did not encode as a JSON object".to_string(),
         ));
     };
+    // Forward fields are sized and shed exactly like unprotected known
+    // fields; none of them carries identity this build can recognize.
+    for (field, value) in forward_fields {
+        fields.insert(field.clone(), value.clone());
+    }
     let mut sizes = BTreeMap::new();
     for (field, value) in &fields {
         let size = serde_json::to_vec(value)
@@ -323,36 +457,49 @@ pub fn prepare_task_record_archive(
         inspect_command: task_record_archive_inspect_command(&original.task_id),
     };
     loop {
-        let mut tombstone: TaskRecord = serde_json::from_value(serde_json::Value::Object(
-            fields.clone(),
-        ))
-        .map_err(|source| {
-            DaemonCoreError::json(
-                "failed to rebuild task record tombstone for",
-                Path::new(&original.task_id),
-                source,
-            )
-        })?;
+        let retained_forward_fields = forward_fields
+            .iter()
+            .filter(|(field, _)| fields.contains_key(*field))
+            .map(|(field, value)| (field.clone(), value.clone()))
+            .collect::<TaskRecordForwardFields>();
+        let known_fields = fields
+            .iter()
+            .filter(|(field, _)| !forward_fields.contains_key(*field))
+            .map(|(field, value)| (field.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let mut tombstone: TaskRecord =
+            serde_json::from_value(serde_json::Value::Object(known_fields)).map_err(|source| {
+                DaemonCoreError::json(
+                    "failed to rebuild task record tombstone for",
+                    Path::new(&original.task_id),
+                    source,
+                )
+            })?;
         pointer.omitted_fields = omitted_fields.clone();
         // The pointer records its own tombstone size; iterate once so the
         // stored value is exact for the final encoding.
         for _ in 0..4 {
             tombstone.archived = Some(pointer.clone());
-            let encoded = task_record_encoded_len(&tombstone)?;
+            let encoded = task_record_full_encoded_len(&tombstone, Some(&retained_forward_fields))?;
             if encoded == pointer.tombstone_encoded_bytes {
                 break;
             }
             pointer.tombstone_encoded_bytes = encoded;
         }
         tombstone.archived = Some(pointer.clone());
-        let encoded = task_record_encoded_len(&tombstone)?;
+        let encoded = task_record_full_encoded_len(&tombstone, Some(&retained_forward_fields))?;
         if encoded != pointer.tombstone_encoded_bytes {
             return Err(invalid(
                 "task record tombstone size did not converge".to_string(),
             ));
         }
         if encoded <= MAX_TASK_RECORD_TOMBSTONE_BYTES as u64 {
-            return Ok(PreparedTaskRecordArchive { bytes, tombstone });
+            return Ok(PreparedTaskRecordArchive {
+                bytes,
+                tombstone,
+                forward_fields: forward_fields.clone(),
+                retained_forward_fields,
+            });
         }
         let largest = fields
             .keys()
@@ -649,9 +796,13 @@ mod tests {
     #[test]
     fn tombstone_keeps_identity_and_small_fields_and_lists_every_omission() {
         let original = oversized("task-big", 1024 * 1024);
-        let prepared =
-            prepare_task_record_archive(&original, TASK_RECORD_ARCHIVE_REASON_OVERSIZED, 500)
-                .unwrap();
+        let prepared = prepare_task_record_archive(
+            &original,
+            &TaskRecordForwardFields::new(),
+            TASK_RECORD_ARCHIVE_REASON_OVERSIZED,
+            500,
+        )
+        .unwrap();
         let tombstone = &prepared.tombstone;
         let pointer = prepared.pointer();
 
@@ -695,9 +846,13 @@ mod tests {
                 .insert(format!("q{index:03}"), "x".repeat(3 * 1024));
         }
         original.last_error = Some("y".repeat(3 * 1024));
-        let prepared =
-            prepare_task_record_archive(&original, TASK_RECORD_ARCHIVE_REASON_OVERSIZED, 1)
-                .unwrap();
+        let prepared = prepare_task_record_archive(
+            &original,
+            &TaskRecordForwardFields::new(),
+            TASK_RECORD_ARCHIVE_REASON_OVERSIZED,
+            1,
+        )
+        .unwrap();
         // question_texts is a single 190 KiB value; the small last_error stays.
         assert!(prepared
             .pointer()
@@ -712,7 +867,9 @@ mod tests {
         original.watch_ids = (0..10_000)
             .map(|index| format!("watch-{index:05}"))
             .collect();
-        let error = prepare_task_record_archive(&original, "test", 1).unwrap_err();
+        let error =
+            prepare_task_record_archive(&original, &TaskRecordForwardFields::new(), "test", 1)
+                .unwrap_err();
         assert!(error.to_string().contains("without dropping identity"));
     }
 
@@ -827,7 +984,9 @@ mod tests {
             .unwrap();
         let events_before = load_task_events(root.path(), "task-big").unwrap();
 
-        let prepared = prepare_task_record_archive(&original, "test", 2).unwrap();
+        let prepared =
+            prepare_task_record_archive(&original, &TaskRecordForwardFields::new(), "test", 2)
+                .unwrap();
         assert!(prepared.pointer().omitted_fields.contains_key("handoffs"));
         registry
             .tasks
@@ -858,6 +1017,176 @@ mod tests {
         append_next_task_event(root.path(), "task-good", &event).unwrap();
     }
 
+    fn future_evidence() -> serde_json::Value {
+        serde_json::json!({"note": "future-evidence-marker", "bytes": "Y".repeat(70_000)})
+    }
+
+    #[test]
+    fn forward_fields_are_archived_sized_and_shed_or_retained() {
+        let original = oversized("task-big", 1024 * 1024);
+        let forward = TaskRecordForwardFields::from([
+            ("future_evidence".to_string(), future_evidence()),
+            ("future_small".to_string(), serde_json::json!({"v": 7})),
+        ]);
+        let prepared = prepare_task_record_archive(&original, &forward, "test", 3).unwrap();
+        let pointer = prepared.pointer();
+
+        // The archive is the complete persisted record, known and forward.
+        let archived: serde_json::Value = serde_json::from_slice(&prepared.bytes).unwrap();
+        let mut expected = serde_json::to_value(&original).unwrap();
+        for (field, value) in &forward {
+            expected[field] = value.clone();
+        }
+        assert_eq!(archived, expected);
+        assert_eq!(
+            prepared.bytes.len() as u64,
+            task_record_full_encoded_len(&original, Some(&forward)).unwrap()
+        );
+        assert_eq!(pointer.original_encoded_bytes, prepared.bytes.len() as u64);
+        assert_eq!(pointer.digest, task_record_archive_digest(&prepared.bytes));
+        // Large forward values are shed like any unprotected field.
+        assert_eq!(
+            pointer.omitted_fields.keys().collect::<Vec<_>>(),
+            vec!["future_evidence", "last_error"]
+        );
+        assert_eq!(prepared.forward_fields, forward);
+        assert_eq!(
+            prepared.retained_forward_fields,
+            TaskRecordForwardFields::from([(
+                "future_small".to_string(),
+                serde_json::json!({"v": 7})
+            )])
+        );
+        // The recorded tombstone size is the persisted size, retained forward
+        // fields included.
+        assert_eq!(
+            pointer.tombstone_encoded_bytes,
+            encode_task_record_with_forward_fields(
+                &prepared.tombstone,
+                &prepared.retained_forward_fields
+            )
+            .unwrap()
+            .len() as u64
+        );
+        // Without forward fields the archive bytes are unchanged from R1.
+        let plain =
+            prepare_task_record_archive(&original, &TaskRecordForwardFields::new(), "test", 3)
+                .unwrap();
+        assert_eq!(plain.bytes, encode_task_record_compact(&original).unwrap());
+    }
+
+    #[test]
+    fn forward_only_oversized_record_is_sized_and_archivable() {
+        let small = oversized("task-forward", 16);
+        let forward = TaskRecordForwardFields::from([(
+            "future_blob".to_string(),
+            serde_json::json!("f".repeat(1024 * 1024)),
+        )]);
+        assert!(task_record_encoded_len(&small).unwrap() < 4 * 1024);
+        assert!(
+            task_record_full_encoded_len(&small, Some(&forward)).unwrap() > 1024 * 1024,
+            "forward bytes count toward the persisted record size"
+        );
+        let prepared = prepare_task_record_archive(&small, &forward, "test", 1).unwrap();
+        assert!(prepared
+            .pointer()
+            .omitted_fields
+            .contains_key("future_blob"));
+        assert!(prepared.retained_forward_fields.is_empty());
+        let archived: serde_json::Value = serde_json::from_slice(&prepared.bytes).unwrap();
+        assert_eq!(archived["future_blob"], forward["future_blob"]);
+        // A forward key may never shadow a known field.
+        let shadow =
+            TaskRecordForwardFields::from([("last_error".to_string(), serde_json::json!("x"))]);
+        assert!(encode_task_record_with_forward_fields(&small, &shadow).is_err());
+    }
+
+    #[test]
+    fn checkpoint_keeps_retained_forward_fields_and_never_resurrects_shed_ones() {
+        use crate::storage::{
+            ensure_daemon_dir, load_task_record_forward_fields, load_task_registry,
+            save_task_watch_registry_checkpoint,
+        };
+        use packet28_daemon_protocol::paths::task_registry_path;
+        use packet28_daemon_protocol::task::WatchRegistry;
+
+        let root = tempfile::tempdir().unwrap();
+        ensure_daemon_dir(root.path()).unwrap();
+        let path = task_registry_path(root.path());
+        let raw = serde_json::json!({
+            "future_root": {"enabled": true},
+            "tasks": {
+                "task-big": {
+                    "task_id": "task-big",
+                    "running": false,
+                    "last_completed_at_unix": 100,
+                    "last_error": "e".repeat(300 * 1024),
+                    "future_evidence": future_evidence(),
+                    "future_small": {"v": 7}
+                },
+                "task-good": {
+                    "task_id": "task-good",
+                    "running": false,
+                    "future_neighbor": {"keep": "neighbor-marker"}
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let forward = load_task_record_forward_fields(root.path()).unwrap();
+        assert_eq!(
+            forward.keys().collect::<Vec<_>>(),
+            vec!["task-big", "task-good"]
+        );
+        assert_eq!(forward["task-big"]["future_evidence"], future_evidence());
+        let mut registry = load_task_registry(root.path()).unwrap();
+        let original = registry.tasks["task-big"].clone();
+        let prepared =
+            prepare_task_record_archive(&original, &forward["task-big"], "test", 9).unwrap();
+        let archived: serde_json::Value = serde_json::from_slice(&prepared.bytes).unwrap();
+        for (field, value) in raw["tasks"]["task-big"].as_object().unwrap() {
+            assert_eq!(
+                &archived[field], value,
+                "archive must hold raw field {field}"
+            );
+        }
+
+        registry
+            .tasks
+            .insert("task-big".to_string(), prepared.tombstone.clone());
+        for _ in 0..2 {
+            // The first checkpoint replaces the original; the second proves
+            // the tombstone is a fixed point of forward-field preservation.
+            save_task_watch_registry_checkpoint(root.path(), &registry, &WatchRegistry::default())
+                .unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let tombstone = &saved["tasks"]["task-big"];
+            assert!(tombstone.get("future_evidence").is_none());
+            assert_eq!(tombstone["last_error"], serde_json::Value::Null);
+            assert_eq!(tombstone["future_small"], serde_json::json!({"v": 7}));
+            assert_eq!(
+                tombstone["archived"]["digest"],
+                serde_json::json!(prepared.pointer().digest)
+            );
+            assert_eq!(
+                serde_json::to_vec(tombstone).unwrap().len() as u64,
+                prepared.pointer().tombstone_encoded_bytes,
+                "the pointer records the persisted tombstone size"
+            );
+            for (field, value) in raw["tasks"]["task-good"].as_object().unwrap() {
+                assert_eq!(
+                    &saved["tasks"]["task-good"][field], value,
+                    "unselected records keep every field, including {field}"
+                );
+            }
+            assert_eq!(saved["future_root"], raw["future_root"]);
+        }
+        let after = load_task_record_forward_fields(root.path()).unwrap();
+        assert_eq!(after["task-big"], prepared.retained_forward_fields);
+        assert_eq!(after["task-good"], forward["task-good"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn publication_is_private_idempotent_and_authenticated_on_read() {
@@ -865,7 +1194,9 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let original = oversized("task-big", 200 * 1024);
-        let prepared = prepare_task_record_archive(&original, "test", 1).unwrap();
+        let prepared =
+            prepare_task_record_archive(&original, &TaskRecordForwardFields::new(), "test", 1)
+                .unwrap();
         let storage_id = TaskStorageId::try_from("task-big").unwrap();
 
         assert!(publish_task_record_archive(root.path(), &storage_id, &prepared.bytes).unwrap());

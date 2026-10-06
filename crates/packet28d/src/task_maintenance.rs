@@ -18,7 +18,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use packet28_daemon_core::storage::record_archive::task_record_encoded_len;
+use packet28_daemon_core::storage::record_archive::{
+    task_record_full_encoded_len, TaskRecordForwardFields,
+};
 use packet28_daemon_protocol::registry::{
     TaskRecordSizeLevel, TaskRecordSizeWarningV1, MAX_STATUS_RECORD_SIZE_WARNINGS,
 };
@@ -178,16 +180,38 @@ pub(crate) fn admit_task_request(
 /// Tracks records at or above the size warning threshold.
 ///
 /// Sizes are observed on every staged task write, so a record that grows
-/// toward the pagination bound is reported before it becomes unlistable.
+/// toward the pagination bound is reported before it becomes unlistable. A
+/// record's persisted size includes the forward fields that its committed raw
+/// record carries; this build never changes them, so they are loaded once from
+/// the raw authority at startup.
 #[derive(Debug, Default)]
 pub(crate) struct RecordSizeIndex {
     warnings: Mutex<BTreeMap<String, u64>>,
+    forward_fields: Mutex<BTreeMap<String, TaskRecordForwardFields>>,
 }
 
 impl RecordSizeIndex {
-    /// Records `task`'s compact size and logs a threshold crossing once.
+    /// Replaces the forward fields counted toward each record's size.
+    pub(crate) fn set_forward_fields(
+        &self,
+        forward_fields: BTreeMap<String, TaskRecordForwardFields>,
+    ) {
+        *self
+            .forward_fields
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = forward_fields;
+    }
+
+    /// Records `task`'s persisted compact size and logs a threshold crossing
+    /// once.
     pub(crate) fn observe(&self, task: &TaskRecord) {
-        let encoded_bytes = match task_record_encoded_len(task) {
+        let forward_fields = self
+            .forward_fields
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let encoded = task_record_full_encoded_len(task, forward_fields.get(&task.task_id));
+        drop(forward_fields);
+        let encoded_bytes = match encoded {
             Ok(bytes) => bytes,
             Err(error) => {
                 daemon_log(&format!(
@@ -232,6 +256,10 @@ impl RecordSizeIndex {
 
     pub(crate) fn forget(&self, task_id: &str) {
         self.warnings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(task_id);
+        self.forward_fields
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(task_id);
@@ -307,5 +335,28 @@ mod tests {
         index.observe_size("near", 1024);
         index.forget("over");
         assert_eq!(index.status_warnings().0, 0);
+    }
+
+    #[test]
+    fn size_index_counts_forward_fields_of_the_raw_record() {
+        let index = RecordSizeIndex::default();
+        let small = TaskRecord {
+            task_id: "forward-only".to_string(),
+            ..TaskRecord::default()
+        };
+        index.observe(&small);
+        assert_eq!(index.status_warnings().0, 0);
+        index.set_forward_fields(BTreeMap::from([(
+            "forward-only".to_string(),
+            TaskRecordForwardFields::from([(
+                "future_evidence".to_string(),
+                serde_json::json!("f".repeat(MAX_REGISTRY_PAGE_ITEM_BYTES)),
+            )]),
+        )]));
+        index.observe(&small);
+        let (count, warnings) = index.status_warnings();
+        assert_eq!(count, 1);
+        assert_eq!(warnings[0].level, TaskRecordSizeLevel::OverPageLimit);
+        assert!(warnings[0].encoded_bytes > MAX_REGISTRY_PAGE_ITEM_BYTES as u64);
     }
 }

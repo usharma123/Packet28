@@ -197,6 +197,14 @@ pub fn serve(root: PathBuf) -> Result<()> {
     // Size every record once so near-limit and unlistable records are logged
     // and reported by status from the first request.
     let record_sizes = crate::task_maintenance::RecordSizeIndex::default();
+    match packet28_daemon_core::storage::load_task_record_forward_fields(&root) {
+        Ok(forward_fields) => record_sizes.set_forward_fields(forward_fields),
+        // Sizing is diagnostic; archival reloads the raw authority itself and
+        // refuses when it cannot.
+        Err(error) => daemon_log(&format!(
+            "failed to load forward task-record fields for size warnings: {error}"
+        )),
+    }
     for task in tasks.tasks.values() {
         record_sizes.observe(task);
     }

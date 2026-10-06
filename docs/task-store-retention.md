@@ -110,6 +110,19 @@ the omitted field names and sizes, the reason, and the inspection command. The
 event log and task artifacts are untouched, and unselected records are not
 rewritten.
 
+Records written by a newer Packet28 may carry top-level forward fields that
+this build does not model. The committed registry checkpoint is their only
+authority, so archival reads them from it, under the registry lock, for every
+selected record. The archive holds the known fields and every forward field.
+Forward bytes count toward size warnings, the size selector, and the 64 KiB
+floor. A forward value is shed from the tombstone by the same rule as any
+unprotected value: it is listed in `omitted_fields`, and checkpoint
+preservation never carries it back. Small forward values stay in the
+tombstone. Before commit, the forward fields are reread and must match what
+the archive holds. If the raw authority cannot be read or has changed, the
+record is reported as failed and left unchanged; it is never archived without
+its forward fields.
+
 Size selection never goes below 64 KiB, and exact targeting refuses records
 below that floor. Archival refuses running, cancelling, replan-pending, and
 agent-active tasks; the agent's active task; tasks with active watches or
