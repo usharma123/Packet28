@@ -56,9 +56,15 @@ and user-level runtime configuration. Existing valid JSON/TOML is merged;
 invalid configuration is reported and left unchanged.
 
 Setup adds `.packet28/` to the repository's `.gitignore` when needed. This does
-not untrack runtime files that were already committed. The full regex index
-requires a clean Git working tree, so setup can complete with indexing deferred
-until you commit or stash its configuration and instruction changes. Then run:
+not untrack runtime files that were already committed. Setup's own
+configuration and instruction changes do not block the full regex index: a full
+rebuild attests the Git `HEAD` commit and the content digest of every dirty or
+untracked path, provided they stay unchanged while the index builds. Queries
+then serve the index only while those digests still match, so a later edit the
+daemon has not indexed falls back to live search. Setup defers indexing with the
+reason when the working tree cannot be attested, for example when it changes
+during the build, contains a dirty symlink or oversized file, or uses Git
+`skip-worktree`/`assume-unchanged` flags. Resolve the condition, then run:
 
 ```bash
 packet28 daemon index rebuild --root .

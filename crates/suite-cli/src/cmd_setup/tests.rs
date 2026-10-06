@@ -1206,7 +1206,29 @@ fn classify_setup_index_status_reports_building_while_index_is_in_progress() {
 }
 
 #[test]
-fn setup_defers_dirty_git_index_without_masking_corruption() {
+fn setup_defers_unattestable_workspace_index_without_masking_corruption() {
+    let dir = tempdir().unwrap();
+    let mut response = setup_index_status("queued", Some("building"), false);
+    response.manifest.last_error = Some(
+        "index publication failed; queued full retry: failed to build regex search index: regex search index is not ready: Git workspace changed while rebuilding the full regex index; retry once HEAD and the working tree are stable"
+            .to_string(),
+    );
+    match classify_setup_index_status(dir.path(), &response, true) {
+        SetupIndexVerification::Deferred { reason } => assert_eq!(
+            reason,
+            "Git workspace changed while rebuilding the full regex index; retry once HEAD and the working tree are stable"
+        ),
+        other => panic!("expected deferred setup classification, got {other:?}"),
+    }
+    response.manifest.regex_status = Some("corrupt".to_string());
+    assert!(matches!(
+        classify_setup_index_status(dir.path(), &response, false),
+        SetupIndexVerification::Failed { .. }
+    ));
+}
+
+#[test]
+fn setup_still_defers_the_legacy_daemon_clean_tree_rejection() {
     let dir = tempdir().unwrap();
     let mut response = setup_index_status("queued", Some("building"), false);
     response.manifest.last_error = Some(
@@ -1215,9 +1237,9 @@ fn setup_defers_dirty_git_index_without_masking_corruption() {
     );
     assert!(matches!(
         classify_setup_index_status(dir.path(), &response, true),
-        SetupIndexVerification::Deferred
+        SetupIndexVerification::Deferred { .. }
     ));
-    response.manifest.regex_status = Some("corrupt".to_string());
+    response.manifest.status = "corrupt".parse().unwrap();
     assert!(matches!(
         classify_setup_index_status(dir.path(), &response, false),
         SetupIndexVerification::Failed { .. }

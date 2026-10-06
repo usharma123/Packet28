@@ -222,8 +222,8 @@ pub fn run(args: SetupArgs) -> Result<i32> {
     let mut exit_code = 0;
 
     // Ignore Packet28's own runtime directory before the daemon starts writing
-    // into it. Otherwise a tracked `.packet28/` keeps the working tree dirty and
-    // the full regex index can never publish (it requires a clean tree).
+    // into it. Otherwise `.packet28/` changes while the daemon builds, and the
+    // full regex index cannot attest a stable working tree.
     if let Some(path) = ensure_packet28_gitignore(&root)? {
         println!(
             "  {} ignored {} in {}",
@@ -232,7 +232,7 @@ pub fn run(args: SetupArgs) -> Result<i32> {
             path.display().to_string().dimmed()
         );
         println!(
-            "  {} commit the updated .gitignore and setup files so the index can publish",
+            "  {} review and commit the updated .gitignore with your other setup changes",
             "hint:".cyan().bold()
         );
         println!("  hint: .gitignore does not untrack existing files; if .packet28/ is tracked, remove it from the Git index explicitly");
@@ -480,10 +480,11 @@ pub fn run(args: SetupArgs) -> Result<i32> {
                                 render_setup_index_progress(&response)
                             );
                         }
-                        SetupIndexVerification::Deferred => {
+                        SetupIndexVerification::Deferred { reason } => {
                             println!(
-                                "    {} index deferred: commit or stash workspace changes, including the setup files, then run `Packet28 daemon index rebuild --root {}`",
+                                "    {} index deferred: {}; once the workspace is stable, run `Packet28 daemon index rebuild --root {}`",
                                 "·".yellow().bold(),
+                                reason,
                                 root_display
                             );
                         }

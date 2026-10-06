@@ -7,7 +7,7 @@ use std::path::{Component, Path};
 
 use crate::error::{Result, SearchError};
 use crate::git_process::run_git;
-use crate::model::{RegexIndexManifest, MAX_INDEXED_FILE_BYTES};
+use crate::model::{OverlayState, RegexIndexManifest, MAX_INDEXED_FILE_BYTES};
 use crate::paths::{inspect_workspace_path, WorkspacePathInspection, WorkspacePathKind};
 
 const MAX_ATTESTED_WORKSPACE_ENTRIES: usize = 4_096;
@@ -282,45 +282,59 @@ fn attest_workspace_path(
     })
 }
 
+/// Captures the HEAD commit and every Git-dirty path digest before a full build.
+///
+/// A dirty tree is accepted here; [`authenticate_full_build_workspace`]
+/// requires the same commit and dirty digests once scanning has finished.
 pub(crate) fn begin_full_build_workspace(root: &Path) -> Result<Option<GitWorkspaceSnapshot>> {
     if !git_metadata_present(root).map_err(index_not_ready)? {
         return Ok(None);
     }
-    let snapshot = git_workspace_snapshot(root, &[])
-        .map_err(|reason| SearchError::IndexNotReady { reason })?;
-    if !snapshot.clean {
-        return Err(SearchError::IndexNotReady {
-            reason: "full regex index rebuild requires a clean Git working tree".to_string(),
-        });
-    }
-    Ok(Some(snapshot))
+    git_workspace_snapshot(root, &[])
+        .map(Some)
+        .map_err(|reason| SearchError::IndexNotReady { reason })
 }
 
+/// Authenticates the scanned bytes and records the full-build attestation.
+///
+/// HEAD and every dirty-path digest must match the pre-build snapshot, and
+/// every discovered path must have been indexed from its final bytes. A clean
+/// tree keeps the legacy `workspace_clean_commit` label; a dirty tree records
+/// `workspace_attested_commit` and returns its digests as overlay state.
 pub(crate) fn authenticate_full_build_workspace(
     root: &Path,
     before: Option<&GitWorkspaceSnapshot>,
     reported_paths: &[String],
     indexed_fingerprints: &BTreeMap<String, String>,
-) -> Result<Option<String>> {
+    manifest: &mut RegexIndexManifest,
+) -> Result<OverlayState> {
     let Some(before) = before else {
         if git_metadata_present(root).map_err(index_not_ready)? {
             return Err(SearchError::IndexNotReady {
                 reason: "a Git repository appeared while rebuilding the regex index".to_string(),
             });
         }
-        return Ok(None);
+        return Ok(OverlayState::default());
     };
     let after = git_workspace_snapshot_with_limits(root, reported_paths, BUILD_ATTESTATION_LIMITS)
         .map_err(|reason| SearchError::IndexNotReady { reason })?;
-    if !before.clean || !after.clean || before.commit != after.commit {
+    if before.commit != after.commit || before.entries != after.entries {
         return Err(SearchError::IndexNotReady {
             reason:
-                "Git workspace changed while rebuilding the full regex index; retry from a clean working tree"
+                "Git workspace changed while rebuilding the full regex index; retry once HEAD and the working tree are stable"
                     .to_string(),
         });
     }
     after.ensure_indexed_bytes(indexed_fingerprints)?;
-    Ok(Some(after.commit))
+    manifest.base_commit = Some(after.commit.clone());
+    let mut overlay_state = OverlayState::default();
+    if after.clean {
+        manifest.workspace_clean_commit = Some(after.commit);
+    } else {
+        manifest.workspace_attested_commit = Some(after.commit);
+        overlay_state.workspace_entries = after.entries;
+    }
+    Ok(overlay_state)
 }
 
 fn git_metadata_present(root: &Path) -> std::result::Result<bool, String> {
@@ -364,21 +378,14 @@ pub(crate) fn workspace_freshness_reason(
     expected_entries: &BTreeMap<String, String>,
 ) -> Option<String> {
     let expected_base = manifest.base_commit.as_deref()?;
-    let Some(expected_clean) = manifest.workspace_clean_commit.as_deref() else {
-        return Some(
-            "workspace freshness could not be authenticated; rebuild the regex index from a clean Git working tree"
-                .to_string(),
-        );
+    let expected_commit = match manifest.authenticated_workspace_commit(expected_base) {
+        Ok(commit) => commit,
+        Err(reason) => return Some(reason),
     };
-    if expected_clean != expected_base {
-        return Some(format!(
-            "workspace freshness attestation does not match the indexed base commit (base={expected_base}, attested={expected_clean})"
-        ));
-    }
     let reported = expected_entries.keys().cloned().collect::<Vec<_>>();
     match git_workspace_snapshot(root, &reported) {
-        Ok(workspace) if workspace.commit != expected_clean => Some(format!(
-            "regex index base commit changed (indexed={expected_clean}, current={})",
+        Ok(workspace) if workspace.commit != expected_commit => Some(format!(
+            "regex index base commit changed (indexed={expected_commit}, current={})",
             workspace.commit
         )),
         Ok(workspace) if workspace.entries != *expected_entries => Some(
@@ -410,7 +417,9 @@ pub(crate) fn authenticate_incremental_workspace(
             previous.get(candidate) == snapshot.entries.get(candidate)
                 || changed_paths.iter().any(|path| candidate == path)
         });
-    if manifest.workspace_clean_commit.as_deref() != Some(base_commit)
+    if manifest
+        .authenticated_workspace_commit(base_commit)
+        .is_err()
         || snapshot.commit != base_commit
         || !changes_are_reported
     {
