@@ -4,9 +4,9 @@ mod support;
 mod daemon_support;
 
 use daemon_support::{
-    cli_with_daemon_env, daemon_bin, daemon_runtime_pid, process_is_alive, start_daemon,
-    start_daemon_forced_tcp, start_daemon_workspace_fallback, stop_detached_daemon,
-    DelayedShutdownDaemon,
+    cli_with_daemon_env, daemon_bin, daemon_runtime_pid, daemon_status, process_is_alive,
+    read_runtime, start_daemon, start_daemon_forced_tcp, start_daemon_workspace_fallback,
+    stop_detached_daemon, wait_for_startup_admission, DelayedShutdownDaemon, GatedWorkspace,
 };
 use packet28_daemon_protocol::message::DaemonRuntimeInfo;
 use packet28_daemon_protocol::paths::{log_path, runtime_path, workspace_socket_path};
@@ -251,6 +251,17 @@ impl P28Client {
     }
 }
 
+impl P28Client {
+    /// Collects the output of a client that has already exited.
+    fn take_output(&mut self) -> Output {
+        self.child
+            .take()
+            .unwrap()
+            .wait_with_output()
+            .expect("collect p28 client output")
+    }
+}
+
 impl Drop for P28Client {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -387,4 +398,382 @@ fn p28_bootstrap_gives_up_at_its_bound_without_touching_a_stalled_owner() {
     assert_ne!(daemon_runtime_pid(&workspace), Some(original_pid));
 
     stop_detached_daemon(&workspace);
+}
+
+/// Hold a gated startup past the 10 s authority bound. Clients must keep
+/// waiting under the separate 30 s startup-readiness phase. Holds are
+/// measured from when the test observes the daemon in startup, which is after
+/// any bootstrap deadline for that daemon began, so the margin past 10 s does
+/// not depend on client process start-up latency.
+const HOLD_PAST_AUTHORITY_BOUND: Duration = Duration::from_secs(13);
+
+/// Bootstrap's startup-readiness phase in `packet28d start`.
+const STARTUP_READINESS_PHASE: Duration = Duration::from_secs(30);
+
+/// Keeps a gated startup pending until `elapsed` has passed since `from`,
+/// asserting throughout that every client is still waiting, the daemon has
+/// not published readiness, and no replacement daemon was spawned.
+fn hold_pending_startup(
+    workspace: &Path,
+    clients: &mut [&mut P28Client],
+    daemon_pid: u32,
+    from: Instant,
+    elapsed: Duration,
+) {
+    while from.elapsed() < elapsed {
+        for client in clients.iter_mut() {
+            if !client.is_running() {
+                let output = client.take_output();
+                panic!(
+                    "p28 completed with {} after {:?} while startup was pending; stdout={:?} \
+                     stderr={:?}",
+                    output.status,
+                    from.elapsed(),
+                    stdout_text(&output),
+                    stderr_text(&output)
+                );
+            }
+        }
+        let runtime = read_runtime(workspace).expect("pending daemon runtime");
+        assert_eq!(runtime.pid, daemon_pid, "pending daemon was replaced");
+        assert!(runtime.ready_at_unix.is_none(), "gated daemon became ready");
+        assert!(process_is_alive(daemon_pid));
+        assert_no_losing_replacement(workspace);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_search_succeeded(output: &Output) {
+    assert!(
+        output.status.success(),
+        "p28 failed: stdout={:?} stderr={:?}",
+        stdout_text(output),
+        stderr_text(output)
+    );
+    assert!(stdout_text(output).contains("src/lib.rs:1:pub struct Alpha;"));
+    assert!(stderr_text(output).contains("transport=daemon"));
+}
+
+fn assert_serving_identity(workspace: &Path, pid: u32) {
+    let status = daemon_status(workspace).expect("selected daemon answers status");
+    assert_eq!(status.pid, pid, "status identity changed");
+    let runtime = read_runtime(workspace).expect("selected daemon runtime");
+    assert_eq!(runtime.pid, pid, "runtime identity changed");
+    assert!(runtime.ready_at_unix.is_some());
+    assert_eq!(status.workspace_root, runtime.workspace_root);
+}
+
+#[test]
+fn p28_waits_for_spawned_daemon_startup_held_past_authority_bound() {
+    let (_dir, workspace) = lifecycle_workspace();
+    let mut fixture = GatedWorkspace::hold(&workspace);
+    let started = Instant::now();
+    let mut client = P28Client::spawn(&workspace, &DAEMON_SEARCH_ARGS);
+    let daemon_pid = wait_for_startup_admission(&workspace).pid;
+    let admitted = Instant::now();
+
+    hold_pending_startup(
+        &workspace,
+        &mut [&mut client],
+        daemon_pid,
+        admitted,
+        HOLD_PAST_AUTHORITY_BOUND,
+    );
+    fixture.release();
+    let output = client.wait();
+    let elapsed = started.elapsed();
+
+    assert_search_succeeded(&output);
+    assert!(
+        elapsed < STARTUP_READINESS_PHASE,
+        "p28 finished after {elapsed:?}, beyond the startup-readiness phase"
+    );
+    assert_serving_identity(&workspace, daemon_pid);
+    assert_no_losing_replacement(&workspace);
+    fixture.close();
+}
+
+fn reuses_connected_starting_daemon(force_tcp: bool) {
+    let (_dir, workspace) = lifecycle_workspace();
+    let mut fixture = GatedWorkspace::hold(&workspace);
+    let daemon_pid = fixture.start_direct(force_tcp);
+    let endpoint = read_runtime(&workspace).unwrap().socket_path;
+    assert_eq!(endpoint.starts_with("tcp://"), force_tcp);
+
+    let started = Instant::now();
+    let mut client = P28Client::spawn(&workspace, &DAEMON_SEARCH_ARGS);
+    hold_pending_startup(
+        &workspace,
+        &mut [&mut client],
+        daemon_pid,
+        started,
+        HOLD_PAST_AUTHORITY_BOUND,
+    );
+    assert!(fixture.direct_is_running());
+    fixture.release();
+    let output = client.wait();
+
+    assert_search_succeeded(&output);
+    assert!(started.elapsed() < STARTUP_READINESS_PHASE);
+    assert_serving_identity(&workspace, daemon_pid);
+    assert_eq!(read_runtime(&workspace).unwrap().socket_path, endpoint);
+    assert!(fixture.direct_is_running());
+    assert_no_losing_replacement(&workspace);
+    fixture.close();
+}
+
+#[test]
+fn p28_reuses_connected_starting_daemon_over_unix_socket() {
+    reuses_connected_starting_daemon(false);
+}
+
+#[test]
+fn p28_reuses_connected_starting_daemon_over_authenticated_tcp() {
+    reuses_connected_starting_daemon(true);
+}
+
+#[test]
+fn concurrent_p28_starters_share_one_slow_starting_daemon() {
+    let (_dir, workspace) = lifecycle_workspace();
+    let mut fixture = GatedWorkspace::hold(&workspace);
+    let started = Instant::now();
+    let mut first = P28Client::spawn(&workspace, &DAEMON_SEARCH_ARGS);
+    let mut second = P28Client::spawn(&workspace, &DAEMON_SEARCH_ARGS);
+    let daemon_pid = wait_for_startup_admission(&workspace).pid;
+    let admitted = Instant::now();
+
+    hold_pending_startup(
+        &workspace,
+        &mut [&mut first, &mut second],
+        daemon_pid,
+        admitted,
+        HOLD_PAST_AUTHORITY_BOUND,
+    );
+    fixture.release();
+    let first = first.wait();
+    let second = second.wait();
+
+    assert_search_succeeded(&first);
+    assert_search_succeeded(&second);
+    assert!(started.elapsed() < STARTUP_READINESS_PHASE);
+    assert_serving_identity(&workspace, daemon_pid);
+    assert_no_losing_replacement(&workspace);
+    fixture.close();
+}
+
+#[test]
+fn p28_startup_timeout_is_bounded_and_leaves_the_starting_daemon_running() {
+    let (_dir, workspace) = lifecycle_workspace();
+    let mut fixture = GatedWorkspace::hold(&workspace);
+    let started = Instant::now();
+    let client = P28Client::spawn(&workspace, &DAEMON_SEARCH_ARGS);
+    let daemon_pid = wait_for_startup_admission(&workspace).pid;
+
+    // The spawned daemon accepts connections but never answers while gated,
+    // so each status request must end at the phase deadline.
+    let output = client.wait();
+    let elapsed = started.elapsed();
+    assert!(
+        !output.status.success(),
+        "p28 succeeded against a gated daemon"
+    );
+    let stderr = stderr_text(&output);
+    assert!(
+        stderr.contains("did not become ready within 30000 ms")
+            && stderr.contains("startup readiness phase")
+            && stderr.contains(&format!("pid {daemon_pid}"))
+            && stderr.contains("left running")
+            && stderr.contains("packet28d.log"),
+        "missing startup timeout diagnostic: {stderr}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(29) && elapsed < Duration::from_secs(36),
+        "startup readiness timeout after {elapsed:?}, outside its ~30 s phase"
+    );
+
+    // The caller's timeout did not stop the healthy slow starter.
+    assert!(process_is_alive(daemon_pid));
+    let runtime = read_runtime(&workspace).expect("pending daemon runtime");
+    assert_eq!(runtime.pid, daemon_pid);
+    assert!(runtime.ready_at_unix.is_none());
+    fixture.release();
+    wait_for_fixture_signal_or_panic(&workspace, daemon_pid);
+    assert_serving_identity(&workspace, daemon_pid);
+    assert_no_losing_replacement(&workspace);
+    fixture.close();
+}
+
+fn wait_for_fixture_signal_or_panic(workspace: &Path, pid: u32) {
+    let started = Instant::now();
+    while daemon_status(workspace).map(|status| status.pid) != Some(pid) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "released daemon pid {pid} did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn p28_bootstrap_bounds_an_offline_owner_with_never_ready_runtime() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let (_dir, workspace) = lifecycle_workspace();
+    let daemon_dir = workspace.join(".packet28/daemon");
+    fs::create_dir_all(&daemon_dir).unwrap();
+    // A non-serving owner holds the instance lease. Its never-ready runtime
+    // metadata names an endpoint with no live listener, so it is not a
+    // startup candidate and gets only the authority bound.
+    let instance = daemon_support::hold_instance_lock(&workspace);
+    let dead_socket = daemon_dir.join("offline.sock");
+    let runtime = DaemonRuntimeInfo {
+        pid: std::process::id(),
+        socket_path: dead_socket.to_string_lossy().to_string(),
+        workspace_root: workspace.to_string_lossy().to_string(),
+        ..DaemonRuntimeInfo::default()
+    };
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(runtime_path(&workspace))
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, &serde_json::to_vec(&runtime).unwrap())
+        })
+        .unwrap();
+    let runtime_before = fs::read(runtime_path(&workspace)).unwrap();
+
+    let started = Instant::now();
+    let output = P28Client::spawn(&workspace, &DAEMON_SEARCH_ARGS).wait();
+    let elapsed = started.elapsed();
+
+    assert!(
+        !output.status.success(),
+        "p28 succeeded against an offline owner"
+    );
+    let stderr = stderr_text(&output);
+    assert!(
+        stderr.contains("did not release workspace authority")
+            && stderr.contains("authority phase"),
+        "missing authority timeout diagnostic: {stderr}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(25),
+        "offline owner bound was {elapsed:?}, not the ~10 s authority phase"
+    );
+    assert_eq!(fs::read(runtime_path(&workspace)).unwrap(), runtime_before);
+    assert!(
+        !log_path(&workspace).exists(),
+        "p28 spawned a replacement daemon"
+    );
+    drop(instance);
+}
+
+#[test]
+fn p28_fails_closed_on_corrupt_runtime_of_a_starting_owner() {
+    let (_dir, workspace) = lifecycle_workspace();
+    let mut fixture = GatedWorkspace::hold(&workspace);
+    let daemon_pid = fixture.start_direct(false);
+    let corrupt = b"{not runtime metadata";
+    let replacement = workspace.join(".packet28/daemon/runtime.json.corrupt");
+    fs::write(&replacement, corrupt).unwrap();
+    fs::set_permissions(
+        &replacement,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    fs::rename(&replacement, runtime_path(&workspace)).unwrap();
+
+    let started = Instant::now();
+    let output = P28Client::spawn(&workspace, &DAEMON_SEARCH_ARGS).wait();
+
+    assert!(
+        !output.status.success(),
+        "p28 accepted corrupt runtime metadata"
+    );
+    let stderr = stderr_text(&output);
+    assert!(
+        stderr.contains("runtime metadata"),
+        "missing runtime integrity diagnostic: {stderr}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "corrupt metadata was retried instead of failing closed"
+    );
+    assert_eq!(fs::read(runtime_path(&workspace)).unwrap(), corrupt);
+    assert!(fixture.direct_is_running());
+    assert!(process_is_alive(daemon_pid));
+    assert!(
+        !log_path(&workspace).exists(),
+        "p28 spawned a replacement daemon"
+    );
+    // Readiness republishes authentic metadata, after which the fixture can
+    // stop the owner through its endpoint.
+    fixture.release();
+    wait_for_fixture_signal_or_panic(&workspace, daemon_pid);
+    fixture.close();
+}
+
+#[test]
+fn p28_reports_early_daemon_exit_without_waiting_for_readiness() {
+    let (_dir, workspace) = lifecycle_workspace();
+    let daemon_dir = workspace.join(".packet28/daemon");
+    fs::create_dir_all(&daemon_dir).unwrap();
+    fs::write(daemon_dir.join("task-registry-v1.json"), b"{not a registry").unwrap();
+
+    let started = Instant::now();
+    let output = P28Client::spawn(&workspace, &DAEMON_SEARCH_ARGS).wait();
+
+    assert!(
+        !output.status.success(),
+        "p28 succeeded with corrupt durable state"
+    );
+    let stderr = stderr_text(&output);
+    assert!(
+        stderr.contains("exited with") && stderr.contains("before becoming ready"),
+        "missing early-exit diagnostic: {stderr}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(9));
+    assert!(daemon_status(&workspace).is_none());
+    assert!(daemon_support::instance_lease_released(&workspace));
+}
+
+#[test]
+fn packet28d_start_reuses_connected_starting_daemon() {
+    let (_dir, workspace) = lifecycle_workspace();
+    let mut fixture = GatedWorkspace::hold(&workspace);
+    let daemon_pid = fixture.start_direct(false);
+
+    let started = Instant::now();
+    let mut bootstrap = P28Client {
+        child: Some(
+            std::process::Command::new(daemon_bin())
+                .args(["start", "--root", workspace.to_str().unwrap()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn packet28d start"),
+        ),
+    };
+    hold_pending_startup(
+        &workspace,
+        &mut [&mut bootstrap],
+        daemon_pid,
+        started,
+        HOLD_PAST_AUTHORITY_BOUND,
+    );
+    fixture.release();
+    let output = bootstrap.wait();
+
+    assert!(
+        output.status.success(),
+        "packet28d start failed: {}",
+        stderr_text(&output)
+    );
+    assert!(started.elapsed() < STARTUP_READINESS_PHASE);
+    assert!(fixture.direct_is_running());
+    assert_serving_identity(&workspace, daemon_pid);
+    assert_no_losing_replacement(&workspace);
+    fixture.close();
 }

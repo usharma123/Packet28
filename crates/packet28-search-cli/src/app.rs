@@ -1240,7 +1240,15 @@ impl TransportMode {
 #[cfg(unix)]
 fn ensure_daemon(root: &Path) -> Result<()> {
     let root = resolve_workspace_root(root);
-    if daemon_status_existing(&root).is_ok() {
+    // A starting daemon accepts connections but answers only once ready, so
+    // `packet28d start` awaits it under its startup-readiness deadline rather
+    // than this fast path's socket timeout. Read failures are left to
+    // `packet28d start`, which fails closed on them.
+    let starting = matches!(
+        packet28_daemon_client::runtime_discovery::read_runtime_info_if_present(&root),
+        Ok(Some(runtime)) if runtime.ready_at_unix.is_none()
+    );
+    if !starting && daemon_status_existing(&root).is_ok() {
         return Ok(());
     }
     // An unreachable endpoint does not mean the previous daemon has exited: a
@@ -1254,8 +1262,10 @@ fn ensure_daemon(root: &Path) -> Result<()> {
 
 /// Runs the lease-guarded `packet28d start` bootstrap for `root`.
 ///
-/// It returns once a daemon is ready, or fails without touching the runtime
-/// files of a daemon that has not released workspace authority in time.
+/// It returns once a daemon answers status, or fails without touching the
+/// runtime files of a daemon that has not released workspace authority in
+/// time. A daemon that is still starting gets the longer startup-readiness
+/// allowance and is left running if it misses it.
 #[cfg(unix)]
 fn start_daemon(root: &Path) -> Result<()> {
     let binary = packet28d_binary()?;
@@ -1277,26 +1287,41 @@ fn start_daemon(root: &Path) -> Result<()> {
     ))
 }
 
+/// Confirms that the daemon selected by `packet28d start` answers status.
+///
+/// Each status request is bounded by the time remaining before `timeout`.
+/// Unauthentic runtime discovery fails immediately.
 #[cfg(unix)]
 fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
-    let start = StdInstant::now();
-    while start.elapsed() < timeout {
-        if daemon_status_existing(root).is_ok() {
-            return Ok(());
+    use packet28_daemon_client::transport::{discover_endpoint, request_status_v1};
+
+    let deadline = StdInstant::now() + timeout;
+    let mut last_error = None;
+    while StdInstant::now() < deadline {
+        let endpoint = discover_endpoint(root)?;
+        match request_status_v1(&endpoint, deadline) {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = Some(error),
         }
         thread::sleep(Duration::from_millis(10));
     }
+    let last_error = last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "none".to_string());
     if let Ok(Some(runtime)) =
         packet28_daemon_client::runtime_discovery::read_runtime_info_if_present(root)
     {
         return Err(anyhow!(
-            "packet28d did not become ready; runtime file exists for pid {} at {} (log: {})",
+            "packet28d did not answer status; runtime file exists for pid {} at {} (log: {}; \
+             last probe: {last_error})",
             runtime.pid,
             runtime.socket_path,
             runtime.log_path
         ));
     }
-    Err(anyhow!("packet28d did not become ready"))
+    Err(anyhow!(
+        "packet28d did not answer status (last probe: {last_error})"
+    ))
 }
 
 #[cfg(unix)]

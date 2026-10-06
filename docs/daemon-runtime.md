@@ -100,6 +100,20 @@ lease, and spawns `serve`. It is the bootstrap path for `p28`, which may not
 link `packet28-daemon-core`. The `p28` daemon process tests cover a held
 shutdown and the bounded authority timeout.
 
+Bootstrap, in `packet28d start` and the Packet28 CLI, keeps two phases with
+separate fixed deadlines. An instance-lease owner that is neither serving nor
+starting, such as a stopping daemon, gets 10 s to release authority. A daemon
+that bootstrap spawned, or an owner whose authenticated runtime metadata has no
+readiness time and whose endpoint accepts connections, gets 30 s to answer
+bounded V1 status with the same pid and workspace root. Each status request is
+bounded by the time left in its phase. Runtime metadata only selects what to
+wait for; cleanup and spawn still require the released instance lease, and
+unauthentic or malformed metadata fails closed. A timed-out caller leaves a
+starting daemon running. Startup-lease acquisition precedes both deadlines and
+blocks behind another bootstrap or an explicit stop, so neither phase bounds a
+whole call. Gated-startup process tests in `p28` and the CLI hold a real
+registry lock to keep startup pending past 10 s.
+
 The checker also requires each source anchor below to resolve to exactly one
 Rustdoc fence of the declared kind and to contain the relevant API operations.
 This covers the public `DaemonCoreError` re-export and the frozen core-root

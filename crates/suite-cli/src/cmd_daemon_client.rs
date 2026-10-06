@@ -2,12 +2,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 #[cfg(unix)]
-use packet28_daemon_client::transport::{DaemonEndpoint, DaemonStream};
-use packet28_daemon_core::storage::read_runtime_info;
+use packet28_daemon_client::runtime_discovery::read_runtime_info_if_present;
+#[cfg(unix)]
+use packet28_daemon_client::transport::{
+    endpoint_accepts_connections, request_status_v1, DaemonClientError, DaemonEndpoint,
+    DaemonStream,
+};
 #[cfg(unix)]
 use packet28_daemon_core::task_store_lease::{
     acquire_daemon_startup_lease, daemon_instance_lock_path,
 };
+#[cfg(unix)]
+use packet28_daemon_protocol::message::DaemonRuntimeInfo;
 use packet28_daemon_protocol::{
     commands::{
         CoverCheckRequest, CoverCheckResponse, PacketFetchRequest, PacketFetchResponse,
@@ -37,7 +43,9 @@ use std::io::{BufReader, BufWriter};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::sync::mpsc;
 #[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
@@ -319,20 +327,21 @@ impl PersistentDaemonClient {
 #[cfg(unix)]
 pub(crate) fn ensure_daemon(root: &Path) -> Result<()> {
     let root = normalize_daemon_root(root);
-    if daemon_status_existing(&root).is_ok() {
+    // A starting daemon accepts connections but answers only once ready, so
+    // its status is awaited under the startup-readiness deadline below rather
+    // than the unbounded socket timeout of this fast path.
+    if !daemon_runtime_is_starting(&root) && daemon_status_existing(&root).is_ok() {
         return Ok(());
     }
     // Discovery, stale-file cleanup, and bootstrap stay inside one startup
     // lease so a concurrent client cannot replace the runtime between the
     // authority probe and cleanup.
     let _startup_lease = acquire_daemon_startup_lease(&root)?;
-    if daemon_status_existing(&root).is_ok() {
-        return Ok(());
-    }
     // An unreachable endpoint does not mean the previous daemon has exited: a
     // stopping daemon withdraws its endpoint before it finishes persistence and
     // cleanup. Leave its runtime files alone and do not spawn a replacement
-    // until it releases the instance lease.
+    // until it releases the instance lease. A daemon that became ready, or is
+    // still starting, while this client waited for the lease is reused.
     if wait_for_daemon_authority(&root, DAEMON_BOOTSTRAP_AUTHORITY_TIMEOUT)?
         == DaemonAuthority::Serving
     {
@@ -342,8 +351,8 @@ pub(crate) fn ensure_daemon(root: &Path) -> Result<()> {
     if endpoint_may_have_stale_socket(&endpoint) && connect_daemon_endpoint(&endpoint).is_err() {
         cleanup_unreachable_runtime_files(&root)?;
     }
-    start_daemon(&root)?;
-    wait_for_daemon(&root, Duration::from_secs(10))
+    let daemon = start_daemon(&root)?;
+    wait_for_spawned_daemon(&root, &daemon)
 }
 
 #[cfg(not(unix))]
@@ -410,8 +419,15 @@ fn daemon_supports_managed_log(binary: &Path) -> bool {
         })
 }
 
+/// A daemon process spawned by this client, reaped by a background thread.
 #[cfg(unix)]
-fn start_daemon(root: &Path) -> Result<()> {
+struct SpawnedDaemon {
+    pid: u32,
+    exited: mpsc::Receiver<std::io::Result<ExitStatus>>,
+}
+
+#[cfg(unix)]
+fn start_daemon(root: &Path) -> Result<SpawnedDaemon> {
     let binary = packet28d_binary()?;
     ensure_executable(&binary)?;
     let mut command = Command::new(&binary);
@@ -449,36 +465,205 @@ fn start_daemon(root: &Path) -> Result<()> {
     }
     let mut child = command.spawn().context("failed to spawn packet28d")?;
     let pid = child.id();
+    let (sender, exited) = mpsc::channel();
     thread::Builder::new()
         .name(format!("packet28d-reaper-{pid}"))
         .spawn(move || {
-            let _ = child.wait();
+            let _ = sender.send(child.wait());
         })
         .context("failed to start packet28d child reaper")?;
-    Ok(())
+    Ok(SpawnedDaemon { pid, exited })
 }
 
+/// Bound for a starting daemon to answer status after it was spawned or
+/// identified. It matches the connected status budget of
+/// [`DAEMON_SOCKET_TIMEOUT`] that bootstrap effectively allowed before startup
+/// readiness was separated from authority release; seeded 5,000-task debug
+/// startup measured about 20 s.
 #[cfg(unix)]
-fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if daemon_status_existing(root).is_ok() {
-            return Ok(());
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits for the daemon this client spawned to answer status with its own
+/// identity.
+///
+/// The instance lease is never probed here: a probe could briefly hold it
+/// while the child tries to acquire it. On timeout the daemon is left running
+/// to finish startup.
+#[cfg(unix)]
+fn wait_for_spawned_daemon(root: &Path, daemon: &SpawnedDaemon) -> Result<()> {
+    let started = Instant::now();
+    let deadline = started + DAEMON_STARTUP_TIMEOUT;
+    let mut last_error = None;
+    loop {
+        match daemon.exited.try_recv() {
+            Ok(status) => {
+                let status = status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|error| format!("an unobservable status ({error})"));
+                return Err(anyhow!(
+                    "packet28d pid {} exited with {status} before becoming ready (startup \
+                     readiness phase, elapsed {} ms; log: {})",
+                    daemon.pid,
+                    started.elapsed().as_millis(),
+                    log_path(root).display()
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!("packet28d pid {} reaper stopped", daemon.pid))
+            }
+        }
+        // Until the child publishes its own metadata, runtime files may belong
+        // to the daemon that released authority; they are never trusted for
+        // the child.
+        match read_runtime_info_if_present(root) {
+            Ok(Some(runtime)) if runtime.pid == daemon.pid => {
+                let endpoint = DaemonEndpoint::from_runtime(root, &runtime)?;
+                match request_status_v1(&endpoint, deadline) {
+                    Ok(status) if same_daemon(&status, &runtime) => return Ok(()),
+                    Ok(status) => last_error = Some(identity_mismatch(&status, &runtime)),
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if Instant::now() >= deadline {
+            return Err(daemon_startup_timeout(
+                root, daemon.pid, started, last_error,
+            ));
         }
         thread::sleep(Duration::from_millis(10));
     }
-    if let Ok(runtime) = read_runtime_info(root) {
-        return Err(anyhow!(
-            "packet28d did not become ready; runtime file exists for pid {} at {} (log: {})",
-            runtime.pid,
-            runtime.socket_path,
-            runtime.log_path
-        ));
+}
+
+/// Reports whether authenticated runtime metadata names a daemon that has not
+/// published readiness. Any read failure is left to the lease-guarded path,
+/// which fails closed on it.
+#[cfg(unix)]
+fn daemon_runtime_is_starting(root: &Path) -> bool {
+    matches!(
+        read_runtime_info_if_present(root),
+        Ok(Some(runtime)) if runtime.ready_at_unix.is_none()
+    )
+}
+
+/// A daemon identified by authenticated runtime metadata that has not yet
+/// published readiness.
+#[cfg(unix)]
+struct StartupCandidate {
+    runtime: DaemonRuntimeInfo,
+    endpoint: DaemonEndpoint,
+}
+
+/// What the current instance-lease owner's published state shows.
+#[cfg(unix)]
+enum DaemonOwner {
+    Serving,
+    Starting(Box<StartupCandidate>),
+    Unavailable,
+}
+
+/// Classifies the instance-lease owner from authenticated runtime metadata.
+///
+/// Runtime metadata only selects what to wait for; it never authorizes
+/// cleanup. Unauthentic or malformed metadata fails closed.
+#[cfg(unix)]
+fn observe_daemon_owner(root: &Path, deadline: Instant) -> Result<DaemonOwner> {
+    let Some(runtime) = read_runtime_info_if_present(root)
+        .context("failed to read packet28d runtime metadata while the daemon owns the workspace")?
+    else {
+        return Ok(DaemonOwner::Unavailable);
+    };
+    let endpoint = DaemonEndpoint::from_runtime(root, &runtime)?;
+    if runtime.ready_at_unix.is_none() {
+        // A daemon binds its listener and publishes runtime metadata before it
+        // loads durable state, then accepts requests once ready.
+        if endpoint_accepts_connections(&endpoint)? {
+            return Ok(DaemonOwner::Starting(Box::new(StartupCandidate {
+                runtime,
+                endpoint,
+            })));
+        }
+        return Ok(DaemonOwner::Unavailable);
     }
-    Err(anyhow!(
-        "packet28d did not become ready (log: {})",
-        log_path(root).display()
-    ))
+    match request_status_v1(&endpoint, deadline) {
+        Ok(status) if same_daemon(&status, &runtime) => Ok(DaemonOwner::Serving),
+        // An older daemon answers the authenticated V1 request with a
+        // protocol error; callers reach it through legacy requests.
+        Err(DaemonClientError::StatusRejected { message, .. })
+            if daemon_error_indicates_protocol_mismatch(&message) =>
+        {
+            Ok(DaemonOwner::Serving)
+        }
+        // A stopping daemon withdraws its endpoint before it releases
+        // authority; keep waiting within the authority deadline.
+        Ok(_) | Err(_) => Ok(DaemonOwner::Unavailable),
+    }
+}
+
+/// Waits for an existing starting daemon to answer status with its identity.
+///
+/// Returns [`DaemonAuthority::Released`] if it releases the instance lease
+/// first. On timeout the daemon is left running to finish startup.
+#[cfg(unix)]
+fn wait_for_existing_daemon_startup(
+    root: &Path,
+    candidate: &StartupCandidate,
+) -> Result<DaemonAuthority> {
+    let started = Instant::now();
+    let deadline = started + DAEMON_STARTUP_TIMEOUT;
+    loop {
+        let last_error = match request_status_v1(&candidate.endpoint, deadline) {
+            Ok(status) if same_daemon(&status, &candidate.runtime) => {
+                return Ok(DaemonAuthority::Serving)
+            }
+            Ok(status) => identity_mismatch(&status, &candidate.runtime),
+            Err(error) => error.to_string(),
+        };
+        if daemon_instance_released(root)? {
+            return Ok(DaemonAuthority::Released);
+        }
+        if Instant::now() >= deadline {
+            return Err(daemon_startup_timeout(
+                root,
+                candidate.runtime.pid,
+                started,
+                Some(last_error),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn same_daemon(status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> bool {
+    status.pid == runtime.pid && status.workspace_root == runtime.workspace_root
+}
+
+#[cfg(unix)]
+fn identity_mismatch(status: &DaemonStatusV1, runtime: &DaemonRuntimeInfo) -> String {
+    format!(
+        "status identity pid {} root '{}' does not match runtime pid {} root '{}'",
+        status.pid, status.workspace_root, runtime.pid, runtime.workspace_root
+    )
+}
+
+#[cfg(unix)]
+fn daemon_startup_timeout(
+    root: &Path,
+    pid: u32,
+    started: Instant,
+    last_error: Option<String>,
+) -> anyhow::Error {
+    anyhow!(
+        "packet28d pid {pid} did not become ready within {} ms (startup readiness phase, \
+         elapsed {} ms); it was left running to finish startup (log: {}; last probe: {})",
+        DAEMON_STARTUP_TIMEOUT.as_millis(),
+        started.elapsed().as_millis(),
+        log_path(root).display(),
+        last_error.as_deref().unwrap_or("none")
+    )
 }
 
 /// Bound for bootstrap to wait for a daemon that is stopping or held offline to
@@ -562,8 +747,8 @@ pub(crate) fn restart_daemon(root: &Path) -> Result<()> {
     request_daemon_stop(&root)?;
     wait_for_daemon_shutdown(&root, daemon_stop_timeout())?;
     cleanup_unreachable_runtime_files(&root)?;
-    start_daemon(&root)?;
-    wait_for_daemon(&root, Duration::from_secs(10))
+    let daemon = start_daemon(&root)?;
+    wait_for_spawned_daemon(&root, &daemon)
 }
 
 #[cfg(unix)]
@@ -729,17 +914,24 @@ enum DaemonAuthority {
     Released,
 }
 
-/// Waits until a daemon answers status or no daemon owns the workspace
-/// instance lease.
+/// Waits until the owner of the workspace serves it or releases authority.
+///
+/// Each status probe is bounded by the remaining authority time. An owner
+/// identified as starting moves to the startup-readiness phase with its own
+/// deadline of [`DAEMON_STARTUP_TIMEOUT`].
 #[cfg(unix)]
 fn wait_for_daemon_authority(root: &Path, timeout: Duration) -> Result<DaemonAuthority> {
     let deadline = Instant::now() + timeout;
     loop {
-        if daemon_status_existing(root).is_ok() {
-            return Ok(DaemonAuthority::Serving);
-        }
         if daemon_instance_released(root)? {
             return Ok(DaemonAuthority::Released);
+        }
+        match observe_daemon_owner(root, deadline)? {
+            DaemonOwner::Serving => return Ok(DaemonAuthority::Serving),
+            DaemonOwner::Starting(candidate) => {
+                return wait_for_existing_daemon_startup(root, &candidate)
+            }
+            DaemonOwner::Unavailable => {}
         }
         if Instant::now() >= deadline {
             return Err(daemon_authority_timeout(root, timeout));

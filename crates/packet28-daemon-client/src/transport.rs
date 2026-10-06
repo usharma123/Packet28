@@ -5,11 +5,14 @@ use std::net::TcpStream;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use packet28_daemon_protocol::frame::{read_frame, write_frame, FrameError};
-use packet28_daemon_protocol::message::{DaemonResponse, DaemonTransportAuth};
+use packet28_daemon_protocol::message::{DaemonResponse, DaemonRuntimeInfo, DaemonTransportAuth};
 use packet28_daemon_protocol::paths::socket_path;
+use packet28_daemon_protocol::registry::{
+    DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1,
+};
 use thiserror::Error;
 
 use crate::runtime_discovery::{read_runtime_info_if_present, RuntimeDiscoveryError};
@@ -25,6 +28,33 @@ impl DaemonEndpoint {
     /// Returns the Unix path or `tcp://` address published for the daemon.
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// Selects the endpoint published in authenticated runtime metadata.
+    ///
+    /// `runtime` must come from [`crate::runtime_discovery`]; an empty
+    /// endpoint selects the conventional Unix socket for `root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonClientError::LegacyUnauthenticatedTcp`] when the
+    /// runtime advertises TCP without a per-instance capability.
+    pub fn from_runtime(
+        root: &Path,
+        runtime: &DaemonRuntimeInfo,
+    ) -> Result<DaemonEndpoint, DaemonClientError> {
+        if runtime.socket_path.is_empty() {
+            return Ok(default_endpoint(root));
+        }
+        if runtime.socket_path.starts_with("tcp://") && runtime.transport_auth.is_none() {
+            return Err(DaemonClientError::LegacyUnauthenticatedTcp {
+                endpoint: runtime.socket_path.clone(),
+            });
+        }
+        Ok(DaemonEndpoint {
+            address: runtime.socket_path.clone(),
+            transport_auth: runtime.transport_auth.clone(),
+        })
     }
 }
 
@@ -48,6 +78,24 @@ pub enum DaemonStream {
 }
 
 impl DaemonStream {
+    /// Bounds each subsequent socket read and write by `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error, including for a zero `timeout`.
+    pub fn set_io_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+        match self {
+            Self::Unix(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))
+            }
+            Self::Tcp(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))
+            }
+        }
+    }
+
     /// Clones the underlying socket handle.
     ///
     /// # Errors
@@ -140,6 +188,30 @@ pub enum DaemonClientError {
         /// Unexpected response.
         response: Box<DaemonResponse>,
     },
+    /// A bounded request had no time left before its deadline.
+    #[error("deadline elapsed before {operation} '{endpoint}'")]
+    DeadlineElapsed {
+        /// Operation that could not start.
+        operation: &'static str,
+        /// Endpoint being accessed.
+        endpoint: String,
+    },
+    /// The daemon answered a status request with an error.
+    #[error("daemon at '{endpoint}' rejected the status request: {message}")]
+    StatusRejected {
+        /// Endpoint that answered.
+        endpoint: String,
+        /// Daemon error message.
+        message: String,
+    },
+    /// The daemon answered a status request with another response.
+    #[error("unexpected daemon status response from '{endpoint}': {response:?}")]
+    UnexpectedStatusResponse {
+        /// Endpoint that answered.
+        endpoint: String,
+        /// Unexpected response.
+        response: Box<DaemonRegistryResponseV1>,
+    },
 }
 
 /// Discovers the authoritative endpoint for `root`.
@@ -158,18 +230,7 @@ pub fn discover_endpoint(root: &Path) -> Result<DaemonEndpoint, DaemonClientErro
     let Some(runtime) = read_runtime_info_if_present(root)? else {
         return Ok(default_endpoint(root));
     };
-    if runtime.socket_path.is_empty() {
-        return Ok(default_endpoint(root));
-    }
-    if runtime.socket_path.starts_with("tcp://") && runtime.transport_auth.is_none() {
-        return Err(DaemonClientError::LegacyUnauthenticatedTcp {
-            endpoint: runtime.socket_path,
-        });
-    }
-    Ok(DaemonEndpoint {
-        address: runtime.socket_path,
-        transport_auth: runtime.transport_auth,
-    })
+    DaemonEndpoint::from_runtime(root, &runtime)
 }
 
 /// Returns whether a discovered endpoint can leave a stale socket artifact.
@@ -207,6 +268,122 @@ pub fn connect_endpoint(
         return connect_tcp(address, endpoint, timeout);
     }
     connect_unix(Path::new(&endpoint.address), timeout)
+}
+
+/// Reports whether a live listener accepts connections at `endpoint`.
+///
+/// A daemon binds its listener before loading durable state but serves
+/// requests only once ready, so this is liveness evidence for a daemon that is
+/// still starting, not readiness. A Unix peer must have the client's effective
+/// user. A TCP listener cannot answer the capability prelude before it is
+/// ready, so its connection is closed without sending a request; callers rely
+/// on the owner-private runtime metadata that published the capability.
+///
+/// # Errors
+///
+/// Returns [`DaemonClientError`] for a Unix peer owned by another user, a
+/// legacy TCP endpoint without a capability, or a connection failure other
+/// than an absent or refusing listener.
+pub fn endpoint_accepts_connections(endpoint: &DaemonEndpoint) -> Result<bool, DaemonClientError> {
+    let refused = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    };
+    if let Some(address) = endpoint.address.strip_prefix("tcp://") {
+        if endpoint.transport_auth.is_none() {
+            return Err(DaemonClientError::LegacyUnauthenticatedTcp {
+                endpoint: endpoint.address.clone(),
+            });
+        }
+        return match TcpStream::connect(address) {
+            Ok(_) => Ok(true),
+            Err(error) if refused(&error) => Ok(false),
+            Err(source) => Err(DaemonClientError::Io {
+                operation: "failed to connect to daemon endpoint",
+                endpoint: endpoint.address.clone(),
+                source,
+            }),
+        };
+    }
+    match UnixStream::connect(&endpoint.address) {
+        Ok(stream) => {
+            verify_unix_server_peer(&stream, effective_uid()).map_err(|source| {
+                DaemonClientError::Io {
+                    operation: "failed to authenticate daemon peer",
+                    endpoint: endpoint.address.clone(),
+                    source,
+                }
+            })?;
+            Ok(true)
+        }
+        Err(error) if refused(&error) => Ok(false),
+        Err(source) => Err(DaemonClientError::Io {
+            operation: "failed to connect to",
+            endpoint: endpoint.address.clone(),
+            source,
+        }),
+    }
+}
+
+/// Requests bounded V1 status from an authenticated endpoint.
+///
+/// Connection authentication and each socket read or write are bounded by the
+/// time remaining before `deadline`, so a connected daemon that has not begun
+/// serving cannot hold the request past it. Establishing a local connection
+/// is not separately bounded.
+///
+/// # Errors
+///
+/// Returns [`DaemonClientError::DeadlineElapsed`] when no time remains, a
+/// connection, authentication, or framing error, or the daemon's rejection or
+/// unexpected response.
+pub fn request_status_v1(
+    endpoint: &DaemonEndpoint,
+    deadline: Instant,
+) -> Result<DaemonStatusV1, DaemonClientError> {
+    let remaining = |operation| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err(DaemonClientError::DeadlineElapsed {
+                operation,
+                endpoint: endpoint.address.clone(),
+            })
+        } else {
+            Ok(remaining)
+        }
+    };
+    let mut stream = connect_endpoint(endpoint, remaining("connecting to")?)?;
+    stream
+        .set_io_timeout(remaining("requesting status from")?)
+        .map_err(|source| DaemonClientError::Io {
+            operation: "failed to configure status timeout for",
+            endpoint: endpoint.address.clone(),
+            source,
+        })?;
+    write_frame(&mut stream, &DaemonRegistryRequestV1::Status).map_err(|source| {
+        DaemonClientError::Frame {
+            operation: "failed to write status request to",
+            endpoint: endpoint.address.clone(),
+            source,
+        }
+    })?;
+    match read_frame(&mut stream).map_err(|source| DaemonClientError::Frame {
+        operation: "failed to read status response from",
+        endpoint: endpoint.address.clone(),
+        source,
+    })? {
+        DaemonRegistryResponseV1::Status { status } => Ok(*status),
+        DaemonRegistryResponseV1::Error { message } => Err(DaemonClientError::StatusRejected {
+            endpoint: endpoint.address.clone(),
+            message,
+        }),
+        response => Err(DaemonClientError::UnexpectedStatusResponse {
+            endpoint: endpoint.address.clone(),
+            response: Box::new(response),
+        }),
+    }
 }
 
 fn default_endpoint(root: &Path) -> DaemonEndpoint {
@@ -392,7 +569,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
-    use packet28_daemon_protocol::message::{DaemonRuntimeInfo, DAEMON_TRANSPORT_SECRET_BYTES};
+    use packet28_daemon_protocol::message::DAEMON_TRANSPORT_SECRET_BYTES;
     use packet28_daemon_protocol::paths::{runtime_path, workspace_socket_path};
 
     fn write_runtime(root: &Path, runtime: &DaemonRuntimeInfo) {
@@ -471,6 +648,149 @@ mod tests {
             error,
             DaemonClientError::LegacyUnauthenticatedTcp { .. }
         ));
+    }
+
+    /// Slack for scheduler and socket-timeout granularity. Assertions only
+    /// check that a request ended near its deadline, never how early.
+    const DEADLINE_SLACK: Duration = Duration::from_millis(750);
+
+    fn unix_endpoint(socket: &Path) -> DaemonEndpoint {
+        DaemonEndpoint {
+            address: socket.to_string_lossy().to_string(),
+            transport_auth: None,
+        }
+    }
+
+    #[test]
+    fn status_request_to_connected_unserved_unix_listener_ends_at_its_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("starting.sock");
+        // Bound but never accepted, like a daemon still loading durable state.
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let endpoint = unix_endpoint(&socket);
+        assert!(endpoint_accepts_connections(&endpoint).unwrap());
+
+        let budget = Duration::from_millis(400);
+        let started = Instant::now();
+        let error = request_status_v1(&endpoint, started + budget).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(error, DaemonClientError::Frame { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            elapsed < budget + DEADLINE_SLACK,
+            "status request outlived its deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn status_request_to_unserved_tcp_listener_ends_at_its_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = DaemonEndpoint {
+            address: format!("tcp://{}", listener.local_addr().unwrap()),
+            transport_auth: Some(DaemonTransportAuth::from_secret_bytes(
+                [0x5a; DAEMON_TRANSPORT_SECRET_BYTES],
+            )),
+        };
+        assert!(endpoint_accepts_connections(&endpoint).unwrap());
+
+        let budget = Duration::from_millis(400);
+        let started = Instant::now();
+        let error = request_status_v1(&endpoint, started + budget).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(error, DaemonClientError::Frame { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            elapsed < budget + DEADLINE_SLACK,
+            "status request outlived its deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn status_request_with_elapsed_deadline_does_not_connect() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("never.sock");
+        let error = request_status_v1(&unix_endpoint(&socket), Instant::now()).unwrap_err();
+        assert!(matches!(error, DaemonClientError::DeadlineElapsed { .. }));
+    }
+
+    #[test]
+    fn endpoint_liveness_reports_absent_and_refusing_listeners() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            !endpoint_accepts_connections(&unix_endpoint(&root.path().join("absent.sock")))
+                .unwrap()
+        );
+        let closed = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let endpoint = DaemonEndpoint {
+            address: format!("tcp://{address}"),
+            transport_auth: Some(DaemonTransportAuth::from_secret_bytes(
+                [0x5a; DAEMON_TRANSPORT_SECRET_BYTES],
+            )),
+        };
+        assert!(!endpoint_accepts_connections(&endpoint).unwrap());
+        let legacy = DaemonEndpoint {
+            address: format!("tcp://{address}"),
+            transport_auth: None,
+        };
+        assert!(matches!(
+            endpoint_accepts_connections(&legacy),
+            Err(DaemonClientError::LegacyUnauthenticatedTcp { .. })
+        ));
+    }
+
+    #[test]
+    fn status_request_returns_the_served_status() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("ready.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: DaemonRegistryRequestV1 = read_frame(&mut stream).unwrap();
+            assert!(matches!(request, DaemonRegistryRequestV1::Status));
+            write_frame(
+                &mut stream,
+                &DaemonRegistryResponseV1::Status {
+                    status: Box::new(DaemonStatusV1 {
+                        pid: 4242,
+                        ..DaemonStatusV1::default()
+                    }),
+                },
+            )
+            .unwrap();
+        });
+
+        let status = request_status_v1(
+            &unix_endpoint(&socket),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(status.pid, 4242);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_endpoint_selection_rejects_legacy_tcp() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = DaemonRuntimeInfo {
+            socket_path: "tcp://127.0.0.1:4242".to_string(),
+            ..DaemonRuntimeInfo::default()
+        };
+        assert!(matches!(
+            DaemonEndpoint::from_runtime(root.path(), &runtime),
+            Err(DaemonClientError::LegacyUnauthenticatedTcp { .. })
+        ));
+        let empty =
+            DaemonEndpoint::from_runtime(root.path(), &DaemonRuntimeInfo::default()).unwrap();
+        assert_eq!(empty.address(), socket_path(root.path()).to_string_lossy());
     }
 
     #[test]

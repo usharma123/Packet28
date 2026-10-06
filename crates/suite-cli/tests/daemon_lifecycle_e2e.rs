@@ -773,3 +773,422 @@ fn corrupt_daemon_instance_lock_fails_closed_for_stop_and_start() {
     assert!(daemon_dir.join("ready").exists());
     assert!(!daemon_dir.join("packet28d.log").exists());
 }
+
+/// Hold a gated startup past the 10 s authority bound. Clients must keep
+/// waiting under the separate 30 s startup-readiness phase. Holds are
+/// measured from when the test observes the daemon in startup, which is after
+/// any bootstrap deadline for that daemon began, so the margin past 10 s does
+/// not depend on client process start-up latency.
+#[cfg(unix)]
+const HOLD_PAST_AUTHORITY_BOUND: Duration = Duration::from_secs(13);
+
+/// The CLI bootstrap's startup-readiness phase.
+#[cfg(unix)]
+const STARTUP_READINESS_PHASE: Duration = Duration::from_secs(30);
+
+#[cfg(unix)]
+fn packet28d_path() -> PathBuf {
+    PathBuf::from(assert_cmd::cargo::cargo_bin!("Packet28")).with_file_name("packet28d")
+}
+
+#[cfg(unix)]
+fn read_test_runtime(root: &Path) -> Option<Value> {
+    serde_json::from_slice(&fs::read(root.join(".packet28/daemon/runtime.json")).ok()?).ok()
+}
+
+/// Status pid reported through the CLI's authenticated status command.
+#[cfg(unix)]
+fn status_pid(root: &Path) -> Option<u64> {
+    let output = suite_cmd()
+        .args([
+            "daemon",
+            "status",
+            "--root",
+            root.to_str().unwrap(),
+            "--json",
+        ])
+        .timeout(Duration::from_secs(30))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&output.stdout).ok()?["pid"].as_u64()
+}
+
+/// Owns every daemon a gated lifecycle test may create, including on
+/// unwinding.
+///
+/// The fixture holds the watch-registry lock that a starting daemon needs only
+/// after it has taken the instance lease, bound its listener, and published
+/// runtime metadata, so startup stays pending until the test releases it.
+#[cfg(unix)]
+struct GatedStartupFixture {
+    dir: TempDir,
+    gate: Option<fs::File>,
+    // Harness-owned, so the directly started daemon stays in the harness
+    // process group and is terminated and reaped even on unwinding.
+    direct: Option<ProcessHarness>,
+}
+
+#[cfg(unix)]
+impl GatedStartupFixture {
+    fn hold() -> Self {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        ensure_packet28d_built();
+        let dir = TempDir::new().unwrap();
+        write_repo_fixture(dir.path());
+        init_repo(dir.path());
+        let daemon_dir = dir.path().join(".packet28/daemon");
+        fs::create_dir_all(&daemon_dir).unwrap();
+        let gate = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(daemon_dir.join(".watch-registry-v1.json.lock"))
+            .unwrap();
+        // SAFETY: flock only takes an advisory lock on the descriptor owned by
+        // `gate`, which stays open for the duration of the call.
+        let locked = unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(locked, 0, "{}", std::io::Error::last_os_error());
+        Self {
+            dir,
+            gate: Some(gate),
+            direct: None,
+        }
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn root_arg(&self) -> &str {
+        self.dir.path().to_str().unwrap()
+    }
+
+    fn release(&mut self) {
+        // Closing the descriptor releases the flock.
+        drop(self.gate.take());
+    }
+
+    /// Waits until a daemon published runtime metadata without readiness.
+    fn wait_for_admission(&self) -> u64 {
+        let ready = self.root().join(".packet28/daemon/ready");
+        let mut pid = None;
+        wait_for_fixture_signal("daemon entered the gated startup phase", || {
+            pid = read_test_runtime(self.root())
+                .filter(|runtime| runtime["ready_at_unix"].is_null())
+                .and_then(|runtime| runtime["pid"].as_u64());
+            pid.is_some() && !ready.exists()
+        });
+        pid.unwrap()
+    }
+
+    fn start_direct(&mut self) -> u64 {
+        let daemon = ProcessHarness::spawn(
+            std::process::Command::new(packet28d_path()).args(["serve", "--root", self.root_arg()]),
+            HarnessLimits::default(),
+        )
+        .expect("spawn packet28d serve");
+        let pid = u64::from(daemon.pid());
+        self.direct = Some(daemon);
+        assert_eq!(
+            self.wait_for_admission(),
+            pid,
+            "another daemon entered startup"
+        );
+        pid
+    }
+
+    fn direct_is_running(&mut self) -> bool {
+        client_is_running(self.direct.as_mut().expect("direct daemon"))
+    }
+
+    /// Asserts that a gated startup stays pending until `until` has elapsed
+    /// since `from`.
+    fn hold_pending(
+        &self,
+        clients: &mut [&mut ProcessHarness],
+        pid: u64,
+        from: std::time::Instant,
+        until: Duration,
+    ) {
+        while from.elapsed() < until {
+            for client in clients.iter_mut() {
+                if !client_is_running(client) {
+                    let output = wait_for_client(client);
+                    panic!(
+                        "client completed with {} after {:?} while startup was pending; \
+                         stdout={:?} stderr={:?}",
+                        output.status,
+                        from.elapsed(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            let runtime = read_test_runtime(self.root()).expect("pending daemon runtime");
+            assert_eq!(
+                runtime["pid"].as_u64(),
+                Some(pid),
+                "pending daemon was replaced"
+            );
+            assert!(
+                runtime["ready_at_unix"].is_null(),
+                "gated daemon became ready"
+            );
+            self.assert_no_losing_replacement();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn assert_no_losing_replacement(&self) {
+        let log = fs::read_to_string(self.root().join(".packet28/daemon/packet28d.log"))
+            .unwrap_or_default();
+        assert!(
+            !log.contains("another Packet28 daemon already owns"),
+            "a replacement daemon was spawned while the original owned the workspace:\n{log}"
+        );
+    }
+
+    fn assert_serving(&self, pid: u64) {
+        assert_eq!(
+            status_pid(self.root()),
+            Some(pid),
+            "status identity changed"
+        );
+        let runtime = read_test_runtime(self.root()).expect("serving runtime");
+        assert_eq!(
+            runtime["pid"].as_u64(),
+            Some(pid),
+            "runtime identity changed"
+        );
+        assert!(!runtime["ready_at_unix"].is_null());
+    }
+
+    /// Stops every daemon and verifies authority release from the instance
+    /// lease itself, then reaps a directly started daemon.
+    fn close(mut self) {
+        self.release();
+        suite_cmd()
+            .args(["daemon", "stop", "--root", self.root_arg()])
+            .timeout(Duration::from_secs(60))
+            .assert()
+            .success();
+        assert!(!daemon_instance_is_held(self.root()));
+        assert!(!self.root().join(".packet28/daemon/runtime.json").exists());
+        assert!(!self.root().join(".packet28/daemon/ready").exists());
+        if let Some(mut daemon) = self.direct.take() {
+            let output = daemon
+                .wait(FIXTURE_SIGNAL_TIMEOUT)
+                .expect("direct daemon exited after stop");
+            assert!(
+                output.status.success(),
+                "direct daemon exited with {}",
+                output.status
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GatedStartupFixture {
+    fn drop(&mut self) {
+        self.release();
+        let detached = daemon_runtime_pid(self.root());
+        let _ = suite_cmd()
+            .args(["daemon", "stop", "--root", self.root_arg()])
+            .timeout(Duration::from_secs(60))
+            .output();
+        // Dropping the harness terminates and reaps the daemon's group.
+        drop(self.direct.take());
+        if let Some(pid) = detached.and_then(|pid| i32::try_from(pid).ok()) {
+            if process_exists(pid) {
+                // SAFETY: kill only signals the daemon this fixture's client
+                // started; no pointers are passed.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn start_waits_for_spawned_daemon_held_past_authority_bound() {
+    let mut fixture = GatedStartupFixture::hold();
+    let root = fixture.root_arg().to_string();
+    let started = std::time::Instant::now();
+    let mut start = spawn_lifecycle_client(&["daemon", "start", "--root", &root], &[]);
+    let pid = fixture.wait_for_admission();
+    let admitted = std::time::Instant::now();
+
+    fixture.hold_pending(&mut [&mut start], pid, admitted, HOLD_PAST_AUTHORITY_BOUND);
+    fixture.release();
+    let output = wait_for_client(&mut start);
+
+    assert!(
+        output.status.success(),
+        "daemon start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.elapsed() < STARTUP_READINESS_PHASE);
+    fixture.assert_serving(pid);
+    fixture.assert_no_losing_replacement();
+    fixture.close();
+}
+
+#[test]
+#[cfg(unix)]
+fn start_reuses_connected_starting_daemon_with_stable_identity() {
+    let mut fixture = GatedStartupFixture::hold();
+    let root = fixture.root_arg().to_string();
+    let pid = fixture.start_direct();
+
+    let started = std::time::Instant::now();
+    let mut start = spawn_lifecycle_client(&["daemon", "start", "--root", &root], &[]);
+    fixture.hold_pending(&mut [&mut start], pid, started, HOLD_PAST_AUTHORITY_BOUND);
+    assert!(fixture.direct_is_running());
+    fixture.release();
+    let output = wait_for_client(&mut start);
+
+    assert!(
+        output.status.success(),
+        "daemon start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.elapsed() < STARTUP_READINESS_PHASE);
+    assert!(fixture.direct_is_running());
+    fixture.assert_serving(pid);
+    fixture.assert_no_losing_replacement();
+    fixture.close();
+}
+
+#[test]
+#[cfg(unix)]
+fn concurrent_cli_and_packet28d_starters_share_one_slow_starting_daemon() {
+    let mut fixture = GatedStartupFixture::hold();
+    let root = fixture.root_arg().to_string();
+    let started = std::time::Instant::now();
+    let mut cli = spawn_lifecycle_client(&["daemon", "start", "--root", &root], &[]);
+    let mut bootstrap = ProcessHarness::spawn(
+        std::process::Command::new(packet28d_path()).args(["start", "--root", &root]),
+        HarnessLimits::default(),
+    )
+    .expect("spawn packet28d start");
+    let pid = fixture.wait_for_admission();
+    let admitted = std::time::Instant::now();
+
+    fixture.hold_pending(
+        &mut [&mut cli, &mut bootstrap],
+        pid,
+        admitted,
+        HOLD_PAST_AUTHORITY_BOUND,
+    );
+    fixture.release();
+    for (name, client) in [
+        ("daemon start", &mut cli),
+        ("packet28d start", &mut bootstrap),
+    ] {
+        let output = wait_for_client(client);
+        assert!(
+            output.status.success(),
+            "{name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert!(started.elapsed() < STARTUP_READINESS_PHASE);
+    fixture.assert_serving(pid);
+    fixture.assert_no_losing_replacement();
+    fixture.close();
+}
+
+#[test]
+#[cfg(unix)]
+fn start_timeout_for_existing_starting_daemon_is_bounded_and_leaves_it_running() {
+    let mut fixture = GatedStartupFixture::hold();
+    let root = fixture.root_arg().to_string();
+    let pid = fixture.start_direct();
+
+    // The starting daemon accepts connections but never answers while gated,
+    // so each status request must end at the startup-readiness deadline.
+    let started = std::time::Instant::now();
+    let output = run_lifecycle_client(&["daemon", "start", "--root", &root], &[]);
+    let elapsed = started.elapsed();
+
+    assert!(
+        !output.status.success(),
+        "start succeeded against a gated daemon"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("did not become ready within 30000 ms")
+            && stderr.contains("startup readiness phase")
+            && stderr.contains(&format!("pid {pid}"))
+            && stderr.contains("left running")
+            && stderr.contains("packet28d.log"),
+        "missing startup timeout diagnostic: {stderr}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(29) && elapsed < Duration::from_secs(36),
+        "startup readiness timeout after {elapsed:?}, outside its ~30 s phase"
+    );
+    // The caller's timeout neither stopped nor replaced the slow starter.
+    assert!(fixture.direct_is_running());
+    let runtime = read_test_runtime(fixture.root()).expect("pending daemon runtime");
+    assert_eq!(runtime["pid"].as_u64(), Some(pid));
+    assert!(runtime["ready_at_unix"].is_null());
+    fixture.assert_no_losing_replacement();
+
+    fixture.release();
+    wait_for_fixture_signal("released daemon answers status", || {
+        status_pid(fixture.root()) == Some(pid)
+    });
+    fixture.assert_serving(pid);
+    fixture.close();
+}
+
+#[test]
+#[cfg(unix)]
+fn start_fails_closed_on_corrupt_runtime_of_a_starting_owner() {
+    let mut fixture = GatedStartupFixture::hold();
+    let root = fixture.root_arg().to_string();
+    let pid = fixture.start_direct();
+    let runtime_path = fixture.root().join(".packet28/daemon/runtime.json");
+    let replacement = fixture.root().join(".packet28/daemon/runtime.json.corrupt");
+    let corrupt = b"{not runtime metadata";
+    fs::write(&replacement, corrupt).unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(&replacement, &runtime_path).unwrap();
+
+    let started = std::time::Instant::now();
+    let output = run_lifecycle_client(&["daemon", "start", "--root", &root], &[]);
+
+    assert!(
+        !output.status.success(),
+        "start accepted corrupt runtime metadata"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("runtime metadata"),
+        "missing runtime integrity diagnostic: {stderr}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(9));
+    assert_eq!(fs::read(&runtime_path).unwrap(), corrupt);
+    assert!(fixture.direct_is_running());
+    assert!(daemon_instance_is_held(fixture.root()));
+    assert!(!fixture
+        .root()
+        .join(".packet28/daemon/packet28d.log")
+        .exists());
+
+    fixture.release();
+    wait_for_fixture_signal("released daemon answers status", || {
+        status_pid(fixture.root()) == Some(pid)
+    });
+    fixture.close();
+}

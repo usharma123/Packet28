@@ -34,6 +34,7 @@ covy-ingest.workspace = true
 mapy-core.workspace = true
 ignore.workspace = true
 notify.workspace = true
+packet28-daemon-client.workspace = true
 packet28-daemon-core.workspace = true
 packet28-daemon-protocol.workspace = true
 packet28-reducer-core.workspace = true

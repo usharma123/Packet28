@@ -332,3 +332,233 @@ impl Drop for DelayedShutdownDaemon {
         }
     }
 }
+
+/// Starts `packet28d serve` directly without waiting for readiness, so a test
+/// can observe a daemon that is still loading durable state.
+pub fn spawn_unready_daemon(root: &Path, force_tcp: bool) -> DaemonHandle {
+    let canonical_root = root.canonicalize().unwrap();
+    let mut command = ProcessCommand::new(daemon_bin());
+    command
+        .args(["serve", "--root", canonical_root.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if force_tcp {
+        command.env("PACKET28D_FORCE_TCP", "1");
+    }
+    DaemonHandle {
+        child: command.spawn().unwrap(),
+    }
+}
+
+impl DaemonHandle {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
+    /// Sends protocol `Stop` and reaps the daemon, requiring a clean exit.
+    pub fn stop_and_reap(&mut self, root: &Path) {
+        stop_daemon(root);
+        wait_for_fixture_signal("directly started daemon exited", || !self.is_running());
+        let status = self.child.wait().unwrap();
+        assert!(
+            status.success(),
+            "directly started daemon exited with {status}"
+        );
+    }
+}
+
+/// Holds the watch-registry lock that a starting daemon needs only after it
+/// has taken the instance lease, bound its listener, and published runtime
+/// metadata. Startup stays pending, deterministically and without a
+/// production delay knob, until the test releases the lock.
+pub struct StartupGate {
+    lock: Option<std::fs::File>,
+}
+
+impl StartupGate {
+    pub fn hold(root: &Path) -> Self {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let daemon_dir = root.join(".packet28/daemon");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(daemon_dir.join(".watch-registry-v1.json.lock"))
+            .unwrap();
+        // SAFETY: flock only takes an advisory lock on the descriptor owned by
+        // `lock`, which stays open for the duration of the call.
+        let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(locked, 0, "{}", std::io::Error::last_os_error());
+        Self { lock: Some(lock) }
+    }
+
+    pub fn release(&mut self) {
+        // Closing the descriptor releases the flock.
+        drop(self.lock.take());
+    }
+}
+
+/// Reads runtime metadata the way a test observer may: unauthenticated and
+/// only for assertions, never for cleanup decisions.
+pub fn read_runtime(root: &Path) -> Option<packet28_daemon_protocol::message::DaemonRuntimeInfo> {
+    serde_json::from_slice(&std::fs::read(runtime_path(root)).ok()?).ok()
+}
+
+/// Waits until a daemon has entered the gated startup phase: it published
+/// runtime metadata without readiness, and no ready marker exists.
+pub fn wait_for_startup_admission(
+    root: &Path,
+) -> packet28_daemon_protocol::message::DaemonRuntimeInfo {
+    let mut admitted = None;
+    wait_for_fixture_signal("daemon entered the gated startup phase", || {
+        admitted = read_runtime(root).filter(|runtime| runtime.ready_at_unix.is_none());
+        admitted.is_some() && !ready_path(root).exists()
+    });
+    admitted.unwrap()
+}
+
+/// Probes whether the workspace instance lease is free. Call only when no
+/// daemon should be starting: the probe briefly holds the lease.
+pub fn instance_lease_released(root: &Path) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(".packet28/daemon/.daemon-instance.lock"))
+    else {
+        return true;
+    };
+    // SAFETY: flock only operates on the descriptor owned by `lock`.
+    let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    locked == 0
+}
+
+/// Requests bounded V1 status through the authenticated endpoint.
+pub fn daemon_status(root: &Path) -> Option<packet28_daemon_protocol::registry::DaemonStatusV1> {
+    let endpoint = packet28_daemon_client::transport::discover_endpoint(root).ok()?;
+    packet28_daemon_client::transport::request_status_v1(
+        &endpoint,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .ok()
+}
+
+/// Owns every daemon a gated test may create, including on unwinding.
+///
+/// Drop releases the startup gate, stops and reaps a directly started daemon,
+/// then stops any detached daemon a client spawned, escalating to SIGKILL so
+/// no test daemon outlives the fixture. `close` performs the same shutdown
+/// with assertions on the normal path.
+pub struct GatedWorkspace {
+    pub root: PathBuf,
+    gate: StartupGate,
+    direct: Option<DaemonHandle>,
+}
+
+impl GatedWorkspace {
+    pub fn hold(root: &Path) -> Self {
+        let root = root.canonicalize().unwrap();
+        let gate = StartupGate::hold(&root);
+        Self {
+            root,
+            gate,
+            direct: None,
+        }
+    }
+
+    /// Starts a daemon directly and waits until it is pending at the gate.
+    pub fn start_direct(&mut self, force_tcp: bool) -> u32 {
+        let daemon = spawn_unready_daemon(&self.root, force_tcp);
+        let pid = daemon.pid();
+        self.direct = Some(daemon);
+        let admitted = wait_for_startup_admission(&self.root);
+        assert_eq!(admitted.pid, pid, "a different daemon entered startup");
+        pid
+    }
+
+    pub fn direct_is_running(&mut self) -> bool {
+        self.direct.as_mut().expect("direct daemon").is_running()
+    }
+
+    pub fn release(&mut self) {
+        self.gate.release();
+    }
+
+    /// Stops every daemon and verifies authority release and runtime cleanup
+    /// from the instance lease itself, not from a stop acknowledgement.
+    pub fn close(mut self) {
+        self.gate.release();
+        if let Some(mut direct) = self.direct.take() {
+            direct.stop_and_reap(&self.root);
+        }
+        stop_detached_daemon(&self.root);
+        wait_for_fixture_signal("workspace authority released", || {
+            instance_lease_released(&self.root)
+        });
+        assert!(
+            !runtime_path(&self.root).exists(),
+            "runtime metadata remained"
+        );
+        assert!(!ready_path(&self.root).exists(), "ready marker remained");
+    }
+}
+
+impl Drop for GatedWorkspace {
+    fn drop(&mut self) {
+        self.gate.release();
+        if let Some(mut direct) = self.direct.take() {
+            if direct.is_running() {
+                stop_daemon(&self.root);
+                let started = Instant::now();
+                while direct.is_running() && started.elapsed() < FIXTURE_SIGNAL_TIMEOUT {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            // DaemonHandle's own drop kills and reaps it if still running.
+        }
+        if let Some(pid) = daemon_runtime_pid(&self.root) {
+            let started = Instant::now();
+            while process_is_alive(pid) && started.elapsed() < FIXTURE_SIGNAL_TIMEOUT {
+                stop_daemon(&self.root);
+                thread::sleep(Duration::from_millis(50));
+            }
+            if process_is_alive(pid) {
+                if let Ok(pid) = libc::pid_t::try_from(pid) {
+                    // SAFETY: kill only signals the detached daemon this
+                    // fixture's client started; no pointers are passed.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+}
+
+/// Holds the workspace instance lock as a non-serving owner would.
+pub fn hold_instance_lock(root: &Path) -> std::fs::File {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.join(".packet28/daemon/.daemon-instance.lock"))
+        .unwrap();
+    // SAFETY: flock only operates on the descriptor owned by `lock`.
+    let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(locked, 0, "{}", std::io::Error::last_os_error());
+    lock
+}
