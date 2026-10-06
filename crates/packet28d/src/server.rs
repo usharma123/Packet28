@@ -278,17 +278,12 @@ fn request_daemon_stop(
     state: &Arc<Mutex<DaemonState>>,
     blocking_pool: &BlockingPool,
 ) -> Result<()> {
-    let (shutdown, index_result) = {
-        let mut guard = state.lock().map_err(lock_err)?;
-        guard.shutting_down = true;
-        let index_result = guard.index_tx.send(IndexCommand::Shutdown);
-        (guard.shutdown.clone(), index_result)
-    };
     // The acknowledgement is already on the wire. This is the stop
     // linearization point: no later blocking request or child can be admitted.
     blocking_pool.request_shutdown();
-    shutdown.request();
-    index_result
+    let mut guard = state.lock().map_err(lock_err)?;
+    guard.shutting_down = true;
+    guard.index_tx.request_shutdown(|| guard.shutdown.request())
 }
 
 async fn dispatch_request(
