@@ -194,3 +194,55 @@ fn test_system_infra_and_count_commands_use_reducer_wrappers() {
         .success()
         .stdout(predicate::str::contains("gt log returned 2 stack entries"));
 }
+
+#[test]
+#[cfg(unix)]
+fn test_system_pr_view_bounds_success_and_preserves_failed_output_and_exit() {
+    let root = TempDir::new().unwrap();
+    let bin_dir = root.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let count = root.path().join("count");
+    let stdout_path = root.path().join("stdout");
+    let stderr_path = root.path().join("stderr");
+    let original = format!(
+        "title:\tCLI preview\nstate:\tOPEN\nauthor:\tfixture\nnumber:\t71\nurl:\thttps://example.test/pull/71\n--\n{}\n",
+        "🦀body ".repeat(200)
+    );
+    fs::write(&stdout_path, &original).unwrap();
+    write_executable_script(
+        &bin_dir.join("gh"),
+        "#!/bin/sh\nprintf 'run\\n' >> \"$GH_COUNT\"\ncat \"$GH_STDOUT\"\ncat \"$GH_STDERR\" >&2\nexit \"$GH_EXIT\"\n",
+    );
+    for exit in [0, 7] {
+        let diagnostic = if exit == 0 {
+            ""
+        } else {
+            "request failed\nsecond diagnostic\n"
+        };
+        fs::write(&stderr_path, diagnostic).unwrap();
+        let output = suite_cmd()
+            .current_dir(root.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+            .env("GH_COUNT", &count)
+            .env("GH_STDOUT", &stdout_path)
+            .env("GH_STDERR", &stderr_path)
+            .env("GH_EXIT", exit.to_string())
+            .args(["gh", "pr", "view", "71"])
+            .timeout(std::time::Duration::from_secs(5))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit));
+        let visible = String::from_utf8(output.stdout).unwrap();
+        if exit == 0 {
+            assert!(visible.contains("PR #71 OPEN by fixture - CLI preview"));
+            assert!(visible.contains("https://example.test/pull/71"));
+            assert!(visible.contains("content omitted"));
+            assert!(!visible.contains("title:\t"));
+            assert!(visible.len() < 512);
+        } else {
+            assert!(visible.contains(&original));
+            assert!(visible.contains(diagnostic));
+        }
+    }
+    assert_eq!(fs::read_to_string(count).unwrap(), "run\nrun\n");
+}

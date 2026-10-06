@@ -50,7 +50,7 @@ def validate(summary: dict) -> tuple[list[str], list[str]]:
             continue
         if result.get("status") != "ok":
             if result.get("status") == "passthrough":
-                errors.append(f"{case}: command was not compacted by the hook")
+                errors.append(f"{case}: command was not reduced by the explicitly requested CLI")
             else:
                 detail = result.get("error") or "benchmark execution failed"
                 errors.append(f"{case}: {detail}")
@@ -62,6 +62,23 @@ def validate(summary: dict) -> tuple[list[str], list[str]]:
         for needle in config.get("forbidden_reduced_substrings", []):
             if needle in reduced_preview:
                 errors.append(f"{case}: reduced output contained forbidden substring {needle!r}")
+        if config.get("read_window_integrity"):
+            integrity = result.get("read_window_integrity", {})
+            if (not integrity.get("passed")
+                    or integrity.get("line_start") != 1
+                    or integrity.get("line_end") != 5
+                    or integrity.get("raw_line_count") != 5
+                    or result.get("raw_exit_code") != 0
+                    or result.get("reduced_exit_code") != 0):
+                errors.append(f"{case}: exact five-line content/window/exit integrity failed")
+            else:
+                notes.append(
+                    f"{case}: exact five-line content/window/exit integrity passed; "
+                    f"{result.get('raw_est_tokens')} raw -> {result.get('reduced_est_tokens')} visible tokens "
+                    f"({result.get('token_reduction_pct')}%) remains in the weighted mean. "
+                    "Full contents plus line numbers replace the former 70% per-case savings claim."
+                )
+            continue
         raw_tokens = result.get("raw_est_tokens", 0)
         if raw_tokens < config["min_raw_tokens"]:
             notes.append(
@@ -84,7 +101,7 @@ def validate(summary: dict) -> tuple[list[str], list[str]]:
 
 def render_markdown(summary: dict, errors: list[str], notes: list[str]) -> str:
     lines = [
-        "# Hook Benchmark Validation",
+        "# Explicit CLI and Hook Capture Benchmark Validation",
         "",
         f"- Summary: `{summary.get('artifact_dir', '<unknown>')}/summary.json`",
         f"- Status: `{'failed' if errors else 'passed'}`",
