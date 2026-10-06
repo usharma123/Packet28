@@ -1,13 +1,35 @@
 #![cfg(unix)]
 
-use assert_cmd::Command;
 use serde_json::{json, Value};
 use std::fs;
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-fn suite_cmd() -> Command {
-    assert_cmd::cargo::cargo_bin_cmd!("Packet28")
+#[path = "support/setup_runtime_hooks.rs"]
+#[expect(
+    dead_code,
+    reason = "this binary only exercises the shared setup helper"
+)]
+mod setup_support;
+
+fn run_setup(root: &Path, home: &Path) {
+    setup_support::run_setup(root, home, "windsurf");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease(root) {
+            Ok(_lease) => return,
+            Err(packet28_daemon_core::DaemonCoreError::DaemonInstanceAlreadyRunning { .. }) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture daemon kept its instance lease after stop"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to verify fixture daemon instance lease release: {error}"),
+        }
+    }
 }
 
 fn setup_windsurf_e2e_lock() -> MutexGuard<'static, ()> {
@@ -22,20 +44,7 @@ fn test_setup_windsurf_writes_rules_hooks_and_mcp() {
     let home = TempDir::new().unwrap();
     fs::create_dir_all(home.path().join(".codeium").join("windsurf")).unwrap();
 
-    suite_cmd()
-        .current_dir(root.path())
-        .env("HOME", home.path())
-        .env("PATH", "/usr/bin:/bin")
-        .args([
-            "setup",
-            "--root",
-            root.path().to_str().unwrap(),
-            "--runtime",
-            "windsurf",
-            "--yes",
-        ])
-        .assert()
-        .success();
+    run_setup(root.path(), home.path());
 
     assert!(root.path().join(".windsurf").join("hooks.json").exists());
     assert!(root
@@ -57,7 +66,8 @@ fn test_setup_windsurf_writes_rules_hooks_and_mcp() {
             .join("packet28.md"),
     )
     .unwrap();
-    assert!(rules.contains("Windsurf command rewrite is not guaranteed"));
+    assert!(rules.contains("Windsurf hooks preserve native commands and permissions"));
+    assert!(rules.contains("use explicit Packet28 CLI/MCP tools for reduced output"));
 }
 
 #[test]
@@ -101,20 +111,7 @@ fn test_setup_windsurf_preserves_existing_mcp_servers_and_hooks() {
     )
     .unwrap();
 
-    suite_cmd()
-        .current_dir(root.path())
-        .env("HOME", home.path())
-        .env("PATH", "/usr/bin:/bin")
-        .args([
-            "setup",
-            "--root",
-            root.path().to_str().unwrap(),
-            "--runtime",
-            "windsurf",
-            "--yes",
-        ])
-        .assert()
-        .success();
+    run_setup(root.path(), home.path());
 
     let mcp_config: Value =
         serde_json::from_str(&fs::read_to_string(mcp_config_path).unwrap()).unwrap();

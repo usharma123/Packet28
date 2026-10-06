@@ -538,7 +538,7 @@ fn write_copilot_hook_config_installs_packet28_pretool_hook() {
 }
 
 #[test]
-fn write_opencode_plugin_installs_packet28_rewrite_plugin() {
+fn write_opencode_plugin_installs_command_preserving_adapter() {
     let dir = tempdir().unwrap();
     let path = dir
         .path()
@@ -549,16 +549,17 @@ fn write_opencode_plugin_installs_packet28_rewrite_plugin() {
     let status = setup_plugins::write_opencode_plugin(&path, true).unwrap();
     assert!(matches!(status, McpConfigStatus::Written));
     let content = fs::read_to_string(&path).unwrap();
-    assert!(content.contains("Packet28 rewrite"));
+    assert!(content.contains("Packet28 preserves native command arguments"));
     assert!(content.contains("tool.execute.before"));
-    assert!(content.contains("args as Record<string, unknown>).command = rewritten"));
+    assert!(!content.contains(".command ="));
+    assert!(!content.contains("Packet28 rewrite"));
 
     let status = setup_plugins::write_opencode_plugin(&path, true).unwrap();
     assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
 }
 
 #[test]
-fn opencode_plugin_smoke_rewrites_and_passes_through_empty_stdout() {
+fn opencode_plugin_smoke_preserves_commands_without_running_wrappers() {
     if std::process::Command::new("node")
         .arg("--version")
         .output()
@@ -602,6 +603,7 @@ code += `
   const passthroughArgs = { command: "htop" }
   await plugin["tool.execute.before"]({ tool: "bash" }, { args: rewriteArgs })
   await plugin["tool.execute.before"]({ tool: "shell" }, { args: passthroughArgs })
+  if (calls.length !== 0) throw new Error("unexpected subprocess wrapper")
   console.log(rewriteArgs.command)
   console.log(passthroughArgs.command)
 })().catch((err) => { console.error(err); process.exit(1) })
@@ -621,7 +623,7 @@ eval(code)
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "rewritten git status\nhtop\n"
+        "git status --short\nhtop\n"
     );
 }
 
@@ -636,7 +638,7 @@ fn write_hermes_plugin_installs_plugin_and_enables_config() {
     let manifest = fs::read_to_string(plugin_dir.join("plugin.yaml")).unwrap();
     let config =
         fs::read_to_string(crate::runtime_integrations::hermes::config_path(dir.path())).unwrap();
-    assert!(init.contains("Packet28 rewrite"));
+    assert!(init.contains("Packet28 preserves native command arguments"));
     assert!(manifest.contains("packet28-rewrite"));
     assert!(setup_plugins::hermes_config_enables_packet28(&config).unwrap());
 
@@ -646,7 +648,7 @@ fn write_hermes_plugin_installs_plugin_and_enables_config() {
 
 #[test]
 #[cfg(unix)]
-fn hermes_plugin_smoke_rewrites_and_passes_through_empty_stdout() {
+fn hermes_plugin_smoke_preserves_commands_without_running_wrappers() {
     if std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -665,17 +667,9 @@ import sys
 spec = importlib.util.spec_from_file_location("packet28_rewrite", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-class FakeResult:
-    def __init__(self, stdout="", stderr="", returncode=0):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-def fake_run(argv, **kwargs):
-    assert argv[0:2] == ["Packet28", "rewrite"]
-    if argv[2] == "git status --short":
-        return FakeResult("rewritten git status\n")
-    return FakeResult("")
-mod.subprocess.run = fake_run
+def forbidden_run(*args, **kwargs):
+    raise AssertionError("unexpected subprocess wrapper")
+subprocess.run = forbidden_run
 rewrite_args = {"command": "git status --short"}
 mod._pre_tool_call(tool_name="terminal", args=rewrite_args)
 passthrough_args = {"command": "htop"}
@@ -696,7 +690,7 @@ print(passthrough_args["command"])
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "rewritten git status\nhtop\n"
+        "git status --short\nhtop\n"
     );
 }
 

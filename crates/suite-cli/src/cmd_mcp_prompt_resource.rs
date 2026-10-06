@@ -71,11 +71,11 @@ pub(crate) fn handle_prompt_get(
             let prompt = format!(
                 "Start Packet28 task `{task_id}` for: {task}\n\n\
 Use Packet28 as the primary context broker for this task.\n\
-- Let Claude hooks rewrite supported Bash commands through Packet28 reducers and capture native tool activity automatically; do not call reducer MCP tools in the active loop.\n\
+- Let hooks capture native tool activity without changing commands or native permission matching. Use explicit Packet28 CLI/MCP tools when reduced output is needed.\n\
 - Use `packet28.write_intention` when the current objective or next step changes materially.\n\
 - Keep one mutable Packet28 context block and replace older briefs when a newer brief supersedes them.\n\
 - If Packet28 is fronting upstream MCP tools via proxy, prefer those proxied tools so activity is auto-captured into the next brief.\n\
-- During the active turn, keep MCP usage to intent and explicit handoff/context inspection only.\n\
+- During the active turn, use MCP for intent, explicit reduction, and handoff/context inspection.\n\
 - For long-running work, record the current objective with `packet28.write_intention`, then let the daemon assemble handoff at threshold or stop boundaries.\n\
 - Use `packet28.fetch_context` only when you explicitly need to inspect a stored handoff/context artifact.\n\
 - If Packet28 is unavailable, fall back to direct reads and commands."

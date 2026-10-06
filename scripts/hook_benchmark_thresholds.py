@@ -4,7 +4,10 @@ DEFAULT_THRESHOLDS = {
     "mean_token_reduction_pct": 85.0,
     "cases": {
         "git_status": {"min_reduction_pct": 90.0, "min_raw_tokens": 100},
-        "fs_head": {"min_reduction_pct": 70.0, "min_raw_tokens": 40},
+        # An exact five-line read preserves the content and adds line numbers.
+        # Validate that contract instead of claiming impossible 70% reduction;
+        # its actual visible token count still contributes to the 85% mean.
+        "fs_head": {"read_window_integrity": True, "min_raw_tokens": 40},
         "rust_test": {"min_reduction_pct": 90.0, "min_raw_tokens": 100},
         "grep_basic_alternation_integrity": {
             "min_reduction_pct": 0.0,

@@ -101,6 +101,7 @@ pub fn reduce_github_command(
         operation_kind: spec.operation_kind,
         summary,
         compact_preview: match spec.canonical_kind.as_str() {
+            "gh_pr_view" if failed => format!("{stdout}{stderr}"),
             "gh_pr_view" => compact_pr_view_preview(stdout),
             "gh_pr_checks" => compact_pr_checks_preview(&lines),
             "gh_run_view" => compact_run_view_preview(&lines),
@@ -156,7 +157,7 @@ fn compact(value: &str, limit: usize) -> String {
     if compact.len() <= limit {
         compact
     } else {
-        format!("{}...", &compact[..limit.saturating_sub(3)])
+        format!("{}...", utf8_prefix(&compact, limit.saturating_sub(3)))
     }
 }
 
@@ -348,22 +349,92 @@ fn extract_section_count(lines: &[String], heading: &str) -> usize {
 }
 
 fn compact_pr_view_preview(stdout: &str) -> String {
+    let separator = stdout.lines().position(|line| line.trim() == "--");
+    let header = stdout
+        .lines()
+        .take(separator.unwrap_or(0))
+        .collect::<Vec<_>>();
+    let recognized_header = separator.is_some()
+        && header
+            .first()
+            .is_some_and(|line| line.starts_with("title:\t"))
+        && header.iter().all(|line| line.split_once(":\t").is_some())
+        && ["title:\t", "state:\t", "number:\t"]
+            .iter()
+            .all(|prefix| header.iter().any(|line| line.starts_with(prefix)));
     let mut parts = Vec::new();
-    for line in stdout.lines() {
+    if recognized_header {
+        if let Some(url) = header.iter().find_map(|line| line.strip_prefix("url:\t")) {
+            parts.push(format!("url: {url}"));
+        }
+    }
+    let body_start = if recognized_header {
+        separator.map_or(0, |index| index + 1)
+    } else {
+        0
+    };
+    let (body, body_omitted) = compact_pr_body(stdout.lines().skip(body_start));
+    if !body.is_empty() {
+        parts.push(body);
+    }
+    let metadata_omitted = recognized_header
+        && header.iter().any(|line| {
+            line.split_once(":\t").is_some_and(|(key, value)| {
+                !value.trim().is_empty()
+                    && !matches!(key, "title" | "state" | "number" | "author" | "url")
+            })
+        });
+    if body_omitted || metadata_omitted {
+        parts.push("[content omitted; use original gh command for full output]".to_string());
+    }
+    parts.join("\n")
+}
+
+fn compact_pr_body<'a>(lines: impl Iterator<Item = &'a str>) -> (String, bool) {
+    const MAX_BYTES: usize = 320;
+    const MAX_LINES: usize = 8;
+    let mut body = String::new();
+    let mut rendered_lines = 0;
+    let mut omitted = false;
+    for line in lines {
         let trimmed = line.trim();
-        // Skip markdown images, badges, HTML comments
         if trimmed.starts_with("![")
             || trimmed.starts_with("<!--")
             || trimmed.starts_with("<img")
             || trimmed.starts_with("[![")
         {
+            omitted = true;
             continue;
         }
-        parts.push(trimmed.to_string());
+        let separator = if rendered_lines > 0 { "\n" } else { "" };
+        let remaining = MAX_BYTES.saturating_sub(body.len());
+        if rendered_lines == MAX_LINES || separator.len() > remaining {
+            omitted = true;
+            break;
+        }
+        let prefix = utf8_prefix(trimmed, remaining - separator.len());
+        body.push_str(separator);
+        body.push_str(prefix);
+        rendered_lines += 1;
+        if prefix.len() != trimmed.len() {
+            omitted = true;
+            break;
+        }
     }
-    // Limit to 30 lines
-    parts.truncate(30);
-    parts.join("\n")
+    (body, omitted)
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    &value[..end]
 }
 
 fn compact_pr_checks_preview(lines: &[String]) -> String {
@@ -419,6 +490,100 @@ fn compact_run_view_preview(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pr_view_spec() -> CommandReducerSpec {
+        let argv = ["gh", "pr", "view", "71"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        classify_github_command("gh pr view 71", &argv).unwrap()
+    }
+
+    fn pr_view_stdout(body: &str) -> String {
+        format!(
+            "title:\tIntegrate native lifecycle hooks\nstate:\tOPEN\nauthor:\tusharma123\nlabels:\t\nreviewers:\tconnector (Commented)\nnumber:\t71\nurl:\thttps://github.com/usharma123/Packet28/pull/71\nadditions:\t1207\ndeletions:\t33\n--\n{body}"
+        )
+    }
+
+    #[test]
+    fn pr_view_preview_preserves_identity_without_duplicate_header() {
+        let output = pr_view_stdout("## Problem\nPreserve native commands and permissions.\n");
+        let reduction = reduce_github_command(&pr_view_spec(), &output, "", 0);
+        assert_eq!(
+            reduction.summary,
+            "gh pr view: PR #71 OPEN by usharma123 - Integrate native lifecycle hooks"
+        );
+        assert!(reduction
+            .compact_preview
+            .contains("url: https://github.com/usharma123/Packet28/pull/71"));
+        assert!(reduction.compact_preview.contains("## Problem"));
+        for field in ["title:\t", "state:\t", "author:\t", "number:\t"] {
+            assert!(!reduction.compact_preview.contains(field));
+        }
+        assert!(reduction.compact_preview.contains("content omitted"));
+        assert!(reduction.compact_preview.contains("original gh command"));
+    }
+
+    #[test]
+    fn pr_view_preview_bounds_long_unicode_body_without_cutting_characters() {
+        let body = "🦀修".repeat(1000);
+        let output = pr_view_stdout(&body);
+        let reduction = reduce_github_command(&pr_view_spec(), &output, "", 0);
+        let rendered_body = reduction.compact_preview.lines().nth(1).unwrap();
+        assert!(rendered_body.len() <= 320);
+        assert!(rendered_body.starts_with("🦀修"));
+        assert!(body.starts_with(rendered_body));
+        assert!(reduction
+            .compact_preview
+            .ends_with("[content omitted; use original gh command for full output]"));
+    }
+
+    #[test]
+    fn pr_view_preview_bounds_body_lines_and_discloses_filtered_content() {
+        let body = format!(
+            "![badge](badge.png)\n{}",
+            (0..12)
+                .map(|index| format!("body line {index}\n"))
+                .collect::<String>()
+        );
+        let reduction = reduce_github_command(&pr_view_spec(), &pr_view_stdout(&body), "", 0);
+        assert!(reduction.compact_preview.contains("body line 7"));
+        assert!(!reduction.compact_preview.contains("body line 8"));
+        assert!(!reduction.compact_preview.contains("badge.png"));
+        assert!(reduction.compact_preview.contains("content omitted"));
+    }
+
+    #[test]
+    fn pr_view_preview_keeps_plain_body_separator_without_recognized_header() {
+        let body = "ordinary heading\n--\nordinary body";
+        assert_eq!(compact_pr_view_preview(body), body);
+        let malformed = "title:\tHeading\n--\nstate:\tOPEN\nnumber:\t71\nbody";
+        assert_eq!(compact_pr_view_preview(malformed), malformed);
+        let ordinary = "ordinary heading\ntitle:\tBody title\nstate:\tOPEN\nnumber:\t71\n--\nbody";
+        assert_eq!(compact_pr_view_preview(ordinary), ordinary);
+    }
+
+    #[test]
+    fn pr_view_preview_keeps_metadata_when_header_separator_is_absent() {
+        let output =
+            "title:\tHeading\nstate:\tOPEN\nnumber:\t71\nurl:\thttps://example.test/pr/71\nbody";
+        assert_eq!(compact_pr_view_preview(output), output);
+    }
+
+    #[test]
+    fn pr_view_reduction_preserves_complete_failed_output_and_exit() {
+        let stdout = pr_view_stdout(&"partial output\n".repeat(40));
+        let stderr = format!(
+            "request failed: {}\nadditional diagnostic\n",
+            "🦀".repeat(100)
+        );
+        let reduction = reduce_github_command(&pr_view_spec(), &stdout, &stderr, 7);
+        assert!(reduction.failed);
+        assert_eq!(reduction.exit_code, 7);
+        assert_eq!(reduction.compact_preview, format!("{stdout}{stderr}"));
+        assert!(reduction.summary.contains(stderr.lines().next().unwrap()));
+        assert!(reduction.error_message.as_ref().unwrap().len() <= 200);
+    }
 
     #[test]
     fn classify_github_declines_json_and_patch_variants() {

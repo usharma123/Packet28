@@ -600,6 +600,11 @@ def build_summary(
         "recoverable_output_case_count": sum(
             1 for result in ok_results if result.get("raw_output_recoverable")
         ),
+        "head_integrity_contract": (
+            "fs_head preserves the exact first five lines and exit; line numbering can increase "
+            "visible tokens; exact content integrity replaces the former 70% per-case savings assertion, "
+            "and its actual result remains in the 85% aggregate"
+        ),
         "results": results,
     }
 
@@ -621,6 +626,7 @@ def render_text(summary: dict) -> str:
         "live integrity: "
         f"{summary['successful_live_case_count']}/{summary['expected_live_case_count']} successful"
     )
+    lines.append(summary["head_integrity_contract"])
     for result in summary["results"]:
         if result["status"] != "ok":
             detail = result.get("error") or f"status={result.get('status', 'unknown')}"
@@ -643,12 +649,13 @@ def render_text(summary: dict) -> str:
 
 def render_markdown(summary: dict) -> str:
     lines = [
-        "# Hook Benchmark Suite",
+        "# Explicit CLI and Hook Capture Benchmark Suite",
         "",
         f"- Artifact dir: `{summary['artifact_dir']}`",
         f"- GitHub repo: `{summary['gh_repo'] or '<none>'}`",
         f"- PR seed: `{summary['gh_pr_number'] or '<none>'}`",
         f"- Run seed: `{summary['gh_run_id'] or '<none>'}`",
+        f"- Head contract: {summary['head_integrity_contract']}",
     ]
     if summary.get("mean_token_reduction_pct") is not None:
         lines.append(
@@ -693,7 +700,7 @@ def render_markdown(summary: dict) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run a Packet28 hook rewrite benchmark suite and save JSON artifacts."
+        description="Run explicit CLI reduction and capture-only hook integrity benchmarks."
     )
     parser.add_argument("--root", default=".", help="Repository root")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
@@ -715,7 +722,7 @@ def main() -> int:
     parser.add_argument(
         "--shell",
         default=None,
-        help="Shell binary used for live hook benchmark execution",
+        help="Shell binary used for raw live benchmark execution",
     )
     args = parser.parse_args()
 

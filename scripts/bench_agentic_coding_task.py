@@ -167,11 +167,20 @@ def init_repo(root: Path) -> None:
     )
 
 
+def fixture_environment(root: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    # The two traces share a package name, so a global Cargo target can reuse
+    # the fixed baseline artifact for the still-broken Packet28 workspace.
+    environment["CARGO_TARGET_DIR"] = str(root / "target")
+    return environment
+
+
 def run_command(root: Path, command: list[str], *, shell: bool = False) -> dict[str, Any]:
     started = time.perf_counter()
     completed = subprocess.run(
         command if not shell else command[0],
         cwd=root,
+        env=fixture_environment(root),
         text=True,
         capture_output=True,
         shell=shell,
@@ -200,6 +209,7 @@ class McpSession:
         self.proc = subprocess.Popen(
             [str(self.packet28_bin), "mcp", "serve", "--root", str(self.root)],
             cwd=self.root,
+            env=fixture_environment(self.root),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -292,7 +302,8 @@ def record_mcp_step(
     }
 
 
-def run_packet28_hook(root: Path, packet28_bin: Path, command: str) -> dict[str, Any]:
+def run_explicit_packet28_cargo(root: Path, packet28_bin: Path) -> dict[str, Any]:
+    command = "cargo test --lib"
     pretool_payload = json.dumps(
         {
             "hook_event_name": "PreToolUse",
@@ -303,41 +314,23 @@ def run_packet28_hook(root: Path, packet28_bin: Path, command: str) -> dict[str,
             "tool_input": {"command": command},
         }
     )
-    rewrite = subprocess.run(
+    hook = subprocess.run(
         [str(packet28_bin), "hook", "claude", "--root", str(root)],
         cwd=root,
+        env=fixture_environment(root),
         input=pretool_payload,
         text=True,
         capture_output=True,
         check=False,
     )
-    rewritten = None
-    if rewrite.returncode in (0, 2):
-        try:
-            payload = json.loads(rewrite.stdout.strip() or "{}")
-            rewritten = (
-                payload.get("hookSpecificOutput", {})
-                .get("updatedInput", {})
-                .get("command")
-            )
-        except json.JSONDecodeError:
-            rewritten = None
-    raw = run_command(root, [command], shell=True)
-    if not rewritten:
-        return {
-            "name": command,
-            "tool": "packet28.hook",
-            "status": "passthrough",
-            "command": command,
-            "tokens": raw["tokens"],
-            "raw_tokens": raw["tokens"],
-            "reduced_tokens": raw["tokens"],
-            "reduction_pct": 0.0,
-            "raw_output_recoverable": False,
-            "exit_code": raw["exit_code"],
-            "preview": raw["preview"],
-        }
-    reduced = run_command(root, [rewritten], shell=True)
+    payload = json.loads(hook.stdout.strip() or "{}")
+    specific = payload.get("hookSpecificOutput", {})
+    capture_only = hook.returncode == 0 and all(
+        key not in payload and key not in specific
+        for key in ("updatedInput", "permissionDecision", "decision")
+    )
+    raw = run_command(root, ["cargo", "test", "--lib"])
+    reduced = run_command(root, [str(packet28_bin), "cargo", "test", "--lib"])
     reduction = (
         round(100.0 * (raw["tokens"] - reduced["tokens"]) / raw["tokens"], 1)
         if raw["tokens"]
@@ -345,16 +338,18 @@ def run_packet28_hook(root: Path, packet28_bin: Path, command: str) -> dict[str,
     )
     return {
         "name": command,
-        "tool": "packet28.hook",
-        "status": "ok",
+        "tool": "packet28.explicit_cli",
+        "status": "ok" if capture_only and raw["exit_code"] == reduced["exit_code"] else "failed",
         "command": command,
-        "rewritten_command": rewritten,
+        "explicit_command": f"{packet28_bin} cargo test --lib",
+        "pretool_capture_only": capture_only,
         "tokens": reduced["tokens"],
         "raw_tokens": raw["tokens"],
         "reduced_tokens": reduced["tokens"],
         "reduction_pct": reduction,
-        "raw_output_recoverable": True,
+        "raw_output_recoverable": False,
         "exit_code": reduced["exit_code"],
+        "raw_exit_code": raw["exit_code"],
         "preview": reduced["preview"],
     }
 
@@ -433,9 +428,9 @@ def run_packet28_trace(root: Path, packet28_bin: Path) -> tuple[list[dict[str, A
                 fetch_artifact=False,
             )
         )
-        steps.append(run_packet28_hook(root, packet28_bin, "cargo test --lib"))
+        steps.append(run_explicit_packet28_cargo(root, packet28_bin))
         apply_fix(root)
-        steps.append(run_packet28_hook(root, packet28_bin, "cargo test --lib"))
+        steps.append(run_explicit_packet28_cargo(root, packet28_bin))
         validate = record_mcp_step(
             session,
             "validate tool outcome",
@@ -455,13 +450,15 @@ def run_packet28_trace(root: Path, packet28_bin: Path) -> tuple[list[dict[str, A
             "patch_risk_returned_required_checks": bool(
                 steps[3].get("payload", {}).get("required_checks")
             ),
-            "hook_reduced_pre_fix_test": steps[4].get("status") == "ok",
-            "workspace_fingerprint_busted_stale_test_cache": (
-                steps[5].get("status") == "ok"
-                and steps[5].get("exit_code") == 0
-                and steps[5].get("rewritten_command") == steps[4].get("rewritten_command")
+            "pretool_hooks_preserve_commands_and_permissions": all(
+                step.get("pretool_capture_only") for step in steps[4:6]
             ),
-            "hook_reduced_post_fix_test": steps[5].get("status") == "ok",
+            "explicit_cli_pre_fix_failure_preserved": (
+                steps[4].get("status") == "ok" and steps[4].get("exit_code") != 0
+            ),
+            "explicit_cli_rerun_observes_source_fix": (
+                steps[5].get("status") == "ok" and steps[5].get("exit_code") == 0
+            ),
             "post_fix_tests_passed": steps[5].get("exit_code") == 0,
             "validate_tool_outcome_returned_status": bool(
                 steps[6].get("payload", {}).get("status")
@@ -488,16 +485,16 @@ def summarize(normal_steps: list[dict[str, Any]], packet_steps: list[dict[str, A
     pct_with_artifacts = (
         round(100.0 * saved_with_artifacts / normal_tokens, 1) if normal_tokens else 0.0
     )
-    hook_steps = [
+    explicit_cli_steps = [
         step
         for step in packet_steps
-        if step.get("tool") == "packet28.hook" and step.get("status") == "ok"
+        if step.get("tool") == "packet28.explicit_cli" and step.get("status") == "ok"
     ]
-    hook_raw_tokens = sum(step.get("raw_tokens", 0) for step in hook_steps)
-    hook_reduced_tokens = sum(step.get("reduced_tokens", 0) for step in hook_steps)
-    hook_reduction_pct = (
-        round(100.0 * (hook_raw_tokens - hook_reduced_tokens) / hook_raw_tokens, 1)
-        if hook_raw_tokens
+    explicit_cli_raw_tokens = sum(step.get("raw_tokens", 0) for step in explicit_cli_steps)
+    explicit_cli_reduced_tokens = sum(step.get("reduced_tokens", 0) for step in explicit_cli_steps)
+    explicit_cli_reduction_pct = (
+        round(100.0 * (explicit_cli_raw_tokens - explicit_cli_reduced_tokens) / explicit_cli_raw_tokens, 1)
+        if explicit_cli_raw_tokens
         else None
     )
     artifact_steps = [step for step in packet_steps if step.get("artifact_fetch_tokens", 0) > 0]
@@ -519,9 +516,9 @@ def summarize(normal_steps: list[dict[str, Any]], packet_steps: list[dict[str, A
         "normal_step_count": len(normal_steps),
         "packet28_step_count": len(packet_steps),
         "packet28_optional_artifact_fetch_tokens": artifact_tokens,
-        "hook_raw_tokens": hook_raw_tokens,
-        "hook_reduced_tokens": hook_reduced_tokens,
-        "hook_reduction_pct": hook_reduction_pct,
+        "explicit_cli_raw_tokens": explicit_cli_raw_tokens,
+        "explicit_cli_reduced_tokens": explicit_cli_reduced_tokens,
+        "explicit_cli_reduction_pct": explicit_cli_reduction_pct,
         "artifact_full_tokens": artifact_full_tokens,
         "artifact_slim_tokens": artifact_slim_tokens,
         "artifact_slim_reduction_pct": artifact_slim_reduction_pct,
@@ -545,14 +542,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Savings: `{summary['savings_pct']}%`",
         f"- Packet28 context if every optional artifact is fetched into context: `{summary['packet28_context_with_optional_artifacts_tokens']}` estimated tokens",
         f"- Savings with optional artifact fetches included: `{summary['savings_with_optional_artifacts_pct']}%`",
-        f"- Hook-only route reduction: `{summary['hook_reduction_pct']}%`",
+        f"- Explicit CLI route reduction: `{summary['explicit_cli_reduction_pct']}%`",
         f"- Slim MCP payload reduction versus full artifact payloads: `{summary['artifact_slim_reduction_pct']}%`",
         f"- Normal steps: `{summary['normal_step_count']}`",
         f"- Packet28 steps, including extra safety/features: `{summary['packet28_step_count']}`",
         f"- Optional full-artifact fetch tokens verified but not counted in slim context: `{summary['packet28_optional_artifact_fetch_tokens']}`",
         f"- Feature checks passed: `{passed_feature_checks}/{total_feature_checks}`",
         "",
-        "The 90% claim is valid only for slim context kept in the agent window. Artifact fetches are recovery/debug operations and are reported separately because fetching every artifact into context is a different usage mode.",
+        "Measured savings combine slim MCP responses with explicitly requested CLI reduction. Native hooks preserve commands and permissions; they do not reduce command output. Artifact fetches are reported separately because fetching every artifact into context is a different usage mode.",
         "",
         "## Feature Checks",
         "",
@@ -577,8 +574,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     for idx, step in enumerate(report["packet28_steps"], start=1):
         status = step.get("exit_code", step.get("status", "ok"))
         note = "slim MCP payload"
-        if step.get("tool") == "packet28.hook":
-            note = f"hook reduction {step.get('reduction_pct', 0.0)}%"
+        if step.get("tool") == "packet28.explicit_cli":
+            note = f"explicit CLI reduction {step.get('reduction_pct', 0.0)}%; native PreToolUse preserved"
         elif step.get("artifact_id"):
             note = f"artifact `{step['artifact_id']}` fetch ok={step.get('artifact_fetch_succeeded')}"
         lines.append(
@@ -591,7 +588,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "- Both traces applied the same deterministic fix: `input.trim().to_ascii_lowercase()`.",
             f"- Packet28 post-fix focused Rust tests: `{'passed' if report['packet28_feature_checks'].get('post_fix_tests_passed') else 'failed'}`.",
-            "- Packet28 used more featureful steps than the normal baseline and still reduced context.",
+            f"- Measured context savings for this trace: `{summary['savings_pct']}%`.",
             "",
         ]
     )

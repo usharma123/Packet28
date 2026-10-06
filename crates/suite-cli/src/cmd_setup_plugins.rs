@@ -10,42 +10,12 @@ use crate::runtime_integrations::hermes;
 fn opencode_plugin_content() -> &'static str {
     r#"import type { Plugin } from "@opencode-ai/plugin"
 
-// Packet28 OpenCode plugin - rewrites shell commands through Packet28.
-// Requires: Packet28 in PATH.
-//
-// This is a thin delegating plugin. Rewrite policy lives in Packet28's
-// route registry, so runtime behavior stays consistent with hooks and MCP.
-
-export const Packet28OpenCodePlugin: Plugin = async ({ $ }) => {
-  try {
-    await $`Packet28 --version`.quiet()
-  } catch {
-    console.warn("[packet28] Packet28 binary not found in PATH - plugin disabled")
-    return {}
-  }
-
-  return {
-    "tool.execute.before": async (input, output) => {
-      const tool = String(input?.tool ?? "").toLowerCase()
-      if (tool !== "bash" && tool !== "shell") return
-      const args = output?.args
-      if (!args || typeof args !== "object") return
-
-      const command = (args as Record<string, unknown>).command
-      if (typeof command !== "string" || !command) return
-
-      try {
-        const result = await $`Packet28 rewrite ${command}`.quiet().nothrow()
-        const rewritten = String(result.stdout).trim()
-        if (rewritten && rewritten !== command) {
-          ;(args as Record<string, unknown>).command = rewritten
-        }
-      } catch {
-        // Packet28 rewrite failed - pass through unchanged.
-      }
-    },
-  }
-}
+// Packet28 preserves native command arguments and host permission matching.
+// Use explicit Packet28 CLI/MCP reduction when reduced output is needed.
+// This replaces the legacy automatic rewrite plugin on setup.
+export const Packet28OpenCodePlugin: Plugin = async () => ({
+  "tool.execute.before": async () => {},
+})
 "#
 }
 
@@ -78,89 +48,24 @@ pub(crate) fn write_opencode_plugin(path: &Path, auto_yes: bool) -> Result<McpCo
 }
 
 fn hermes_plugin_init_content() -> &'static str {
-    r#""""Hermes plugin adapter for Packet28 command rewriting."""
-
-import shutil
-import subprocess
-import sys
-
-
-ACCEPTED_REWRITE_RETURN_CODES = {0, 3}
-EXPECTED_PASSTHROUGH_RETURN_CODES = {1, 2}
-_packet28_available = None
-_packet28_missing_warned = False
+    r#""""Packet28 preserves native command arguments and host permission matching."""
 
 
 def register(ctx):
-    """Register the Hermes pre-tool callback."""
-    if not _check_packet28():
-        return
-
+    """Replace the legacy automatic rewrite callback without modifying commands."""
     ctx.register_hook("pre_tool_call", _pre_tool_call)
 
 
-def _check_packet28():
-    """Return whether Packet28 is in PATH, warning once when missing."""
-    global _packet28_available, _packet28_missing_warned
-
-    if _packet28_available is None:
-        _packet28_available = shutil.which("Packet28") is not None
-
-    if not _packet28_available and not _packet28_missing_warned:
-        _warn("Packet28 binary not found in PATH; Hermes hook not registered")
-        _packet28_missing_warned = True
-
-    return _packet28_available
-
-
 def _pre_tool_call(tool_name=None, args=None, **_kwargs):
-    """Rewrite mutable Hermes terminal command args when Packet28 provides a change."""
-    try:
-        if tool_name != "terminal" or not isinstance(args, dict):
-            return
-
-        command = args.get("command")
-        if not isinstance(command, str) or not command.strip():
-            return
-
-        try:
-            result = subprocess.run(
-                ["Packet28", "rewrite", command],
-                shell=False,
-                timeout=2,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.TimeoutExpired:
-            _warn("Packet28 rewrite timed out")
-            return
-
-        if result.returncode not in ACCEPTED_REWRITE_RETURN_CODES:
-            if result.returncode not in EXPECTED_PASSTHROUGH_RETURN_CODES:
-                details = f"Packet28 rewrite failed with exit {result.returncode}"
-                stderr = result.stderr.strip()
-                if stderr:
-                    details = f"{details}: {stderr}"
-                _warn(details)
-            return
-
-        rewritten = result.stdout.strip()
-        if rewritten and rewritten != command:
-            args["command"] = rewritten
-    except Exception as e:
-        _warn(str(e))
-        return
-
-
-def _warn(message):
-    print(f"packet28: hermes plugin warning: {message}", file=sys.stderr)
+    """Use explicit Packet28 CLI/MCP reduction when reduced output is needed."""
+    return
 "#
 }
 
 fn hermes_plugin_manifest_content() -> &'static str {
     r#"name: packet28-rewrite
-version: "0.1.0"
-description: Rewrite Hermes terminal commands through Packet28 before execution.
+version: "0.2.0"
+description: Preserve native Hermes command arguments. Use explicit Packet28 CLI/MCP reduction.
 author: Packet28
 hooks:
   - pre_tool_call
@@ -221,8 +126,8 @@ fn hermes_plugin_is_configured(home: &Path) -> Result<bool> {
         .with_context(|| format!("failed to read '{}'", manifest_path.display()))?;
     let config = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read '{}'", config_path.display()))?;
-    Ok(init.contains("Packet28 rewrite")
-        && manifest.contains("packet28-rewrite")
+    Ok(init == hermes_plugin_init_content()
+        && manifest == hermes_plugin_manifest_content()
         && hermes_config_enables_packet28(&config).unwrap_or(false))
 }
 

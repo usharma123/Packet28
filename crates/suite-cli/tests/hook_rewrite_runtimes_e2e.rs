@@ -11,14 +11,15 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use hook_rewrite::{
-    ensure_packet28d_built, init_repo, run_hook_raw, suite_cmd, write_repo_fixture,
+    ensure_packet28d_built, init_repo, run_hook_raw, suite_cmd, write_repo_fixture, DaemonStopGuard,
 };
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_runtimes_cursor_pretool_rewrites_and_returns_empty_json_on_noop() {
+fn test_hook_rewrite_runtimes_cursor_pretool_preserves_commands_and_returns_empty_json() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
+    let _daemon = DaemonStopGuard::new(dir.path());
     init_repo(dir.path());
     write_repo_fixture(dir.path());
 
@@ -48,7 +49,6 @@ fn test_hook_rewrite_runtimes_cursor_pretool_rewrites_and_returns_empty_json_on_
             "shell_command":"git status --short src/alpha.rs"
         }),
     ];
-    let mut first_rewritten = String::new();
     for payload in payloads {
         let (status, stdout, _stderr) = run_hook_raw(
             "cursor",
@@ -58,13 +58,7 @@ fn test_hook_rewrite_runtimes_cursor_pretool_rewrites_and_returns_empty_json_on_
         assert_eq!(status, 0);
         let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
         assert!(rendered.get("permission").is_none());
-        let rewritten = rendered["updated_input"]["command"].as_str().unwrap();
-        assert!(rewritten.contains("hook reducer-runner"));
-        assert!(rewritten.contains("--family git"));
-        assert!(rewritten.contains("--kind git_status"));
-        if first_rewritten.is_empty() {
-            first_rewritten = rewritten.to_string();
-        }
+        assert!(rendered.get("updated_input").is_none());
     }
 
     let (status, stdout, _stderr) = run_hook_raw(
@@ -74,7 +68,7 @@ fn test_hook_rewrite_runtimes_cursor_pretool_rewrites_and_returns_empty_json_on_
             "hook_event_name":"beforeShellExecution",
             "conversation_id":"cursor-session-idempotent",
             "cwd":dir.path().to_str().unwrap(),
-            "command":first_rewritten
+            "command":"git status --short src/alpha.rs"
         }))
         .unwrap(),
     );
@@ -103,9 +97,10 @@ fn test_hook_rewrite_runtimes_cursor_pretool_rewrites_and_returns_empty_json_on_
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_runtimes_gemini_before_tool_rewrites_shell_command() {
+fn test_hook_rewrite_runtimes_gemini_before_tool_preserves_shell_command() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
+    let _daemon = DaemonStopGuard::new(dir.path());
     init_repo(dir.path());
     write_repo_fixture(dir.path());
 
@@ -121,14 +116,7 @@ fn test_hook_rewrite_runtimes_gemini_before_tool_rewrites_shell_command() {
         .unwrap(),
     );
     assert_eq!(status, 0);
-    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(rendered.get("decision").is_none());
-    let rewritten = rendered["hookSpecificOutput"]["tool_input"]["command"]
-        .as_str()
-        .unwrap();
-    assert!(rewritten.contains("hook reducer-runner"));
-    assert!(rewritten.contains("--family git"));
-    assert!(rewritten.contains("--kind git_status"));
+    assert!(stdout.trim().is_empty());
 
     let (status, stdout, _stderr) = run_hook_raw(
         "gemini",

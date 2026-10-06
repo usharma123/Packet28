@@ -181,3 +181,26 @@ view is insufficient.
 - [Operations](operations.md)
 - [Instruction rendering modes](instruction-rendering-modes.md)
 - [Task-store retention](task-store-retention.md)
+
+## Native command permissions
+
+Generated runtime integrations preserve the host's original command arguments.
+Hooks capture results and correlate task activity without returning rewritten
+commands or permission decisions. This also applies when an older
+`.packet28/daemon/hook-runtime-v1.json` contains `rewrite_enabled: true`; that legacy flag
+is inactive. `Packet28 hook rewrite status --json` reports actual capture-only
+behavior and the stored flag separately. `Packet28 hook rewrite on` returns an
+error without changing configuration. `Packet28 hook rewrite off` clears the old
+flag.
+
+Use explicit Packet28 CLI or MCP reduction when you want reduced output. An
+opaque wrapper changes which command a native host permission rule matches.
+Re-run setup for OpenCode or Hermes to replace previously installed automatic
+rewrite plugins with command-preserving adapters.
+
+`Packet28 rewrite` and `Packet28 compact rewrite` no longer return executable
+wrappers. JSON output retains route metadata with `applied: false` and
+`rewritten_command: null`; plain output is empty. This also makes previously
+installed OpenCode and Hermes rewrite plugins pass through original commands
+when they invoke the updated binary. Explicit executing reducers and MCP
+reduction remain available.

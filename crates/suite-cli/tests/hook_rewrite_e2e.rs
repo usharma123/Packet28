@@ -14,45 +14,83 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use hook_rewrite::{
-    ensure_packet28d_built, init_repo, run_hook_raw, suite_cmd, write_repo_fixture,
+    ensure_packet28d_built, init_repo, run_hook_raw, suite_cmd, write_repo_fixture, DaemonStopGuard,
 };
 
 fn run_claude_hook(root: &std::path::Path, payload: &Value) -> (i32, String) {
-    let (status, stdout, _) =
+    let (status, stdout, stderr) =
         run_hook_raw("claude", root, &serde_json::to_string(payload).unwrap());
+    if !stderr.is_empty() {
+        eprintln!("hook diagnostic: {stderr}");
+    }
     (status, stdout)
 }
 
-fn assert_claude_rewrite(command: &str, family: &str, kind: &str) {
+fn assert_capture_only(stdout: &str) {
+    if stdout.trim().is_empty() {
+        return;
+    }
+    let output: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(output.get("updatedInput").is_none(), "{output}");
+    assert!(output.get("permissionDecision").is_none(), "{output}");
+    assert!(
+        output["hookSpecificOutput"].get("updatedInput").is_none(),
+        "{output}"
+    );
+    assert!(
+        output["hookSpecificOutput"]
+            .get("permissionDecision")
+            .is_none(),
+        "{output}"
+    );
+}
+
+fn assert_claude_capture(command: &str, family: &str, kind: &str) {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
+    let _daemon = DaemonStopGuard::new(dir.path());
     init_repo(dir.path());
     write_repo_fixture(dir.path());
-
-    let (status, stdout) = run_claude_hook(
-        dir.path(),
-        &json!({
-            "hook_event_name":"PreToolUse",
-            "task_id":format!("task-pretool-{family}-rewrite"),
-            "session_id":format!("session-pretool-{family}-rewrite"),
-            "cwd":dir.path().to_str().unwrap(),
-            "tool_name":"Bash",
-            "tool_input":{"command":command}
-        }),
-    );
+    let task_id = format!("task-{family}-capture");
+    let config_path = hook_runtime_config_path(dir.path());
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let config = packet28_daemon_protocol::hooks::HookRuntimeConfig {
+        rewrite_enabled: true,
+        ..Default::default()
+    };
+    let original = serde_json::to_vec(&config).unwrap();
+    fs::write(&config_path, &original).unwrap();
+    let mut payload = json!({
+        "hook_event_name":"PreToolUse", "task_id":task_id,
+        "session_id":format!("session-{family}-capture"),
+        "cwd":dir.path().to_str().unwrap(), "tool_name":"Bash",
+        "tool_input":{"command":command}
+    });
+    let (status, stdout) = run_claude_hook(dir.path(), &payload);
     assert_eq!(status, 0);
-    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
-    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
+    assert_capture_only(&stdout);
+    payload["hook_event_name"] = json!("PostToolUse");
+    payload["tool_response"] = json!({"stdout":"sample completion\n","stderr":"","exit_code":0});
+    let (status, _) = run_claude_hook(dir.path(), &payload);
+    assert_eq!(status, 0);
+    let output = suite_cmd()
+        .args([
+            "daemon",
+            "task",
+            "status",
+            "--task-id",
+            &task_id,
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
         .unwrap();
-    assert!(rewritten.contains("hook reducer-runner"));
-    assert!(rewritten.contains(&format!("--family {family}")));
-    assert!(rewritten.contains(&format!("--kind {kind}")));
-    assert!(
-        rewritten.chars().all(|ch| ch == '\t' || ch >= ' '),
-        "{rewritten:?}"
-    );
-
+    assert!(output.status.success(), "{output:?}");
+    let task: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(task["task_id"], task_id, "{task}");
+    assert_eq!(task["latest_hook_command_kind"], kind, "{task}");
+    assert_eq!(fs::read(config_path).unwrap(), original);
     suite_cmd()
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
         .assert()
@@ -64,6 +102,7 @@ fn assert_claude_rewrite(command: &str, family: &str, kind: &str) {
 fn test_hook_rewrite_cli_degrades_gracefully_on_bad_json_and_no_rewrite() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
+    let _daemon = DaemonStopGuard::new(dir.path());
     init_repo(dir.path());
 
     let (status, stdout, stderr) = run_hook_raw("claude", dir.path(), "{not json");
@@ -200,7 +239,7 @@ fn test_hook_rewrite_cli_unreadable_runtime_config_skips_processing() {
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_status_uses_enabled_defaults_when_runtime_config_is_missing() {
+fn test_hook_rewrite_status_reports_capture_only_when_runtime_config_is_missing() {
     let dir = TempDir::new().unwrap();
 
     let output = suite_cmd()
@@ -223,9 +262,40 @@ fn test_hook_rewrite_status_uses_enabled_defaults_when_runtime_config_is_missing
             status["hooks_enabled"].as_bool(),
             status["fallback_post_tool_capture"].as_bool(),
         ),
-        (Some(true), Some(true), Some(true))
+        (Some(false), Some(true), Some(true))
     );
     assert!(!hook_runtime_config_path(dir.path()).exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_hook_rewrite_status_reports_stored_true_flag_as_inactive() {
+    let dir = TempDir::new().unwrap();
+    let path = hook_runtime_config_path(dir.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = serde_json::to_vec(&packet28_daemon_protocol::hooks::HookRuntimeConfig {
+        rewrite_enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    fs::write(&path, &original).unwrap();
+    let output = suite_cmd()
+        .args([
+            "hook",
+            "rewrite",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "status",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["rewrite_enabled"], false);
+    assert_eq!(status["legacy_rewrite_enabled"], true);
+    assert_eq!(status["mode"], "capture_only");
+    assert_eq!(fs::read(path).unwrap(), original);
 }
 
 #[test]
@@ -289,9 +359,10 @@ fn test_hook_rewrite_toggle_rejects_invalid_utf8_without_replacing_bytes() {
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_cli_can_disable_and_reenable_command_rewrites() {
+fn test_hook_rewrite_off_clears_legacy_flag_and_on_is_explicitly_unsupported() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
+    let _daemon = DaemonStopGuard::new(dir.path());
     init_repo(dir.path());
     write_repo_fixture(dir.path());
     let root = dir.path().to_str().unwrap();
@@ -331,29 +402,14 @@ fn test_hook_rewrite_cli_can_disable_and_reenable_command_rewrites() {
     assert_eq!(status_json["rewrite_enabled"], false);
     assert_eq!(status_json["fallback_post_tool_capture"], true);
 
+    let config_path = hook_runtime_config_path(dir.path());
+    let before = fs::read(&config_path).unwrap();
     suite_cmd()
         .args(["hook", "rewrite", "--root", root, "on"])
         .assert()
-        .success()
-        .stdout(predicates::str::contains("enabled"));
-
-    let (status, stdout) = run_claude_hook(
-        dir.path(),
-        &json!({
-            "hook_event_name":"PreToolUse",
-            "task_id":"task-pretool-rewrite-on",
-            "session_id":"session-pretool-rewrite-on",
-            "cwd":root,
-            "tool_name":"Bash",
-            "tool_input":{"command":"git status --short src/alpha.rs"}
-        }),
-    );
-    assert_eq!(status, 0);
-    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(rendered["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .unwrap()
-        .contains("hook reducer-runner"));
+        .failure()
+        .stderr(predicates::str::contains("unsupported"));
+    assert_eq!(fs::read(config_path).unwrap(), before);
 
     suite_cmd()
         .args(["daemon", "stop", "--root", root])
@@ -366,6 +422,7 @@ fn test_hook_rewrite_cli_can_disable_and_reenable_command_rewrites() {
 fn test_hook_rewrite_cli_is_idempotent_and_ignores_non_bash_tools() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
+    let _daemon = DaemonStopGuard::new(dir.path());
     init_repo(dir.path());
     write_repo_fixture(dir.path());
 
@@ -379,11 +436,8 @@ fn test_hook_rewrite_cli_is_idempotent_and_ignores_non_bash_tools() {
     });
     let (status, stdout) = run_claude_hook(dir.path(), &base_payload);
     assert_eq!(status, 0);
-    let rendered: Value = serde_json::from_str(stdout.trim()).unwrap();
-    let rewritten = rendered["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .unwrap();
-    assert!(rewritten.contains("hook reducer-runner"));
+    assert_capture_only(&stdout);
+    let rewritten = "git status --short src/alpha.rs";
 
     let (status, stdout) = run_claude_hook(
         dir.path(),
@@ -397,7 +451,7 @@ fn test_hook_rewrite_cli_is_idempotent_and_ignores_non_bash_tools() {
         }),
     );
     assert_eq!(status, 0);
-    assert!(matches!(stdout.trim(), "" | "{}"), "{stdout}");
+    assert_capture_only(&stdout);
 
     let (status, stdout) = run_claude_hook(
         dir.path(),
@@ -421,8 +475,8 @@ fn test_hook_rewrite_cli_is_idempotent_and_ignores_non_bash_tools() {
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_cli_rewrites_supported_git_command() {
-    assert_claude_rewrite("git status --short src/alpha.rs", "git", "git_status");
+fn test_hook_capture_preserves_supported_git_command() {
+    assert_claude_capture("git status --short src/alpha.rs", "git", "git_status");
 }
 
 #[test]
@@ -430,6 +484,7 @@ fn test_hook_rewrite_cli_rewrites_supported_git_command() {
 fn test_hook_rewrite_cli_does_not_rewrite_grep_extraction_pipeline() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
+    let _daemon = DaemonStopGuard::new(dir.path());
     init_repo(dir.path());
     write_repo_fixture(dir.path());
 
@@ -461,30 +516,30 @@ fn test_hook_rewrite_cli_does_not_rewrite_grep_extraction_pipeline() {
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_cli_rewrites_supported_github_command() {
-    assert_claude_rewrite("gh pr list --limit 5", "github", "gh_pr_list");
+fn test_hook_capture_preserves_supported_github_command() {
+    assert_claude_capture("gh pr list --limit 5", "github", "gh_pr_list");
 }
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_cli_rewrites_supported_python_command() {
-    assert_claude_rewrite("python3 -m pytest tests", "python", "python_pytest");
+fn test_hook_capture_preserves_supported_python_command() {
+    assert_claude_capture("python3 -m pytest tests", "python", "python_pytest");
 }
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_cli_rewrites_supported_javascript_command() {
-    assert_claude_rewrite("npx tsc --noEmit", "javascript", "javascript_tsc");
+fn test_hook_capture_preserves_supported_javascript_command() {
+    assert_claude_capture("npx tsc --noEmit", "javascript", "javascript_tsc");
 }
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_cli_rewrites_supported_go_command() {
-    assert_claude_rewrite("go test ./...", "go", "go_test");
+fn test_hook_capture_preserves_supported_go_command() {
+    assert_claude_capture("go test ./...", "go", "go_test");
 }
 
 #[test]
 #[cfg(unix)]
-fn test_hook_rewrite_cli_rewrites_supported_infra_command() {
-    assert_claude_rewrite("kubectl get pods", "infra", "kubectl_get");
+fn test_hook_capture_preserves_supported_infra_command() {
+    assert_claude_capture("kubectl get pods", "infra", "kubectl_get");
 }
