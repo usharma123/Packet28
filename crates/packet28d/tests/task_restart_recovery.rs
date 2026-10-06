@@ -220,7 +220,18 @@ fn stop_and_wait(daemon: &mut ChildGuard, runtime: &DaemonRuntimeInfo) {
     ));
 
     let status = daemon.0.wait().expect("join daemon after Stop");
-    assert!(status.success(), "daemon Stop completed with {status}");
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .expect("captured daemon stderr")
+        .read_to_string(&mut stderr)
+        .expect("read daemon stderr after Stop");
+    assert!(
+        status.success(),
+        "daemon Stop completed with {status}: {stderr}"
+    );
 }
 
 fn wait_for_task_completion(runtime: &DaemonRuntimeInfo, expected_task_id: &str) {
