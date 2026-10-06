@@ -43,7 +43,11 @@ fn open_managed_log(root: &Path, file_name: &str) -> Option<RotatingLog> {
     std::fs::create_dir_all(daemon_dir(root)).ok()?;
     let directory = StateDir::open(root, &daemon_dir_components(), false).ok()?;
     let policy = LogRotation::new(runtime_log_max_bytes(), RUNTIME_LOG_BACKUPS);
-    RotatingLog::new(directory, file_name, policy).ok()
+    let log = RotatingLog::new(directory, file_name, policy).ok()?;
+    // Bound oversized generations left by earlier binaries or a larger
+    // threshold now, even if this process stays quiet. Best-effort.
+    let _ = log.enforce_retention();
+    Some(log)
 }
 
 /// Records a diagnostic in the managed log, or writes it to stderr.

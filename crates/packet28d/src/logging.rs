@@ -38,7 +38,11 @@ fn open_managed_log(root: &Path) -> Option<RotatingLog> {
     std::fs::create_dir_all(daemon_dir(root)).ok()?;
     let directory = StateDir::open(root, &daemon_dir_components(), false).ok()?;
     let policy = LogRotation::new(runtime_log_max_bytes(), RUNTIME_LOG_BACKUPS);
-    RotatingLog::new(directory, LOG_FILE_NAME, policy).ok()
+    let log = RotatingLog::new(directory, LOG_FILE_NAME, policy).ok()?;
+    // Bound oversized generations left by earlier binaries or a larger
+    // threshold now, even if this process stays quiet. Best-effort.
+    let _ = log.enforce_retention();
+    Some(log)
 }
 
 pub(crate) fn daemon_log(message: &str) {

@@ -96,6 +96,48 @@ fn assert_bounded_generations(log: &Path, limit: u64) {
     );
 }
 
+/// Waits until the log is quiescent and contains `needle`.
+///
+/// Background services may record a diagnostic after the triggering
+/// connection closes, so a reader can otherwise observe a rotation in
+/// progress (for example `.3` removed but `.2` not yet renamed). Two
+/// identical snapshots of every generation, taken 300 ms apart, show that no
+/// owner transaction is in flight. A stalled writer fails the test at the
+/// deadline instead of being treated as settled.
+fn wait_for_settled_log(log: &Path, needle: &str) {
+    let snapshot = || {
+        (0..=4)
+            .map(|index| {
+                let path = if index == 0 {
+                    log.to_path_buf()
+                } else {
+                    generation(log, index)
+                };
+                fs::read(path).ok()
+            })
+            .collect::<Vec<_>>()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut previous = snapshot();
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let current = snapshot();
+        let found = current
+            .iter()
+            .flatten()
+            .any(|bytes| String::from_utf8_lossy(bytes).contains(needle));
+        if found && current == previous {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} did not settle with {needle:?}",
+            log.display()
+        );
+        previous = current;
+    }
+}
+
 fn daemon_pid(root: &Path) -> u64 {
     let output = suite_cmd()
         .args([
@@ -159,6 +201,7 @@ fn background_daemon_rotates_its_own_log_after_the_launcher_exits() {
         pid,
         "rotation must happen inside the same running daemon"
     );
+    wait_for_settled_log(&log, "missing-late-047");
     assert_bounded_generations(&log, DAEMON_LOG_LIMIT);
     let active = fs::read_to_string(&log).unwrap();
     assert!(active.contains("missing-late-047"), "{active}");
@@ -181,6 +224,7 @@ fn background_daemon_rotates_its_own_log_after_the_launcher_exits() {
     )
     .unwrap();
     assert!(!contender.status.success());
+    wait_for_settled_log(&log, "packet28d exited with error");
     let active = fs::read_to_string(&log).unwrap();
     assert!(active.contains("packet28d exited with error"), "{active}");
 
@@ -197,6 +241,96 @@ fn background_daemon_rotates_its_own_log_after_the_launcher_exits() {
     assert!(!foreground.status.success());
     let stderr = String::from_utf8_lossy(&foreground.stderr);
     assert!(stderr.contains("error:"), "{stderr}");
+}
+
+#[test]
+fn managed_daemon_reduces_legacy_logs_and_serializes_contending_owners() {
+    ensure_packet28d_built();
+    let dir = TempDir::new().unwrap();
+    write_repo_fixture(dir.path());
+    init_repo(dir.path());
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let log = root.join(".packet28/daemon/packet28d.log");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    // Oversized generations left by an earlier unbounded launcher.
+    let mut legacy = String::new();
+    for index in 0..200_000 {
+        legacy.push_str(&format!("legacy record {index:06}\n"));
+    }
+    fs::write(&log, &legacy).unwrap();
+    fs::write(generation(&log, 2), vec![b'B'; 2 * 1024 * 1024]).unwrap();
+
+    suite_cmd()
+        .env(RUNTIME_LOG_MAX_BYTES_ENV, DAEMON_LOG_LIMIT.to_string())
+        .args(["daemon", "start", "--root", root.to_str().unwrap()])
+        .assert()
+        .success();
+    let _stop = StopDaemon(root.clone());
+    wait_for_settled_log(&log, "[log] older diagnostics discarded");
+
+    // Even a quiet daemon reduces every generation to a marked recent tail.
+    for index in 0..=3 {
+        let path = if index == 0 {
+            log.clone()
+        } else {
+            generation(&log, index)
+        };
+        if let Ok(metadata) = fs::metadata(&path) {
+            assert!(
+                metadata.len() <= DAEMON_LOG_LIMIT,
+                "{} has {} bytes",
+                path.display(),
+                metadata.len()
+            );
+        }
+    }
+    let retained = read_generations(&log);
+    assert!(
+        retained.contains("[log] older diagnostics discarded"),
+        "{retained}"
+    );
+    assert!(retained.contains("legacy record 199999\n"), "{retained}");
+    assert!(!retained.contains("legacy record 000000\n"));
+
+    // Contending daemons lose instance authority but log into the same file
+    // while the live daemon is also logging; every owner serializes.
+    let contenders = (0..6)
+        .map(|_| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let mut contender = Command::new(packet28d_binary());
+                contender
+                    .env(RUNTIME_LOG_MAX_BYTES_ENV, DAEMON_LOG_LIMIT.to_string())
+                    .args(["serve", "--managed-log", "--root"])
+                    .arg(&root);
+                ProcessHarness::run(
+                    &mut contender,
+                    &[],
+                    Duration::from_secs(60),
+                    HarnessLimits::default(),
+                )
+                .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    for index in 0..64 {
+        fail_packet_fetch(&root, format!("missing-contended-{index:03}"));
+    }
+    for contender in contenders {
+        assert!(!contender.join().unwrap().status.success());
+    }
+
+    wait_for_settled_log(&log, "missing-contended-063");
+    assert_bounded_generations(&log, DAEMON_LOG_LIMIT);
+    let retained = read_generations(&log);
+    assert!(retained.contains("missing-contended-063"), "{retained}");
+    assert!(
+        retained.contains("packet28d exited with error"),
+        "{retained}"
+    );
+    let mut sidecar = log.clone().into_os_string();
+    sidecar.push(".lock");
+    assert_eq!(fs::metadata(sidecar).unwrap().len(), 0);
 }
 
 #[test]
@@ -287,7 +421,9 @@ fn background_hook_server_rotates_its_own_log_after_setup_exits() {
     let response = http_exchange(port, health.as_bytes());
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
-    assert_bounded_generations(&log, HOOK_LOG_LIMIT);
+    // The server records a request failure after closing that connection.
+    wait_for_settled_log(&log, "malformed HTTP request line");
     let active = fs::read_to_string(&log).unwrap();
     assert!(active.contains("malformed HTTP request line"), "{active}");
+    assert_bounded_generations(&log, HOOK_LOG_LIMIT);
 }

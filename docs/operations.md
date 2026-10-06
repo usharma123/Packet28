@@ -223,12 +223,27 @@ file past the threshold, the process renames it to `<log>.1`, shifts older
 generations up to `<log>.3`, drops the oldest, and reopens a fresh file. The
 threshold defaults to 16 MiB and can be changed with
 `PACKET28_DAEMON_LOG_MAX_BYTES`, read from the launching environment. One record
-is capped at 64 KiB and marked `[truncated]`, so retained logs stay within four
-times the threshold even for a crash-looping or misbehaving process. Rotation
-failures truncate the active file in place and record why; logging failures
-never stop the daemon. Panics are recorded in the log. Other output a
-background process writes directly to stdout or stderr is discarded. A daemon
-run in the foreground (`packet28d serve`) keeps ordinary stderr diagnostics.
+is capped at 64 KiB and marked `[truncated]`.
+
+Every process writing the same log, including a second daemon that loses
+startup authority, takes an advisory lock on the empty sidecar `<log>.lock`
+around each size check, rotation, and write, so concurrent owners cannot
+overshoot the threshold. The wait for that lock is bounded (250 ms, 50 ms
+while recording a panic); a record that cannot be serialized in time is
+dropped rather than delaying the process.
+
+When a managed process starts, and after each rotation, any generation larger
+than the threshold, such as a log left by an earlier unbounded launcher or one
+written under a larger threshold, is replaced by its most recent bytes behind
+a `[log] older diagnostics discarded` line. Older diagnostic bytes in those
+generations are deleted. Together these keep the active file and each backup
+within the threshold, so retained logs stay within four times the threshold.
+If a rotation fails, the active file is truncated in place; the failure notice
+and the record share the threshold, and the notice is omitted when the
+threshold is too small for both. Logging failures never stop the daemon.
+Panics are recorded in the log. Other output a background process writes
+directly to stdout or stderr is discarded. A daemon run in the foreground
+(`packet28d serve`) keeps ordinary stderr diagnostics.
 When the resolved `packet28d` binary predates managed logs, the launcher keeps
 the earlier behavior: it rotates `packet28d.log` once at start and appends the
 child's stdout and stderr to it.
