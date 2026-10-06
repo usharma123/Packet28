@@ -127,8 +127,25 @@ fn first_cold_agent_wrapper_resumes_linked_recovery_handoff() {
         .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
         .assert()
         .success();
+    // Stop acknowledges the request before shutdown releases daemon authority.
+    // Hold that authority while installing the offline-corruption fixture.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let stopped_lease = loop {
+        match packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease(dir.path()) {
+            Ok(lease) => break lease,
+            Err(packet28_daemon_core::DaemonCoreError::DaemonInstanceAlreadyRunning { .. }) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture daemon did not release its instance lease"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => panic!("fixture daemon authority check failed: {error}"),
+        }
+    };
     let event_path = task_event_log_path(dir.path(), &TaskStorageId::try_from(task_id).unwrap());
     fs::write(&event_path, b"{damaged history}\n").unwrap();
+    drop(stopped_lease);
     let output = agent_cmd()
         .current_dir(dir.path())
         .args([
