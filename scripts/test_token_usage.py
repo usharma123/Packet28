@@ -2,10 +2,10 @@
 """
 Token-usage comparison: raw tool output vs Packet28-reduced output.
 
-Runs real commands both raw and through the Packet28 hook reducer, then
-compares MCP surface overhead against what an agent would see without
-Packet28.  Produces a side-by-side table showing token savings at every
-layer: hook reduction, MCP prompts, context fetch, and capabilities.
+Runs real commands raw and through supported explicit Packet28 CLI routes.
+Native hooks must preserve commands and permissions. Shell expressions without
+an equivalent explicit route remain raw. MCP sizes and session totals below are
+illustrative models, separate from measured CLI output and provider usage.
 
 Usage:
     python3 scripts/test_token_usage.py --root /path/to/repo
@@ -20,10 +20,11 @@ import time
 from pathlib import Path
 
 from benchmark_common import estimate_tokens, resolve_shell, run_capture as run
+from benchmark_hook_rewrite import explicit_cli_args, is_capture_only
 
 
 # ---------------------------------------------------------------------------
-# Layer 1: Hook reducer — raw command output vs reduced packet
+# Layer 1: Explicit CLI — raw command output vs visible reduced output
 # ---------------------------------------------------------------------------
 
 HOOK_CASES = [
@@ -38,13 +39,13 @@ HOOK_CASES = [
 
 
 def run_hook_case(root: Path, case_name: str, command: str, shell_path: str) -> dict:
-    """Run a command raw and through the hook reducer, compare tokens."""
+    """Compare supported explicit CLI output; never execute host-provided rewrites."""
     # Raw execution
     raw = run([shell_path, "-lc", command], root)
     raw_output = raw.stdout + raw.stderr
     raw_tokens = estimate_tokens(raw_output)
 
-    # Hook rewrite
+    # Check native hook authority separately from the explicit reduction.
     task_id = f"bench-{case_name}-{int(time.time())}"
     pretool_payload = json.dumps({
         "hook_event_name": "PreToolUse",
@@ -55,17 +56,17 @@ def run_hook_case(root: Path, case_name: str, command: str, shell_path: str) -> 
         "tool_input": {"command": command},
     })
     hook_cmd = ["Packet28", "hook", "claude", "--root", str(root)]
-    rewrite = run(hook_cmd, root, stdin=pretool_payload)
+    hook = run(hook_cmd, root, stdin_text=pretool_payload)
 
-    if rewrite.returncode not in (0, 2):
+    if hook.returncode != 0:
         return {
             "case": case_name, "command": command, "status": "hook_error",
             "raw_tokens": raw_tokens, "reduced_tokens": raw_tokens,
-            "reduction_pct": 0.0, "error": rewrite.stderr.strip(),
+            "reduction_pct": 0.0, "error": hook.stderr.strip(),
         }
 
     try:
-        rewrite_payload = json.loads(rewrite.stdout.strip() or "{}")
+        hook_payload = json.loads(hook.stdout.strip() or "{}")
     except json.JSONDecodeError:
         return {
             "case": case_name, "command": command, "status": "parse_error",
@@ -73,20 +74,23 @@ def run_hook_case(root: Path, case_name: str, command: str, shell_path: str) -> 
             "reduction_pct": 0.0,
         }
 
-    rewritten_cmd = (
-        rewrite_payload.get("hookSpecificOutput", {})
-        .get("updatedInput", {})
-        .get("command")
-    )
-    if not rewritten_cmd:
-        # Not rewritten — Packet28 passed it through.
+    if not is_capture_only(hook_payload) or "allowing runtime action after processing error" in hook.stderr:
         return {
-            "case": case_name, "command": command, "status": "passthrough",
+            "case": case_name, "command": command, "status": "authority_error",
+            "raw_tokens": raw_tokens, "reduced_tokens": raw_tokens,
+            "reduction_pct": 0.0, "error": "PreToolUse did not preserve native command authority",
+        }
+    try:
+        explicit_args = explicit_cli_args(root, shlex.split(command), task_id)
+    except ValueError:
+        return {
+            "case": case_name, "command": command, "status": "capture_only",
+            "pretool_capture_only": True,
             "raw_tokens": raw_tokens, "reduced_tokens": raw_tokens,
             "reduction_pct": 0.0,
+            "detail": "no equivalent explicit CLI route; original shell expression executed unchanged",
         }
-
-    reduced = run([shell_path, "-lc", rewritten_cmd], root)
+    reduced = run(["Packet28", *explicit_args], root)
     reduced_output = reduced.stdout + reduced.stderr
     reduced_tokens = estimate_tokens(reduced_output)
     reduction_pct = (
@@ -95,10 +99,13 @@ def run_hook_case(root: Path, case_name: str, command: str, shell_path: str) -> 
     )
 
     return {
-        "case": case_name, "command": command, "status": "ok",
-        "rewritten": rewritten_cmd,
-        "compact_path": "hook_rewrite",
-        "raw_output_recoverable": True,
+        "case": case_name, "command": command,
+        "status": "ok" if raw.returncode == reduced.returncode else "exit_mismatch",
+        "explicit_command": shlex.join(["Packet28", *explicit_args]),
+        "pretool_capture_only": True,
+        "compact_path": "explicit_cli",
+        "estimate_scope": "visible_cli_output",
+        "raw_output_recoverable": False,
         "raw_tokens": raw_tokens, "reduced_tokens": reduced_tokens,
         "reduction_pct": reduction_pct,
     }
@@ -155,7 +162,7 @@ def measure_mcp_surface(root: Path) -> list[dict]:
         'Continue Packet28 task `test-task`.\n\n'
         'Status: version=5, handoff_ready=false, push=true\n\n'
         'Read `packet28://task/test-task/brief` for full context. '
-        'Let hooks handle reducer capture. '
+        'Let hooks capture results. Request explicit CLI tools for reduced output. '
         'Use `packet28.write_intention` for objective changes.'
     )
     compare("prompt:continue", continue_prompt, BASELINE_MCP_TOKENS["prompt:continue"])
@@ -220,8 +227,8 @@ def simulate_session(root: Path) -> list[dict]:
     # threshold (~75% of budget). So effective tokens = budget * 0.75
     # plus one handoff brief (~400 tokens).
     budget = 200_000
-    # In practice, hook window accumulates reduced packets.
-    # At threshold, handoff fires and window resets. The new session
+    # Model assumption: explicit CLI calls return these reduced packet sizes.
+    # This model assumes a handoff/reset at the selected threshold. The new session
     # starts with just the brief (~400 tokens) instead of all history.
     reduced_session_tokens = num_calls * avg_reduced_per_call
     # But with handoff, the context resets — so effective is capped.
@@ -230,7 +237,7 @@ def simulate_session(root: Path) -> list[dict]:
     # Effective = min(accumulated reduced, threshold) + brief after reset.
     effective_session_tokens = min(reduced_session_tokens, int(budget * 0.75)) + handoff_brief_tokens
 
-    # The real savings: without Packet28, 16K tokens of raw output.
+    # Illustrative model: without Packet28, 16K tokens of raw output.
     # With Packet28: ~2.8K tokens of reduced output (or ~400 after handoff reset).
     reduction = round(100 * (raw_session_tokens - effective_session_tokens) / raw_session_tokens, 1)
 
@@ -304,9 +311,9 @@ def render_markdown_table(results: list[dict]) -> str:
     lines.append("")
     lines.append("## Layers")
     lines.append("")
-    lines.append("- **Hook reducer**: Raw command output piped through Packet28 reducers")
-    lines.append("- **MCP surface**: Capabilities, prompts, resources injected into agent context")
-    lines.append("- **Session**: Cumulative tokens over a 20-tool-call session with handoff reset")
+    lines.append("- **Explicit CLI**: Measured raw output versus supported explicit CLI output; hooks preserve native commands")
+    lines.append("- **MCP surface**: Illustrative payload sizes, not measured provider usage")
+    lines.append("- **Session**: Illustrative 20-call model assuming a handoff reset, not automatic runtime behavior")
     lines.append("")
     return "\n".join(lines)
 

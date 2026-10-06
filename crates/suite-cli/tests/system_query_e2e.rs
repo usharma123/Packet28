@@ -172,3 +172,83 @@ fn test_system_query_pipe_filters_stdin_like_rtk_pipe() {
         .success()
         .stdout(predicate::str::contains("raw\nunchanged\n"));
 }
+
+#[test]
+#[cfg(unix)]
+fn test_system_query_explicit_compact_read_preserves_head_window_and_contents() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("README.md");
+    for contents in [
+        "alpha\n\nbeta\ngamma\ndelta\nexcluded sixth line\n",
+        "updated alpha\n\nupdated beta\nupdated gamma\nupdated delta\nexcluded update\n",
+    ] {
+        fs::write(&path, contents).unwrap();
+        let raw = Command::new("head")
+            .args(["-n", "5", path.to_str().unwrap()])
+            .timeout(std::time::Duration::from_secs(5))
+            .output()
+            .unwrap();
+        let reduced = suite_cmd()
+            .current_dir(root.path())
+            .args([
+                "--via-daemon",
+                "--daemon-root",
+                root.path().to_str().unwrap(),
+                "compact",
+                "read",
+                "--root",
+                root.path().to_str().unwrap(),
+                "--cwd",
+                root.path().to_str().unwrap(),
+                "--line-start",
+                "1",
+                "--line-end",
+                "5",
+                "--json",
+                "README.md",
+            ])
+            .timeout(std::time::Duration::from_secs(5))
+            .output()
+            .unwrap();
+        assert_eq!(reduced.status.code(), raw.status.code());
+        assert!(raw.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&reduced.stdout).unwrap();
+        let expected = String::from_utf8(raw.stdout)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{}|{}", index + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(value["line_start"], 1);
+        assert_eq!(value["line_end"], 5);
+        assert_eq!(value["line_count"], 5);
+        assert_eq!(value["compact_preview"], expected);
+        let visible = suite_cmd()
+            .current_dir(root.path())
+            .args([
+                "--via-daemon",
+                "--daemon-root",
+                root.path().to_str().unwrap(),
+                "compact",
+                "read",
+                "--root",
+                root.path().to_str().unwrap(),
+                "--cwd",
+                root.path().to_str().unwrap(),
+                "--line-start",
+                "1",
+                "--line-end",
+                "5",
+                "README.md",
+            ])
+            .timeout(std::time::Duration::from_secs(5))
+            .output()
+            .unwrap();
+        assert!(visible.status.success());
+        assert_eq!(
+            String::from_utf8(visible.stdout).unwrap(),
+            format!("{expected}\n")
+        );
+    }
+}

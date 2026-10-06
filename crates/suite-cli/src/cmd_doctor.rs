@@ -1280,9 +1280,11 @@ fn check_windsurf_rules(root: &Path) -> DoctorCheck {
     let result = (|| -> Result<String> {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
-        if !content.contains("Windsurf command rewrite is not guaranteed") {
+        if !content.contains("Windsurf hooks preserve native commands and permissions")
+            || !content.contains("use explicit Packet28 CLI/MCP tools for reduced output")
+        {
             return Err(anyhow!(
-                "rules do not state Windsurf command rewrite limitations"
+                "rules do not state native command preservation and explicit reduction guidance"
             ));
         }
         Ok(format!("rules present at {}", path.display()))
@@ -1428,6 +1430,28 @@ mod tests {
         let config_path = hermes::config_path(home);
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(config_path, config).unwrap();
+    }
+
+    #[test]
+    fn windsurf_rules_accept_generated_capture_only_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        let path = windsurf::rule_path(root.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let guidance = crate::agent_surface::render_prompt_fragment(
+            crate::agent_surface::AgentPromptFormat::WindsurfRule,
+            None,
+        );
+        fs::write(path, guidance).unwrap();
+        assert!(check_windsurf_rules(root.path()).ok);
+    }
+
+    #[test]
+    fn windsurf_rules_reject_legacy_rewrite_only_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        let path = windsurf::rule_path(root.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "Windsurf command rewrite is not guaranteed\n").unwrap();
+        assert!(!check_windsurf_rules(root.path()).ok);
     }
 
     #[test]
