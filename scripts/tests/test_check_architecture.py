@@ -166,10 +166,15 @@ def write_packet28d_sources(
     (source / "application.rs").write_text(
         "pub fn serve() {}\n", encoding="utf-8"
     )
+    (source / "bootstrap.rs").write_text(
+        "pub fn start() {}\n", encoding="utf-8"
+    )
     (source / "lib.rs").write_text(
         "mod application;\n"
+        "mod bootstrap;\n"
         "mod broker;\n"
         "pub use application::serve;\n"
+        "pub use bootstrap::start;\n"
         '#[cfg(feature = "shared-repository-scan")]\n'
         "pub mod shared_repository_scan;\n",
         encoding="utf-8",

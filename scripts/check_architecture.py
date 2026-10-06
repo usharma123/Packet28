@@ -178,6 +178,7 @@ PACKET28D_PUBLIC_DOC_INVENTORY = (
         "packet28d", "serve_with_managed_log", "excluded",
         "non-hermetic-process-lifecycle-owner",
     ),
+    ("packet28d", "start", "excluded", "p28-bootstrap-authority-process-tests"),
     ("packet28d", "shared_repository_scan", "covered", "packet28d-shared-scan-no_run+feature-shared-repository-scan"),
 )
 

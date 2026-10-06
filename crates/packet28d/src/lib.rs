@@ -84,6 +84,7 @@ use packet28_daemon_protocol::task::{
 use serde_json::{json, Value};
 
 mod application;
+mod bootstrap;
 mod broker;
 mod commands;
 mod hooks;
@@ -139,6 +140,7 @@ use crate::watch::{rollback_failed_task_admission, run_sequence_for_task, WatchI
 
 pub use application::serve;
 pub use application::serve_with_managed_log;
+pub use bootstrap::start;
 
 #[cfg(feature = "shared-repository-scan")]
 pub mod shared_repository_scan;

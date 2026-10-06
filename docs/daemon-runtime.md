@@ -57,6 +57,7 @@ deliberate coverage, not an undocumented omission.
 | packet28-daemon-core | root_compatibility | excluded | exact-182-name-frozen-v0-inventory |
 | packet28d | serve | excluded | non-hermetic-process-lifecycle-owner |
 | packet28d | serve_with_managed_log | excluded | non-hermetic-process-lifecycle-owner |
+| packet28d | start | excluded | p28-bootstrap-authority-process-tests |
 | packet28d | shared_repository_scan | covered | packet28d-shared-scan-no_run+feature-shared-repository-scan |
 
 <!-- packet28d-public owner=packet28-daemon-protocol item=broker classification=excluded evidence=wire-dto-json-compat-tests -->
@@ -82,6 +83,7 @@ deliberate coverage, not an undocumented omission.
 <!-- packet28d-public owner=packet28-daemon-core item=root_compatibility classification=excluded evidence=exact-182-name-frozen-v0-inventory -->
 <!-- packet28d-public owner=packet28d item=serve classification=excluded evidence=non-hermetic-process-lifecycle-owner -->
 <!-- packet28d-public owner=packet28d item=serve_with_managed_log classification=excluded evidence=non-hermetic-process-lifecycle-owner -->
+<!-- packet28d-public owner=packet28d item=start classification=excluded evidence=p28-bootstrap-authority-process-tests -->
 <!-- packet28d-public owner=packet28d item=shared_repository_scan classification=covered evidence=packet28d-shared-scan-no_run+feature-shared-repository-scan -->
 
 `packet28d::serve` and `packet28d::serve_with_managed_log` are intentionally
@@ -91,6 +93,12 @@ and block until shutdown, so a runnable doctest would not be hermetic.
 Lifecycle and process tests cover that boundary instead. The managed-log
 variant additionally owns the size-rotated workspace log described in
 [operations](operations.md#logs-and-troubleshooting).
+
+`packet28d::start` (`packet28d start --root`) is excluded for the same reason:
+it takes the startup lease, waits for a stopping daemon to release the instance
+lease, and spawns `serve`. It is the bootstrap path for `p28`, which may not
+link `packet28-daemon-core`. The `p28` daemon process tests cover a held
+shutdown and the bounded authority timeout.
 
 The checker also requires each source anchor below to resolve to exactly one
 Rustdoc fence of the declared kind and to contain the relevant API operations.

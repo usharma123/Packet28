@@ -81,6 +81,18 @@ fn read_mcp_message_newline(server: &mut McpHarness) -> Value {
         .unwrap_or_else(|error| panic!("failed to read newline MCP message: {error}"))
 }
 
+/// Stops the workspace daemon an MCP server started, including when a failing
+/// assertion unwinds, so it never outlives its temporary workspace.
+struct StopDaemonOnDrop<'a>(&'a Path);
+
+impl Drop for StopDaemonOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = mcp_cmd()
+            .args(["daemon", "stop", "--root", self.0.to_str().unwrap()])
+            .output();
+    }
+}
+
 fn start_mcp_server(root: &Path) -> McpHarness {
     let mut command = mcp_cmd();
     command
@@ -255,6 +267,7 @@ fn test_mcp_native_stdio_accepts_newline_json() {
     ensure_packet28d_built();
     let dir = TempDir::new().unwrap();
     init_repo(dir.path());
+    let _daemon = StopDaemonOnDrop(dir.path());
 
     let mut server = start_mcp_server(dir.path());
 
@@ -384,6 +397,17 @@ fn test_mcp_native_stdio_accepts_newline_json() {
     server
         .finish(MCP_SHUTDOWN_TIMEOUT)
         .unwrap_or_else(|error| panic!("failed to stop newline MCP server: {error}"));
+
+    let stop = mcp_cmd()
+        .args(["daemon", "stop", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "daemon stop failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
 }
 
 #[test]

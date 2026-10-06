@@ -337,6 +337,42 @@ pub fn acquire_daemon_instance_lease(root: &Path) -> Result<TaskStoreLease> {
     }
 }
 
+/// Probes, without blocking, whether a daemon still owns the workspace.
+///
+/// Returns `true` when no instance lock exists or it can be acquired; the
+/// probe releases any lease it took before returning. Only
+/// [`DaemonCoreError::DaemonInstanceAlreadyRunning`] means a daemon still owns
+/// the workspace, so an integrity or I/O failure is returned instead of being
+/// mistaken for a stopped daemon.
+///
+/// # Errors
+///
+/// Returns [`DaemonCoreError::Io`] if the lock path cannot be inspected or
+/// safely opened, validated, or locked.
+pub fn daemon_instance_released(root: &Path) -> Result<bool> {
+    let path = daemon_instance_lock_path(root);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        // No daemon has created an instance lock for this workspace.
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => {
+            return Err(DaemonCoreError::io(
+                "failed to inspect daemon instance lease",
+                &path,
+                source,
+            ))
+        }
+    }
+    match acquire_daemon_instance_lease(root) {
+        Ok(lease) => {
+            drop(lease);
+            Ok(true)
+        }
+        Err(DaemonCoreError::DaemonInstanceAlreadyRunning { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Serializes daemon discovery, stale-file cleanup, and process bootstrap.
 ///
 /// The daemon instance lease prevents two daemons from becoming live, while
@@ -999,6 +1035,38 @@ mod tests {
         drop(first);
         acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         drop(second.join().unwrap());
+    }
+
+    #[test]
+    fn daemon_instance_released_probe_reports_ownership_without_retaining_it() {
+        let root = tempdir().unwrap();
+        assert!(daemon_instance_released(root.path()).unwrap());
+        assert!(!daemon_instance_lock_path(root.path()).exists());
+
+        let daemon = acquire_daemon_instance_lease(root.path()).unwrap();
+        assert!(!daemon_instance_released(root.path()).unwrap());
+        drop(daemon);
+
+        assert!(daemon_instance_released(root.path()).unwrap());
+        // The probe released the lease it took.
+        drop(acquire_daemon_instance_lease(root.path()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_instance_released_probe_fails_closed_on_a_substituted_lock() {
+        let root = tempdir().unwrap();
+        drop(acquire_daemon_instance_lease(root.path()).unwrap());
+        let lock = daemon_instance_lock_path(root.path());
+        fs::remove_file(&lock).unwrap();
+        fs::write(root.path().join("lock-target"), b"").unwrap();
+        std::os::unix::fs::symlink(root.path().join("lock-target"), &lock).unwrap();
+
+        let error = daemon_instance_released(root.path()).unwrap_err();
+        assert!(!matches!(
+            error,
+            DaemonCoreError::DaemonInstanceAlreadyRunning { .. }
+        ));
     }
 
     #[test]

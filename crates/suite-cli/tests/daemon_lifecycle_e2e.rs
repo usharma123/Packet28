@@ -698,12 +698,20 @@ fn stop_timeout_fails_without_touching_runtime_files_of_a_live_owner() {
     fixture.wait_for_shutdown_started();
     assert!(daemon_instance_is_held(fixture.root()));
 
+    // Bootstrap keeps its pre-existing ~10 s bound regardless of the stop
+    // timeout, so hooks and MCP clients do not inherit the stop grace.
+    let started = std::time::Instant::now();
     let start = run_lifecycle_client(&["daemon", "start", "--root", &root], &short_timeout);
+    let elapsed = started.elapsed();
     assert!(!start.status.success(), "start succeeded while held");
     let stderr = String::from_utf8_lossy(&start.stderr);
     assert!(
         stderr.contains("did not release workspace authority"),
         "missing start timeout diagnostic: {stderr}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(25),
+        "daemon start gave up after {elapsed:?}, outside its ~10 s bootstrap bound"
     );
     // Neither timed-out client removed state owned by the live daemon.
     assert!(socket.exists(), "client removed a live daemon socket");

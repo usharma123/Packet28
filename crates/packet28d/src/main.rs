@@ -21,6 +21,12 @@ enum Commands {
         #[arg(long)]
         managed_log: bool,
     },
+    /// Start the daemon for a workspace unless one is already serving it,
+    /// waiting for a stopping daemon to release workspace authority first
+    Start {
+        #[arg(long, default_value = ".")]
+        root: String,
+    },
 }
 
 fn main() {
@@ -41,5 +47,6 @@ fn run() -> Result<()> {
             root,
             managed_log: false,
         } => packet28d::serve(PathBuf::from(root)),
+        Commands::Start { root } => packet28d::start(PathBuf::from(root)),
     }
 }

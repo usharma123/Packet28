@@ -1,6 +1,4 @@
 use std::ffi::OsString;
-#[cfg(unix)]
-use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -22,9 +20,7 @@ use packet28_daemon_protocol::message::{
     DaemonRequest, DaemonResponse, Packet28SearchGuardResponse,
     Packet28SearchRequest as DaemonPacket28SearchRequest,
 };
-use packet28_daemon_protocol::paths::{
-    log_path, ready_path, resolve_workspace_root, socket_path, workspace_socket_path,
-};
+use packet28_daemon_protocol::paths::resolve_workspace_root;
 use packet28_daemon_protocol::registry::{DaemonRegistryRequestV1, DaemonRegistryResponseV1};
 use packet28_reducer_core::{parse_region_for_path, SearchRequest, SearchResult};
 use packet28_reducer_core::{SearchEngineStats, SearchGroup, SearchMatch};
@@ -1247,56 +1243,38 @@ fn ensure_daemon(root: &Path) -> Result<()> {
     if daemon_status_existing(&root).is_ok() {
         return Ok(());
     }
-    let endpoint = packet28_daemon_client::transport::discover_endpoint(&root)?;
-    if packet28_daemon_client::transport::endpoint_may_have_stale_socket(&endpoint)
-        && packet28_daemon_client::transport::connect_endpoint(&endpoint, DAEMON_SOCKET_TIMEOUT)
-            .is_err()
-    {
-        cleanup_unreachable_runtime_files(&root)?;
-    }
+    // An unreachable endpoint does not mean the previous daemon has exited: a
+    // stopping daemon withdraws its endpoint before it finishes persistence and
+    // cleanup. Stale-file cleanup and spawn need the daemon startup and
+    // instance leases, which p28 does not link, so `packet28d start` performs
+    // them under the same authority as the Packet28 CLI.
     start_daemon(&root)?;
     wait_for_daemon(&root, Duration::from_secs(10))
 }
 
+/// Runs the lease-guarded `packet28d start` bootstrap for `root`.
+///
+/// It returns once a daemon is ready, or fails without touching the runtime
+/// files of a daemon that has not released workspace authority in time.
 #[cfg(unix)]
 fn start_daemon(root: &Path) -> Result<()> {
     let binary = packet28d_binary()?;
-    let root_arg = root.to_string_lossy().to_string();
-    let log_path = log_path(root);
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create daemon log dir '{}'", parent.display()))?;
-    }
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
-    let mut child = Command::new(binary)
-        .arg("serve")
+    let output = Command::new(binary)
+        .arg("start")
         .arg("--root")
-        .arg(root_arg)
+        .arg(root)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("failed to spawn packet28d")?;
-    // Reap the daemon if it exits while p28 is still running (for example a
-    // bind failure because another daemon won the startup race) so it does
-    // not linger as a zombie for the lifetime of this process.
-    let pid = child.id();
-    thread::Builder::new()
-        .name(format!("packet28d-reaper-{pid}"))
-        .spawn(move || {
-            let _ = child.wait();
-        })
-        .context("failed to start packet28d child reaper")?;
-    Ok(())
+        .output()
+        .context("failed to run packet28d start")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "packet28d start failed with {}: {}",
+        output.status,
+        stderr.trim()
+    ))
 }
 
 #[cfg(unix)]
@@ -1372,22 +1350,6 @@ fn send_request_existing_daemon(root: &Path, request: &DaemonRequest) -> Result<
     let mut reader = BufReader::new(reader_stream);
     write_frame(&mut writer, request)?;
     Ok(read_frame(&mut reader)?)
-}
-
-#[cfg(unix)]
-fn cleanup_unreachable_runtime_files(root: &Path) -> Result<()> {
-    for path in [
-        socket_path(root),
-        workspace_socket_path(root),
-        ready_path(root),
-    ] {
-        if path.exists() {
-            std::fs::remove_file(&path).with_context(|| {
-                format!("failed to remove stale runtime file '{}'", path.display())
-            })?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(unix)]

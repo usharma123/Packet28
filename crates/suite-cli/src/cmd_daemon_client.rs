@@ -6,10 +6,8 @@ use packet28_daemon_client::transport::{DaemonEndpoint, DaemonStream};
 use packet28_daemon_core::storage::read_runtime_info;
 #[cfg(unix)]
 use packet28_daemon_core::task_store_lease::{
-    acquire_daemon_instance_lease, acquire_daemon_startup_lease, daemon_instance_lock_path,
+    acquire_daemon_startup_lease, daemon_instance_lock_path,
 };
-#[cfg(unix)]
-use packet28_daemon_core::DaemonCoreError;
 use packet28_daemon_protocol::{
     commands::{
         CoverCheckRequest, CoverCheckResponse, PacketFetchRequest, PacketFetchResponse,
@@ -335,7 +333,9 @@ pub(crate) fn ensure_daemon(root: &Path) -> Result<()> {
     // stopping daemon withdraws its endpoint before it finishes persistence and
     // cleanup. Leave its runtime files alone and do not spawn a replacement
     // until it releases the instance lease.
-    if wait_for_daemon_authority(&root, daemon_stop_timeout())? == DaemonAuthority::Serving {
+    if wait_for_daemon_authority(&root, DAEMON_BOOTSTRAP_AUTHORITY_TIMEOUT)?
+        == DaemonAuthority::Serving
+    {
         return Ok(());
     }
     let endpoint = daemon_endpoint(&root)?;
@@ -480,6 +480,14 @@ fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
         log_path(root).display()
     ))
 }
+
+/// Bound for bootstrap to wait for a daemon that is stopping or held offline to
+/// release workspace authority. It matches the client bootstrap bound that
+/// predates authority waiting, so hooks and MCP clients keep their worst-case
+/// latency; only explicit stop and restart use [`DAEMON_STOP_TIMEOUT`]. A
+/// bootstrap that times out neither removes runtime files nor spawns.
+#[cfg(unix)]
+const DAEMON_BOOTSTRAP_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default bound for a stopping daemon to release workspace authority. It
 /// exceeds the daemon's default shutdown grace so normal persistence and
@@ -742,36 +750,15 @@ fn wait_for_daemon_authority(root: &Path, timeout: Duration) -> Result<DaemonAut
 
 /// Probes the authenticated daemon instance lease without blocking.
 ///
-/// Only [`DaemonCoreError::DaemonInstanceAlreadyRunning`] means a daemon still
-/// owns the workspace. Any other lock failure is an integrity or I/O error and
-/// is never treated as a stopped daemon.
+/// Integrity and I/O failures are reported, never treated as a stopped daemon.
 #[cfg(unix)]
 fn daemon_instance_released(root: &Path) -> Result<bool> {
-    let path = daemon_instance_lock_path(root);
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        // No daemon has created an instance lock for this workspace.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to inspect packet28d instance authority '{}'",
-                    path.display()
-                )
-            })
-        }
-    }
-    match acquire_daemon_instance_lease(root) {
-        Ok(lease) => {
-            drop(lease);
-            Ok(true)
-        }
-        Err(DaemonCoreError::DaemonInstanceAlreadyRunning { .. }) => Ok(false),
-        Err(error) => Err(anyhow::Error::new(error).context(format!(
+    packet28_daemon_core::task_store_lease::daemon_instance_released(root).with_context(|| {
+        format!(
             "failed to probe packet28d instance authority '{}'",
-            path.display()
-        ))),
-    }
+            daemon_instance_lock_path(root).display()
+        )
+    })
 }
 
 #[cfg(unix)]
