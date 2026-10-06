@@ -793,6 +793,9 @@ fn resume_repair(
             "the repair archive receipt schema is unsupported",
         ));
     }
+    // The archive may hold the only copy of an original that a completed
+    // write already replaced, so it must be intact before anything advances.
+    verify_archived_originals(root, &archive, &receipt)?;
     // Checkpoint authority must be byte-identical to what the plan was
     // verified against; only planned canonical files may have advanced.
     for (name, max_bytes) in CANONICAL_REGISTRY_FILES
@@ -888,6 +891,73 @@ fn resume_repair(
     complete_repair(root, daemon, &archive, &receipt, &mut report)?;
     report.status = RegistryCheckpointRepairStatus::Resumed;
     Ok(report)
+}
+
+/// Requires the receipt to describe a coherent archive and every archived
+/// original to be present, a regular file, and byte-identical to its digest.
+#[cfg(unix)]
+fn verify_archived_originals(
+    root: &Path,
+    archive: &CapabilityDir,
+    receipt: &RepairReceipt,
+) -> Result<()> {
+    let mut sources = BTreeSet::new();
+    for entry in &receipt.archived {
+        let (_, max_bytes) = CANONICAL_REGISTRY_FILES
+            .into_iter()
+            .chain(CHECKPOINT_AUTHORITY_FILE_NAMES)
+            .find(|(name, _)| *name == entry.source)
+            .ok_or_else(|| {
+                interrupted_refusal(root, "the receipt lists an archived original it cannot own")
+            })?;
+        if !sources.insert(entry.source.as_str())
+            || entry.archive != archive_file_name("original", &entry.source)
+        {
+            return Err(interrupted_refusal(
+                root,
+                "the receipt lists inconsistent archived originals",
+            ));
+        }
+        match read_optional(archive, &entry.archive, max_bytes) {
+            Ok(Some(raw)) if entry.digest.matches(&raw) => {}
+            Ok(_) => {
+                return Err(interrupted_refusal(
+                    root,
+                    &format!(
+                        "the archived original {} is missing or altered",
+                        entry.archive
+                    ),
+                ))
+            }
+            Err(error) => {
+                return Err(interrupted_refusal(
+                    root,
+                    &format!(
+                        "the archived original {} could not be authenticated ({error})",
+                        entry.archive
+                    ),
+                ))
+            }
+        }
+    }
+    let mut files = BTreeSet::new();
+    for write in &receipt.writes {
+        let archived = receipt
+            .archived
+            .iter()
+            .find(|entry| entry.source == write.file)
+            .map(|entry| &entry.digest);
+        if !files.insert(write.file.as_str())
+            || write.target_archive != archive_file_name("target", &write.file)
+            || write.original.as_ref() != archived
+        {
+            return Err(interrupted_refusal(
+                root,
+                "the receipt plans a write whose archived original is inconsistent",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Publishes every planned image that is not yet in place, verifies the
@@ -991,6 +1061,7 @@ pub(super) fn inject_repair_interruption_after(phase: &'static str) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::fs::symlink;
 
     use packet28_daemon_protocol::commands::WatchSpec;
@@ -1559,6 +1630,221 @@ mod tests {
 
         assert!(error.to_string().contains("changed outside"), "{error}");
         assert_eq!(state(root.path()), before);
+    }
+
+    /// Every regular file and symlink under the repair archives, without
+    /// following links.
+    fn archive_tree(root: &Path) -> BTreeMap<PathBuf, (bool, Vec<u8>)> {
+        let mut entries = BTreeMap::new();
+        for archive in archives(root) {
+            for entry in fs::read_dir(&archive).unwrap() {
+                let path = entry.unwrap().path();
+                let link = fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink();
+                let bytes = if link {
+                    fs::read_link(&path).unwrap().into_os_string().into_vec()
+                } else {
+                    fs::read(&path).unwrap()
+                };
+                entries.insert(path, (link, bytes));
+            }
+        }
+        entries
+    }
+
+    fn pending_archive(root: &Path) -> PathBuf {
+        let journal: RepairJournal = serde_json::from_slice(
+            &fs::read(file(root, CHECKPOINT_REPAIR_JOURNAL_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        file(root, REGISTRY_REPAIR_ARCHIVE_DIR_NAME).join(journal.archive)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ArchiveTamper {
+        Missing,
+        SameLengthEdit,
+        Appended,
+        SymlinkToIdenticalBytes,
+    }
+
+    fn tamper(root: &Path, path: &Path, how: ArchiveTamper) {
+        let bytes = fs::read(path).unwrap();
+        match how {
+            ArchiveTamper::Missing => fs::remove_file(path).unwrap(),
+            ArchiveTamper::SameLengthEdit => {
+                let mut edited = bytes;
+                edited[0] ^= 0x20;
+                fs::write(path, edited).unwrap();
+            }
+            ArchiveTamper::Appended => fs::write(path, [bytes.as_slice(), b"\n"].concat()).unwrap(),
+            ArchiveTamper::SymlinkToIdenticalBytes => {
+                let outside = root.join("outside-original");
+                fs::write(&outside, &bytes).unwrap();
+                fs::remove_file(path).unwrap();
+                symlink(&outside, path).unwrap();
+            }
+        }
+    }
+
+    /// Resume must refuse, in dry run and apply, without touching canonical
+    /// state, the journal, or the archive.
+    fn assert_resume_refused_unchanged(root: &Path, context: &str) {
+        let before = state(root);
+        let archived = archive_tree(root);
+        for apply in [false, true] {
+            let error = if apply {
+                repair_task_watch_registry_checkpoint(root).unwrap_err()
+            } else {
+                inspect_task_watch_registry_checkpoint_repair(root).unwrap_err()
+            };
+            assert!(
+                error.to_string().contains("archived original"),
+                "{context} apply={apply}: {error}"
+            );
+            assert_eq!(state(root), before, "{context} apply={apply}");
+            assert_eq!(archive_tree(root), archived, "{context} apply={apply}");
+            assert!(file(root, CHECKPOINT_REPAIR_JOURNAL_FILE_NAME).exists());
+            assert!(assert_startup_rejects(root).contains("interrupted"));
+        }
+    }
+
+    #[test]
+    fn resume_refuses_missing_altered_or_symlinked_archived_originals() {
+        let originals = [TASK_REGISTRY_FILE_NAME, MANIFEST];
+        let tampers = [
+            ArchiveTamper::Missing,
+            ArchiveTamper::SameLengthEdit,
+            ArchiveTamper::Appended,
+            ArchiveTamper::SymlinkToIdenticalBytes,
+        ];
+        // Before any canonical write, and after the task image (the only
+        // planned write) replaced the edited bytes, so that the archive holds
+        // the only copy of the original.
+        for phase in ["journal", TASK_REGISTRY_FILE_NAME] {
+            for original in originals {
+                for how in tampers {
+                    let context = format!("{phase}/{original}/{how:?}");
+                    let (root, committed) = committed_store();
+                    let task_path = file(root.path(), TASK_REGISTRY_FILE_NAME);
+                    reformat(&task_path);
+                    let edited = fs::read(&task_path).unwrap();
+                    inject_repair_interruption_after(phase);
+                    assert!(repair_task_watch_registry_checkpoint(root.path()).is_err());
+                    let current = fs::read(&task_path).unwrap();
+                    if phase == "journal" {
+                        assert_eq!(current, edited, "{context}");
+                    } else {
+                        assert_eq!(current, committed, "{context}");
+                    }
+                    let archive = pending_archive(root.path());
+                    let task_original =
+                        archive.join(archive_file_name("original", TASK_REGISTRY_FILE_NAME));
+                    assert_eq!(fs::read(&task_original).unwrap(), edited, "{context}");
+
+                    tamper(
+                        root.path(),
+                        &archive.join(archive_file_name("original", original)),
+                        how,
+                    );
+                    assert_resume_refused_unchanged(root.path(), &context);
+                }
+            }
+        }
+    }
+
+    fn reformat_both_and_interrupt_after_watch() -> (TempDir, Vec<u8>, Vec<u8>) {
+        let (root, committed_tasks) = committed_store();
+        let committed_watches = fs::read(file(root.path(), WATCH_REGISTRY_FILE_NAME)).unwrap();
+        let edited_watches = [committed_watches.as_slice(), b" "].concat();
+        fs::write(file(root.path(), WATCH_REGISTRY_FILE_NAME), &edited_watches).unwrap();
+        reformat(&file(root.path(), TASK_REGISTRY_FILE_NAME));
+        inject_repair_interruption_after(WATCH_REGISTRY_FILE_NAME);
+        assert!(repair_task_watch_registry_checkpoint(root.path()).is_err());
+        assert_eq!(
+            fs::read(file(root.path(), WATCH_REGISTRY_FILE_NAME)).unwrap(),
+            committed_watches,
+            "the watch image is published first"
+        );
+        assert_ne!(
+            fs::read(file(root.path(), TASK_REGISTRY_FILE_NAME)).unwrap(),
+            committed_tasks
+        );
+        let archive = pending_archive(root.path());
+        assert_eq!(
+            fs::read(archive.join(archive_file_name("original", WATCH_REGISTRY_FILE_NAME)))
+                .unwrap(),
+            edited_watches
+        );
+        (root, committed_tasks, committed_watches)
+    }
+
+    #[test]
+    fn resume_after_the_first_write_refuses_unauthenticated_originals() {
+        for original in [WATCH_REGISTRY_FILE_NAME, TASK_REGISTRY_FILE_NAME] {
+            for how in [ArchiveTamper::Missing, ArchiveTamper::SameLengthEdit] {
+                let (root, _, _) = reformat_both_and_interrupt_after_watch();
+                let archive = pending_archive(root.path());
+                tamper(
+                    root.path(),
+                    &archive.join(archive_file_name("original", original)),
+                    how,
+                );
+                assert_resume_refused_unchanged(root.path(), &format!("{original}/{how:?}"));
+            }
+        }
+
+        // Healthy evidence still resumes and keeps both originals.
+        let (root, committed_tasks, committed_watches) = reformat_both_and_interrupt_after_watch();
+        let archived = archive_tree(root.path());
+        let dry = inspect_task_watch_registry_checkpoint_repair(root.path()).unwrap();
+        assert_eq!(
+            dry.status,
+            RegistryCheckpointRepairStatus::InterruptedRepair
+        );
+        let resumed = repair_task_watch_registry_checkpoint(root.path()).unwrap();
+        assert_eq!(resumed.status, RegistryCheckpointRepairStatus::Resumed);
+        assert_eq!(
+            fs::read(file(root.path(), TASK_REGISTRY_FILE_NAME)).unwrap(),
+            committed_tasks
+        );
+        assert_eq!(
+            fs::read(file(root.path(), WATCH_REGISTRY_FILE_NAME)).unwrap(),
+            committed_watches
+        );
+        let after = archive_tree(root.path());
+        for (path, entry) in &archived {
+            assert_eq!(after.get(path), Some(entry), "{}", path.display());
+        }
+        assert_eq!(load_task_registry(root.path()).unwrap().tasks.len(), 3);
+    }
+
+    #[test]
+    fn resume_refuses_a_receipt_inconsistent_with_its_archive() {
+        let (root, _) = committed_store();
+        reformat(&file(root.path(), TASK_REGISTRY_FILE_NAME));
+        inject_repair_interruption_after(TASK_REGISTRY_FILE_NAME);
+        assert!(repair_task_watch_registry_checkpoint(root.path()).is_err());
+        let archive = pending_archive(root.path());
+        // Re-bind a receipt that no longer archives the task original, so a
+        // digest check alone would accept it.
+        let mut receipt: RepairReceipt =
+            serde_json::from_slice(&fs::read(archive.join(REPAIR_RECEIPT_FILE_NAME)).unwrap())
+                .unwrap();
+        receipt
+            .archived
+            .retain(|entry| entry.source != TASK_REGISTRY_FILE_NAME);
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        fs::write(archive.join(REPAIR_RECEIPT_FILE_NAME), &receipt_bytes).unwrap();
+        let journal_path = file(root.path(), CHECKPOINT_REPAIR_JOURNAL_FILE_NAME);
+        let mut journal: RepairJournal =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        journal.receipt = RegistryArtifactDigest::of(&receipt_bytes);
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+
+        assert_resume_refused_unchanged(root.path(), "receipt without task original");
     }
 
     #[test]

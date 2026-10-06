@@ -413,3 +413,51 @@ fn storage_repair_completes_after_a_process_interruption() {
             .contains_key("task")
     );
 }
+
+#[test]
+fn storage_repair_resume_refuses_a_missing_archived_original() {
+    let root = TempDir::new().unwrap();
+    seed_task_registry(&root, &[("task", 0), ("neighbor", 0)]);
+    let (task_path, committed) = whitespace_edit_task_registry(&root);
+    let edited = fs::read(&task_path).unwrap();
+    let daemon = root.path().join(".packet28/daemon");
+    let journal_path = daemon.join(".task-watch-checkpoint-v1.repair.json");
+
+    suite_cmd()
+        .args(["daemon", "storage", "repair", "--apply", "--root"])
+        .arg(root.path())
+        .env("PACKET28_REGISTRY_REPAIR_EXIT_AFTER", "journal")
+        .assert()
+        .code(87);
+    let journal: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    let backup = daemon
+        .join("registry-repair")
+        .join(journal["archive"].as_str().unwrap())
+        .join("original-task-registry-v1.json");
+    assert_eq!(fs::read(&backup).unwrap(), edited);
+    fs::remove_file(&backup).unwrap();
+    let journal_bytes = fs::read(&journal_path).unwrap();
+
+    for extra in [&[][..], &["--apply"][..]] {
+        suite_cmd()
+            .args(["daemon", "storage", "repair", "--json", "--root"])
+            .arg(root.path())
+            .args(extra)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "the archived original original-task-registry-v1.json is missing or altered",
+            ));
+        assert_eq!(fs::read(&task_path).unwrap(), edited, "{extra:?}");
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_bytes, "{extra:?}");
+        assert!(!backup.exists());
+    }
+
+    // Restoring the exact evidence lets the same journaled repair complete.
+    fs::write(&backup, &edited).unwrap();
+    let resumed = repair_json(&root, &["--apply"]);
+    assert_eq!(resumed["registry_checkpoint"]["status"], "resumed");
+    assert_eq!(fs::read(&task_path).unwrap(), committed);
+    assert_eq!(fs::read(&backup).unwrap(), edited);
+    assert!(!journal_path.exists());
+}
