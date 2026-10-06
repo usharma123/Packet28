@@ -25,10 +25,9 @@ use crate::cmd_daemon::{
 ///
 /// # Examples
 ///
-/// ```no_run
-/// let exit_code = run_storage(args)?;
-/// std::process::exit(exit_code);
-/// # Ok::<(), anyhow::Error>(())
+/// ```text
+/// Packet28 daemon storage inspect --root /path/to/workspace
+/// Packet28 daemon storage repair --root /path/to/workspace
 /// ```
 pub(crate) fn run_storage(args: StorageArgs) -> Result<i32> {
     match args.command {
@@ -65,14 +64,6 @@ fn run_repair(args: StorageRepairArgs) -> Result<i32> {
 }
 
 /// Emits corrupt task event log repair results in JSON or human-readable form.
-///
-/// # Examples
-///
-/// ```
-/// use std::path::Path;
-///
-/// emit_repair(Path::new("."), &[], false, false, false).unwrap();
-/// ```
 ///
 /// # Arguments
 ///
@@ -153,16 +144,8 @@ fn emit_repair(
 ///
 /// # Examples
 ///
-/// ```no_run
-/// let args = StorageInspectArgs {
-///     root: None,
-///     json: false,
-///     pretty: false,
-/// };
-///
-/// let exit_code = run_inspect(args)?;
-/// assert_eq!(exit_code, 0);
-/// # Ok::<(), anyhow::Error>(())
+/// ```text
+/// Packet28 daemon storage inspect --root /path/to/workspace --json
 /// ```
 fn run_inspect(args: StorageInspectArgs) -> Result<i32> {
     let root = resolve_root_arg(&args.root);
