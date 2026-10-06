@@ -643,7 +643,9 @@ pub(crate) fn hook_ingest(
         {
             let mut guard = state.lock().map_err(lock_err)?;
             let task = ensure_task_record_mut(&mut guard.tasks, task_id);
-            cache_hit = cache_hit_for_packet(task, packet);
+            // Each completed execution is fresh evidence, even when output repeats.
+            cache_hit = !matches!(request.event_kind, HookEventKind::CommandFinished)
+                && cache_hit_for_packet(task, packet);
             if !cache_hit {
                 update_cache_for_packet(task, packet, artifact_id.clone());
             }

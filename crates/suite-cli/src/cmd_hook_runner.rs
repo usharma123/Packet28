@@ -1,18 +1,20 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use packet28_daemon_core::storage::{load_task_registry, now_unix};
-use packet28_daemon_core::task_store_lease::acquire_task_store_writer_lease;
+use packet28_daemon_core::storage::now_unix;
+use packet28_daemon_core::task_store_lease::{acquire_task_store_writer_lease, TaskStoreLease};
 use packet28_daemon_protocol::hooks::{
     ActiveTaskRecord, HookBoundaryKind, HookEventKind, HookIngestRequest, HookLifecycleEvent,
-    HookLifecycleKind, HookReducerCacheEntry, HookReducerPacket,
+    HookLifecycleKind, HookReducerPacket,
 };
 use packet28_daemon_protocol::paths::{task_artifact_dir, TaskStorageId};
-use packet28_daemon_protocol::task::TaskRecord;
 use packet28_reducer_core::{
     classify_command, classify_command_argv, reduce_command_output, CommandReducerSpec,
 };
@@ -23,25 +25,38 @@ use crate::cmd_hook::{
     shell_join, ReduceFixtureArgs, ReducerRunnerArgs,
 };
 
-pub(crate) fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
-    let root = crate::broker_client::resolve_root(&args.root);
-    crate::broker_client::ensure_daemon(&root)?;
-    let _writer_lease = acquire_task_store_writer_lease(&root)?;
-    if args.argv.is_empty() {
-        return Err(anyhow!("reducer-runner requires a command after '--'"));
-    }
+struct RunnerCapture {
+    task_id: String,
+    spec: CommandReducerSpec,
+    workspace_fingerprint: String,
+    command_id: String,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    stdout_file: File,
+    stderr_file: File,
+    stdout_reader: File,
+    stderr_reader: File,
+    _writer_lease: TaskStoreLease,
+}
 
+fn prepare_runner_capture(
+    root: &Path,
+    cwd: &Path,
+    args: &ReducerRunnerArgs,
+) -> Result<RunnerCapture> {
+    crate::broker_client::ensure_daemon(root)?;
+    let _writer_lease = acquire_task_store_writer_lease(root)?;
     let task_id = if let Some(task_id) = args.task_id.clone() {
         task_id
-    } else if let Some(active) = crate::task_runtime::load_active_task(&root)? {
+    } else if let Some(active) = crate::task_runtime::load_active_task(root)? {
         active.task_id
     } else {
         crate::broker_client::derive_task_id("claude-hook-runner")
     };
-    let task_id = crate::task_runtime::resolve_task_continuation(&root, &task_id)?;
+    let task_id = crate::task_runtime::resolve_task_continuation(root, &task_id)?;
     let task_storage_id = TaskStorageId::try_from(task_id.as_str())?;
     crate::task_runtime::store_active_task(
-        &root,
+        root,
         &ActiveTaskRecord {
             task_id: task_id.clone(),
             session_id: args.session_id.clone(),
@@ -49,11 +64,6 @@ pub(crate) fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
         },
     )?;
 
-    let cwd = args
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.clone());
     let command_text = shell_join(&args.argv);
     let spec = classify_command_argv(&command_text, &args.argv)
         .ok_or_else(|| anyhow!("command is not eligible for reducer rewrite"))?;
@@ -64,50 +74,15 @@ pub(crate) fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
         return Err(anyhow!("reducer-runner classification mismatch"));
     }
 
-    let workspace_fingerprint = workspace_cache_fingerprint(&root, &cwd, &spec);
-
-    if let Some((cached_packet, exit_code)) = cached_reducer_packet(
-        &root,
-        &task_id,
-        &spec,
-        &command_text,
-        Some(&workspace_fingerprint),
-    ) {
-        let command_id = format!("runner-cache-{}", now_unix_millis());
-        let _ = crate::broker_client::hook_ingest(
-            &root,
-            HookIngestRequest {
-                task_id,
-                session_id: args.session_id,
-                event_kind: HookEventKind::CommandFinished,
-                matcher: None,
-                source: Some("packet28-reducer-runner-cache".to_string()),
-                boundary_kind: HookBoundaryKind::None,
-                lifecycle_event: Some(HookLifecycleEvent {
-                    kind: HookLifecycleKind::CommandFinished,
-                    command_id: Some(command_id),
-                    reducer_family: cached_packet.reducer_family.clone(),
-                    canonical_command_kind: cached_packet.canonical_command_kind.clone(),
-                    cache_fingerprint: cached_packet.cache_fingerprint.clone(),
-                    elapsed_ms: Some(0),
-                    exit_code: cached_packet.exit_code,
-                    ..HookLifecycleEvent::default()
-                }),
-                reducer_packet: Some(cached_packet.clone()),
-                host_context_budget_tokens: None,
-            },
-        )?;
-        println!("{}", cached_packet.summary);
-        return Ok(exit_code);
-    }
+    let workspace_fingerprint = workspace_cache_fingerprint(root, cwd, &spec);
 
     let command_id = format!("runner-{}", now_unix_millis());
-    let spool_dir = task_artifact_dir(&root, &task_storage_id).join("hook-spool");
+    let spool_dir = task_artifact_dir(root, &task_storage_id).join("hook-spool");
     let stdout_path = spool_dir.join(format!("{command_id}-stdout.log"));
     let stderr_path = spool_dir.join(format!("{command_id}-stderr.log"));
 
     let admission = crate::broker_client::hook_ingest(
-        &root,
+        root,
         HookIngestRequest {
             task_id: task_id.clone(),
             session_id: args.session_id.clone(),
@@ -136,22 +111,125 @@ pub(crate) fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
     }
 
     fs::create_dir_all(&spool_dir)?;
-    let stdout_file = File::create(&stdout_path)
+    let stdout_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&stdout_path)
         .with_context(|| format!("failed to create '{}'", stdout_path.display()))?;
-    let stderr_file = File::create(&stderr_path)
+    let stderr_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&stderr_path)
         .with_context(|| format!("failed to create '{}'", stderr_path.display()))?;
 
-    let started = Instant::now();
-    let mut child = Command::new(&args.argv[0])
+    #[cfg(unix)]
+    let (stdout_reader, stderr_reader) = (stdout_file.try_clone()?, stderr_file.try_clone()?);
+    #[cfg(not(unix))]
+    let (stdout_reader, stderr_reader) = (File::open(&stdout_path)?, File::open(&stderr_path)?);
+    Ok(RunnerCapture {
+        task_id,
+        spec,
+        workspace_fingerprint,
+        command_id,
+        stdout_path,
+        stderr_path,
+        stdout_file,
+        stderr_file,
+        stdout_reader,
+        stderr_reader,
+        _writer_lease,
+    })
+}
+
+fn runner_command(args: &ReducerRunnerArgs, cwd: &Path) -> Command {
+    let mut command = Command::new(&args.argv[0]);
+    command
         .args(&args.argv[1..])
-        .current_dir(&cwd)
+        .current_dir(cwd)
+        .envs(args.env.iter().filter_map(|entry| entry.split_once('=')));
+    command
+}
+
+fn read_spool_snapshot(reader: &mut File, output: &mut Vec<u8>) -> io::Result<()> {
+    let length = reader.metadata()?.len();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut offset = 0;
+        let mut buffer = [0_u8; 8192];
+        while offset < length {
+            let remaining = (length - offset).min(buffer.len() as u64) as usize;
+            let count = match reader.read_at(&mut buffer[..remaining], offset) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count]);
+            offset += count as u64;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // These readers were opened separately before spawn and have independent cursors.
+        reader.take(length).read_to_end(output)?;
+    }
+    Ok(())
+}
+
+fn runner_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
+}
+
+pub(crate) fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
+    if args.argv.is_empty() {
+        return Err(anyhow!("reducer-runner requires a command after '--'"));
+    }
+    let root = crate::broker_client::resolve_root(&args.root);
+    let cwd = args
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.clone());
+    let command_text = shell_join(&args.argv);
+    let Ok(RunnerCapture {
+        task_id,
+        spec,
+        workspace_fingerprint,
+        command_id,
+        stdout_path,
+        stderr_path,
+        stdout_file,
+        stderr_file,
+        mut stdout_reader,
+        mut stderr_reader,
+        _writer_lease,
+    }) = prepare_runner_capture(&root, &cwd, &args)
+    else {
+        // Capture is optional. Only this pre-spawn path may execute a fallback.
+        let status = runner_command(&args, &cwd)
+            .status()
+            .with_context(|| format!("failed to spawn '{}'", args.argv[0]))?;
+        return Ok(runner_exit_code(status));
+    };
+
+    let started = Instant::now();
+    let mut child = runner_command(&args, &cwd)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
-        .envs(args.env.iter().filter_map(|entry| {
-            entry
-                .split_once('=')
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-        }))
         .spawn()
         .with_context(|| format!("failed to spawn '{}'", args.argv[0]))?;
 
@@ -200,100 +278,120 @@ pub(crate) fn run_reducer_runner(args: ReducerRunnerArgs) -> Result<i32> {
         thread::sleep(Duration::from_millis(200));
     };
 
-    let stdout = read_to_string_lossy(&stdout_path).unwrap_or_default();
-    let stderr = read_to_string_lossy(&stderr_path).unwrap_or_default();
-    let exit_code = status.code().unwrap_or(1);
-    let reduced = reduce_command_output(&spec, &stdout, &stderr, exit_code)?;
-    let artifact = json!({
-        "command_id": command_id,
-        "command": command_text,
-        "argv": args.argv,
-        "cwd": cwd.display().to_string(),
-        "cache_hit": false,
-        "cache_validity": "workspace_fingerprint",
-        "workspace_fingerprint": workspace_fingerprint,
-        "stdout_spool_path": stdout_path.display().to_string(),
-        "stderr_spool_path": stderr_path.display().to_string(),
-        "stdout_preview": compact_text(&stdout, 400),
-        "stderr_preview": compact_text(&stderr, 400),
-        "stdout_bytes": fs::metadata(&stdout_path).map(|meta| meta.len()).unwrap_or(0),
-        "stderr_bytes": fs::metadata(&stderr_path).map(|meta| meta.len()).unwrap_or(0),
-        "exit_code": exit_code,
-    });
-    let est_bytes = reduced.summary.len() as u64;
-    let est_tokens = ((est_bytes as f64) / 4.0).ceil() as u64;
-    let response = crate::broker_client::hook_ingest(
-        &root,
-        HookIngestRequest {
-            task_id,
-            session_id: args.session_id,
-            event_kind: HookEventKind::CommandFinished,
-            matcher: None,
-            source: Some("packet28-reducer-runner".to_string()),
-            boundary_kind: HookBoundaryKind::None,
-            lifecycle_event: Some(HookLifecycleEvent {
-                kind: HookLifecycleKind::CommandFinished,
-                command_id: Some(command_id),
-                reducer_family: Some(reduced.family.clone()),
-                canonical_command_kind: Some(reduced.canonical_kind.clone()),
-                cache_fingerprint: Some(reduced.cache_fingerprint.clone()),
-                stdout_spool_path: Some(stdout_path.display().to_string()),
-                stderr_spool_path: Some(stderr_path.display().to_string()),
-                stdout_bytes: Some(
-                    fs::metadata(&stdout_path)
-                        .map(|meta| meta.len())
-                        .unwrap_or(0),
-                ),
-                stderr_bytes: Some(
-                    fs::metadata(&stderr_path)
-                        .map(|meta| meta.len())
-                        .unwrap_or(0),
-                ),
-                elapsed_ms: Some(started.elapsed().as_millis() as u64),
-                exit_code: Some(exit_code),
-            }),
-            reducer_packet: Some(HookReducerPacket {
-                packet_type: reduced.packet_type,
-                tool_name: "Bash".to_string(),
-                operation_kind: reduced.operation_kind,
-                reducer_family: Some(reduced.family),
-                canonical_command_kind: Some(reduced.canonical_kind),
-                summary: reduced.summary.clone(),
-                compact_preview: (!reduced.compact_preview.is_empty())
-                    .then_some(reduced.compact_preview.clone()),
-                command: Some(command_text),
-                search_query: None,
-                compact_path: Some("reducer_rewrite".to_string()),
-                passthrough_reason: None,
-                raw_est_tokens: Some((((stdout.len() + stderr.len()) as f64) / 4.0).ceil() as u64),
-                reduced_est_tokens: Some(est_tokens),
-                paths: reduced.paths,
-                regions: reduced.regions,
-                symbols: reduced.symbols,
-                equivalence_key: reduced.equivalence_key,
-                est_tokens,
-                est_bytes,
-                failed: reduced.failed,
-                error_class: reduced.error_class,
-                error_message: reduced.error_message,
-                retryable: reduced.retryable,
-                duration_ms: Some(started.elapsed().as_millis() as u64),
-                exit_code: Some(reduced.exit_code),
-                cache_fingerprint: Some(reduced.cache_fingerprint),
-                cacheable: Some(reduced.cacheable),
-                mutation: Some(reduced.mutation),
-                raw_artifact_handle: stdout_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_owned),
-                raw_artifact_available: true,
-                artifact: Some(artifact),
-            }),
-            host_context_budget_tokens: None,
-        },
-    )?;
-    let _ = response;
-    println!("{}", reduced.summary);
+    let mut raw_stdout = Vec::new();
+    let mut raw_stderr = Vec::new();
+    let stdout_read = read_spool_snapshot(&mut stdout_reader, &mut raw_stdout);
+    let stderr_read = read_spool_snapshot(&mut stderr_reader, &mut raw_stderr);
+    let exit_code = runner_exit_code(status);
+    let capture_result = (|| -> Result<String> {
+        stdout_read?;
+        stderr_read?;
+        let stdout = String::from_utf8_lossy(&raw_stdout);
+        let stderr = String::from_utf8_lossy(&raw_stderr);
+        let reduced = reduce_command_output(&spec, &stdout, &stderr, exit_code)?;
+        let artifact = json!({
+            "command_id": command_id,
+            "command": command_text,
+            "argv": args.argv,
+            "cwd": cwd.display().to_string(),
+            "cache_hit": false,
+            "cache_validity": "workspace_fingerprint",
+            "workspace_fingerprint": workspace_fingerprint,
+            "stdout_spool_path": stdout_path.display().to_string(),
+            "stderr_spool_path": stderr_path.display().to_string(),
+            "stdout_preview": compact_text(&stdout, 400),
+            "stderr_preview": compact_text(&stderr, 400),
+            "stdout_bytes": fs::metadata(&stdout_path).map(|meta| meta.len()).unwrap_or(0),
+            "stderr_bytes": fs::metadata(&stderr_path).map(|meta| meta.len()).unwrap_or(0),
+            "exit_code": exit_code,
+        });
+        let est_bytes = reduced.summary.len() as u64;
+        let est_tokens = ((est_bytes as f64) / 4.0).ceil() as u64;
+        let response = crate::broker_client::hook_ingest(
+            &root,
+            HookIngestRequest {
+                task_id,
+                session_id: args.session_id,
+                event_kind: HookEventKind::CommandFinished,
+                matcher: None,
+                source: Some("packet28-reducer-runner".to_string()),
+                boundary_kind: HookBoundaryKind::None,
+                lifecycle_event: Some(HookLifecycleEvent {
+                    kind: HookLifecycleKind::CommandFinished,
+                    command_id: Some(command_id),
+                    reducer_family: Some(reduced.family.clone()),
+                    canonical_command_kind: Some(reduced.canonical_kind.clone()),
+                    cache_fingerprint: Some(reduced.cache_fingerprint.clone()),
+                    stdout_spool_path: Some(stdout_path.display().to_string()),
+                    stderr_spool_path: Some(stderr_path.display().to_string()),
+                    stdout_bytes: Some(
+                        fs::metadata(&stdout_path)
+                            .map(|meta| meta.len())
+                            .unwrap_or(0),
+                    ),
+                    stderr_bytes: Some(
+                        fs::metadata(&stderr_path)
+                            .map(|meta| meta.len())
+                            .unwrap_or(0),
+                    ),
+                    elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                    exit_code: Some(exit_code),
+                }),
+                reducer_packet: Some(HookReducerPacket {
+                    packet_type: reduced.packet_type,
+                    tool_name: "Bash".to_string(),
+                    operation_kind: reduced.operation_kind,
+                    reducer_family: Some(reduced.family),
+                    canonical_command_kind: Some(reduced.canonical_kind),
+                    summary: reduced.summary.clone(),
+                    compact_preview: (!reduced.compact_preview.is_empty())
+                        .then_some(reduced.compact_preview.clone()),
+                    command: Some(command_text),
+                    search_query: None,
+                    compact_path: Some("reducer_rewrite".to_string()),
+                    passthrough_reason: None,
+                    raw_est_tokens: Some(
+                        (((stdout.len() + stderr.len()) as f64) / 4.0).ceil() as u64
+                    ),
+                    reduced_est_tokens: Some(est_tokens),
+                    paths: reduced.paths,
+                    regions: reduced.regions,
+                    symbols: reduced.symbols,
+                    equivalence_key: reduced.equivalence_key,
+                    est_tokens,
+                    est_bytes,
+                    failed: reduced.failed,
+                    error_class: reduced.error_class,
+                    error_message: reduced.error_message,
+                    retryable: reduced.retryable,
+                    duration_ms: Some(started.elapsed().as_millis() as u64),
+                    exit_code: Some(reduced.exit_code),
+                    cache_fingerprint: Some(reduced.cache_fingerprint),
+                    cacheable: Some(reduced.cacheable),
+                    mutation: Some(reduced.mutation),
+                    raw_artifact_handle: stdout_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned),
+                    raw_artifact_available: true,
+                    artifact: Some(artifact),
+                }),
+                host_context_budget_tokens: None,
+            },
+        )?;
+        if !response.accepted {
+            return Err(anyhow!("reducer-runner completion capture was rejected"));
+        }
+        Ok(reduced.summary)
+    })();
+    match capture_result {
+        Ok(summary) => println!("{summary}"),
+        Err(_) => {
+            // The child has already run. Replay its bytes, never its command.
+            let _ = io::stdout().lock().write_all(&raw_stdout);
+            let _ = io::stderr().lock().write_all(&raw_stderr);
+        }
+    }
     Ok(exit_code)
 }
 
@@ -483,119 +581,38 @@ fn git_output_for_fingerprint(root: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn cached_reducer_packet(
-    root: &Path,
-    task_id: &str,
-    spec: &CommandReducerSpec,
-    command_text: &str,
-    workspace_fingerprint: Option<&str>,
-) -> Option<(HookReducerPacket, i32)> {
-    if spec.mutation {
-        return None;
-    }
-    let registry = load_task_registry(root).ok()?;
-    let task = registry.tasks.get(task_id)?;
-    let entry = task.hook_reducer_cache.get(&spec.cache_fingerprint)?;
-    if !cache_entry_matches(task, entry, spec, workspace_fingerprint) {
-        return None;
-    }
-    let est_bytes = entry.summary.len() as u64;
-    let est_tokens = ((est_bytes as f64) / 4.0).ceil() as u64;
-    let exit_code = entry.exit_code.unwrap_or(if entry.failed { 1 } else { 0 });
-    Some((
-        HookReducerPacket {
-            packet_type: spec.packet_type.clone(),
-            tool_name: "Bash".to_string(),
-            operation_kind: spec.operation_kind,
-            reducer_family: Some(spec.family.clone()),
-            canonical_command_kind: Some(spec.canonical_kind.clone()),
-            summary: entry.summary.clone(),
-            compact_preview: entry.compact_preview.clone(),
-            command: Some(command_text.to_string()),
-            search_query: None,
-            compact_path: Some("reducer_rewrite".to_string()),
-            passthrough_reason: None,
-            raw_est_tokens: None,
-            reduced_est_tokens: Some(est_tokens),
-            paths: entry.paths.clone(),
-            regions: entry.regions.clone(),
-            symbols: entry.symbols.clone(),
-            equivalence_key: spec.equivalence_key.clone(),
-            est_tokens,
-            est_bytes,
-            failed: entry.failed,
-            error_class: entry.failed.then_some("cached_tool_error".to_string()),
-            error_message: entry.error_message.clone(),
-            retryable: entry.failed.then_some(false),
-            duration_ms: Some(0),
-            exit_code: Some(exit_code),
-            cache_fingerprint: Some(spec.cache_fingerprint.clone()),
-            cacheable: Some(spec.cacheable),
-            mutation: Some(spec.mutation),
-            raw_artifact_handle: entry.raw_artifact_handle.clone(),
-            raw_artifact_available: entry.raw_artifact_handle.is_some(),
-            artifact: None,
-        },
-        exit_code,
-    ))
-}
-
-fn cache_entry_matches(
-    task: &TaskRecord,
-    entry: &HookReducerCacheEntry,
-    spec: &CommandReducerSpec,
-    workspace_fingerprint: Option<&str>,
-) -> bool {
-    if spec.mutation {
-        return false;
-    }
-    if entry.reducer_family != spec.family || entry.canonical_command_kind != spec.canonical_kind {
-        return false;
-    }
-    if workspace_fingerprint.is_some()
-        && entry.workspace_fingerprint.as_deref() != workspace_fingerprint
-    {
-        return false;
-    }
-    if entry.git_epoch != task.hook_git_epoch
-        || entry.fs_epoch != task.hook_fs_epoch
-        || entry.rust_epoch != task.hook_rust_epoch
-    {
-        return false;
-    }
-    if let Some(ttl_secs) =
-        remote_state_cache_ttl_secs(&entry.reducer_family, &entry.canonical_command_kind)
-    {
-        let age = now_unix().saturating_sub(entry.occurred_at_unix);
-        return age <= ttl_secs;
-    }
-    true
-}
-
+#[cfg(test)]
 fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
     fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-}
-
-fn remote_state_cache_ttl_secs(family: &str, kind: &str) -> Option<u64> {
-    match family {
-        "github" => Some(300),
-        "infra"
-            if kind.starts_with("aws_")
-                || kind == "psql_query"
-                || kind.starts_with("docker_")
-                || kind.starts_with("docker_compose_")
-                || kind.starts_with("kubectl_")
-                || kind == "curl_fetch" =>
-        {
-            Some(300)
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn spool_snapshot_preserves_shared_writer_cursor_and_appended_bytes() {
+        use std::io::{Seek, SeekFrom};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log");
+        let mut writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"before").unwrap();
+        writer.seek(SeekFrom::Start(2)).unwrap();
+        let mut reader = writer.try_clone().unwrap();
+        let mut snapshot = Vec::new();
+        read_spool_snapshot(&mut reader, &mut snapshot).unwrap();
+        assert_eq!(snapshot, b"before");
+        assert_eq!(writer.stream_position().unwrap(), 2);
+        writer.seek(SeekFrom::End(0)).unwrap();
+        writer.write_all(b"after").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"beforeafter");
+    }
 
     #[test]
     fn reads_non_utf8_output_lossily() {

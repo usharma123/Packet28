@@ -16,6 +16,8 @@ pub(crate) struct RunSavingsRecord {
     pub(crate) exit_code: i32,
     pub(crate) raw_est_tokens: u64,
     pub(crate) reduced_est_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) estimate_scope: Option<String>,
     pub(crate) savings_percent: f64,
     pub(crate) fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,4 +76,25 @@ pub(crate) fn reset_run_savings(root: &Path) -> Result<usize> {
 
 fn run_savings_path(root: &Path) -> PathBuf {
     root.join(".packet28").join(RUN_SAVINGS_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_run_savings_records_preserve_unknown_estimate_scope() {
+        let record: RunSavingsRecord = serde_json::from_value(serde_json::json!({
+            "command": "cargo test", "cwd": "/fixture", "family": "rust",
+            "canonical_kind": "rust_test", "exit_code": 0, "raw_est_tokens": 20,
+            "reduced_est_tokens": 0, "savings_percent": 100.0,
+            "fallback_reason": null, "timestamp_unix_ms": 1
+        }))
+        .unwrap();
+        assert!(record.estimate_scope.is_none());
+        assert!(serde_json::to_value(record)
+            .unwrap()
+            .get("estimate_scope")
+            .is_none());
+    }
 }
