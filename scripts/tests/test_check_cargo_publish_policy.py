@@ -1,8 +1,12 @@
 import copy
 import importlib.util
+import io
+import os
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -420,6 +424,132 @@ class CargoPublishPolicyTests(unittest.TestCase):
                 mirror_manifest.read_text(encoding="utf-8"),
             )
 
+    def test_inherited_target_directory_cannot_reroute_package_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "source"
+            inherited_target = base / "inherited-target"
+            manifest = (
+                "[package]\n"
+                'name = "private-core"\n'
+                'version = "0.2.63"\n'
+                "publish.workspace = true\n"
+            )
+            files = {
+                Path("Cargo.toml"): '[workspace]\nmembers = ["crates/private-core"]\n',
+                Path("Cargo.lock"): "version = 4\n",
+                Path("crates/private-core/Cargo.toml"): manifest,
+                Path("crates/private-core/src/lib.rs"): "pub fn core() {}\n",
+            }
+            for relative, text in files.items():
+                (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                (root / relative).write_text(text, encoding="utf-8")
+            source_before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            candidate = package("private-core")
+            candidate["manifest_path"] = str(root / "crates/private-core/Cargo.toml")
+            packages = {"private-core": candidate}
+            calls = []
+            recovered = {}
+
+            def fake_cargo(command, *, cwd, env, check):
+                command = tuple(command)
+                calls.append((command, Path(cwd), dict(env)))
+                # Mirror Cargo's precedence: flag, then environment, then default.
+                if "--target-dir" in command:
+                    target = Path(command[command.index("--target-dir") + 1])
+                elif "CARGO_TARGET_DIR" in env:
+                    target = Path(env["CARGO_TARGET_DIR"])
+                else:
+                    target = Path(cwd) / "target"
+                if command[:2] == ("cargo", "package"):
+                    mirror_manifest = Path(cwd) / "crates/private-core/Cargo.toml"
+                    original = mirror_manifest.read_bytes()
+                    archive = target / "package" / "private-core-0.2.63.crate"
+                    archive.parent.mkdir(parents=True)
+                    with tarfile.open(archive, mode="w:gz") as crate:
+                        for name, data in (
+                            ("Cargo.toml", b"# normalized\n"),
+                            ("Cargo.toml.orig", original),
+                            ("src/lib.rs", b"pub fn core() {}\n"),
+                        ):
+                            member = tarfile.TarInfo(f"private-core-0.2.63/{name}")
+                            member.size = len(data)
+                            member.mode = 0o644
+                            crate.addfile(member, io.BytesIO(data))
+                else:
+                    crate_root = Path(cwd) / "crates/private-core"
+                    recovered.update(
+                        manifest=(crate_root / "Cargo.toml").read_text(encoding="utf-8"),
+                        leftover_orig=(crate_root / "Cargo.toml.orig").exists(),
+                    )
+                return mock.Mock(returncode=0)
+
+            policy_module = package_workspace.publish_policy
+            environment = {
+                "CARGO_TARGET_DIR": str(inherited_target),
+                "CARGO_BUILD_TARGET_DIR": str(inherited_target),
+                "CARGO_REGISTRY_TOKEN": "secret",
+                "CARGO_REGISTRIES_CRATES_IO_TOKEN": "secret",
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(policy_module, "load_metadata", return_value={}),
+                mock.patch.object(
+                    policy_module, "load_policy", return_value=policy()
+                ),
+                mock.patch.object(
+                    policy_module, "workspace_packages", return_value=packages
+                ),
+                mock.patch.object(policy_module, "collect_package_files"),
+                mock.patch.object(policy_module, "policy_errors", return_value=[]),
+                mock.patch.object(
+                    package_workspace,
+                    "workspace_inputs",
+                    return_value=sorted(files),
+                ),
+                mock.patch.object(
+                    package_workspace.subprocess, "run", side_effect=fake_cargo
+                ),
+            ):
+                package_workspace.verify_packages(root)
+
+            self.assertEqual([call[0][:2] for call in calls], [
+                ("cargo", "package"),
+                ("cargo", "check"),
+            ])
+            (package_call, mirror, _), (check_call, packaged, _) = calls
+            package_target = Path(package_call[package_call.index("--target-dir") + 1])
+            self.assertEqual(package_target.parent, mirror.parent)
+            self.assertNotEqual(package_target, inherited_target)
+            self.assertEqual(
+                Path(check_call[check_call.index("--target-dir") + 1]),
+                root / "target" / "cargo-package-archive-check",
+            )
+            self.assertEqual(packaged, mirror.parent / "packaged-workspace")
+            self.assertEqual(
+                recovered,
+                {
+                    "manifest": package_workspace.verification_manifest(manifest),
+                    "leftover_orig": False,
+                },
+            )
+            for _command, _cwd, child_environment in calls:
+                for variable in environment:
+                    self.assertNotIn(variable, child_environment)
+            self.assertFalse(inherited_target.exists())
+            self.assertFalse(mirror.parent.exists())
+            self.assertEqual(
+                {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file()
+                },
+                source_before,
+            )
 
 if __name__ == "__main__":
     unittest.main()

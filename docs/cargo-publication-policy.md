@@ -22,6 +22,10 @@ This is an explicit decision, not an inference from missing metadata:
   `--no-verify` only to avoid resolving private internal crates from crates.io.
   It then reconstructs a second workspace exclusively from the generated
   archives and runs a locked, offline, all-target, all-feature `cargo check`.
+  Both Cargo commands receive an explicit `--target-dir`: archives go to a
+  disposable directory beside the mirror, and the packaged-source check uses
+  `target/cargo-package-archive-check` under the source root, so an inherited
+  `CARGO_TARGET_DIR` or Cargo `build.target-dir` cannot reroute either step.
   The guarded source manifests remain non-publishable.
 
 The repository history records a narrower, historical crates.io experiment:
