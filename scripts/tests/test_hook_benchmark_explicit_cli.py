@@ -12,10 +12,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 import benchmark_hook_rewrite as benchmark
-import benchmark_hook_suite as suite
 import test_token_usage as token_usage
-import validate_hook_benchmarks as validator
-from hook_benchmark_thresholds import eligible_for_mean
 sys.path.pop(0)
 
 
@@ -45,11 +42,13 @@ class ExplicitBenchmarkTests(unittest.TestCase):
             self.assertEqual(benchmark.main(), 0)
         return json.loads(output.getvalue()), calls
 
-    def test_all_seven_live_cases_keep_their_corpus_and_execute_explicit_routes(self):
-        cases = suite.default_cases("owner/repo", "12", "34")
-        self.assertEqual([name for name, _ in cases], [
-            "git_status", "fs_head", "rust_test", "gh_pr_list", "gh_pr_view", "gh_run_list", "gh_run_view",
-        ])
+    def test_representative_commands_execute_explicit_routes(self):
+        cases = [
+            ("git_status", ["git", "status"]),
+            ("fs_head", ["head", "-n", "5", "README.md"]),
+            ("cargo_test", ["cargo", "test", "-p", "packet28-reducer-core", "--lib"]),
+            ("gh_pr_view", ["gh", "pr", "view", "12", "--repo", "owner/repo"]),
+        ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             for name, argv in cases:
@@ -93,24 +92,6 @@ class ExplicitBenchmarkTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["status"], "error")
         self.assertFalse(payload["read_window_integrity"]["passed"])
-
-    def test_head_negative_reduction_remains_in_mean_and_requires_integrity(self):
-        head = {
-            "case": "fs_head", "status": "ok", "surface": "live",
-            "raw_est_tokens": 62, "reduced_est_tokens": 65, "token_reduction_pct": -4.8,
-            "raw_exit_code": 0, "reduced_exit_code": 0,
-            "read_window_integrity": {"passed": True, "line_start": 1, "line_end": 5, "raw_line_count": 5},
-        }
-        self.assertTrue(eligible_for_mean(head))
-        summary = suite.build_summary([head], Path("/fixture"), Path("/artifacts"), None, None, None)
-        self.assertEqual(summary["mean_token_reduction_pct"], -4.8)
-        errors, notes = validator.validate(summary)
-        self.assertTrue(any("below required 85.0%" in error for error in errors))
-        self.assertFalse(any("fs_head:" in error for error in errors))
-        self.assertTrue(any("62 raw -> 65 visible tokens (-4.8%) remains" in note for note in notes))
-        head["read_window_integrity"]["passed"] = False
-        errors, _ = validator.validate(summary)
-        self.assertTrue(any("content/window/exit integrity failed" in error for error in errors))
 
     def test_authority_fields_never_become_executable_benchmark_input(self):
         for key in ("updatedInput", "permissionDecision", "decision"):

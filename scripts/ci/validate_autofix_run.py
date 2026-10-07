@@ -12,7 +12,7 @@ from typing import Any
 ALLOWED_WORKFLOWS = frozenset(
     {
         "Build",
-        "Hook Benchmark Suite",
+        "Agent DX Benchmark",
         "Context Anomalies",
         "Experiment Manifest",
         "Handoff Readiness",

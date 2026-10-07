@@ -145,6 +145,11 @@ Evidence belongs in a versioned directory under `benchmarks/` or
 - behavior-parity assertion;
 - accepted/rejected decision and scope.
 
+The [agent DX benchmark](agent-dx-benchmark.md) is the required workflow
+benchmark. It gates correctness, evidence, recovery and authority, and reports
+savings and latency without gating them. Add a hard performance floor only with
+a fixed corpus, repeated source-bound measurements and a stated product reason.
+
 Architectural experiments should be feature-gated until their output parity,
 failure behavior, and performance justify adoption. Historical or external
 measurements remain labeled as such.

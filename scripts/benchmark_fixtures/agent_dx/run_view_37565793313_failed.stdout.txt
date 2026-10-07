@@ -1,0 +1,35 @@
+
+X fix/scope-closure-registry-recovery Hook Benchmark Suite usharma123/Packet28#74 · 37565793313
+Triggered via pull_request about 10 hours ago
+
+JOBS
+X benchmark in 4m24s (ID 112613078067)
+  ✓ Set up job
+  ✓ Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+  ✓ Run dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+  ✓ Install benchmark system dependencies
+  ✓ Cache cargo artifacts
+  ✓ Build benchmark dependencies
+  ✓ Run hook grep regression tests
+  ✓ Run p28 search CLI tests
+  ✓ Run hook benchmark suite
+  ✓ Run native MCP benchmark suite
+  ✓ Run agentic tokenomics benchmark
+  X Validate hook benchmark thresholds
+  - Validate native MCP benchmark thresholds
+  - Publish workflow summary
+  - Upload hook benchmark artifacts
+  - Post Cache cargo artifacts
+  ✓ Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+  ✓ Complete job
+
+ANNOTATIONS
+X Process completed with exit code 1.
+benchmark: .github#43
+
+- "The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748"
+benchmark: .github#1
+
+
+To see what failed, try: gh run view 37565793313 --log-failed
+View this run on GitHub: https://github.com/usharma123/Packet28/actions/runs/37565793313

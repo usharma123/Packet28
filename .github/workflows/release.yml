@@ -39,34 +39,28 @@ jobs:
           echo "$RUNNER_TEMP/cargo-deny-bin" >> "$GITHUB_PATH"
 
       - name: Run tag-aware canonical gate
-        run: scripts/validate_full_gate.sh --release-tag "$GITHUB_REF_NAME"
-
-      - name: Run hook benchmark suite
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/benchmark_hook_suite.py \
-            --root "$GITHUB_WORKSPACE" \
-            --gh-repo "${{ github.repository }}" \
-            --artifact-dir "$GITHUB_WORKSPACE/.packet28/benchmarks/release-hook-suite"
+          set -o pipefail
+          mkdir -p .packet28/benchmarks
+          scripts/validate_full_gate.sh --release-tag "$GITHUB_REF_NAME" 2>&1 \
+            | tee .packet28/benchmarks/release-full-gate.log
 
-      - name: Run native MCP benchmark suite
+      # The canonical gate above built target/debug and ran every delegated
+      # product test; its log is the same-tree receipt for those contracts.
+      - name: Run agent DX benchmark
         run: |
-          python3 scripts/benchmark_native_mcp.py \
-            --root "$GITHUB_WORKSPACE" \
-            --artifact-dir "$GITHUB_WORKSPACE/.packet28/benchmarks/release-native-suite"
+          python3 scripts/benchmark_agent_dx.py \
+            --bin-dir "$GITHUB_WORKSPACE/target/debug" \
+            --product-test-log .packet28/benchmarks/release-full-gate.log \
+            --artifact-dir "$GITHUB_WORKSPACE/.packet28/benchmarks/release-agent-dx"
 
-      - name: Validate hook benchmark thresholds
+      - name: Validate agent DX benchmark
+        if: always()
         run: |
-          python3 scripts/validate_hook_benchmarks.py \
-            "$GITHUB_WORKSPACE/.packet28/benchmarks/release-hook-suite/summary.json" \
-            --markdown-path "$GITHUB_WORKSPACE/.packet28/benchmarks/release-hook-suite/validation.md"
-
-      - name: Validate native MCP benchmark thresholds
-        run: |
-          python3 scripts/validate_native_benchmarks.py \
-            "$GITHUB_WORKSPACE/.packet28/benchmarks/release-native-suite/summary.json" \
-            --markdown-path "$GITHUB_WORKSPACE/.packet28/benchmarks/release-native-suite/validation.md"
+          python3 scripts/validate_agent_dx_benchmark.py \
+            "$GITHUB_WORKSPACE/.packet28/benchmarks/release-agent-dx/summary.json" \
+            --bin-dir "$GITHUB_WORKSPACE/target/debug" \
+            --markdown-path "$GITHUB_WORKSPACE/.packet28/benchmarks/release-agent-dx-validation.md"
 
       - name: Check manifest artifacts are committed
         run: node scripts/check_experiment_manifest_artifacts_tracked.mjs
@@ -92,10 +86,7 @@ jobs:
         if: always()
         run: |
           for file in \
-            .packet28/benchmarks/release-hook-suite/summary.md \
-            .packet28/benchmarks/release-hook-suite/validation.md \
-            .packet28/benchmarks/release-native-suite/summary.md \
-            .packet28/benchmarks/release-native-suite/validation.md; do
+            .packet28/benchmarks/release-agent-dx-validation.md; do
             if [ -f "$file" ]; then
               cat "$file" >> "$GITHUB_STEP_SUMMARY"
               printf '\n' >> "$GITHUB_STEP_SUMMARY"

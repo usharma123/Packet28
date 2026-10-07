@@ -1,0 +1,38 @@
+title:	feat: integrate native Codex lifecycle continuation hooks
+state:	OPEN
+author:	usharma123
+labels:	
+assignees:	
+reviewers:	chatgpt-codex-connector (Commented)
+projects:	
+milestone:	
+number:	71
+url:	https://github.com/usharma123/Packet28/pull/71
+additions:	1532
+deletions:	44
+auto-merge:	disabled
+--
+## Problem and behavior
+
+Codex setup previously wrote MCP and instructions but did not install native lifecycle hooks. `hook codex` also attributed events and fresh session task IDs to Claude. Codex setup now writes project `.codex/hooks.json`, keeps user handlers and unknown events, and replaces only exactly generated Packet28 handlers. Hook files are bounded, reject symlinks, and use an atomic write with a retained directory lease.
+
+Native Codex events now record Codex attribution, retain the original host command and permission policy, and use a separate fresh-session namespace while preserving explicit or active continuation task IDs. Hook execution does not bootstrap the Claude HTTP service. User MCP configuration honors `CODEX_HOME`; doctor checks the Codex user/project registration and all generated lifecycle handlers, exercises the local Codex adapter/MCP handoff, and reports host enablement, trust and execution as unverified. Doctor requires the same exact shell serializer as setup, including correct escaping of literal `$` paths.
+
+Explicit successful Codex hook setup now re-enables Packet28 ingestion using the opt-in behavior already reviewed in #55. Configuration/token initialization alone still preserves a disabled state. The setup integration cases require all seven generated lifecycle events and the correct guarded Codex command/root.
+
+This PR inherits final #70 head `720f4e216932bc096c2aded71f5d7368d16b015a`, including action-critic documentation, bounded GitHub PR previews and explicit benchmark compatibility. Explicit CLI/MCP reduction remains available. Setup still uses the existing generic hook-service bootstrap; this change does not claim that Codex setup starts no HTTP service.
+
+## Validation
+
+- Fresh baseline regression with a valid Git fixture: doctor lacks the Codex hook/trust checks; the final source passes.
+- Nine source-bound integration tests passed, including both host-envelope restart contracts, repeated original commands/environment, and Codex doctor attribution/trust behavior.
+- 58 nonzero focused library unit tests passed; the affected identity test passed again after a test-only Clippy cleanup.
+- Canonical `scripts/check_rust_hazards.py`, formatting, architecture, direct dependency, harness and generated README checks passed.
+- Earlier source-bound native receipt: real installed Codex 0.160.1, source-bound Packet28/packet28d and generated MCP entry using a temporary source CLI shim: two original commands ran with the environment intact; two Codex PostToolUse events were captured; native `exec resume` received the latest handoff after completed daemon stop; only the current hypothesis survived; the stored handoff artifact remained readable; and the original `cat` prefix deny rule rejected the command with the execution count unchanged. A stored legacy rewrite flag remained byte-for-byte unchanged and inactive.
+- Two actual baseline disabled-ingest assertion failures reproduced uninstall/reinstall and existing-hook reactivation; corrected source passes both generated-handler cases. Each executes the generated PostToolUse handler, verifies persisted task/session state and the exact Codex payload, preserves runtime config/preferences, and proves daemon instance authority release before fixture deletion.
+- The setup integration suite passed 3/3 and setup library suite 29/29; final focused/static validation passed at `7666eabd`, which contains atomic fixes `2788886e` and `7666eabd`. The initial test-only `cargo_test` versus canonical `rust_test` mismatch is retained separately and excluded from passing receipts.
+- The invalid TOML refusal fixture now explicitly binds `CODEX_HOME` to its temporary `HOME`; both invalid-config cases and canonical/static checks pass at `e3cbc26a`. Refusal-message and exact-byte assertions are unchanged. The earlier combined gate failure from the mismatched fixture directories is retained.
+- Earlier source-bound native Claude Code continuation/permission evidence is documented in #70. Both native-host fixtures used isolated temporary homes, synthetic credentials and deterministic localhost providers, not live model providers.
+
+The native fixture waited for daemon instance authority release after stop acknowledgement. It does not claim the pre-existing immediate stop/start timing limitation is repaired. Initial fixture failures from a missing Git HEAD and an installed older MCP wrapper were retained and excluded from passing source-bound receipts. Latest exact-head canonical and Rust 1.88 MSRV checks remain pending at `e3cbc26a43689b8a36baad34cc61e173a0c3ccbf`. Final combined linked-corruption/native validation also remains pending.
+

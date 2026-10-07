@@ -1,0 +1,2 @@
+# Frozen command output: keep exact bytes so manifest hashes and measurements are stable.
+*.txt -text -whitespace

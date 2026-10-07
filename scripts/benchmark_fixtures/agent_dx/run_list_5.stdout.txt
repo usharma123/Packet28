@@ -1,0 +1,5 @@
+completed	skipped	Codex Autofix	Codex Autofix	main	workflow_run	37567442957	1s	2026-10-07T03:35:19Z
+completed	skipped	Codex Autofix	Codex Autofix	main	workflow_run	37566141622	1s	2026-10-07T03:18:34Z
+completed	skipped	Codex Autofix	Codex Autofix	main	workflow_run	37565929536	1s	2026-10-07T03:15:46Z
+completed	success	fix(storage): recover registry checkpoints from authenticated evidence	Build	fix/scope-closure-registry-recovery	pull_request	37565793390	21m12s	2026-10-07T03:14:05Z
+completed	failure	fix(storage): recover registry checkpoints from authenticated evidence	Hook Benchmark Suite	fix/scope-closure-registry-recovery	pull_request	37565793313	4m27s	2026-10-07T03:14:05Z

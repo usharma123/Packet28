@@ -1,0 +1,26 @@
+title:	fix(storage): recover registry checkpoints from authenticated evidence
+state:	OPEN
+author:	usharma123 (Utsav Sharma )
+labels:	
+assignees:	
+reviewers:	
+projects:	
+milestone:	
+number:	74
+url:	https://github.com/usharma123/Packet28/pull/74
+additions:	3139
+deletions:	75
+auto-merge:	disabled
+--
+A whitespace or ordering edit could leave valid registry JSON that no longer matched the committed checkpoint, with no supported recovery command. Offline registry repair now accepts only a reconstruction matching authenticated checkpoint authority, preserves original authority files in a durable archive, and resumes interrupted repair through a dedicated intent journal.
+
+Substantive edits without a matching recovery source fail closed. Repair preserves WAL authority and unknown fields. It does not adopt edited state or blindly restore an old journal base. This is the separately requested registry recovery portion of issue #54; it does not close that issue by itself.
+
+Validation:
+
+- Repair unit, CLI, startup, checkpoint and storage regressions passed, including refusal when an archived original is missing. The parent independently repeated that failure case and verified that edited canonical bytes and the repair journal remain unchanged.
+- Strict checks and Rust 1.88 passed on the repair implementation. The combined remediation tree passed the canonical full and MSRV gates.
+- This delivery tip preserves the reviewed production code. Its only changes after the reviewed repair commits are the fixture displacement correction and generated README statistics. Repository policy checks pass on this tip; hosted checks verify the published head.
+
+Stacked above #72. Merge after the existing stack, using a merge commit to preserve reviewed ancestry. No release or production-store repair is included.
+

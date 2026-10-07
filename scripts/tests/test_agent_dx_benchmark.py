@@ -1,0 +1,354 @@
+"""Negative controls for the agent-DX benchmark contract, checkers and validator.
+
+These prove that broken semantics, missing cases, skipped checks, tampered
+evidence and stale product-test receipts fail. They need no Packet28 binary;
+the workflow run itself exercises the real binaries.
+"""
+
+import copy
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import unittest
+
+SCRIPTS = Path(__file__).resolve().parents[1]
+REPO = SCRIPTS.parent
+sys.path.insert(0, str(SCRIPTS))
+import agent_dx_contract as contract
+import agent_dx_reduction as reduction
+import benchmark_agent_dx as runner
+import validate_agent_dx_benchmark as validator
+sys.path.pop(0)
+
+# Visible output of the real renderer at source 6d92eb0f for two frozen cases.
+GOOD_PR_VIEW = (
+    "gh pr view: PR #71 OPEN by usharma123 - feat: integrate native Codex lifecycle continuation hooks\n"
+    "url: https://github.com/usharma123/Packet28/pull/71\n## Problem and behavior\n\nCodex setup previously "
+    "wrote MCP and instructions but did not install native lifecycle hooks. `hook codex` also attributed events "
+    "and fresh session task IDs to Claude. Codex setup now writes project `.codex/hooks.json`, keeps user handlers "
+    "and unknown events, and replaces only exactly generated\n"
+    "[content omitted; use original gh command for full output]\n"
+)
+GOOD_CARGO = (
+    "cargo test reported 37 passed and 1 failed\nFAIL tests::discount_rounds_to_nearest_cent\n\n"
+    "thread 'tests::discount_rounds_to_nearest_cent' (18967413) panicked at src/lib.rs:233:9:\n"
+    "assertion `left == right` failed: 15% off 999 cents\nleft: 850\nright: 849\n"
+)
+
+
+def case(name):
+    return next(c for c in reduction.load_manifest()["cases"] if c["case"] == name)
+
+
+def streams_for(name, reduced_stdout, reduced_stderr=b""):
+    raw_stdout, raw_stderr, errors = reduction.read_fixture_inputs(case(name))
+    assert not errors, errors
+    return {"raw_stdout": raw_stdout, "raw_stderr": raw_stderr,
+            "reduced_stdout": reduced_stdout, "reduced_stderr": reduced_stderr}
+
+
+class FixtureManifestTests(unittest.TestCase):
+    def test_every_fixture_matches_its_hash_and_declares_provenance(self):
+        manifest = reduction.load_manifest()
+        names = [c["case"] for c in manifest["cases"]]
+        self.assertEqual(len(names), len(set(names)))
+        for item in manifest["cases"]:
+            with self.subTest(case=item["case"]):
+                _, _, errors = reduction.read_fixture_inputs(item)
+                self.assertEqual(errors, [])
+                self.assertIn(item["role"], {"verbose", "correctness"})
+                self.assertIn(item["provenance"]["kind"], {"captured", "reconstruction", "synthetic"})
+
+    def test_all_four_github_command_shapes_are_required(self):
+        contracts = {c["contract"] for c in reduction.load_manifest()["cases"]}
+        self.assertTrue({"gh_pr_view", "gh_pr_list", "gh_run_list", "gh_run_view", "cargo_test"} <= contracts)
+
+    def test_altered_fixture_bytes_fail(self):
+        altered = dict(case("gh_pr_list_5"), stdout_sha256="0" * 64)
+        _, _, errors = reduction.read_fixture_inputs(altered)
+        self.assertTrue(any("differ from the manifest" in e for e in errors))
+
+
+class ReductionContractTests(unittest.TestCase):
+    def errors(self, name, reduced_stdout, reduced_stderr=b"", exit_code=None):
+        item = case(name)
+        exit_code = item["exit_code"] if exit_code is None else exit_code
+        errors, _, _ = reduction.reduction_errors(item, streams_for(name, reduced_stdout, reduced_stderr), exit_code)
+        return errors
+
+    def test_real_renderings_hold(self):
+        self.assertEqual(self.errors("gh_pr_view_long_description", GOOD_PR_VIEW.encode()), [])
+        self.assertEqual(self.errors("cargo_test_one_failure", GOOD_CARGO.encode()), [])
+
+    def test_pr_view_broken_semantics_fail(self):
+        lines = GOOD_PR_VIEW.splitlines(keepends=True)
+        mutations = {
+            "summary only": lines[0],
+            "missing URL": "".join(lines[:1] + lines[2:]),
+            "missing notice": "".join(lines[:-1]),
+            "expanded body": "".join(lines[:-1]) + "x" * 400 + "\n" + lines[-1],
+            "rewritten body": GOOD_PR_VIEW.replace("Codex setup previously", "Codex setup formerly"),
+        }
+        for label, text in mutations.items():
+            with self.subTest(label):
+                self.assertNotEqual(self.errors("gh_pr_view_long_description", text.encode()), [])
+
+    def test_passthrough_and_exit_or_stderr_changes_fail(self):
+        raw = streams_for("gh_pr_view_long_description", b"")["raw_stdout"]
+        self.assertTrue(any("not reduced" in e for e in self.errors("gh_pr_view_long_description", raw)))
+        self.assertTrue(any("exit" in e for e in self.errors("gh_pr_view_long_description", GOOD_PR_VIEW.encode(), exit_code=0 + 1)))
+        self.assertNotEqual(self.errors("gh_pr_view_long_description", GOOD_PR_VIEW.encode(), b"warning\n"), [])
+
+    def test_failed_read_must_keep_everything_and_its_exit(self):
+        raw = streams_for("gh_pr_view_failed_exit7", b"")
+        kept = raw["raw_stdout"] + raw["raw_stderr"]
+        self.assertEqual(self.errors("gh_pr_view_failed_exit7", b"gh pr view failed\n" + kept), [])
+        self.assertNotEqual(self.errors("gh_pr_view_failed_exit7", b"gh pr view failed\n" + kept[:-40]), [])
+        self.assertNotEqual(self.errors("gh_pr_view_failed_exit7", b"gh pr view failed\n" + kept, exit_code=0), [])
+
+    def test_cargo_failure_facts_and_noise_are_checked(self):
+        mutations = {
+            "wrong counts": GOOD_CARGO.replace("37 passed", "38 passed"),
+            "missing failing test": GOOD_CARGO.replace("FAIL tests::discount_rounds_to_nearest_cent\n", ""),
+            "missing panic location": GOOD_CARGO.replace("panicked at src/lib.rs:233:9", "panicked"),
+            "passing noise kept": GOOD_CARGO + "test tests::total_of_01_items_matches_sum ... ok\n",
+        }
+        for label, text in mutations.items():
+            with self.subTest(label):
+                self.assertNotEqual(self.errors("cargo_test_one_failure", text.encode()), [])
+
+    def test_run_view_counts_are_derived_from_raw_not_the_reducer(self):
+        bad = ("gh run view: fix/scope-closure-registry-recovery Hook Benchmark Suite usharma123/Packet28#74 "
+               "(19 jobs, 6 annotations)\nX benchmark in 4m24s (ID 112613078067)\nX Validate hook benchmark thresholds\n"
+               "Process completed with exit code 1.\n")
+        errors = self.errors("gh_run_view_failed_benchmark_run", bad.encode())
+        self.assertTrue(any("(1 job, 2 annotations)" in e for e in errors), errors)
+        good = bad.replace("(19 jobs, 6 annotations)", "(1 job, 2 annotations)")
+        self.assertEqual(self.errors("gh_run_view_failed_benchmark_run", good.encode()), [])
+        self.assertNotEqual(self.errors("gh_run_view_failed_benchmark_run",
+                                        good.replace("X Validate hook benchmark thresholds\n", "").encode()), [])
+        self.assertEqual(self.errors("gh_run_view_failed_benchmark_run",
+                                     good.replace("Process completed with exit code 1.\n", "").encode()), [])
+
+    def test_declared_facts_must_come_from_raw_input(self):
+        item = dict(case("pytest_one_failure"), facts=["invented fact"])
+        errors, _, _ = reduction.reduction_errors(item, streams_for("pytest_one_failure", b"invented fact\n"), 1)
+        self.assertTrue(any("does not occur in the raw input" in e for e in errors))
+
+    def test_short_inputs_may_expand_but_verbose_inputs_may_not(self):
+        raw = streams_for("ruff_two_errors", b"")
+        expanded = b"[FAIL] ruff check src\n" + raw["raw_stdout"]
+        self.assertEqual(self.errors("ruff_two_errors", expanded), [])
+
+
+class HookAuthorityTests(unittest.TestCase):
+    def test_nested_authority_fields_are_found(self):
+        self.assertEqual(runner._authority_keys({"hookSpecificOutput": {"updatedInput": {"command": "x"}}}), ["updatedInput"])
+        self.assertEqual(runner._authority_keys([{"permissionDecision": "allow"}]), ["permissionDecision"])
+        self.assertEqual(runner._authority_keys({"hookSpecificOutput": {"hookEventName": "PreToolUse"}}), [])
+
+
+def write(artifact, rel, data, hashes):
+    path = artifact / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    hashes[rel] = hashlib.sha256(data).hexdigest()
+    return {"path": rel, "bytes": len(data), "sha256": hashes[rel]}
+
+
+def product_log(skip=None, outcome="ok"):
+    lines = []
+    for spec in contract.DELEGATED.values():
+        for test in spec["tests"]:
+            path, _, name = test.partition("::")
+            if "/tests/" in path:
+                lines.append(f"     Running {path} (target/debug/deps/x)")
+                full = name
+            else:
+                lines.append("     Running unittests src/lib.rs (target/debug/deps/x)")
+                full = f"{Path(path).stem}::tests::{name}"
+            if test != skip:
+                lines.append(f"test {full} ... {outcome}")
+    return ("\n".join(lines) + "\n").encode()
+
+
+class ValidatorTests(unittest.TestCase):
+    """Builds a minimal artifact that satisfies the contract, then breaks it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.artifact = self.tmp / "artifact"
+        hashes = {}
+        runtime = {path: validator.git_tree_entry(REPO, "HEAD", path) for path in validator.RUNTIME_PATHS}
+        tree = validator.subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=REPO, capture_output=True, text=True).stdout.strip()
+        invocation = {"label": "x", "argv": ["Packet28", "--version"], "exit_code": 0,
+                      "stdout": write(self.artifact, "cli/x.stdout", b"Packet28\n", hashes),
+                      "stderr": write(self.artifact, "cli/x.stderr", b"", hashes)}
+        cases = []
+        for item in reduction.load_manifest()["cases"]:
+            raw_stdout, raw_stderr, _ = reduction.read_fixture_inputs(item)
+            if item["case"] == "gh_pr_view_long_description":
+                visible = GOOD_PR_VIEW.encode()
+            elif item["case"] == "cargo_test_one_failure":
+                visible = GOOD_CARGO.encode()
+            else:
+                visible = None
+            streams = {"raw_stdout": raw_stdout, "raw_stderr": raw_stderr,
+                       "reduced_stdout": visible if visible is not None else raw_stdout,
+                       "reduced_stderr": b"" if visible is not None else raw_stderr}
+            record = {label: write(self.artifact, f"reduction/{item['case']}.{label}", data, hashes) for label, data in streams.items()}
+            _, _, measured = reduction.reduction_errors(item, streams, item["exit_code"])
+            cases.append({"case": item["case"], "stub_invocations": [item["argv"][1:]], "reduced_exit_code": item["exit_code"],
+                          "streams": record, **measured})
+        self.focus = {"gh_pr_view_long_description", "cargo_test_one_failure"}
+        self.manifest_cases = reduction.load_manifest()["cases"]
+        log = write(self.artifact, "inputs/product-tests.log", product_log(), hashes)
+        write(self.artifact, "invocations.json", json.dumps([invocation]).encode(), hashes)
+        self.summary = {
+            "schema": "packet28.agent_dx_benchmark.v1", "contract_version": contract.SCHEMA_VERSION,
+            "source": {"commit": "HEAD", "tree": tree, "runtime_trees": runtime, "dirty": False},
+            "binaries": [{"name": "Packet28", "sha256": "a" * 64}, {"name": "packet28d", "sha256": "b" * 64}],
+            "scenarios": [{"id": sid, "checks": [{"id": cid, "passed": True, "detail": "ok", "evidence": []}
+                                                  for cid in spec["checks"]]} for sid, spec in contract.MEASURED.items()],
+            "reduction_cases": cases,
+            "product_tests": {"log": log, "source_tree": tree},
+            "evidence_sha256": hashes,
+        }
+
+    def failures(self, summary=None):
+        return validator.validate(summary or self.summary, self.artifact, REPO).failures
+
+    def only_focus(self, failures):
+        return [f for f in failures if not any(f"explicit_cli_reduction/{c['case']}" in f
+                                               for c in self.manifest_cases if c["case"] not in self.focus)]
+
+    def test_complete_artifact_passes_for_the_real_renderings(self):
+        self.assertEqual(self.only_focus(self.failures()), [])
+
+    def test_missing_scenario_skipped_check_and_failed_check_fail(self):
+        summary = copy.deepcopy(self.summary)
+        summary["scenarios"] = [s for s in summary["scenarios"] if s["id"] != "native_retrieval"]
+        self.assertTrue(any("native_retrieval" in f and "missing" in f for f in self.failures(summary)))
+        summary = copy.deepcopy(self.summary)
+        summary["scenarios"][0]["checks"].pop()
+        self.assertTrue(any("missing or was skipped" in f for f in self.failures(summary)))
+        summary = copy.deepcopy(self.summary)
+        summary["scenarios"][0]["checks"] = []
+        self.assertTrue(any("missing or was skipped" in f for f in self.failures(summary)))
+        summary = copy.deepcopy(self.summary)
+        summary["scenarios"][-1]["checks"][0]["passed"] = False
+        self.assertTrue(any("cleanup/" in f for f in self.failures(summary)))
+
+    def test_missing_reduction_case_fails(self):
+        summary = copy.deepcopy(self.summary)
+        summary["reduction_cases"] = [c for c in summary["reduction_cases"] if c["case"] != "gh_pr_view_long_description"]
+        self.assertTrue(any("gh_pr_view_long_description" in f and "missing" in f for f in self.failures(summary)))
+
+    def test_tampered_or_deleted_stream_fails(self):
+        target = self.artifact / "reduction/cargo_test_one_failure.reduced_stdout"
+        target.write_bytes(b"cargo test reported 37 passed and 1 failed\n")
+        self.assertTrue(any("cargo_test_one_failure" in f for f in self.failures()))
+        target.unlink()
+        self.assertTrue(any("missing or altered" in f for f in self.failures()))
+
+    def test_stream_must_match_its_own_record_even_if_the_ledger_was_updated(self):
+        summary = copy.deepcopy(self.summary)
+        rel = "reduction/cargo_test_one_failure.reduced_stdout"
+        data = GOOD_CARGO.replace("left: 850", "left:  850").encode()
+        (self.artifact / rel).write_bytes(data)
+        summary["evidence_sha256"][rel] = hashlib.sha256(data).hexdigest()
+        failures = self.failures(summary)
+        self.assertTrue(any("cargo_test_one_failure" in f and "missing or altered" in f for f in failures), failures)
+
+    def test_summary_only_stream_with_updated_hash_still_fails_semantics(self):
+        summary = copy.deepcopy(self.summary)
+        rel = "reduction/gh_pr_view_long_description.reduced_stdout"
+        data = GOOD_PR_VIEW.splitlines(keepends=True)[0].encode()
+        (self.artifact / rel).write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        summary["evidence_sha256"][rel] = digest
+        entry = next(c for c in summary["reduction_cases"] if c["case"] == "gh_pr_view_long_description")
+        entry["streams"]["reduced_stdout"]["sha256"] = digest
+        failures = self.failures(summary)
+        self.assertTrue(any("URL line" in f for f in failures), failures)
+        self.assertTrue(any("reported measurements" in f for f in failures))
+
+    def test_passthrough_of_a_verbose_case_fails(self):
+        self.assertTrue(any("gh_pr_list_5" in f and "not reduced" in f for f in self.failures()))
+
+    def test_stub_not_invoked_fails(self):
+        summary = copy.deepcopy(self.summary)
+        next(c for c in summary["reduction_cases"] if c["case"] == "cargo_test_one_failure")["stub_invocations"] = []
+        self.assertTrue(any("exactly once" in f for f in self.failures(summary)))
+
+    def test_product_test_receipt_controls(self):
+        summary = copy.deepcopy(self.summary)
+        summary.pop("product_tests")
+        self.assertTrue(any("no product test log" in f for f in self.failures(summary)))
+        first = next(iter(contract.DELEGATED.values()))["tests"][0]
+        for data, expected in ((product_log(skip=first), "did not run"), (product_log(outcome="FAILED"), "FAILED")):
+            (self.artifact / "inputs/product-tests.log").write_bytes(data)
+            summary = copy.deepcopy(self.summary)
+            summary["product_tests"]["log"]["sha256"] = summary["evidence_sha256"]["inputs/product-tests.log"] = hashlib.sha256(data).hexdigest()
+            self.assertTrue(any(expected in f for f in self.failures(summary)), expected)
+        summary = copy.deepcopy(self.summary)
+        summary["product_tests"]["source_tree"] = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # the empty tree
+        self.assertTrue(any("differs in" in f for f in self.failures(summary)))
+
+    def test_renamed_delegated_test_fails(self):
+        root = self.tmp / "root"
+        for test in (t for spec in contract.DELEGATED.values() for t in spec["tests"]):
+            source = Path(test.partition("::")[0])
+            (root / source).parent.mkdir(parents=True, exist_ok=True)
+            if not (root / source).exists():
+                shutil.copy(REPO / source, root / source)
+        renamed = root / "crates/packet28d/tests/status_pagination.rs"
+        renamed.write_text(renamed.read_text().replace("fn seeded_five_thousand_task_daemon", "fn renamed_daemon"))
+        report = validator.Report(self.artifact)
+        validator.check_delegated(self.summary, report, root)
+        self.assertTrue(any("no longer exists" in f for f in report.failures))
+
+    def test_dirty_source_and_wrong_schema_fail(self):
+        summary = copy.deepcopy(self.summary)
+        summary["source"]["dirty_paths"] = ["JavaTest/mapy-cache-v1.bin"]
+        self.assertFalse(any("unmodified runtime" in f for f in self.failures(summary)))
+        summary["source"]["dirty_paths"] = ["crates/packet28d/src/main.rs"]
+        self.assertTrue(any("unmodified runtime" in f for f in self.failures(summary)))
+        self.assertTrue(self.failures(dict(self.summary, schema="old")))
+
+    def test_failure_lines_name_contract_and_evidence(self):
+        summary = copy.deepcopy(self.summary)
+        summary["scenarios"][3]["checks"][0].update(passed=False, detail="boom", evidence=["scenarios/x.wire"])
+        line = next(f for f in self.failures(summary) if "boom" in f)
+        self.assertIn(contract.MEASURED[summary["scenarios"][3]["id"]]["checks"][summary["scenarios"][3]["checks"][0]["id"]], line)
+        self.assertIn(str(self.artifact / "scenarios/x.wire"), line)
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_benchmark_workflow_always_validates_and_uploads(self):
+        text = (REPO / ".github/workflows/agent-dx-benchmark.yml").read_text()
+        self.assertIn("scripts/benchmark_agent_dx.py", text)
+        self.assertIn("scripts/validate_agent_dx_benchmark.py", text)
+        for step in ("Validate agent DX benchmark", "Publish workflow summary", "Upload agent DX benchmark artifacts"):
+            block = text.split(f"name: {step}", 1)[1].split("- name:", 1)[0]
+            self.assertIn("if: always()", block, step)
+        self.assertNotIn("cargo run", text)
+
+    def test_retired_percentage_gates_are_gone(self):
+        for name in ("benchmark_hook_suite.py", "validate_hook_benchmarks.py", "hook_benchmark_thresholds.py",
+                     "validate_native_benchmarks.py", "benchmark_native_mcp.py"):
+            self.assertFalse((SCRIPTS / name).exists(), name)
+        for workflow in (REPO / ".github/workflows").glob("*.yml"):
+            text = workflow.read_text()
+            self.assertNotIn("validate_hook_benchmarks", text, workflow.name)
+            self.assertNotIn("Hook Benchmark Suite", text, workflow.name)
+        release = (REPO / ".github/workflows/release.yml").read_text()
+        self.assertIn("scripts/validate_agent_dx_benchmark.py", release)
+
+
+if __name__ == "__main__":
+    unittest.main()
