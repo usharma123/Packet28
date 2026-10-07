@@ -1675,13 +1675,22 @@ fn run_writer_observing_lock_descriptors<T: Send + 'static>(
 ) -> ObservedWriter<T> {
     let (opened_tx, opened_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
+        // The process-wide write mutex can queue this fixture behind other
+        // tests before its lock deadline exists. Measure from the first lock
+        // observation, without resetting the clock when a detached lock is reopened.
+        let started = std::rc::Rc::new(std::cell::OnceCell::new());
+        let hook_started = std::rc::Rc::clone(&started);
         set_clear_state_lock_wait_hook_for_test(Some(Box::new(move |file: &fs::File| {
+            hook_started.get_or_init(Instant::now);
             let _ = opened_tx.send(file_identity(file));
         })));
-        let started = Instant::now();
         let result = writer();
         set_clear_state_lock_wait_hook_for_test(None);
-        (result, started.elapsed())
+        let elapsed = started
+            .get()
+            .expect("writer did not attempt a lock")
+            .elapsed();
+        (result, elapsed)
     });
     (opened_rx, handle)
 }
@@ -1695,6 +1704,47 @@ fn drain_last_identity(
         last = identity;
     }
     last
+}
+
+/// Three writers start together but serialize on the process-wide write
+/// mutex. Each lock attempt gets its own one-second deadline; time queued
+/// behind the other fixtures must not be charged to that attempt.
+#[cfg(unix)]
+#[test]
+fn clear_state_writer_deadline_measurement_excludes_other_writers() {
+    let start = Arc::new(Barrier::new(4));
+    let mut writers = Vec::new();
+    for _ in 0..3 {
+        let state = daemon_test_state();
+        let root = daemon_test_root(&state);
+        fs::create_dir_all(index_dir(&root)).expect("create index dir");
+        let held = hold_exclusive_lock(&clear_state_lock_path(&root));
+        let (opened, writer) = run_writer_observing_lock_descriptors({
+            let root = root.clone();
+            let start = start.clone();
+            move || {
+                start.wait();
+                persist_index_clear_pending(&root)
+            }
+        });
+        writers.push((state, root, held, opened, writer));
+    }
+    start.wait();
+    for (_state, root, held, opened, writer) in writers {
+        let (result, elapsed) = writer.join().expect("join contending writer");
+        let error = result.expect_err("writer acquired a held fixture lock");
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(opened.recv().expect("opened lock"), file_identity(&held));
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(3),
+            "lock deadline measurement included time queued behind other writers: {elapsed:?}"
+        );
+        fs2::FileExt::unlock(&held).expect("release fixture lock");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
 }
 
 /// Reproduces the reviewed serialization bypass: writer A opens the current
