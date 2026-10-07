@@ -246,3 +246,47 @@ fn test_system_pr_view_bounds_success_and_preserves_failed_output_and_exit() {
     }
     assert_eq!(fs::read_to_string(count).unwrap(), "run\nrun\n");
 }
+
+#[test]
+#[cfg(unix)]
+fn test_gh_run_view_counts_jobs_and_annotations_from_real_output() {
+    let root = TempDir::new().unwrap();
+    let bin_dir = root.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../packet28-reducer-core/tests/fixtures/github/run_view_37565793313.stdout");
+    write_executable_script(
+        &bin_dir.join("gh"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = run ] && [ \"$2\" = view ]; then cat '{}'; exit 0; fi\nexit 2\n",
+            fixture.display()
+        ),
+    );
+    let path_env = std::env::join_paths(std::iter::once(bin_dir.as_path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+
+    suite_cmd()
+        .current_dir(root.path())
+        .env("PATH", &path_env)
+        .args([
+            "gh",
+            "run",
+            "view",
+            "37565793313",
+            "--repo",
+            "usharma123/Packet28",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Hook Benchmark Suite usharma123/Packet28#74 (1 job, 2 annotations)",
+        ))
+        .stdout(predicate::str::contains(
+            "X benchmark in 4m24s (ID 112613078067)\n  ✓ Set up job\n",
+        ))
+        .stdout(predicate::str::contains(
+            "  X Validate hook benchmark thresholds",
+        ));
+}

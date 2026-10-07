@@ -81,7 +81,7 @@ pub fn reduce_github_command(
                 .map(|line| format!("gh issue view: {line}"))
                 .unwrap_or_else(|| "gh issue view completed".to_string()),
             "gh_run_list" => summarize_list_entries("gh run list", &lines, "run"),
-            "gh_run_view" => summarize_run_view(&lines),
+            "gh_run_view" => summarize_run_view(&lines, stdout),
             "gh_release_list" => summarize_list_entries("gh release list", &lines, "release"),
             "gh_api" => summarize_api(stdout),
             "glab_mr_list" => summarize_list_entries("glab mr list", &lines, "MR"),
@@ -104,7 +104,7 @@ pub fn reduce_github_command(
             "gh_pr_view" if failed => format!("{stdout}{stderr}"),
             "gh_pr_view" => compact_pr_view_preview(stdout),
             "gh_pr_checks" => compact_pr_checks_preview(&lines),
-            "gh_run_view" => compact_run_view_preview(&lines),
+            "gh_run_view" => compact_run_view_preview(stdout),
             "gh_pr_diff" | "glab_mr_diff" => crate::git::compact_diff_public(stdout, 500),
             _ => String::new(),
         },
@@ -181,7 +181,7 @@ fn summarize_pr_view(lines: &[String]) -> String {
     }
 }
 
-fn summarize_run_view(lines: &[String]) -> String {
+fn summarize_run_view(lines: &[String], stdout: &str) -> String {
     let title = lines
         .first()
         .and_then(|line| line.strip_prefix('✓').or_else(|| line.strip_prefix('X')))
@@ -190,19 +190,100 @@ fn summarize_run_view(lines: &[String]) -> String {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned);
-    let jobs = extract_section_count(lines, "JOBS");
-    let annotations = extract_section_count(lines, "ANNOTATIONS");
-    match title {
-        Some(title) => format!(
-            "gh run view: {title} ({jobs} job{}, {annotations} annotation{})",
-            if jobs == 1 { "" } else { "s" },
+    let raw_lines = stdout.lines().map(str::trim_end).collect::<Vec<_>>();
+    // Counts come from the untrimmed output: step lines are only
+    // distinguishable from jobs by their indentation. A section that does not
+    // match gh's layout yields no count rather than a wrong one.
+    let jobs = count_run_view_jobs(&raw_lines);
+    let annotations = if jobs.is_some() {
+        count_run_view_annotations(&raw_lines)
+    } else {
+        None
+    };
+    let mut counts = Vec::new();
+    if let Some(jobs) = jobs {
+        counts.push(format!("{jobs} job{}", if jobs == 1 { "" } else { "s" }));
+    }
+    if let Some(annotations) = annotations {
+        counts.push(format!(
+            "{annotations} annotation{}",
             if annotations == 1 { "" } else { "s" }
-        ),
+        ));
+    }
+    match title {
+        Some(title) if counts.is_empty() => format!("gh run view: {title}"),
+        Some(title) => format!("gh run view: {title} ({})", counts.join(", ")),
         None => lines
             .first()
             .map(|line| format!("gh run view: {line}"))
             .unwrap_or_else(|| "gh run view completed".to_string()),
     }
+}
+
+/// Counts `<symbol> <name>[ in <elapsed>] (ID <id>)` lines in the JOBS
+/// section, skipping their two-space-indented step lines.
+fn count_run_view_jobs(lines: &[&str]) -> Option<usize> {
+    let start = lines.iter().position(|line| *line == "JOBS")? + 1;
+    let mut jobs = 0;
+    for line in lines[start..].iter().take_while(|line| !line.is_empty()) {
+        if line.starts_with("  ") && jobs > 0 {
+            continue;
+        }
+        if !is_run_view_job_line(line) {
+            return None;
+        }
+        jobs += 1;
+    }
+    Some(jobs)
+}
+
+fn is_run_view_job_line(line: &str) -> bool {
+    let Some((symbol, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    let id = rest
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" (ID "))
+        .map(|(_, id)| id);
+    !symbol.is_empty()
+        && !symbol.starts_with(char::is_whitespace)
+        && id.is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Counts annotations in gh's `<symbol> <message>` / `<job>: <path>#<line>`
+/// blocks. Messages may span lines, so a block ends only at a location line
+/// followed by a blank line; the section ends at the next blank line.
+fn count_run_view_annotations(lines: &[&str]) -> Option<usize> {
+    let Some(heading) = lines.iter().position(|line| *line == "ANNOTATIONS") else {
+        // gh omits the heading when the run has no annotations.
+        return Some(0);
+    };
+    let mut annotations = 0;
+    let mut index = heading + 1;
+    while lines.get(index).is_some_and(|line| !line.is_empty()) {
+        let first = lines[index];
+        if !matches!(
+            first.split_once(' ').map(|(symbol, _)| symbol),
+            Some("X" | "!" | "-")
+        ) {
+            return None;
+        }
+        let end = (index + 1..lines.len()).find(|&candidate| {
+            is_run_view_annotation_location(lines[candidate])
+                && lines.get(candidate + 1).is_none_or(|next| next.is_empty())
+        })?;
+        annotations += 1;
+        index = end + 2;
+    }
+    Some(annotations)
+}
+
+fn is_run_view_annotation_location(line: &str) -> bool {
+    line.rsplit_once('#').is_some_and(|(location, number)| {
+        location.contains(": ")
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn summarize_list_entries(label: &str, lines: &[String], noun: &str) -> String {
@@ -319,33 +400,6 @@ fn extract_tab_field(lines: &[String], key: &str) -> Option<String> {
         .iter()
         .find_map(|line| line.strip_prefix(&prefix))
         .map(ToOwned::to_owned)
-}
-
-fn extract_section_count(lines: &[String], heading: &str) -> usize {
-    let mut in_section = false;
-    let mut count = 0;
-    for line in lines {
-        if line == heading {
-            in_section = true;
-            continue;
-        }
-        if in_section {
-            if line.trim().is_empty() {
-                if count > 0 {
-                    break;
-                }
-                continue;
-            }
-            if line
-                .chars()
-                .all(|ch| ch.is_ascii_uppercase() || ch == ' ' || ch == '_')
-            {
-                break;
-            }
-            count += 1;
-        }
-    }
-    count
 }
 
 fn compact_pr_view_preview(stdout: &str) -> String {
@@ -467,10 +521,10 @@ fn summarize_glab_ci_status(lines: &[String]) -> String {
     format!("glab ci status: {first}")
 }
 
-fn compact_run_view_preview(lines: &[String]) -> String {
+fn compact_run_view_preview(stdout: &str) -> String {
     let mut result = Vec::new();
     let mut in_jobs = false;
-    for line in lines {
+    for line in stdout.lines() {
         let trimmed = line.trim();
         if trimmed == "JOBS" {
             in_jobs = true;
@@ -481,7 +535,8 @@ fn compact_run_view_preview(lines: &[String]) -> String {
             continue;
         }
         if in_jobs && !trimmed.is_empty() {
-            result.push(trimmed.to_string());
+            // Keep step indentation so steps are not mistaken for jobs.
+            result.push(line.trim_end().to_string());
         }
     }
     result.join("\n")
@@ -640,19 +695,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reduce_github_run_view_summarizes_jobs_and_annotations() {
+    fn run_view_reduction(stdout: &str) -> CommandReduction {
         let argv = vec!["gh", "run", "view", "23079602872"]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
         let spec = classify_github_command("gh run view 23079602872", &argv).unwrap();
-        let stdout = "\n✓ v0.2.24 Release · 23079602872\nTriggered via push about 17 hours ago\n\nJOBS\n✓ test in 2m19s\n✓ publish in 47s\n\nANNOTATIONS\n! Node.js 20 actions are deprecated.\n! Another warning.\n";
-        let reduction = reduce_github_command(&spec, stdout, "", 0);
+        reduce_github_command(&spec, stdout, "", 0)
+    }
+
+    #[test]
+    fn reduce_github_run_view_summarizes_jobs_and_annotations() {
+        let stdout = "\n✓ v0.2.24 Release · 23079602872\nTriggered via push about 17 hours ago\n\nJOBS\n✓ test in 2m19s (ID 1)\n✓ publish in 47s (ID 2)\n\nANNOTATIONS\n! Node.js 20 actions are deprecated.\ntest: .github#1\n\n! Another warning.\npublish: .github#1\n\n\nFor more information about a job, try: gh run view --job=<job-id>\nView this run on GitHub: https://github.com/o/r/actions/runs/23079602872\n";
         assert_eq!(
-            reduction.summary,
+            run_view_reduction(stdout).summary,
             "gh run view: v0.2.24 Release (2 jobs, 2 annotations)"
         );
+    }
+
+    #[test]
+    fn run_view_counts_failed_job_without_its_steps_or_annotation_locations() {
+        // Real `gh run view 37565793313 --repo usharma123/Packet28` output.
+        let stdout = include_str!("../tests/fixtures/github/run_view_37565793313.stdout");
+        let reduction = run_view_reduction(stdout);
+        assert_eq!(
+            reduction.summary,
+            "gh run view: fix/scope-closure-registry-recovery Hook Benchmark Suite usharma123/Packet28#74 (1 job, 2 annotations)"
+        );
+        let preview = reduction.compact_preview.lines().collect::<Vec<_>>();
+        assert_eq!(preview[0], "X benchmark in 4m24s (ID 112613078067)");
+        assert_eq!(preview.len(), 19);
+        assert!(preview[1..].iter().all(|line| line.starts_with("  ")));
+        assert!(preview.contains(&"  X Validate hook benchmark thresholds"));
+    }
+
+    #[test]
+    fn run_view_counts_successful_jobs_and_annotations() {
+        // Real `gh run view 37565793390 --repo usharma123/Packet28` output.
+        let stdout = include_str!("../tests/fixtures/github/run_view_37565793390.stdout");
+        let reduction = run_view_reduction(stdout);
+        assert_eq!(
+            reduction.summary,
+            "gh run view: fix/scope-closure-registry-recovery Build usharma123/Packet28#74 (2 jobs, 2 annotations)"
+        );
+        assert_eq!(
+            reduction.compact_preview,
+            "✓ quality in 21m9s (ID 112613078285)\n✓ msrv in 3m48s (ID 112613078536)"
+        );
+    }
+
+    #[test]
+    fn run_view_counts_multiline_annotations_artifacts_and_jobs_without_elapsed() {
+        let stdout = "\nX main CI · 7\nTriggered via push about 1 hour ago\n\nJOBS\nX build in 8s (ID 11)\n  ✓ Set up job\n  X Publish\n- test-plugins (ID 12)\n* lint (ID 13)\n\nANNOTATIONS\nX NpmCallError: publish failed\nnpm error code E404\n\nnpm error 404 Not Found\nbuild: .github#6\n\n- \"The ubuntu-latest label will migrate\"\nbuild: .github#1\n\n\nARTIFACTS\nreport\n\nTo see what failed, try: gh run view 7 --log-failed\nView this run on GitHub: https://github.com/o/r/actions/runs/7\n";
+        assert_eq!(
+            run_view_reduction(stdout).summary,
+            "gh run view: main CI (3 jobs, 2 annotations)"
+        );
+    }
+
+    #[test]
+    fn run_view_counts_zero_annotations_when_section_is_absent() {
+        let stdout = "\n✓ main CI · 7\nTriggered via push about 1 hour ago\n\nJOBS\n✓ build in 8s (ID 11)\n\nFor more information about the job, try: gh run view --job=11\nView this run on GitHub: https://github.com/o/r/actions/runs/7\n";
+        assert_eq!(
+            run_view_reduction(stdout).summary,
+            "gh run view: main CI (1 job, 0 annotations)"
+        );
+        let crlf = stdout.replace('\n', "\r\n");
+        assert_eq!(
+            run_view_reduction(&crlf).summary,
+            "gh run view: main CI (1 job, 0 annotations)"
+        );
+    }
+
+    #[test]
+    fn run_view_omits_counts_it_cannot_parse() {
+        // Steps whose indentation was lost, an unknown job line, or a missing
+        // JOBS heading must not be counted as jobs.
+        for jobs in [
+            "X build in 8s (ID 11)\n✓ Set up job\n",
+            "build passed\n",
+            "  ✓ Set up job\nX build in 8s (ID 11)\n",
+        ] {
+            let stdout = format!(
+                "\nX main CI · 7\n\nJOBS\n{jobs}\nANNOTATIONS\nX failed\nbuild: .github#1\n\n"
+            );
+            assert_eq!(run_view_reduction(&stdout).summary, "gh run view: main CI");
+        }
+        assert_eq!(
+            run_view_reduction(
+                "\nX main CI · 7\n\nX This run likely failed because of a workflow file issue.\n"
+            )
+            .summary,
+            "gh run view: main CI"
+        );
+        // Annotations without gh's location lines are not guessed at.
+        for annotations in [
+            "! one warning\n! another warning\n",
+            "X failed\nno location\n",
+        ] {
+            let stdout =
+                format!("\nX main CI · 7\n\nJOBS\nX build (ID 11)\n\nANNOTATIONS\n{annotations}\n");
+            assert_eq!(
+                run_view_reduction(&stdout).summary,
+                "gh run view: main CI (1 job)"
+            );
+        }
     }
 
     #[test]

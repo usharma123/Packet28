@@ -1,0 +1,18 @@
+
+✓ fix/scope-closure-registry-recovery Build usharma123/Packet28#74 · 37565793390
+Triggered via pull_request about 10 hours ago
+
+JOBS
+✓ quality in 21m9s (ID 112613078285)
+✓ msrv in 3m48s (ID 112613078536)
+
+ANNOTATIONS
+- "The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748"
+quality: .github#1
+
+- "The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748"
+msrv: .github#1
+
+
+For more information about a job, try: gh run view --job=<job-id>
+View this run on GitHub: https://github.com/usharma123/Packet28/actions/runs/37565793390
