@@ -10,7 +10,7 @@ use crate::runtime_files::{
     clear_index_files_with_binding_hook_for_test,
     clear_index_files_with_generation_fence_hook_for_test,
     index_clear_is_pending_with_final_binding_hook_for_test,
-    open_index_clear_parent_with_sync_for_test,
+    open_index_clear_parent_with_sync_for_test, set_clear_state_lock_wait_hook_for_test,
 };
 #[cfg(test)]
 use crate::runtime_files::{
