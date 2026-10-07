@@ -104,9 +104,16 @@ class GateTests(unittest.TestCase):
         full = self.commands()
         extra = {"+ cargo check --workspace --all-targets --all-features --locked",
                  "+ cargo build --workspace --all-targets --all-features --locked"}
-        self.assertEqual(set(full), set(split) | extra)
+        self.assertEqual(set(full), (set(split) - {"+ cargo fetch --locked"}) | extra)
         self.assertEqual(len(split), len(set(split)))
         self.assertEqual(len(full), len(set(full)))
+
+    def test_isolated_packages_fetch_before_offline_verification(self):
+        commands = self.commands("--phase", "packages")
+        self.assertEqual(commands[0], "+ cargo fetch --locked")
+        self.assertIn("+ python3 scripts/package_cargo_workspace.py", commands[1:])
+        # The complete gate already bootstraps every locked workspace.
+        self.assertNotIn("+ cargo fetch --locked", self.commands())
 
     def test_policy_does_not_compile_and_lint_keeps_hazard_checks(self):
         policy = "\n".join(self.commands("--phase", "policy"))

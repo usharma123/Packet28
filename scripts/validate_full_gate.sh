@@ -144,6 +144,11 @@ if selected audit; then
   run_cmd cargo deny --locked check
 fi
 if selected packages; then
+  # The full gate fetched every workspace during policy. An isolated package
+  # job must populate its own registry cache before archive checks go offline.
+  if [[ "$phase" == packages ]]; then
+    run_cmd cargo fetch --locked
+  fi
   run_cmd python3 scripts/verify_release_packages.py source
   run_cmd python3 scripts/package_cargo_workspace.py
 fi
