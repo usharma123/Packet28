@@ -1,0 +1,27 @@
+name: Archive race diagnostic
+on:
+  push:
+    branches: [diagnostic/archive-race-v067]
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.93.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          key: tests
+          save-if: false
+      - name: Reproduce with full error diagnostics
+        run: python3 scripts/archive_race_diagnostic.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: archive-race-diagnostic
+          path: archive-diagnostics
