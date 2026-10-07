@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,9 @@ NATIVE_WIRE = (NATIVE_FIXTURES / "retrieval.wire").read_bytes()
 NATIVE_STEPS = json.loads((NATIVE_FIXTURES / "retrieval.steps.json").read_text())["steps"]
 FRESH_WIRE = (NATIVE_FIXTURES / "after-edit.wire").read_bytes()
 FRESH_FORCED = json.loads((NATIVE_FIXTURES / "forced-index.json").read_text())
+# Authentic delegated product-test receipt from the final agent-DX run (plain Cargo output).
+PRODUCT_TESTS_RECEIPT = SCRIPTS / "tests" / "fixtures" / "agent_dx_product_tests.log"
+PRODUCT_TESTS_RECEIPT_SHA256 = "a410c19b2709d460f2455d76701c3b8970baeb37e09eb089776797d5a9be7b07"
 
 # Visible output of the real renderer at source 6d92eb0f for two frozen cases.
 GOOD_PR_VIEW = (
@@ -418,6 +422,79 @@ def product_log(skip=None, outcome="ok"):
     return ("\n".join(lines) + "\n").encode()
 
 
+# Cargo's CARGO_TERM_COLOR=always rendering: bold bright-green status padded inside
+# the escape, then reset; libtest colors the result word when it colors at all.
+CARGO_STATUS = "\x1b[1m\x1b[92m"
+RESET = "\x1b[0m"
+
+
+def colorize_cargo(text):
+    status = {"ok": "\x1b[32m", "FAILED": "\x1b[31m", "ignored": "\x1b[33m"}
+    text = re.sub(r"(?m)^( *)Running ", lambda m: f"{CARGO_STATUS}{m[1]}Running{RESET} ", text)
+    return re.sub(r"(?m)^(test \S+ \.\.\. )(ok|FAILED|ignored)\b", lambda m: f"{m[1]}{status[m[2]]}{m[2]}{RESET}", text)
+
+
+def delegated_tests():
+    return [test for spec in contract.DELEGATED.values() for test in spec["tests"]]
+
+
+class ProductTestLogTests(unittest.TestCase):
+    """The receipt parser keeps (binary source, test) identity under Cargo color."""
+
+    def setUp(self):
+        data = PRODUCT_TESTS_RECEIPT.read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), PRODUCT_TESTS_RECEIPT_SHA256)
+        self.plain = data.decode()
+
+    def matched(self, text):
+        outcomes = validator.parse_test_log(text)
+        return [test for test in delegated_tests() if validator.delegated_outcome(outcomes, test) == "ok"]
+
+    def test_authentic_receipt_matches_every_delegated_test_plain_and_colored(self):
+        colored = colorize_cargo(self.plain)
+        self.assertNotEqual(colored, self.plain)
+        self.assertIn(f"{CARGO_STATUS}     Running{RESET} tests/", colored)
+        plain = validator.parse_test_log(self.plain)
+        self.assertEqual(len(delegated_tests()), 22)
+        self.assertEqual(self.matched(self.plain), delegated_tests())
+        self.assertEqual(validator.parse_test_log(colored), plain)
+        self.assertEqual(self.matched(colored), delegated_tests())
+        self.assertNotIn("", {source for source, _ in plain})
+
+    def test_integration_and_unit_headers_and_status_survive_color(self):
+        plain = product_log().decode()
+        variants = {
+            "around Running": colorize_cargo(plain),
+            "inside padding": plain.replace("     Running ", f"  {CARGO_STATUS}   Running{RESET} "),
+            "before line, OSC hyperlink": plain.replace(
+                "     Running ", f"{RESET}\x1b]8;;file:///x\x1b\\     Running \x1b]8;;\x1b\\"),
+            "status token": plain.replace(" ... ok", f" ... \x1b[32mok{RESET}"),
+        }
+        expected = validator.parse_test_log(plain)
+        self.assertTrue(any(source == "src/lib.rs" for source, _ in expected))
+        self.assertTrue(any("/tests/" in source for source, _ in expected))
+        for label, text in variants.items():
+            self.assertNotEqual(text, plain, label)
+            self.assertEqual(validator.parse_test_log(text), expected, label)
+            self.assertEqual(self.matched(text), delegated_tests(), label)
+
+    def test_colored_failures_skips_and_missing_headers_still_fail_closed(self):
+        first = delegated_tests()[0]
+        for outcome in ("FAILED", "ignored"):
+            outcomes = validator.parse_test_log(colorize_cargo(product_log(outcome=outcome).decode()))
+            self.assertEqual({validator.delegated_outcome(outcomes, t) for t in delegated_tests()}, {outcome})
+        outcomes = validator.parse_test_log(colorize_cargo(product_log(skip=first).decode()))
+        self.assertIsNone(validator.delegated_outcome(outcomes, first))
+        # A test name alone, with its binary header removed, is not a receipt.
+        headerless = "".join(line for line in colorize_cargo(self.plain).splitlines(keepends=True)
+                             if "Running" not in line)
+        self.assertEqual(self.matched(headerless), [])
+        # A header the parser cannot read (non-CSI escape) must not be bypassed by name.
+        garbled = colorize_cargo(self.plain).replace(f"{CARGO_STATUS}     Running", "\x1b(B     Running")
+        self.assertIn("\x1b(B     Running", garbled)
+        self.assertEqual(self.matched(garbled), [])
+
+
 class ValidatorTests(unittest.TestCase):
     """Builds a minimal artifact that satisfies the contract, then breaks it."""
 
@@ -555,6 +632,22 @@ class ValidatorTests(unittest.TestCase):
         summary = copy.deepcopy(self.summary)
         summary["product_tests"]["source_tree"] = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # the empty tree
         self.assertTrue(any("differs in" in f for f in self.failures(summary)))
+
+    def test_colored_release_gate_receipt_passes_and_its_failures_still_fail(self):
+        for data, expected in ((colorize_cargo(PRODUCT_TESTS_RECEIPT.read_text()).encode(), None),
+                               (colorize_cargo(product_log().decode()).encode(), None),
+                               (colorize_cargo(product_log(outcome="FAILED").decode()).encode(), "FAILED")):
+            (self.artifact / "inputs/product-tests.log").write_bytes(data)
+            summary = copy.deepcopy(self.summary)
+            summary["product_tests"]["log"]["sha256"] = summary["evidence_sha256"]["inputs/product-tests.log"] = hashlib.sha256(data).hexdigest()
+            report = validator.Report(self.artifact)
+            validator.check_delegated(summary, report, REPO)
+            if expected is None:
+                self.assertEqual(report.failures, [])
+                self.assertTrue(any(note.startswith("22 delegated product tests passed") for note in report.notes), report.notes)
+            else:
+                self.assertEqual(len(report.failures), 22)
+                self.assertTrue(all(expected in f for f in report.failures))
 
     def test_renamed_delegated_test_fails(self):
         root = self.tmp / "root"

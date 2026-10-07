@@ -279,13 +279,21 @@ def check_reduction(summary: dict, report: Report) -> None:
         report.fail("explicit_cli_reduction", "results match the fixture manifest", f"unknown cases {sorted(unknown)}")
 
 
+# CSI (colors, cursor movement) and OSC (hyperlinks, titles) terminal sequences.
+TERMINAL_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
 def parse_test_log(text: str) -> dict[tuple[str, str], str]:
-    """Map (binary source, test name) to its outcome from `cargo test` output."""
+    """Map (binary source, test name) to its outcome from `cargo test` output.
+
+    Release gates run with CARGO_TERM_COLOR=always, so terminal formatting is
+    stripped here; the hashed receipt keeps its original bytes.
+    """
     outcomes: dict[tuple[str, str], str] = {}
     source = ""
     running = re.compile(r"^\s*Running (?:unittests )?(\S+)")
     result = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)\b")
-    for line in text.splitlines():
+    for line in TERMINAL_ESCAPE.sub("", text).splitlines():
         match = running.match(line)
         if match:
             source = match.group(1)
