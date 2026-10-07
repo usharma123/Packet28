@@ -36,7 +36,11 @@ DEFAULT_THRESHOLDS = {
         # Small live PR listings are dominated by fixed compact-output framing,
         # so their reduction percentage is not a stable regression signal.
         "gh_pr_list": {"min_reduction_pct": 80.0, "min_raw_tokens": 100},
-        "gh_pr_view": {"min_reduction_pct": 80.0, "min_raw_tokens": 100},
+        # The live case views whichever PR is newest. Its successful preview is
+        # bounded (~150 tokens: summary, url, 320-byte body excerpt, omission
+        # marker), so 80% is only reachable once the raw view exceeds ~750
+        # tokens; shorter PR bodies say nothing about reducer regressions.
+        "gh_pr_view": {"min_reduction_pct": 80.0, "min_raw_tokens": 800},
         "gh_run_list": {"min_reduction_pct": 80.0, "min_raw_tokens": 80},
         "gh_run_view": {"min_reduction_pct": 90.0, "min_raw_tokens": 200},
         "python_pytest_fixture": {"min_reduction_pct": 80.0, "min_raw_tokens": 60},
