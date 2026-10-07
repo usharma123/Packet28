@@ -312,7 +312,7 @@ pub fn run_tsc(args: ToolArgs) -> Result<i32> {
 }
 
 pub fn run_vitest(args: ToolArgs) -> Result<i32> {
-    run_tool_command("vitest", args, "vitest")
+    run_test_reducer_tool_command("vitest", args, "vitest")
 }
 
 pub fn run_pytest(args: ToolArgs) -> Result<i32> {
@@ -716,6 +716,87 @@ fn run_reducer_tool_command(program: &str, args: ToolArgs, label: &str) -> Resul
         },
     )?;
     Ok(exit_code)
+}
+
+/// Runs a test tool once and renders its dedicated reducer. A failed run whose
+/// output yields no failing test keeps its raw lines instead of a guessed summary.
+fn run_test_reducer_tool_command(program: &str, args: ToolArgs, label: &str) -> Result<i32> {
+    let mut command = Vec::with_capacity(args.args.len() + 1);
+    command.push(program.to_string());
+    command.extend(args.args);
+    let output = execute_command(&command)?;
+    let exit_code = output.status.code().unwrap_or(1);
+    let success = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let command_text = command.join(" ");
+    let reduction = match classify_command_argv(&command_text, &command) {
+        Some(spec) => Some(reduce_command_output(&spec, &stdout, &stderr, exit_code)?),
+        None => None,
+    };
+    let text = match reduction {
+        Some(reduction) if success || !reduction.compact_preview.trim().is_empty() => {
+            let mut rendered = vec![
+                command_status_line(&command_text, success),
+                reduction.summary,
+            ];
+            if !reduction.compact_preview.trim().is_empty() {
+                rendered.push(reduction.compact_preview.trim_end().to_string());
+            }
+            rendered.join("\n")
+        }
+        Some(_) => render_unrecognized_failure(&command_text, &format!("{stdout}{stderr}")),
+        None => summarize_command_output(&format!("{stdout}{stderr}"), &command_text, success),
+    };
+    emit_system_output(
+        args.json,
+        args.pretty,
+        SystemOutput {
+            command: format!("Packet28 {label}"),
+            summary: summarize_rendered_lines(label, &text),
+            text,
+        },
+    )?;
+    Ok(exit_code)
+}
+
+const UNRECOGNIZED_FAILURE_HEAD_LINES: usize = 10;
+const UNRECOGNIZED_FAILURE_TAIL_LINES: usize = 30;
+
+fn command_status_line(command: &str, success: bool) -> String {
+    format!(
+        "{} Command: {}",
+        if success { "[ok]" } else { "[FAIL]" },
+        compact_for_log(command, 80)
+    )
+}
+
+fn render_unrecognized_failure(command: &str, raw: &str) -> String {
+    let lines = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let mut rendered = vec![
+        command_status_line(command, false),
+        "   output not recognized; showing raw lines".to_string(),
+    ];
+    let limit = UNRECOGNIZED_FAILURE_HEAD_LINES + UNRECOGNIZED_FAILURE_TAIL_LINES;
+    if lines.len() <= limit {
+        rendered.extend(lines.iter().map(|line| line.to_string()));
+    } else {
+        let tail_start = lines.len() - UNRECOGNIZED_FAILURE_TAIL_LINES;
+        rendered.extend(
+            lines[..UNRECOGNIZED_FAILURE_HEAD_LINES]
+                .iter()
+                .map(|line| line.to_string()),
+        );
+        rendered.push(format!(
+            "   ... {} line(s) omitted",
+            tail_start - UNRECOGNIZED_FAILURE_HEAD_LINES
+        ));
+        rendered.extend(lines[tail_start..].iter().map(|line| line.to_string()));
+    }
+    rendered.join("\n")
 }
 
 fn run_filtered_tool_command(program: &str, args: ToolArgs, label: &str) -> Result<i32> {
