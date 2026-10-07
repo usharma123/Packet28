@@ -435,7 +435,12 @@ fn storage_repair_resume_refuses_a_missing_archived_original() {
         .join(journal["archive"].as_str().unwrap())
         .join("original-task-registry-v1.json");
     assert_eq!(fs::read(&backup).unwrap(), edited);
-    fs::remove_file(&backup).unwrap();
+    // Displaced rather than deleted: the shared harness owns fixture cleanup.
+    fs::rename(
+        &backup,
+        root.path().join("displaced-original-task-registry-v1.json"),
+    )
+    .unwrap();
     let journal_bytes = fs::read(&journal_path).unwrap();
 
     for extra in [&[][..], &["--apply"][..]] {
