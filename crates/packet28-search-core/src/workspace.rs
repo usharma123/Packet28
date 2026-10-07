@@ -284,13 +284,14 @@ fn attest_workspace_path(
 
 /// Captures the HEAD commit and every Git-dirty path digest before a full build.
 ///
-/// A dirty tree is accepted here; [`authenticate_full_build_workspace`]
-/// requires the same commit and dirty digests once scanning has finished.
+/// A dirty tree is accepted here under the same build limits that
+/// [`authenticate_full_build_workspace`] applies when it requires the same
+/// commit and dirty digests once scanning has finished.
 pub(crate) fn begin_full_build_workspace(root: &Path) -> Result<Option<GitWorkspaceSnapshot>> {
     if !git_metadata_present(root).map_err(index_not_ready)? {
         return Ok(None);
     }
-    git_workspace_snapshot(root, &[])
+    git_workspace_snapshot_with_limits(root, &[], BUILD_ATTESTATION_LIMITS)
         .map(Some)
         .map_err(|reason| SearchError::IndexNotReady { reason })
 }
