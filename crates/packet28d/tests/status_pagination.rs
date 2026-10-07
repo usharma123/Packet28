@@ -111,6 +111,11 @@ where
 }
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+// This fixture validates serving a large registry, not cold-start latency.
+// Debug startup checkpoints roughly 9 MiB before readiness (17-20 s on idle
+// hosts, over 30 s on a loaded CI runner). Keep that setup watchdog separate
+// from the unchanged five-second status/pagination assertion below.
+const LARGE_REGISTRY_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DIAGNOSTIC_LOG_BYTES: usize = 64 * 1024;
 
 fn file_tail(path: &std::path::Path) -> String {
@@ -137,7 +142,11 @@ fn daemon_diagnostics(daemon: &DaemonChild, root: &std::path::Path) -> String {
     )
 }
 
-fn wait_for_ready(daemon: &mut DaemonChild, root: &std::path::Path) -> DaemonRuntimeInfo {
+fn wait_for_ready(
+    daemon: &mut DaemonChild,
+    root: &std::path::Path,
+    timeout: Duration,
+) -> DaemonRuntimeInfo {
     let started = Instant::now();
     loop {
         if ready_path(root).exists() {
@@ -155,7 +164,7 @@ fn wait_for_ready(daemon: &mut DaemonChild, root: &std::path::Path) -> DaemonRun
                 daemon_diagnostics(daemon, root)
             );
         }
-        if started.elapsed() >= READINESS_TIMEOUT {
+        if started.elapsed() >= timeout {
             let runtime_metadata_present = runtime_path(root).exists();
             let _ = daemon.process.kill();
             let status = daemon
@@ -163,7 +172,7 @@ fn wait_for_ready(daemon: &mut DaemonChild, root: &std::path::Path) -> DaemonRun
                 .wait()
                 .map_or_else(|error| format!("<wait failed: {error}>"), |s| s.to_string());
             panic!(
-                "daemon pid {} did not become ready within {READINESS_TIMEOUT:?} \
+                "daemon pid {} did not become ready within {timeout:?} \
                  (elapsed {:?}, runtime metadata present: {runtime_metadata_present}, \
                  status after kill: {status}); {}",
                 daemon.process.id(),
@@ -212,7 +221,11 @@ fn seeded_five_thousand_task_daemon_keeps_status_live_and_pages_every_task() {
     drop(tasks);
 
     let mut daemon = spawn_daemon(workspace.path());
-    let runtime = wait_for_ready(&mut daemon, workspace.path());
+    let runtime = wait_for_ready(
+        &mut daemon,
+        workspace.path(),
+        LARGE_REGISTRY_READINESS_TIMEOUT,
+    );
     let mut stream = connect(&runtime);
     let requests_started = Instant::now();
 
@@ -342,7 +355,7 @@ fn oversized_records_before_between_and_after_healthy_pages_are_all_reported() {
         .expect("seed oversized task/watch checkpoint");
 
     let mut daemon = spawn_daemon(workspace.path());
-    let runtime = wait_for_ready(&mut daemon, workspace.path());
+    let runtime = wait_for_ready(&mut daemon, workspace.path(), READINESS_TIMEOUT);
     let mut stream = connect(&runtime);
     let status: DaemonRegistryResponseV1 = exchange(&mut stream, &DaemonRegistryRequestV1::Status);
     let revision = match status {
