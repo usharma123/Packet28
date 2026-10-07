@@ -725,9 +725,8 @@ fn next_proxy_invocation(session: &Arc<Mutex<McpSessionState>>) -> Result<(Strin
         .proxy_task_id
         .clone()
         .ok_or_else(|| anyhow!("proxy task_id is not initialized"))?;
-    guard.next_invocation_seq = guard.next_invocation_seq.saturating_add(1).max(1);
-    let sequence = guard.next_invocation_seq;
-    Ok((task_id, sequence, format!("tool-invocation-{sequence}")))
+    let (sequence, invocation_id) = guard.invocations.allocate()?;
+    Ok((task_id, sequence, invocation_id))
 }
 
 async fn handle_proxy_tool_call(

@@ -2296,6 +2296,7 @@ dependencies = [
  "context-memory-core",
  "contextq-core",
  "diffy-core",
+ "getrandom",
  "glob",
  "guardy-core",
  "hex",

@@ -559,10 +559,9 @@ pub(crate) fn next_task_invocation(
     let mut guard = session
         .lock()
         .map_err(|_| anyhow!("failed to lock MCP session"))?;
-    guard.next_invocation_seq = guard.next_invocation_seq.saturating_add(1).max(1);
-    let sequence = guard.next_invocation_seq;
+    // Identities are session-unique, not task-scoped; see InvocationAllocator.
     let _ = task_id;
-    Ok((sequence, format!("tool-invocation-{sequence}")))
+    guard.invocations.allocate()
 }
 
 #[cfg(test)]

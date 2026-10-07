@@ -31,6 +31,8 @@ mod config;
 mod core_tools;
 #[path = "cmd_mcp_fff.rs"]
 mod fff;
+#[path = "cmd_mcp_invocation.rs"]
+mod invocation;
 #[path = "cmd_mcp_memory_tools.rs"]
 mod memory_tools;
 #[path = "cmd_mcp_native.rs"]
@@ -229,7 +231,7 @@ struct McpSessionState {
     upstream_resource_catalog_loaded: bool,
     resource_catalog_epoch: u64,
     proxy_task_id: Option<String>,
-    next_invocation_seq: u64,
+    invocations: invocation::InvocationAllocator,
     fff_client: Option<FffMcpClient>,
     #[cfg(unix)]
     daemon_client: Option<crate::cmd_daemon::PersistentDaemonClient>,

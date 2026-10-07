@@ -49,6 +49,8 @@ constant_time_eq = "0.4"
 hex = "0.4"
 sha2 = "0.11"
 libc = "0.2.172"
+# The version ring already locks, so no new package enters the graph.
+getrandom = "0.2.17"
 thiserror = "2.0.18"
 anyhow = "1.0.47"
 serde = { version = "1.0.228", features = ["derive"] }
