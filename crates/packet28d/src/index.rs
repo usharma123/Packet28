@@ -412,11 +412,32 @@ pub(crate) fn build_index_status(runtime: &InteractiveIndexRuntime) -> DaemonInd
     }
 }
 
+/// Serializes index request admission. Durable intent (the clear state under
+/// `.packet28/index`) and ingress order are decided under this lock and never
+/// under `DaemonState`, so admission does not hold the state mutex while it
+/// waits for retained index files. Lock order is admission, then the
+/// clear-state lease (released before the state mutex), then `DaemonState`;
+/// the index worker and its progress checkpoints never take the admission
+/// lock, so a running build cannot delay or reject a request.
+fn with_index_admission<T>(
+    state: &Arc<Mutex<DaemonState>>,
+    admit: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let (root, admission) = {
+        let guard = state.lock().map_err(lock_err)?;
+        (guard.root.clone(), guard.index_admission.clone())
+    };
+    let _admission = admission.lock().map_err(lock_err)?;
+    admit(&root)
+}
+
 pub(crate) fn enqueue_full_index_rebuild(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
-    let mut guard = state.lock().map_err(lock_err)?;
-    record_index_work_after_clear(&guard.root)?;
-    queue_full_index_rebuild_manifest_locked(&mut guard)?;
-    guard.index_tx.send(IndexCommand::RebuildFull)
+    with_index_admission(state, |root| {
+        record_index_work_after_clear(root)?;
+        let mut guard = state.lock().map_err(lock_err)?;
+        queue_full_index_rebuild_manifest_locked(&mut guard)?;
+        guard.index_tx.send(IndexCommand::RebuildFull)
+    })
 }
 
 fn queue_full_index_rebuild_manifest_locked(guard: &mut DaemonState) -> Result<()> {
@@ -437,29 +458,34 @@ fn queue_full_index_rebuild_manifest_locked(guard: &mut DaemonState) -> Result<(
 }
 
 pub(crate) fn enqueue_index_clear(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
-    let mut guard = state.lock().map_err(lock_err)?;
-    let revision = persist_index_clear_pending(&guard.root)?;
-    queue_index_clear_locked(&mut guard, revision)
+    with_index_admission(state, |root| {
+        let revision = persist_index_clear_pending(root)?;
+        let mut guard = state.lock().map_err(lock_err)?;
+        queue_index_clear_locked(&mut guard, revision)
+    })
 }
 
 pub(crate) fn enqueue_persisted_index_clear(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
-    let mut guard = state.lock().map_err(lock_err)?;
-    let Some((revision, rebuild_after_clear)) = pending_index_clear(&guard.root) else {
-        anyhow::bail!("persisted index clear is not pending");
-    };
-    queue_index_clear_locked(&mut guard, revision)?;
-    if rebuild_after_clear {
-        guard.index_tx.send(IndexCommand::RebuildFull)?;
-    }
-    Ok(())
+    with_index_admission(state, |root| {
+        let Some((revision, rebuild_after_clear)) = pending_index_clear(root) else {
+            anyhow::bail!("persisted index clear is not pending");
+        };
+        let mut guard = state.lock().map_err(lock_err)?;
+        queue_index_clear_locked(&mut guard, revision)?;
+        if rebuild_after_clear {
+            guard.index_tx.send(IndexCommand::RebuildFull)?;
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn enqueue_initial_index_work(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
-    let (clear_pending, clear_complete, should_rebuild, external_regex_only) = {
+    let root = state.lock().map_err(lock_err)?.root.clone();
+    let clear_pending = index_clear_is_pending(&root);
+    let clear_complete = index_clear_is_complete(&root);
+    let (should_rebuild, external_regex_only) = {
         let guard = state.lock().map_err(lock_err)?;
         (
-            index_clear_is_pending(&guard.root),
-            index_clear_is_complete(&guard.root),
             guard.interactive_index.needs_rebuild(),
             guard.interactive_index.manifest.status == DaemonIndexState::Missing
                 && guard.interactive_index.manifest.dirty_paths.is_empty()
@@ -480,11 +506,11 @@ pub(crate) fn enqueue_initial_index_work(state: &Arc<Mutex<DaemonState>>) -> Res
 }
 
 fn rebuild_external_regex_generation_before_ready(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
-    {
+    with_index_admission(state, |root| {
+        record_index_work_after_clear(root)?;
         let mut guard = state.lock().map_err(lock_err)?;
-        record_index_work_after_clear(&guard.root)?;
-        queue_full_index_rebuild_manifest_locked(&mut guard)?;
-    }
+        queue_full_index_rebuild_manifest_locked(&mut guard)
+    })?;
     perform_full_index_rebuild(state, None, None)
         .context("failed to hydrate daemon indexes from an external regex generation")
 }
@@ -529,78 +555,80 @@ fn enqueue_incremental_index_paths_after_root_snapshot(
             queued_paths: Vec::new(),
         });
     }
-    let mut guard = state.lock().map_err(lock_err)?;
-    record_index_work_after_clear(&guard.root)?;
-    let additional_paths = normalized
-        .iter()
-        .filter(|path| {
-            guard
+    with_index_admission(state, |root| {
+        record_index_work_after_clear(root)?;
+        let mut guard = state.lock().map_err(lock_err)?;
+        let additional_paths = normalized
+            .iter()
+            .filter(|path| {
+                guard
+                    .interactive_index
+                    .manifest
+                    .queued_paths
+                    .binary_search(path)
+                    .is_err()
+            })
+            .count();
+        let promote_to_full = input_requires_full
+            || includes_root
+            || guard
                 .interactive_index
                 .manifest
                 .queued_paths
-                .binary_search(path)
-                .is_err()
-        })
-        .count();
-    let promote_to_full = input_requires_full
-        || includes_root
-        || guard
-            .interactive_index
-            .manifest
-            .queued_paths
-            .len()
-            .saturating_add(additional_paths)
-            > MAX_PENDING_INDEX_PATHS;
-    if promote_to_full {
-        guard
-            .interactive_index
-            .manifest
-            .status
-            .transition_to(DaemonIndexState::Queued)?;
-        guard.interactive_index.manifest.total_files = 0;
-        guard.interactive_index.manifest.indexed_files = 0;
-        guard.interactive_index.manifest.regex_status = Some("queued".to_string());
-        guard.interactive_index.manifest.regex_total_files = 0;
-        guard.interactive_index.manifest.regex_indexed_files = 0;
-        guard.interactive_index.manifest.last_error = None;
-        guard.interactive_index.manifest.regex_stale_reason = None;
-        guard.interactive_index.manifest.dirty_paths.clear();
-        guard.interactive_index.manifest.queued_paths.clear();
-    } else {
-        for path in &normalized {
-            insert_sorted_unique(
-                &mut guard.interactive_index.manifest.dirty_paths,
-                path.clone(),
-            );
-            insert_sorted_unique(
-                &mut guard.interactive_index.manifest.queued_paths,
-                path.clone(),
-            );
-        }
-        if guard.interactive_index.manifest.status == DaemonIndexState::Missing {
+                .len()
+                .saturating_add(additional_paths)
+                > MAX_PENDING_INDEX_PATHS;
+        if promote_to_full {
             guard
                 .interactive_index
                 .manifest
                 .status
                 .transition_to(DaemonIndexState::Queued)?;
+            guard.interactive_index.manifest.total_files = 0;
+            guard.interactive_index.manifest.indexed_files = 0;
+            guard.interactive_index.manifest.regex_status = Some("queued".to_string());
+            guard.interactive_index.manifest.regex_total_files = 0;
+            guard.interactive_index.manifest.regex_indexed_files = 0;
+            guard.interactive_index.manifest.last_error = None;
+            guard.interactive_index.manifest.regex_stale_reason = None;
+            guard.interactive_index.manifest.dirty_paths.clear();
+            guard.interactive_index.manifest.queued_paths.clear();
+        } else {
+            for path in &normalized {
+                insert_sorted_unique(
+                    &mut guard.interactive_index.manifest.dirty_paths,
+                    path.clone(),
+                );
+                insert_sorted_unique(
+                    &mut guard.interactive_index.manifest.queued_paths,
+                    path.clone(),
+                );
+            }
+            if guard.interactive_index.manifest.status == DaemonIndexState::Missing {
+                guard
+                    .interactive_index
+                    .manifest
+                    .status
+                    .transition_to(DaemonIndexState::Queued)?;
+            }
         }
-    }
-    save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
-    if promote_to_full {
-        guard.index_tx.send(IndexCommand::RebuildFull)?;
-        Ok(IndexQueueOutcome {
-            full: true,
-            queued_paths: Vec::new(),
-        })
-    } else {
-        guard
-            .index_tx
-            .send(IndexCommand::ReindexPaths(normalized.clone()))?;
-        Ok(IndexQueueOutcome {
-            full: false,
-            queued_paths: normalized,
-        })
-    }
+        save_index_manifest_file(&guard.root, &guard.interactive_index.manifest)?;
+        if promote_to_full {
+            guard.index_tx.send(IndexCommand::RebuildFull)?;
+            Ok(IndexQueueOutcome {
+                full: true,
+                queued_paths: Vec::new(),
+            })
+        } else {
+            guard
+                .index_tx
+                .send(IndexCommand::ReindexPaths(normalized.clone()))?;
+            Ok(IndexQueueOutcome {
+                full: false,
+                queued_paths: normalized,
+            })
+        }
+    })
 }
 
 fn normalize_index_paths(root: &Path, paths: &[String]) -> Result<(Vec<String>, bool, bool)> {
@@ -995,9 +1023,32 @@ fn perform_full_index_rebuild_with_hooks(
     state: &Arc<Mutex<DaemonState>>,
     shutdown: Option<&crate::runtime::ShutdownSignal>,
     batch_epoch: Option<u64>,
+    batch_follow_up: IndexFollowUp,
+    after_start: impl FnOnce() -> Result<()>,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    perform_full_index_rebuild_with_checkpoint_hook(
+        state,
+        shutdown,
+        batch_epoch,
+        batch_follow_up,
+        after_start,
+        before_commit,
+        || {},
+    )
+}
+
+/// `on_lease_held_checkpoint` runs at every persisted progress checkpoint,
+/// while the builder holds the retained index directory lease. Tests use it to
+/// overlap request admission with such a checkpoint deterministically.
+fn perform_full_index_rebuild_with_checkpoint_hook(
+    state: &Arc<Mutex<DaemonState>>,
+    shutdown: Option<&crate::runtime::ShutdownSignal>,
+    batch_epoch: Option<u64>,
     mut batch_follow_up: IndexFollowUp,
     after_start: impl FnOnce() -> Result<()>,
     before_commit: impl FnOnce() -> Result<()>,
+    mut on_lease_held_checkpoint: impl FnMut(),
 ) -> Result<()> {
     if shutdown.is_some_and(crate::runtime::ShutdownSignal::is_requested) {
         return Ok(());
@@ -1038,6 +1089,7 @@ fn perform_full_index_rebuild_with_hooks(
                         progress.total,
                         &mut last_repo_progress,
                     ) {
+                        on_lease_held_checkpoint();
                         let _ =
                             update_repo_build_progress(state, progress.completed, progress.total);
                     }
@@ -1048,6 +1100,7 @@ fn perform_full_index_rebuild_with_hooks(
                         progress.total,
                         &mut last_regex_progress,
                     ) {
+                        on_lease_held_checkpoint();
                         let _ = update_regex_build_progress(
                             state,
                             "building",
@@ -1082,6 +1135,7 @@ fn perform_full_index_rebuild_with_hooks(
     let repo_runtime =
         mapy_core::rebuild_repo_index_runtime_with_progress(&root, true, |indexed, total| {
             if should_persist_progress(indexed, total, &mut last_repo_progress) {
+                on_lease_held_checkpoint();
                 let _ = update_repo_build_progress(state, indexed, total);
             }
         })
@@ -1104,6 +1158,7 @@ fn perform_full_index_rebuild_with_hooks(
     let regex_runtime =
         packet28_search_core::rebuild_full_index_with_progress(&root, true, |indexed, total| {
             if should_persist_progress(indexed, total, &mut last_regex_progress) {
+                on_lease_held_checkpoint();
                 let _ = update_regex_build_progress(state, "building", indexed, total);
             }
         })

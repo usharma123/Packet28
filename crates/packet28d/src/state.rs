@@ -130,6 +130,8 @@ pub(crate) struct DaemonState {
     pub(crate) source_file_cache: BTreeMap<String, CachedSourceFile>,
     pub(crate) interactive_index: InteractiveIndexRuntime,
     pub(crate) index_tx: crate::index::IndexIngress,
+    /// Serializes index request admission; see `index::with_index_admission`.
+    pub(crate) index_admission: Arc<std::sync::Mutex<()>>,
     pub(crate) background_tx: tokio::sync::mpsc::Sender<BackgroundCommand>,
     pub(crate) persistence: crate::persistence::PersistenceHandle,
     #[cfg(test)]

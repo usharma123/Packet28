@@ -12,8 +12,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 const INDEX_CLEAR_STATE_FILE: &str = "clear-state-v1";
+/// Lease for `clear-state-v1`, separate from the retained directory lease
+/// that builders hold for a whole generation and that engine detachment takes.
+/// Request admission persists durable intent under this lease only, so it
+/// never waits for a running build; cross-process writers stay serialized and
+/// a crashed holder releases it with its descriptor.
+const INDEX_CLEAR_STATE_LOCK_FILE: &str = ".index-clear-state.lock";
 const MAX_INDEX_CLEAR_STATE_BYTES: u64 = 128;
-const INDEX_CLEAR_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const INDEX_CLEAR_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 const INDEX_CLEAR_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MAPY_WRITER_LOCK_FILE: &str = ".mapy-v1.writer.lock";
 const MAPY_GENERATION_HIGH_WATER_FILE: &str = ".mapy-v1.generation-high-water.json";
@@ -679,9 +685,9 @@ pub(crate) fn persist_index_clear_pending(root: &Path) -> Result<u64> {
             index_dir(root).display()
         )
     })?;
-    let _directory_guard = directory.lock_exclusive().with_context(|| {
+    let _directory_guard = directory.lock_clear_state_exclusive().with_context(|| {
         format!(
-            "failed to lock index clear state parent '{}'",
+            "failed to lock index clear state in '{}'",
             directory.path.display()
         )
     })?;
@@ -716,9 +722,9 @@ fn complete_index_clear_with_sync(
             index_dir(root).display()
         )
     })?;
-    let _directory_guard = directory.lock_exclusive().with_context(|| {
+    let _directory_guard = directory.lock_clear_state_exclusive().with_context(|| {
         format!(
-            "failed to lock index clear state parent '{}'",
+            "failed to lock index clear state in '{}'",
             directory.path.display()
         )
     })?;
@@ -779,9 +785,9 @@ pub(crate) fn record_index_work_after_clear(root: &Path) -> Result<()> {
             });
         }
     };
-    let _directory_guard = directory.lock_exclusive().with_context(|| {
+    let _directory_guard = directory.lock_clear_state_exclusive().with_context(|| {
         format!(
-            "failed to lock index clear state parent '{}'",
+            "failed to lock index clear state in '{}'",
             directory.path.display()
         )
     })?;
@@ -814,7 +820,7 @@ fn load_index_clear_state(root: &Path) -> Option<PersistedIndexClearState> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(_) => return Some(corrupt_index_clear_state()),
     };
-    let _directory_guard = match directory.lock_shared() {
+    let _directory_guard = match directory.lock_clear_state_shared() {
         Ok(guard) => guard,
         Err(_) => return Some(corrupt_index_clear_state()),
     };
@@ -921,7 +927,7 @@ pub(crate) fn index_clear_is_pending_with_read_hook_for_test(
         Ok(directory) => directory,
         Err(_) => return true,
     };
-    let _directory_guard = match directory.lock_shared() {
+    let _directory_guard = match directory.lock_clear_state_shared() {
         Ok(guard) => guard,
         Err(_) => return true,
     };
@@ -955,7 +961,7 @@ pub(crate) fn index_clear_is_pending_with_final_binding_hook_for_test(
         Ok(directory) => directory,
         Err(_) => return true,
     };
-    let _directory_guard = match directory.lock_shared() {
+    let _directory_guard = match directory.lock_clear_state_shared() {
         Ok(guard) => guard,
         Err(_) => return true,
     };
@@ -1018,9 +1024,9 @@ fn persist_index_clear_state_with_nonce_unlocked(
             index_dir(root).display()
         )
     })?;
-    let _directory_guard = directory.lock_exclusive().with_context(|| {
+    let _directory_guard = directory.lock_clear_state_exclusive().with_context(|| {
         format!(
-            "failed to lock index clear state parent '{}'",
+            "failed to lock index clear state in '{}'",
             directory.path.display()
         )
     })?;
@@ -1149,9 +1155,9 @@ pub(crate) fn persist_index_clear_pending_with_parent_hook_for_test(
             index_dir(root).display()
         )
     })?;
-    let _directory_guard = directory.lock_exclusive().with_context(|| {
+    let _directory_guard = directory.lock_clear_state_exclusive().with_context(|| {
         format!(
-            "failed to lock index clear state parent '{}'",
+            "failed to lock index clear state in '{}'",
             directory.path.display()
         )
     })?;
@@ -1179,9 +1185,9 @@ pub(crate) fn complete_index_clear_with_transition_hook_for_test(
             index_dir(root).display()
         )
     })?;
-    let _directory_guard = directory.lock_exclusive().with_context(|| {
+    let _directory_guard = directory.lock_clear_state_exclusive().with_context(|| {
         format!(
-            "failed to lock index clear state parent '{}'",
+            "failed to lock index clear state in '{}'",
             directory.path.display()
         )
     })?;
@@ -1373,12 +1379,16 @@ impl RetainedIndexDirectory {
         open_lock_file_at(&self.directory, name)
     }
 
-    fn lock_shared(&self) -> std::io::Result<RetainedDirectoryLock<'_>> {
-        RetainedDirectoryLock::acquire(&self.directory, true)
-    }
-
     fn lock_exclusive(&self) -> std::io::Result<RetainedDirectoryLock<'_>> {
         RetainedDirectoryLock::acquire(&self.directory, false)
+    }
+
+    fn lock_clear_state_shared(&self) -> std::io::Result<RetainedClearStateLock> {
+        RetainedClearStateLock::acquire(self, true)
+    }
+
+    fn lock_clear_state_exclusive(&self) -> std::io::Result<RetainedClearStateLock> {
+        RetainedClearStateLock::acquire(self, false)
     }
 
     fn validate_binding(&self) -> std::io::Result<()> {
@@ -1411,6 +1421,68 @@ impl Drop for RetainedDirectoryLock<'_> {
     }
 }
 
+/// Bounded lease on the durable clear state beneath a retained index
+/// directory (`INDEX_CLEAR_STATE_LOCK_FILE`). Shared for readers, exclusive
+/// for writers; the retained ancestry is revalidated after acquisition.
+///
+/// The lock file is opened if it exists and otherwise created exclusively.
+/// Concurrent first-time creation of one name (and lookups racing it) can
+/// report a transient `NotFound`/`AlreadyExists` on macOS, so acquisition
+/// retries those outcomes within the same bounded deadline as the lock wait;
+/// a real detachment keeps failing until the deadline and is still reported.
+#[cfg(unix)]
+struct RetainedClearStateLock {
+    file: fs::File,
+}
+
+#[cfg(unix)]
+impl RetainedClearStateLock {
+    fn acquire(directory: &RetainedIndexDirectory, shared: bool) -> std::io::Result<Self> {
+        let deadline = std::time::Instant::now() + INDEX_CLEAR_LOCK_TIMEOUT;
+        loop {
+            match Self::try_acquire(directory, shared, deadline) {
+                Ok(lock) => return Ok(lock),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+                    ) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(INDEX_CLEAR_LOCK_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn try_acquire(
+        directory: &RetainedIndexDirectory,
+        shared: bool,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Self> {
+        let file = match directory.open_file(INDEX_CLEAR_STATE_LOCK_FILE) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                directory.create_file(INDEX_CLEAR_STATE_LOCK_FILE)?
+            }
+            Err(error) => return Err(error),
+        };
+        lock_file_until(&file, shared, deadline)?;
+        if let Err(error) = directory.validate_binding() {
+            let _ = FileExt::unlock(&file);
+            return Err(error);
+        }
+        Ok(Self { file })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RetainedClearStateLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 #[cfg(unix)]
 struct RetainedEngineWriterLock {
     _file: fs::File,
@@ -1427,7 +1499,19 @@ impl RetainedEngineWriterLock {
 
 #[cfg(unix)]
 fn lock_file_with_timeout(file: &fs::File, shared: bool) -> std::io::Result<()> {
-    let deadline = std::time::Instant::now() + INDEX_CLEAR_LOCK_TIMEOUT;
+    lock_file_until(
+        file,
+        shared,
+        std::time::Instant::now() + INDEX_CLEAR_LOCK_TIMEOUT,
+    )
+}
+
+#[cfg(unix)]
+fn lock_file_until(
+    file: &fs::File,
+    shared: bool,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
     loop {
         let result = if shared {
             FileExt::try_lock_shared(file)
@@ -1508,16 +1592,18 @@ impl RetainedIndexDirectory {
         let _ = fs::remove_file(self.path.join(name));
     }
 
-    fn lock_shared(&self) -> std::io::Result<RetainedDirectoryLock<'_>> {
+    fn lock_exclusive(&self) -> std::io::Result<RetainedDirectoryLock<'_>> {
         Ok(RetainedDirectoryLock {
             _directory: &self.directory,
         })
     }
 
-    fn lock_exclusive(&self) -> std::io::Result<RetainedDirectoryLock<'_>> {
-        Ok(RetainedDirectoryLock {
-            _directory: &self.directory,
-        })
+    fn lock_clear_state_shared(&self) -> std::io::Result<RetainedClearStateLock> {
+        Ok(RetainedClearStateLock)
+    }
+
+    fn lock_clear_state_exclusive(&self) -> std::io::Result<RetainedClearStateLock> {
+        Ok(RetainedClearStateLock)
     }
 
     fn validate_binding(&self) -> std::io::Result<()> {
@@ -1529,6 +1615,9 @@ impl RetainedIndexDirectory {
 struct RetainedDirectoryLock<'a> {
     _directory: &'a fs::File,
 }
+
+#[cfg(not(unix))]
+struct RetainedClearStateLock;
 
 #[cfg(not(unix))]
 fn create_plain_directory(path: &Path) -> std::io::Result<()> {

@@ -468,6 +468,222 @@ fn clear_immediately_before_commit_prevents_ready_publication() {
     assert!(index_clear_is_complete(&fixture.root));
 }
 
+/// Request admission used to record durable index intent under the retained
+/// index directory lease while holding `DaemonState`, and the builder holds
+/// that lease across progress checkpoints that take the state mutex. That
+/// cycle held admission until its lock timeout rejected the request, which is
+/// how `setup` lost the rebuild it requests right after starting the daemon.
+/// Admission now persists intent under the clear-state lease without the
+/// state mutex, so a checkpoint parked inside the builder cannot delay it.
+#[test]
+fn rebuild_admission_succeeds_while_a_builder_checkpoint_holds_the_index_lease() {
+    let fixture = IndexFixture::new(&[("src/a.rs", "pub fn alpha() {}\n")]);
+    let (ingress, receiver) = IndexIngress::new();
+    fixture.state.lock().expect("state").index_tx = ingress;
+    enqueue_full_index_rebuild(&fixture.state).expect("queue the initial rebuild");
+    let initial = receiver
+        .recv_debounced()
+        .expect("receive the initial rebuild");
+    let initial_epoch = initial.full_rebuild_epoch.expect("initial epoch");
+    let checkpoint_reached = Arc::new(Barrier::new(2));
+    let release_builder = Arc::new(Barrier::new(2));
+
+    let builder = std::thread::spawn({
+        let state = fixture.state.clone();
+        let checkpoint_reached = checkpoint_reached.clone();
+        let release_builder = release_builder.clone();
+        move || {
+            let mut first_checkpoint = true;
+            perform_full_index_rebuild_with_checkpoint_hook(
+                &state,
+                None,
+                Some(initial_epoch),
+                IndexFollowUp::default(),
+                || Ok(()),
+                || Ok(()),
+                || {
+                    if first_checkpoint {
+                        first_checkpoint = false;
+                        checkpoint_reached.wait();
+                        release_builder.wait();
+                    }
+                },
+            )
+        }
+    });
+    checkpoint_reached.wait();
+    // The builder holds the retained index lease inside its first checkpoint
+    // and cannot reach the state mutex until it is released below.
+    let started = Instant::now();
+    enqueue_full_index_rebuild(&fixture.state)
+        .expect("admit a rebuild while a builder checkpoint holds the index lease");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < crate::runtime_files::INDEX_CLEAR_LOCK_TIMEOUT,
+        "admission waited {elapsed:?} on a lease-held checkpoint"
+    );
+    release_builder.wait();
+    builder
+        .join()
+        .expect("join builder")
+        .expect("finish the overlapped full build");
+    assert_eq!(
+        fixture
+            .state
+            .lock()
+            .expect("state")
+            .interactive_index
+            .manifest
+            .status,
+        DaemonIndexState::Queued,
+        "the admitted rebuild must supersede the overlapped publication"
+    );
+
+    let admitted = receiver
+        .recv_debounced()
+        .expect("receive the admitted rebuild");
+    assert!(admitted.epoch > initial.epoch);
+    assert_eq!(
+        process_index_batch_with_recovery(&fixture.state, &admitted, None)
+            .expect("complete the admitted rebuild"),
+        IndexBatchStatus::Complete
+    );
+    let guard = fixture.state.lock().expect("state");
+    assert_eq!(
+        guard.interactive_index.manifest.status,
+        DaemonIndexState::Ready
+    );
+    assert!(!guard.interactive_index.needs_rebuild());
+    assert_eq!(
+        guard.interactive_index.manifest.indexed_files,
+        guard.interactive_index.manifest.total_files
+    );
+}
+
+/// Admission must not depend on the generation lease at all. A builder that
+/// holds the retained index lease for longer than the clear-state lock
+/// timeout still admits full, clear, and incremental requests immediately,
+/// their durable intent is readable meanwhile, and the queued order (rebuild,
+/// clear, paths) supersedes the overlapped publication and then completes.
+#[test]
+fn admission_does_not_wait_for_a_long_build_holding_the_index_lease() {
+    let fixture = IndexFixture::new(&[("src/a.rs", "pub fn alpha() {}\n")]);
+    let (ingress, receiver) = IndexIngress::new();
+    fixture.state.lock().expect("state").index_tx = ingress;
+    enqueue_full_index_rebuild(&fixture.state).expect("queue the initial rebuild");
+    let initial = receiver
+        .recv_debounced()
+        .expect("receive the initial rebuild");
+    let initial_epoch = initial.full_rebuild_epoch.expect("initial epoch");
+    let lease_held = Arc::new(Barrier::new(2));
+    let release_builder = Arc::new(Barrier::new(2));
+
+    let builder = std::thread::spawn({
+        let state = fixture.state.clone();
+        let lease_held = lease_held.clone();
+        let release_builder = release_builder.clone();
+        move || {
+            let mut first_checkpoint = true;
+            perform_full_index_rebuild_with_checkpoint_hook(
+                &state,
+                None,
+                Some(initial_epoch),
+                IndexFollowUp::default(),
+                || Ok(()),
+                || Ok(()),
+                || {
+                    if first_checkpoint {
+                        first_checkpoint = false;
+                        lease_held.wait();
+                        release_builder.wait();
+                    }
+                },
+            )
+        }
+    });
+    lease_held.wait();
+    let held_since = Instant::now();
+    let timeout = crate::runtime_files::INDEX_CLEAR_LOCK_TIMEOUT;
+    let admit = |label: &str, request: &dyn Fn() -> Result<()>| {
+        let started = Instant::now();
+        request().unwrap_or_else(|error| panic!("{label} was rejected: {error:#}"));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < timeout,
+            "{label} waited {elapsed:?} on a held lease"
+        );
+    };
+    let path = "src/a.rs".to_string();
+    admit("full rebuild", &|| {
+        enqueue_full_index_rebuild(&fixture.state)
+    });
+    admit("clear", &|| {
+        daemon_index_clear(fixture.state.clone()).map(|_| ())
+    });
+    assert!(
+        index_clear_is_pending(&fixture.root),
+        "clear intent must be readable while the build holds the lease"
+    );
+    admit("incremental paths", &|| {
+        enqueue_incremental_index_paths(&fixture.state, std::slice::from_ref(&path)).map(|_| ())
+    });
+    assert!(
+        index_clear_requires_rebuild(&fixture.root),
+        "paths admitted after the clear must record the rebuild durably"
+    );
+    // Keep the lease held past the admission deadline before releasing it.
+    let minimum_hold = timeout + Duration::from_millis(250);
+    if let Some(remaining) = minimum_hold.checked_sub(held_since.elapsed()) {
+        std::thread::sleep(remaining);
+    }
+    release_builder.wait();
+    builder
+        .join()
+        .expect("join builder")
+        .expect("finish the overlapped full build");
+    {
+        let guard = fixture.state.lock().expect("state");
+        assert_eq!(
+            guard.interactive_index.manifest.status,
+            DaemonIndexState::Queued,
+            "the admitted clear must supersede the overlapped publication"
+        );
+        assert_eq!(
+            guard.interactive_index.manifest.regex_status.as_deref(),
+            Some("clear_pending")
+        );
+    }
+
+    let mut processed = 0;
+    while let Some(batch) = receiver
+        .recv_debounced_timeout(Duration::from_secs(5))
+        .expect("receive queued work")
+    {
+        assert_eq!(
+            process_index_batch_with_recovery(&fixture.state, &batch, None)
+                .expect("process queued work"),
+            IndexBatchStatus::Complete
+        );
+        processed += 1;
+        let guard = fixture.state.lock().expect("state");
+        if guard.interactive_index.manifest.status == DaemonIndexState::Ready
+            && guard.interactive_index.manifest.queued_paths.is_empty()
+        {
+            break;
+        }
+    }
+    assert!(processed > 0, "no queued work was delivered");
+    assert!(!index_clear_is_pending(&fixture.root));
+    let guard = fixture.state.lock().expect("state");
+    assert_eq!(
+        guard.interactive_index.manifest.status,
+        DaemonIndexState::Ready
+    );
+    assert!(guard.interactive_index.manifest.dirty_paths.is_empty());
+    assert!(guard.interactive_index.manifest.queued_paths.is_empty());
+    assert!(!guard.interactive_index.needs_rebuild());
+}
+
 #[test]
 fn older_clear_completion_cannot_acknowledge_a_newer_durable_revision() {
     let fixture = IndexFixture::new(&[("src/a.rs", "pub fn alpha() {}\n")]);
@@ -1090,7 +1306,10 @@ fn clear_state_lock_serializes_processes_and_is_released_after_a_crash() {
     while !ready.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(ready.exists(), "helper did not acquire the directory lock");
+    assert!(
+        ready.exists(),
+        "helper did not acquire the clear-state lock"
+    );
 
     let blocked_at = Instant::now();
     let error = persist_index_clear_pending(&root)

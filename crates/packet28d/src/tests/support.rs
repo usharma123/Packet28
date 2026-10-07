@@ -55,6 +55,7 @@ pub(crate) fn daemon_test_state_with_persistence_debounce(
         source_file_cache: BTreeMap::new(),
         interactive_index: InteractiveIndexRuntime::default(),
         index_tx,
+        index_admission: Arc::new(Mutex::new(())),
         background_tx,
         persistence,
         _persistence_owner: Some(persistence_owner),

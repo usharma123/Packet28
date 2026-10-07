@@ -261,6 +261,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
         source_file_cache: BTreeMap::new(),
         interactive_index,
         index_tx,
+        index_admission: Arc::new(Mutex::new(())),
         background_tx,
         persistence,
         #[cfg(test)]
