@@ -146,6 +146,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
         daemon_log_path.display()
     ));
 
+    let startup_clock = std::time::Instant::now();
     let kernel = Arc::new(
         Kernel::try_with_v1_reducers_and_persistence(PersistConfig::new(root.clone()))
             .with_context(|| {
@@ -160,8 +161,10 @@ pub fn serve(root: PathBuf) -> Result<()> {
         kernel.clone(),
         config.max_persistent_roots,
     )?);
+    daemon_log(&format!("startup profile kernel {:?}", startup_clock.elapsed()));
     let (loaded_registry, event_tails, quarantined_event_logs) =
         load_task_watch_registry_recovering_corrupt_event_logs(&root)?;
+    daemon_log(&format!("startup profile registry load {:?}", startup_clock.elapsed()));
     for record in &quarantined_event_logs {
         let moved_to = record
             .quarantined_path
@@ -195,6 +198,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
         checkpoint_revision,
         replayed_revision,
     )?;
+    daemon_log(&format!("startup profile persistence owner {:?}", startup_clock.elapsed()));
     if restart_reconciliation.changed_tasks > 0 {
         daemon_log(&format!(
             "reconciled {} interrupted task lifecycle(s) after restart",
@@ -225,6 +229,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
     }
     persistence.stage_and_flush(startup_delta)?;
     persistence.checkpoint_current()?;
+    daemon_log(&format!("startup profile checkpoint {:?}", startup_clock.elapsed()));
     // Size every record once so near-limit and unlistable records are logged
     // and reported by status from the first request.
     let record_sizes = crate::task_maintenance::RecordSizeIndex::default();
@@ -239,6 +244,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
     for task in tasks.tasks.values() {
         record_sizes.observe(task);
     }
+    daemon_log(&format!("startup profile record sizes {:?}", startup_clock.elapsed()));
     let manifest = load_index_manifest_file(&root);
     let interactive_index = load_index_runtime_files(&root, manifest);
     let (index_tx, index_rx) = IndexIngress::new();
@@ -273,6 +279,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
         record_sizes,
     }));
     crate::broker::inherit_recovered_agent_state(&state)?;
+    daemon_log(&format!("startup profile agent state {:?}", startup_clock.elapsed()));
     let recovered_replans =
         prepare_recovered_replans(&state, restart_reconciliation.replan_task_ids)?;
 
@@ -290,6 +297,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
         .thread_name("packet28d-runtime")
         .build()
         .context("failed to create packet28d Tokio runtime")?;
+    daemon_log(&format!("startup profile pre-ready {:?}", startup_clock.elapsed()));
     mark_ready(&state)?;
     let runtime_outcome = runtime.block_on(run_daemon_runtime(DaemonRuntimeInputs {
         listener,

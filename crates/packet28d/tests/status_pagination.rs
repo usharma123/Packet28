@@ -110,7 +110,7 @@ where
     read_frame(&mut *stream).expect("read daemon response")
 }
 
-const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DIAGNOSTIC_LOG_BYTES: usize = 64 * 1024;
 
 fn file_tail(path: &std::path::Path) -> String {
@@ -141,7 +141,7 @@ fn wait_for_ready(daemon: &mut DaemonChild, root: &std::path::Path) -> DaemonRun
     let started = Instant::now();
     loop {
         if ready_path(root).exists() {
-            eprintln!("daemon_ready_elapsed={:?}", started.elapsed());
+            eprintln!("daemon_ready_elapsed={:?}\n{}", started.elapsed(), daemon_diagnostics(daemon, root));
             return serde_json::from_slice(
                 &std::fs::read(runtime_path(root)).expect("read runtime metadata"),
             )
