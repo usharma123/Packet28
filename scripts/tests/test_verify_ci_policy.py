@@ -20,7 +20,11 @@ class ReproducibleCargoPolicyTests(unittest.TestCase):
         )
 
     def test_rejects_msrv_toolchain_without_clippy(self) -> None:
-        unsafe = self.build.replace("          components: clippy\n", "", 1)
+        unsafe = self.build.replace(
+            "          toolchain: 1.88.0\n          components: clippy\n",
+            "          toolchain: 1.88.0\n",
+            1,
+        )
 
         errors = verify_ci_policy.msrv_clippy_component_errors(
             self.build_path, unsafe

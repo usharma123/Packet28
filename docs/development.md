@@ -58,6 +58,22 @@ The gate covers:
 6. `cargo-deny`;
 7. source-package, Cargo-package, and publication-policy checks.
 
+PR CI runs policy, lint/docs, workspace tests, dependency auditing, and MSRV
+as separate jobs. The required `quality` check succeeds only when every required
+job and every selected optional job succeeds. New PR commits cancel obsolete
+runs. MSRV runs only the locked workspace check, without repeating policy tests.
+
+Packaging and direct-minimum compilation run on PRs that change manifests,
+lockfiles, toolchain/configuration, CI, or validation scripts. Packaging also
+runs for npm packages, build scripts, and license changes. Ordinary Rust source
+edits defer those two checks to main, the weekly Monday run, or a manual run;
+all of those run every phase. Release validation still uses the complete gate,
+including explicit workspace check/build and packaged-source compilation.
+
+To rerun an individual CI job locally, use `--phase policy`, `--phase lint`,
+`--phase docs`, `--phase tests`, `--phase audit`, `--phase dependencies`, or
+`--phase packages`. `--list` works with every mode.
+
 Exact MSRV:
 
 ```bash
