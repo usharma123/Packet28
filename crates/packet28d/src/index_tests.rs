@@ -485,13 +485,11 @@ fn rebuild_admission_succeeds_while_a_builder_checkpoint_holds_the_index_lease()
         .recv_debounced()
         .expect("receive the initial rebuild");
     let initial_epoch = initial.full_rebuild_epoch.expect("initial epoch");
-    let checkpoint_reached = Arc::new(Barrier::new(2));
-    let release_builder = Arc::new(Barrier::new(2));
+    let (checkpoint_reached_tx, checkpoint_reached_rx) = std::sync::mpsc::channel();
+    let (release_builder, release_builder_rx) = std::sync::mpsc::channel();
 
     let builder = std::thread::spawn({
         let state = fixture.state.clone();
-        let checkpoint_reached = checkpoint_reached.clone();
-        let release_builder = release_builder.clone();
         move || {
             let mut first_checkpoint = true;
             perform_full_index_rebuild_with_checkpoint_hook(
@@ -504,25 +502,28 @@ fn rebuild_admission_succeeds_while_a_builder_checkpoint_holds_the_index_lease()
                 || {
                     if first_checkpoint {
                         first_checkpoint = false;
-                        checkpoint_reached.wait();
-                        release_builder.wait();
+                        checkpoint_reached_tx
+                            .send(())
+                            .expect("announce held index lease");
+                        release_builder_rx
+                            .recv_timeout(Duration::from_secs(30))
+                            .expect("admission did not finish while the builder held its lease");
                     }
                 },
             )
         }
     });
-    checkpoint_reached.wait();
+    checkpoint_reached_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("builder did not reach its held checkpoint");
     // The builder holds the retained index lease inside its first checkpoint
     // and cannot reach the state mutex until it is released below.
-    let started = Instant::now();
     enqueue_full_index_rebuild(&fixture.state)
         .expect("admit a rebuild while a builder checkpoint holds the index lease");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < crate::runtime_files::INDEX_CLEAR_LOCK_TIMEOUT,
-        "admission waited {elapsed:?} on a lease-held checkpoint"
-    );
-    release_builder.wait();
+    // Completion before sending the release proves admission did not wait
+    // for the builder. Other test roots share the process-wide clear-state
+    // mutex, so wall time would also include their unrelated lock waits.
+    release_builder.send(()).expect("release held builder");
     builder
         .join()
         .expect("join builder")
@@ -575,13 +576,11 @@ fn admission_does_not_wait_for_a_long_build_holding_the_index_lease() {
         .recv_debounced()
         .expect("receive the initial rebuild");
     let initial_epoch = initial.full_rebuild_epoch.expect("initial epoch");
-    let lease_held = Arc::new(Barrier::new(2));
-    let release_builder = Arc::new(Barrier::new(2));
+    let (lease_held_tx, lease_held_rx) = std::sync::mpsc::channel();
+    let (release_builder, release_builder_rx) = std::sync::mpsc::channel();
 
     let builder = std::thread::spawn({
         let state = fixture.state.clone();
-        let lease_held = lease_held.clone();
-        let release_builder = release_builder.clone();
         move || {
             let mut first_checkpoint = true;
             perform_full_index_rebuild_with_checkpoint_hook(
@@ -594,24 +593,25 @@ fn admission_does_not_wait_for_a_long_build_holding_the_index_lease() {
                 || {
                     if first_checkpoint {
                         first_checkpoint = false;
-                        lease_held.wait();
-                        release_builder.wait();
+                        lease_held_tx.send(()).expect("announce held index lease");
+                        release_builder_rx
+                            .recv_timeout(Duration::from_secs(30))
+                            .expect("admission did not finish while the builder held its lease");
                     }
                 },
             )
         }
     });
-    lease_held.wait();
+    lease_held_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("builder did not reach its held checkpoint");
     let held_since = Instant::now();
     let timeout = crate::runtime_files::INDEX_CLEAR_LOCK_TIMEOUT;
     let admit = |label: &str, request: &dyn Fn() -> Result<()>| {
-        let started = Instant::now();
+        // The builder cannot release its lease until all requests finish.
+        // Its bounded rendezvous detects blocking without charging admission
+        // for unrelated fixtures queued on the process-wide writer mutex.
         request().unwrap_or_else(|error| panic!("{label} was rejected: {error:#}"));
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < timeout,
-            "{label} waited {elapsed:?} on a held lease"
-        );
     };
     let path = "src/a.rs".to_string();
     admit("full rebuild", &|| {
@@ -636,7 +636,7 @@ fn admission_does_not_wait_for_a_long_build_holding_the_index_lease() {
     if let Some(remaining) = minimum_hold.checked_sub(held_since.elapsed()) {
         std::thread::sleep(remaining);
     }
-    release_builder.wait();
+    release_builder.send(()).expect("release held builder");
     builder
         .join()
         .expect("join builder")
@@ -1257,17 +1257,46 @@ fn clear_state_process_helper() {
 }
 
 #[cfg(unix)]
-fn spawn_clear_state_process(root: &Path, mode: &str, output: &Path) -> Child {
-    Command::new(std::env::current_exe().expect("resolve current test executable"))
-        .arg("--exact")
-        .arg("index::tests::clear_state_process_helper")
-        .arg("--nocapture")
-        .arg("--test-threads=1")
-        .env(CLEAR_STATE_PROCESS_MODE, mode)
-        .env(CLEAR_STATE_PROCESS_ROOT, root)
-        .env(CLEAR_STATE_PROCESS_OUTPUT, output)
-        .spawn()
-        .expect("spawn clear-state helper")
+struct ClearStateProcess(Child);
+
+#[cfg(unix)]
+impl std::ops::Deref for ClearStateProcess {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for ClearStateProcess {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ClearStateProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+fn spawn_clear_state_process(root: &Path, mode: &str, output: &Path) -> ClearStateProcess {
+    ClearStateProcess(
+        Command::new(std::env::current_exe().expect("resolve current test executable"))
+            .arg("--exact")
+            .arg("index::tests::clear_state_process_helper")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CLEAR_STATE_PROCESS_MODE, mode)
+            .env(CLEAR_STATE_PROCESS_ROOT, root)
+            .env(CLEAR_STATE_PROCESS_OUTPUT, output)
+            .spawn()
+            .expect("spawn clear-state helper"),
+    )
 }
 
 #[cfg(unix)]
@@ -1311,10 +1340,12 @@ fn clear_state_lock_serializes_processes_and_is_released_after_a_crash() {
         "helper did not acquire the clear-state lock"
     );
 
-    let blocked_at = Instant::now();
-    let error = persist_index_clear_pending(&root)
-        .expect_err("a held cross-process lock did not bound the caller");
-    let blocked_for = blocked_at.elapsed();
+    let (_, writer) = run_writer_observing_lock_descriptors({
+        let root = root.clone();
+        move || persist_index_clear_pending(&root)
+    });
+    let (result, blocked_for) = writer.join().expect("join held-lock writer");
+    let error = result.expect_err("a held cross-process lock did not bound the caller");
     assert!(
         format!("{error:#}").contains("timed out"),
         "unexpected held-lock error: {error:#}"
@@ -2073,17 +2104,21 @@ fn clear_state_lock_rejects_special_leaves_without_blocking() {
         }
         let planted = fs::symlink_metadata(&lock_path).expect("planted metadata");
 
-        // A blocking FIFO open would never return (there is no peer); the
-        // bound below only has to exceed the in-process writer mutex wait
-        // that concurrent tests can add (at most one lock timeout each).
-        let started = Instant::now();
-        let error =
-            persist_index_clear_pending(&root).expect_err("writer accepted a special lock leaf");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "special leaf '{leaf}' blocked the writer: {elapsed:?}"
-        );
+        // A blocking FIFO open never returns without a peer. Use a watchdog
+        // for that regression, not a latency assertion that counts unrelated
+        // fixtures queued on the process-wide writer mutex.
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let root = root.clone();
+            move || {
+                let _ = result_tx.send(persist_index_clear_pending(&root));
+            }
+        });
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("special lock leaf blocked the writer")
+            .expect_err("writer accepted a special lock leaf");
+        writer.join().expect("join special-leaf writer");
         let chain = format!("{error:#}");
         let expected_rejection = match leaf {
             "directory" | "fifo" => "not a regular file",
