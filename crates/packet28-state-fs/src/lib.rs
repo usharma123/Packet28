@@ -4,6 +4,9 @@
 //! managed descendant is then opened one component at a time without following
 //! symbolic links. Reads admit only single-link regular files and enforce their
 //! byte limit both before allocation and while streaming.
+//!
+//! [`RotatingLog`] is the size-bounded diagnostic sink for long-running
+//! Packet28 processes; it rotates its own retained log leaf in-process.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -570,6 +573,10 @@ fn oversized(name: &str, max_bytes: u64) -> io::Error {
         format!("state file '{name}' exceeds {max_bytes} bytes"),
     )
 }
+
+mod rotating_log;
+
+pub use rotating_log::{LogRotation, RotatingLog, DEFAULT_MAX_RECORD_BYTES};
 
 #[cfg(unix)]
 mod platform;

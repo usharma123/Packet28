@@ -19,8 +19,8 @@ use crate::generation::{
 };
 use crate::layer::{build_layer, IndexedDocument};
 use crate::model::{
-    LayerFiles, LoadedIndex, OverlayState, RegexGenerationRecord, RegexIndexManifest,
-    RegexIndexRuntime, MAX_INDEXED_FILE_BYTES, REGEX_INDEX_SCHEMA_VERSION,
+    LayerFiles, LoadedIndex, RegexGenerationRecord, RegexIndexManifest, RegexIndexRuntime,
+    MAX_INDEXED_FILE_BYTES, REGEX_INDEX_SCHEMA_VERSION,
 };
 #[cfg(test)]
 use crate::paths::{manifest_path, previous_manifest_path};
@@ -119,7 +119,7 @@ impl RegexIndexScanSession {
     ///
     /// Returns a typed filesystem or manifest error when the writer lock or
     /// pre-publication state cannot be read, or [`SearchError::IndexNotReady`]
-    /// when a Git-backed workspace is dirty.
+    /// when a Git-backed workspace cannot be attested.
     pub fn begin(root: &Path, include_tests: bool, discovered_paths: &[String]) -> Result<Self> {
         if let Some(path) = discovered_paths
             .iter()
@@ -205,7 +205,6 @@ impl RegexIndexScanSession {
         for (index, document) in self.docs.iter_mut().enumerate() {
             document.doc_id = u32::try_from(index)?;
         }
-        let overlay_state = OverlayState::default();
         let mut manifest = RegexIndexManifest {
             schema_version: REGEX_INDEX_SCHEMA_VERSION,
             weight_table_version: WEIGHT_TABLE_VERSION,
@@ -213,7 +212,6 @@ impl RegexIndexScanSession {
             include_tests: self.include_tests,
             status: "ready".to_string(),
             last_build_started_at_unix: Some(self.started_at_unix),
-            overlay_state_digest: Some(overlay_state_digest(&overlay_state)?),
             ..RegexIndexManifest::default()
         };
         let mut base_files = LayerFiles::base(self.generation);
@@ -226,14 +224,14 @@ impl RegexIndexScanSession {
             .iter()
             .map(|doc| (doc.path.clone(), doc.fingerprint.clone()))
             .collect();
-        let clean_commit = authenticate_full_build_workspace(
+        let overlay_state = authenticate_full_build_workspace(
             &self.root,
             self.workspace_before.as_ref(),
             &reported_paths,
             &fingerprints,
+            &mut manifest,
         )?;
-        manifest.base_commit = clean_commit.clone();
-        manifest.workspace_clean_commit = clean_commit;
+        manifest.overlay_state_digest = Some(overlay_state_digest(&overlay_state)?);
         manifest.last_build_completed_at_unix = Some(now_unix());
         let mut record = RegexGenerationRecord {
             schema_version: REGEX_INDEX_SCHEMA_VERSION,

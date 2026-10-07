@@ -81,7 +81,7 @@ pub fn reduce_github_command(
                 .map(|line| format!("gh issue view: {line}"))
                 .unwrap_or_else(|| "gh issue view completed".to_string()),
             "gh_run_list" => summarize_list_entries("gh run list", &lines, "run"),
-            "gh_run_view" => summarize_run_view(&lines),
+            "gh_run_view" => summarize_run_view(&lines, stdout),
             "gh_release_list" => summarize_list_entries("gh release list", &lines, "release"),
             "gh_api" => summarize_api(stdout),
             "glab_mr_list" => summarize_list_entries("glab mr list", &lines, "MR"),
@@ -101,9 +101,10 @@ pub fn reduce_github_command(
         operation_kind: spec.operation_kind,
         summary,
         compact_preview: match spec.canonical_kind.as_str() {
+            "gh_pr_view" if failed => format!("{stdout}{stderr}"),
             "gh_pr_view" => compact_pr_view_preview(stdout),
             "gh_pr_checks" => compact_pr_checks_preview(&lines),
-            "gh_run_view" => compact_run_view_preview(&lines),
+            "gh_run_view" => compact_run_view_preview(stdout),
             "gh_pr_diff" | "glab_mr_diff" => crate::git::compact_diff_public(stdout, 500),
             _ => String::new(),
         },
@@ -156,7 +157,7 @@ fn compact(value: &str, limit: usize) -> String {
     if compact.len() <= limit {
         compact
     } else {
-        format!("{}...", &compact[..limit.saturating_sub(3)])
+        format!("{}...", utf8_prefix(&compact, limit.saturating_sub(3)))
     }
 }
 
@@ -180,7 +181,7 @@ fn summarize_pr_view(lines: &[String]) -> String {
     }
 }
 
-fn summarize_run_view(lines: &[String]) -> String {
+fn summarize_run_view(lines: &[String], stdout: &str) -> String {
     let title = lines
         .first()
         .and_then(|line| line.strip_prefix('✓').or_else(|| line.strip_prefix('X')))
@@ -189,19 +190,100 @@ fn summarize_run_view(lines: &[String]) -> String {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned);
-    let jobs = extract_section_count(lines, "JOBS");
-    let annotations = extract_section_count(lines, "ANNOTATIONS");
-    match title {
-        Some(title) => format!(
-            "gh run view: {title} ({jobs} job{}, {annotations} annotation{})",
-            if jobs == 1 { "" } else { "s" },
+    let raw_lines = stdout.lines().map(str::trim_end).collect::<Vec<_>>();
+    // Counts come from the untrimmed output: step lines are only
+    // distinguishable from jobs by their indentation. A section that does not
+    // match gh's layout yields no count rather than a wrong one.
+    let jobs = count_run_view_jobs(&raw_lines);
+    let annotations = if jobs.is_some() {
+        count_run_view_annotations(&raw_lines)
+    } else {
+        None
+    };
+    let mut counts = Vec::new();
+    if let Some(jobs) = jobs {
+        counts.push(format!("{jobs} job{}", if jobs == 1 { "" } else { "s" }));
+    }
+    if let Some(annotations) = annotations {
+        counts.push(format!(
+            "{annotations} annotation{}",
             if annotations == 1 { "" } else { "s" }
-        ),
+        ));
+    }
+    match title {
+        Some(title) if counts.is_empty() => format!("gh run view: {title}"),
+        Some(title) => format!("gh run view: {title} ({})", counts.join(", ")),
         None => lines
             .first()
             .map(|line| format!("gh run view: {line}"))
             .unwrap_or_else(|| "gh run view completed".to_string()),
     }
+}
+
+/// Counts `<symbol> <name>[ in <elapsed>] (ID <id>)` lines in the JOBS
+/// section, skipping their two-space-indented step lines.
+fn count_run_view_jobs(lines: &[&str]) -> Option<usize> {
+    let start = lines.iter().position(|line| *line == "JOBS")? + 1;
+    let mut jobs = 0;
+    for line in lines[start..].iter().take_while(|line| !line.is_empty()) {
+        if line.starts_with("  ") && jobs > 0 {
+            continue;
+        }
+        if !is_run_view_job_line(line) {
+            return None;
+        }
+        jobs += 1;
+    }
+    Some(jobs)
+}
+
+fn is_run_view_job_line(line: &str) -> bool {
+    let Some((symbol, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    let id = rest
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" (ID "))
+        .map(|(_, id)| id);
+    !symbol.is_empty()
+        && !symbol.starts_with(char::is_whitespace)
+        && id.is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Counts annotations in gh's `<symbol> <message>` / `<job>: <path>#<line>`
+/// blocks. Messages may span lines, so a block ends only at a location line
+/// followed by a blank line; the section ends at the next blank line.
+fn count_run_view_annotations(lines: &[&str]) -> Option<usize> {
+    let Some(heading) = lines.iter().position(|line| *line == "ANNOTATIONS") else {
+        // gh omits the heading when the run has no annotations.
+        return Some(0);
+    };
+    let mut annotations = 0;
+    let mut index = heading + 1;
+    while lines.get(index).is_some_and(|line| !line.is_empty()) {
+        let first = lines[index];
+        if !matches!(
+            first.split_once(' ').map(|(symbol, _)| symbol),
+            Some("X" | "!" | "-")
+        ) {
+            return None;
+        }
+        let end = (index + 1..lines.len()).find(|&candidate| {
+            is_run_view_annotation_location(lines[candidate])
+                && lines.get(candidate + 1).is_none_or(|next| next.is_empty())
+        })?;
+        annotations += 1;
+        index = end + 2;
+    }
+    Some(annotations)
+}
+
+fn is_run_view_annotation_location(line: &str) -> bool {
+    line.rsplit_once('#').is_some_and(|(location, number)| {
+        location.contains(": ")
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn summarize_list_entries(label: &str, lines: &[String], noun: &str) -> String {
@@ -320,50 +402,93 @@ fn extract_tab_field(lines: &[String], key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn extract_section_count(lines: &[String], heading: &str) -> usize {
-    let mut in_section = false;
-    let mut count = 0;
-    for line in lines {
-        if line == heading {
-            in_section = true;
-            continue;
-        }
-        if in_section {
-            if line.trim().is_empty() {
-                if count > 0 {
-                    break;
-                }
-                continue;
-            }
-            if line
-                .chars()
-                .all(|ch| ch.is_ascii_uppercase() || ch == ' ' || ch == '_')
-            {
-                break;
-            }
-            count += 1;
+fn compact_pr_view_preview(stdout: &str) -> String {
+    let separator = stdout.lines().position(|line| line.trim() == "--");
+    let header = stdout
+        .lines()
+        .take(separator.unwrap_or(0))
+        .collect::<Vec<_>>();
+    let recognized_header = separator.is_some()
+        && header
+            .first()
+            .is_some_and(|line| line.starts_with("title:\t"))
+        && header.iter().all(|line| line.split_once(":\t").is_some())
+        && ["title:\t", "state:\t", "number:\t"]
+            .iter()
+            .all(|prefix| header.iter().any(|line| line.starts_with(prefix)));
+    let mut parts = Vec::new();
+    if recognized_header {
+        if let Some(url) = header.iter().find_map(|line| line.strip_prefix("url:\t")) {
+            parts.push(format!("url: {url}"));
         }
     }
-    count
+    let body_start = if recognized_header {
+        separator.map_or(0, |index| index + 1)
+    } else {
+        0
+    };
+    let (body, body_omitted) = compact_pr_body(stdout.lines().skip(body_start));
+    if !body.is_empty() {
+        parts.push(body);
+    }
+    let metadata_omitted = recognized_header
+        && header.iter().any(|line| {
+            line.split_once(":\t").is_some_and(|(key, value)| {
+                !value.trim().is_empty()
+                    && !matches!(key, "title" | "state" | "number" | "author" | "url")
+            })
+        });
+    if body_omitted || metadata_omitted {
+        parts.push("[content omitted; use original gh command for full output]".to_string());
+    }
+    parts.join("\n")
 }
 
-fn compact_pr_view_preview(stdout: &str) -> String {
-    let mut parts = Vec::new();
-    for line in stdout.lines() {
+fn compact_pr_body<'a>(lines: impl Iterator<Item = &'a str>) -> (String, bool) {
+    const MAX_BYTES: usize = 320;
+    const MAX_LINES: usize = 8;
+    let mut body = String::new();
+    let mut rendered_lines = 0;
+    let mut omitted = false;
+    for line in lines {
         let trimmed = line.trim();
-        // Skip markdown images, badges, HTML comments
         if trimmed.starts_with("![")
             || trimmed.starts_with("<!--")
             || trimmed.starts_with("<img")
             || trimmed.starts_with("[![")
         {
+            omitted = true;
             continue;
         }
-        parts.push(trimmed.to_string());
+        let separator = if rendered_lines > 0 { "\n" } else { "" };
+        let remaining = MAX_BYTES.saturating_sub(body.len());
+        if rendered_lines == MAX_LINES || separator.len() > remaining {
+            omitted = true;
+            break;
+        }
+        let prefix = utf8_prefix(trimmed, remaining - separator.len());
+        body.push_str(separator);
+        body.push_str(prefix);
+        rendered_lines += 1;
+        if prefix.len() != trimmed.len() {
+            omitted = true;
+            break;
+        }
     }
-    // Limit to 30 lines
-    parts.truncate(30);
-    parts.join("\n")
+    (body, omitted)
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    &value[..end]
 }
 
 fn compact_pr_checks_preview(lines: &[String]) -> String {
@@ -396,10 +521,10 @@ fn summarize_glab_ci_status(lines: &[String]) -> String {
     format!("glab ci status: {first}")
 }
 
-fn compact_run_view_preview(lines: &[String]) -> String {
+fn compact_run_view_preview(stdout: &str) -> String {
     let mut result = Vec::new();
     let mut in_jobs = false;
-    for line in lines {
+    for line in stdout.lines() {
         let trimmed = line.trim();
         if trimmed == "JOBS" {
             in_jobs = true;
@@ -410,7 +535,8 @@ fn compact_run_view_preview(lines: &[String]) -> String {
             continue;
         }
         if in_jobs && !trimmed.is_empty() {
-            result.push(trimmed.to_string());
+            // Keep step indentation so steps are not mistaken for jobs.
+            result.push(line.trim_end().to_string());
         }
     }
     result.join("\n")
@@ -419,6 +545,100 @@ fn compact_run_view_preview(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pr_view_spec() -> CommandReducerSpec {
+        let argv = ["gh", "pr", "view", "71"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        classify_github_command("gh pr view 71", &argv).unwrap()
+    }
+
+    fn pr_view_stdout(body: &str) -> String {
+        format!(
+            "title:\tIntegrate native lifecycle hooks\nstate:\tOPEN\nauthor:\tusharma123\nlabels:\t\nreviewers:\tconnector (Commented)\nnumber:\t71\nurl:\thttps://github.com/usharma123/Packet28/pull/71\nadditions:\t1207\ndeletions:\t33\n--\n{body}"
+        )
+    }
+
+    #[test]
+    fn pr_view_preview_preserves_identity_without_duplicate_header() {
+        let output = pr_view_stdout("## Problem\nPreserve native commands and permissions.\n");
+        let reduction = reduce_github_command(&pr_view_spec(), &output, "", 0);
+        assert_eq!(
+            reduction.summary,
+            "gh pr view: PR #71 OPEN by usharma123 - Integrate native lifecycle hooks"
+        );
+        assert!(reduction
+            .compact_preview
+            .contains("url: https://github.com/usharma123/Packet28/pull/71"));
+        assert!(reduction.compact_preview.contains("## Problem"));
+        for field in ["title:\t", "state:\t", "author:\t", "number:\t"] {
+            assert!(!reduction.compact_preview.contains(field));
+        }
+        assert!(reduction.compact_preview.contains("content omitted"));
+        assert!(reduction.compact_preview.contains("original gh command"));
+    }
+
+    #[test]
+    fn pr_view_preview_bounds_long_unicode_body_without_cutting_characters() {
+        let body = "🦀修".repeat(1000);
+        let output = pr_view_stdout(&body);
+        let reduction = reduce_github_command(&pr_view_spec(), &output, "", 0);
+        let rendered_body = reduction.compact_preview.lines().nth(1).unwrap();
+        assert!(rendered_body.len() <= 320);
+        assert!(rendered_body.starts_with("🦀修"));
+        assert!(body.starts_with(rendered_body));
+        assert!(reduction
+            .compact_preview
+            .ends_with("[content omitted; use original gh command for full output]"));
+    }
+
+    #[test]
+    fn pr_view_preview_bounds_body_lines_and_discloses_filtered_content() {
+        let body = format!(
+            "![badge](badge.png)\n{}",
+            (0..12)
+                .map(|index| format!("body line {index}\n"))
+                .collect::<String>()
+        );
+        let reduction = reduce_github_command(&pr_view_spec(), &pr_view_stdout(&body), "", 0);
+        assert!(reduction.compact_preview.contains("body line 7"));
+        assert!(!reduction.compact_preview.contains("body line 8"));
+        assert!(!reduction.compact_preview.contains("badge.png"));
+        assert!(reduction.compact_preview.contains("content omitted"));
+    }
+
+    #[test]
+    fn pr_view_preview_keeps_plain_body_separator_without_recognized_header() {
+        let body = "ordinary heading\n--\nordinary body";
+        assert_eq!(compact_pr_view_preview(body), body);
+        let malformed = "title:\tHeading\n--\nstate:\tOPEN\nnumber:\t71\nbody";
+        assert_eq!(compact_pr_view_preview(malformed), malformed);
+        let ordinary = "ordinary heading\ntitle:\tBody title\nstate:\tOPEN\nnumber:\t71\n--\nbody";
+        assert_eq!(compact_pr_view_preview(ordinary), ordinary);
+    }
+
+    #[test]
+    fn pr_view_preview_keeps_metadata_when_header_separator_is_absent() {
+        let output =
+            "title:\tHeading\nstate:\tOPEN\nnumber:\t71\nurl:\thttps://example.test/pr/71\nbody";
+        assert_eq!(compact_pr_view_preview(output), output);
+    }
+
+    #[test]
+    fn pr_view_reduction_preserves_complete_failed_output_and_exit() {
+        let stdout = pr_view_stdout(&"partial output\n".repeat(40));
+        let stderr = format!(
+            "request failed: {}\nadditional diagnostic\n",
+            "🦀".repeat(100)
+        );
+        let reduction = reduce_github_command(&pr_view_spec(), &stdout, &stderr, 7);
+        assert!(reduction.failed);
+        assert_eq!(reduction.exit_code, 7);
+        assert_eq!(reduction.compact_preview, format!("{stdout}{stderr}"));
+        assert!(reduction.summary.contains(stderr.lines().next().unwrap()));
+        assert!(reduction.error_message.as_ref().unwrap().len() <= 200);
+    }
 
     #[test]
     fn classify_github_declines_json_and_patch_variants() {
@@ -475,19 +695,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reduce_github_run_view_summarizes_jobs_and_annotations() {
+    fn run_view_reduction(stdout: &str) -> CommandReduction {
         let argv = vec!["gh", "run", "view", "23079602872"]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
         let spec = classify_github_command("gh run view 23079602872", &argv).unwrap();
-        let stdout = "\n✓ v0.2.24 Release · 23079602872\nTriggered via push about 17 hours ago\n\nJOBS\n✓ test in 2m19s\n✓ publish in 47s\n\nANNOTATIONS\n! Node.js 20 actions are deprecated.\n! Another warning.\n";
-        let reduction = reduce_github_command(&spec, stdout, "", 0);
+        reduce_github_command(&spec, stdout, "", 0)
+    }
+
+    #[test]
+    fn reduce_github_run_view_summarizes_jobs_and_annotations() {
+        let stdout = "\n✓ v0.2.24 Release · 23079602872\nTriggered via push about 17 hours ago\n\nJOBS\n✓ test in 2m19s (ID 1)\n✓ publish in 47s (ID 2)\n\nANNOTATIONS\n! Node.js 20 actions are deprecated.\ntest: .github#1\n\n! Another warning.\npublish: .github#1\n\n\nFor more information about a job, try: gh run view --job=<job-id>\nView this run on GitHub: https://github.com/o/r/actions/runs/23079602872\n";
         assert_eq!(
-            reduction.summary,
+            run_view_reduction(stdout).summary,
             "gh run view: v0.2.24 Release (2 jobs, 2 annotations)"
         );
+    }
+
+    #[test]
+    fn run_view_counts_failed_job_without_its_steps_or_annotation_locations() {
+        // Real `gh run view 37565793313 --repo usharma123/Packet28` output.
+        let stdout = include_str!("../tests/fixtures/github/run_view_37565793313.stdout");
+        let reduction = run_view_reduction(stdout);
+        assert_eq!(
+            reduction.summary,
+            "gh run view: fix/scope-closure-registry-recovery Hook Benchmark Suite usharma123/Packet28#74 (1 job, 2 annotations)"
+        );
+        let preview = reduction.compact_preview.lines().collect::<Vec<_>>();
+        assert_eq!(preview[0], "X benchmark in 4m24s (ID 112613078067)");
+        assert_eq!(preview.len(), 19);
+        assert!(preview[1..].iter().all(|line| line.starts_with("  ")));
+        assert!(preview.contains(&"  X Validate hook benchmark thresholds"));
+    }
+
+    #[test]
+    fn run_view_counts_successful_jobs_and_annotations() {
+        // Real `gh run view 37565793390 --repo usharma123/Packet28` output.
+        let stdout = include_str!("../tests/fixtures/github/run_view_37565793390.stdout");
+        let reduction = run_view_reduction(stdout);
+        assert_eq!(
+            reduction.summary,
+            "gh run view: fix/scope-closure-registry-recovery Build usharma123/Packet28#74 (2 jobs, 2 annotations)"
+        );
+        assert_eq!(
+            reduction.compact_preview,
+            "✓ quality in 21m9s (ID 112613078285)\n✓ msrv in 3m48s (ID 112613078536)"
+        );
+    }
+
+    #[test]
+    fn run_view_counts_multiline_annotations_artifacts_and_jobs_without_elapsed() {
+        let stdout = "\nX main CI · 7\nTriggered via push about 1 hour ago\n\nJOBS\nX build in 8s (ID 11)\n  ✓ Set up job\n  X Publish\n- test-plugins (ID 12)\n* lint (ID 13)\n\nANNOTATIONS\nX NpmCallError: publish failed\nnpm error code E404\n\nnpm error 404 Not Found\nbuild: .github#6\n\n- \"The ubuntu-latest label will migrate\"\nbuild: .github#1\n\n\nARTIFACTS\nreport\n\nTo see what failed, try: gh run view 7 --log-failed\nView this run on GitHub: https://github.com/o/r/actions/runs/7\n";
+        assert_eq!(
+            run_view_reduction(stdout).summary,
+            "gh run view: main CI (3 jobs, 2 annotations)"
+        );
+    }
+
+    #[test]
+    fn run_view_counts_zero_annotations_when_section_is_absent() {
+        let stdout = "\n✓ main CI · 7\nTriggered via push about 1 hour ago\n\nJOBS\n✓ build in 8s (ID 11)\n\nFor more information about the job, try: gh run view --job=11\nView this run on GitHub: https://github.com/o/r/actions/runs/7\n";
+        assert_eq!(
+            run_view_reduction(stdout).summary,
+            "gh run view: main CI (1 job, 0 annotations)"
+        );
+        let crlf = stdout.replace('\n', "\r\n");
+        assert_eq!(
+            run_view_reduction(&crlf).summary,
+            "gh run view: main CI (1 job, 0 annotations)"
+        );
+    }
+
+    #[test]
+    fn run_view_omits_counts_it_cannot_parse() {
+        // Steps whose indentation was lost, an unknown job line, or a missing
+        // JOBS heading must not be counted as jobs.
+        for jobs in [
+            "X build in 8s (ID 11)\n✓ Set up job\n",
+            "build passed\n",
+            "  ✓ Set up job\nX build in 8s (ID 11)\n",
+        ] {
+            let stdout = format!(
+                "\nX main CI · 7\n\nJOBS\n{jobs}\nANNOTATIONS\nX failed\nbuild: .github#1\n\n"
+            );
+            assert_eq!(run_view_reduction(&stdout).summary, "gh run view: main CI");
+        }
+        assert_eq!(
+            run_view_reduction(
+                "\nX main CI · 7\n\nX This run likely failed because of a workflow file issue.\n"
+            )
+            .summary,
+            "gh run view: main CI"
+        );
+        // Annotations without gh's location lines are not guessed at.
+        for annotations in [
+            "! one warning\n! another warning\n",
+            "X failed\nno location\n",
+        ] {
+            let stdout =
+                format!("\nX main CI · 7\n\nJOBS\nX build (ID 11)\n\nANNOTATIONS\n{annotations}\n");
+            assert_eq!(
+                run_view_reduction(&stdout).summary,
+                "gh run view: main CI (1 job)"
+            );
+        }
     }
 
     #[test]

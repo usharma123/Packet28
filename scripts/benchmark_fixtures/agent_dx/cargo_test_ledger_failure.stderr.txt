@@ -1,0 +1,4 @@
+   Compiling ledger v0.1.0 (/private/tmp/packet28-scope-closure/agent-dx-capture/ledger)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.53s
+     Running unittests src/lib.rs (/tmp/packet28-scope-closure/agent-dx-capture/ledger/target/debug/deps/ledger-45d488adf5d0ce91)
+error: test failed, to rerun pass `--lib`

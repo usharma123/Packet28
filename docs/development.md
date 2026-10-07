@@ -58,6 +58,22 @@ The gate covers:
 6. `cargo-deny`;
 7. source-package, Cargo-package, and publication-policy checks.
 
+PR CI runs policy, lint/docs, workspace tests, dependency auditing, and MSRV
+as separate jobs. The required `quality` check succeeds only when every required
+job and every selected optional job succeeds. New PR commits cancel obsolete
+runs. MSRV runs only the locked workspace check, without repeating policy tests.
+
+Packaging and direct-minimum compilation run on PRs that change manifests,
+lockfiles, toolchain/configuration, CI, or validation scripts. Packaging also
+runs for npm packages, build scripts, and license changes. Ordinary Rust source
+edits defer those two checks to main, the weekly Monday run, or a manual run;
+all of those run every phase. Release validation still uses the complete gate,
+including explicit workspace check/build and packaged-source compilation.
+
+To rerun an individual CI job locally, use `--phase policy`, `--phase lint`,
+`--phase docs`, `--phase tests`, `--phase audit`, `--phase dependencies`, or
+`--phase packages`. `--list` works with every mode.
+
 Exact MSRV:
 
 ```bash
@@ -144,6 +160,11 @@ Evidence belongs in a versioned directory under `benchmarks/` or
 - raw samples and summary method;
 - behavior-parity assertion;
 - accepted/rejected decision and scope.
+
+The [agent DX benchmark](agent-dx-benchmark.md) is the required workflow
+benchmark. It gates correctness, evidence, recovery and authority, and reports
+savings and latency without gating them. Add a hard performance floor only with
+a fixed corpus, repeated source-bound measurements and a stated product reason.
 
 Architectural experiments should be feature-gated until their output parity,
 failure behavior, and performance justify adoption. Historical or external

@@ -689,20 +689,107 @@ mod tests {
         );
     }
 
-    fn set_fixture_mtimes(path: &Path) {
-        let modified = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        for entry in fs::read_dir(path).expect("read fixture directory") {
-            let entry = entry.expect("read fixture entry");
-            let file_type = entry.file_type().expect("read fixture entry type");
+    const FIXTURE_MTIME_SECONDS: u64 = 1_700_000_000;
+
+    fn set_fixture_mtimes(root: &Path) {
+        set_fixture_mtimes_with(root, root, &mut |_| {});
+    }
+
+    fn set_fixture_mtimes_with(root: &Path, path: &Path, before_open: &mut dyn FnMut(&Path)) {
+        let modified = UNIX_EPOCH + Duration::from_secs(FIXTURE_MTIME_SECONDS);
+        let entries = fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("read fixture directory {}: {error}", path.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("read fixture entry in {}: {error}", path.display())
+            });
+            let entry_path = entry.path();
+            // Git metadata is irrelevant to source parity, and Git may prune
+            // control files at any time, so only fixture content is touched.
+            if path == root && entry.file_name() == ".git" {
+                continue;
+            }
+            let file_type = entry.file_type().unwrap_or_else(|error| {
+                panic!("read fixture entry type {}: {error}", entry_path.display())
+            });
             if file_type.is_dir() {
-                set_fixture_mtimes(&entry.path());
+                set_fixture_mtimes_with(root, &entry_path, before_open);
             } else if file_type.is_file() {
-                fs::File::open(entry.path())
-                    .expect("open fixture file")
+                before_open(&entry_path);
+                fs::File::open(&entry_path)
+                    .unwrap_or_else(|error| {
+                        panic!("open fixture file {}: {error}", entry_path.display())
+                    })
                     .set_modified(modified)
-                    .expect("set fixture file mtime");
+                    .unwrap_or_else(|error| {
+                        panic!("set fixture file mtime {}: {error}", entry_path.display())
+                    });
             }
         }
+    }
+
+    fn fixture_mtime(path: &Path) -> std::time::SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn fixture_mtimes_skip_git_metadata_even_when_git_removes_control_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_fixture(root);
+        let git = root.join(".git");
+        let control = git.join("packet28-transient-control");
+        fs::write(&control, b"transient\n").unwrap();
+        let head_mtime = fixture_mtime(&git.join("HEAD"));
+        let modified = UNIX_EPOCH + Duration::from_secs(FIXTURE_MTIME_SECONDS);
+        let source = root.join("src/lib.rs");
+        fs::write(&source, b"pub fn shared_visible_symbol() -> usize { 9 }\n").unwrap();
+        assert_ne!(fixture_mtime(&source), modified);
+
+        let mut visited = Vec::new();
+        set_fixture_mtimes_with(root, root, &mut |path| {
+            // Model Git pruning a control file after the walk enumerated it
+            // and before it is opened.
+            if path == control {
+                fs::remove_file(path).unwrap();
+            }
+            visited.push(path.to_path_buf());
+        });
+
+        assert!(control.is_file(), "Git control file was touched");
+        assert!(
+            visited.iter().all(|path| !path.starts_with(&git)),
+            "fixture mtime walk visited Git metadata: {visited:?}"
+        );
+        assert!(visited.contains(&source));
+        assert_eq!(fixture_mtime(&source), modified);
+        assert_eq!(fixture_mtime(&git.join("HEAD")), head_mtime);
+    }
+
+    #[test]
+    fn fixture_mtimes_fail_with_the_path_of_a_vanished_source_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_fixture(root);
+        let vanished = root.join("docs/guide.md");
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set_fixture_mtimes_with(root, root, &mut |path| {
+                if path == vanished {
+                    fs::remove_file(path).unwrap();
+                }
+            });
+        }))
+        .expect_err("a vanished fixture source file must fail the walk");
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .expect("formatted panic message");
+
+        assert!(
+            message.starts_with(&format!("open fixture file {}:", vanished.display())),
+            "{message}"
+        );
     }
 
     fn fixture_git(root: &Path, arguments: &[&str]) {
@@ -909,6 +996,122 @@ mod tests {
             packet28_search_core::indexed_search(separate_dir.path(), &expected_regex, &request)
                 .unwrap()
         );
+    }
+
+    fn dirty_fixture(root: &Path) {
+        write_fixture(root);
+        fs::write(
+            root.join("src/lib.rs"),
+            b"pub fn shared_dirty_tracked_symbol() -> usize { 8 }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/setup.md"),
+            b"shared dirty untracked needle\n",
+        )
+        .unwrap();
+        fs::remove_file(root.join("docs/guide.md")).unwrap();
+        set_fixture_mtimes(root);
+    }
+
+    #[test]
+    fn shared_scan_attests_a_stable_dirty_workspace_like_the_separate_rebuild() {
+        let separate_dir = tempfile::tempdir().unwrap();
+        let shared_dir = tempfile::tempdir().unwrap();
+        dirty_fixture(separate_dir.path());
+        dirty_fixture(shared_dir.path());
+
+        let expected = packet28_search_core::rebuild_full_index(separate_dir.path(), true).unwrap();
+        let shared =
+            rebuild_full_indexes_with_shared_scan(shared_dir.path(), true, || false, |_| {})
+                .unwrap();
+
+        assert!(expected.manifest.workspace_attested_commit.is_some());
+        assert_eq!(expected.manifest.workspace_clean_commit, None);
+        for (actual, expected) in [
+            (
+                &shared.regex.manifest.base_commit,
+                &expected.manifest.base_commit,
+            ),
+            (
+                &shared.regex.manifest.workspace_clean_commit,
+                &expected.manifest.workspace_clean_commit,
+            ),
+            (
+                &shared.regex.manifest.workspace_attested_commit,
+                &expected.manifest.workspace_attested_commit,
+            ),
+            (
+                &shared.regex.manifest.overlay_state_digest,
+                &expected.manifest.overlay_state_digest,
+            ),
+        ] {
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(
+            shared.regex.shared_scan_content_digests(),
+            expected.shared_scan_content_digests()
+        );
+        let reloaded = packet28_search_core::load_runtime(shared_dir.path()).unwrap();
+        assert!(reloaded.is_loaded(), "{:?}", reloaded.manifest.stale_reason);
+        for (query, matches) in [
+            ("shared_dirty_tracked_symbol", 1),
+            ("shared dirty untracked needle", 1),
+            ("shared documentation needle", 0),
+            ("shared_visible_symbol", 0),
+        ] {
+            let request = SearchRequest {
+                query: query.to_string(),
+                fixed_string: true,
+                ..SearchRequest::default()
+            };
+            let actual =
+                packet28_search_core::indexed_search(shared_dir.path(), &reloaded, &request)
+                    .unwrap();
+            let separate =
+                packet28_search_core::indexed_search(separate_dir.path(), &expected, &request)
+                    .unwrap();
+            assert_eq!(actual, separate, "query parity failed for {query}");
+            assert_eq!(actual.match_count, matches, "{query}");
+            if matches > 0 {
+                packet28_search_core::guarded_indexed_search(
+                    shared_dir.path(),
+                    &reloaded,
+                    &request,
+                )
+                .unwrap();
+            }
+        }
+
+        fs::write(shared_dir.path().join("docs/setup.md"), b"unreported\n").unwrap();
+        assert!(!packet28_search_core::load_runtime(shared_dir.path())
+            .unwrap()
+            .is_loaded());
+    }
+
+    #[test]
+    fn shared_scan_rejects_a_dirty_workspace_change_during_the_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        dirty_fixture(root);
+        let ready = packet28_search_core::rebuild_full_index(root, true).unwrap();
+        let manifest = root.join(".packet28/index/regex-v1/manifest.json");
+        let expected_regex = fs::read(&manifest).unwrap();
+        let paths = vec!["src/lib.rs".to_string()];
+        let mut session = RegexIndexScanSession::begin(root, true, &paths).unwrap();
+        let changed = b"pub fn shared_dirty_changed_mid_scan() {}\n";
+        fs::write(root.join("src/lib.rs"), changed).unwrap();
+        let metadata = fs::metadata(root.join("src/lib.rs")).unwrap();
+        session.ingest(&paths[0], &metadata, changed).unwrap();
+
+        let error = session
+            .prepare()
+            .err()
+            .expect("dirty workspace changed during the shared scan");
+
+        assert!(matches!(error, SearchError::IndexNotReady { .. }));
+        assert_eq!(fs::read(&manifest).unwrap(), expected_regex);
+        assert!(ready.manifest.workspace_attested_commit.is_some());
     }
 
     #[test]

@@ -459,7 +459,7 @@ def release_package_smoke_errors(
     """Return violations of the pre-publish package verification boundary."""
 
     errors: list[str] = []
-    quality_job = build.partition("\n  quality:")[2].partition("\n  msrv:")[0]
+    package_job = build.partition("\n  packages:")[2].partition("\n  quality:")[0]
     release_gate_job = release.partition("\n  release-gates:")[2].partition(
         "\n  build:"
     )[0]
@@ -471,7 +471,7 @@ def release_package_smoke_errors(
         "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
     )
     node_jobs = {
-        "canonical build gate": quality_job,
+        "build package check": package_job,
         "release gate": release_gate_job,
         "release artifact build": release_build_job,
         "release publish": release_publish_job,
@@ -713,6 +713,25 @@ def incremental_index_evidence_gate_errors(full_gate: str) -> list[str]:
     ]
 
 
+def split_ci_wiring_errors(build: str) -> list[str]:
+    """Keep all validation phases wired while preserving the required check."""
+    errors = []
+    for phase in ("policy", "lint", "tests", "docs", "audit", "dependencies", "packages"):
+        if f"run: scripts/validate_full_gate.sh --phase {phase}" not in build:
+            errors.append(f"build workflow lacks the {phase} phase")
+    required = (
+        "needs: [changes, policy, lint, tests, msrv, audit, dependencies, packages]",
+        "run: python3 scripts/ci/select_checks.py --check-results",
+        "NEEDS_JSON: ${{ toJSON(needs) }}",
+        "  quality:\n    if: always()",
+    )
+    if any(fragment not in build for fragment in required):
+        errors.append("quality must aggregate every job even after failure or cancellation")
+    if re.search(r"run: scripts/validate_full_gate\.sh\s*$", build, re.MULTILINE):
+        errors.append("PR validation must use phases instead of the serial full gate")
+    return errors
+
+
 def verify_workflow_wiring(errors: list[str]) -> None:
     build = (WORKFLOW_DIR / "build.yml").read_text(encoding="utf-8")
     release = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
@@ -723,8 +742,7 @@ def verify_workflow_wiring(errors: list[str]) -> None:
         ROOT / "scripts" / "verify_workspace_policy.sh"
     ).read_text(encoding="utf-8")
 
-    if "scripts/validate_full_gate.sh" not in build:
-        errors.append("build workflow does not invoke the canonical full gate")
+    errors.extend(split_ci_wiring_errors(build))
     if "scripts/validate_full_gate.sh --msrv" not in build:
         errors.append("build workflow does not invoke the canonical MSRV gate")
     if 'scripts/validate_full_gate.sh --release-tag "$GITHUB_REF_NAME"' not in release:
@@ -732,10 +750,10 @@ def verify_workflow_wiring(errors: list[str]) -> None:
     if "run_cmd python3 scripts/check_architecture.py" not in full_gate:
         errors.append("canonical gate does not run the architecture checker")
     if (
-        "run_cmd python3 -m unittest scripts.tests.test_check_architecture"
+        "run_cmd python3 -m unittest discover -s scripts/tests"
         not in full_gate
     ):
-        errors.append("canonical gate does not run architecture-checker unit tests")
+        errors.append("canonical gate does not run the script unit tests")
     if "run_cmd python3 scripts/check_architecture_audit_ledger.py" not in full_gate:
         errors.append("canonical gate does not run the architecture-audit ledger checker")
     errors.extend(audit_finalization_wiring_errors(full_gate))

@@ -46,39 +46,135 @@ fn store_hook_artifact(root: &Path, task_id: &str, prefix: &str, value: &Value) 
     Ok(id)
 }
 
+// Artifact ownership may traverse recovery generations, but never follows an
+// unreciprocated pointer or an unbounded chain supplied by persisted state.
+fn validate_hook_brief_owner(tasks: &TaskRegistry, task_id: &str, owner: &str) -> Result<()> {
+    let mut current = task_id;
+    let mut visited = BTreeSet::new();
+    let mut owner_seen = false;
+    for _ in 0..64 {
+        if !visited.insert(current) {
+            anyhow::bail!("cyclic hook bootstrap recovery lineage");
+        }
+        let task = tasks
+            .tasks
+            .get(current)
+            .ok_or_else(|| anyhow!("missing hook bootstrap lineage task"))?;
+        if task.task_id != current {
+            anyhow::bail!("invalid hook bootstrap lineage identity");
+        }
+        owner_seen |= current == owner;
+        let Some(link) = task.recovered_from.as_ref() else {
+            if owner_seen {
+                return Ok(());
+            }
+            anyhow::bail!("hook bootstrap owner is outside recovery lineage");
+        };
+        if link.successor_task_id != current
+            || tasks
+                .tasks
+                .get(&link.predecessor_task_id)
+                .and_then(|parent| parent.superseded_by.as_ref())
+                != Some(link)
+        {
+            anyhow::bail!("invalid reciprocal hook bootstrap recovery lineage");
+        }
+        current = &link.predecessor_task_id;
+    }
+    anyhow::bail!("hook bootstrap recovery lineage exceeds 64 tasks")
+}
+
 fn hook_task_additional_context(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
     session_id: Option<&str>,
 ) -> Result<Option<String>> {
-    let root = state.lock().map_err(lock_err)?.root.clone();
-    let task = load_task_record(state, task_id);
-    let Some(task) = task else {
+    hook_task_additional_context_with_persistence(state, task_id, session_id, persist_task)
+}
+
+fn hook_task_additional_context_with_persistence(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    session_id: Option<&str>,
+    persist: impl FnOnce(&DaemonState, &str) -> Result<()>,
+) -> Result<Option<String>> {
+    let mut guard = state.lock().map_err(lock_err)?;
+    let Some(task) = guard.tasks.tasks.get(task_id) else {
         return Ok(None);
     };
-    let latest_context_version = task.latest_context_version.clone();
-    let latest_handoff_artifact_id = task.latest_handoff_artifact_id.clone();
-    if task.latest_handoff_artifact_id.is_none() {
+    let Some(artifact_id) = task.latest_handoff_artifact_id.clone() else {
         return Ok(None);
-    }
-    if task.latest_hook_bootstrap_context_version == latest_context_version
-        && task.latest_hook_session_id.as_deref() == session_id
+    };
+    let descriptor = task.handoffs.iter().find(|handoff| {
+        task.latest_handoff_id.as_deref() == Some(handoff.handoff_id.as_str())
+            && handoff.artifact_id == artifact_id
+    });
+    let owner = descriptor
+        .filter(|handoff| !handoff.task_id.is_empty())
+        .map_or(task_id, |handoff| handoff.task_id.as_str())
+        .to_string();
+    validate_hook_brief_owner(&guard.tasks, task_id, &owner)?;
+    let context_version = if owner == task_id {
+        task.latest_context_version.clone()
+    } else {
+        descriptor.map(|handoff| handoff.context_version.clone())
+    };
+    if task.latest_hook_bootstrap_at_unix.is_some()
+        && task.latest_hook_bootstrap_session_id.as_deref() == session_id
+        && task.latest_hook_bootstrap_context_version == context_version
+        && task.latest_hook_bootstrap_owner_task_id.as_deref() == Some(owner.as_str())
+        && task.latest_hook_bootstrap_artifact_id.as_deref() == Some(artifact_id.as_str())
     {
         return Ok(None);
     }
-    let storage_id = task_storage_id(task_id)?;
-    let path = task_brief_markdown_path(&root, &storage_id);
-    let brief = fs::read_to_string(path).ok();
-    {
-        let mut guard = state.lock().map_err(lock_err)?;
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
-        task.latest_hook_bootstrap_context_version = latest_context_version;
-        task.latest_hook_bootstrap_at_unix = Some(now_unix());
-        task.latest_hook_session_id = session_id.map(ToOwned::to_owned);
-        task.latest_agent_handoff_artifact_id = latest_handoff_artifact_id;
-        persist_task(&guard, task_id)?;
+    let brief = if owner == task_id {
+        let storage_id = task_storage_id(task_id)?;
+        fs::read_to_string(task_brief_markdown_path(&guard.root, &storage_id)).ok()
+    } else if let Some(version) = context_version.as_deref() {
+        match crate::broker::load_versioned_broker_response(&guard.root, &owner, version)? {
+            Some(response)
+                if response.context_version == version
+                    && response.artifact_id.as_deref() == Some(artifact_id.as_str()) =>
+            {
+                Some(response.brief)
+            }
+            Some(_) => anyhow::bail!("inherited hook bootstrap artifact identity mismatch"),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let Some(brief) = brief.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let task = ensure_task_record_mut(&mut guard, task_id)?;
+    let previous = (
+        task.latest_hook_bootstrap_context_version.clone(),
+        task.latest_hook_bootstrap_session_id.clone(),
+        task.latest_hook_bootstrap_owner_task_id.clone(),
+        task.latest_hook_bootstrap_artifact_id.clone(),
+        task.latest_hook_bootstrap_at_unix,
+        task.latest_agent_handoff_artifact_id.clone(),
+    );
+    task.latest_hook_bootstrap_context_version = context_version;
+    task.latest_hook_bootstrap_session_id = session_id.map(ToOwned::to_owned);
+    task.latest_hook_bootstrap_owner_task_id = Some(owner);
+    task.latest_hook_bootstrap_artifact_id = Some(artifact_id.clone());
+    task.latest_hook_bootstrap_at_unix = Some(now_unix());
+    task.latest_agent_handoff_artifact_id = Some(artifact_id);
+    if let Err(error) = persist(&guard, task_id) {
+        let task = ensure_task_record_mut(&mut guard, task_id)?;
+        (
+            task.latest_hook_bootstrap_context_version,
+            task.latest_hook_bootstrap_session_id,
+            task.latest_hook_bootstrap_owner_task_id,
+            task.latest_hook_bootstrap_artifact_id,
+            task.latest_hook_bootstrap_at_unix,
+            task.latest_agent_handoff_artifact_id,
+        ) = previous;
+        return Err(error);
     }
-    Ok(brief.filter(|value| !value.trim().is_empty()))
+    Ok(Some(brief))
 }
 
 fn boundary_reason(kind: HookBoundaryKind) -> Option<&'static str> {
@@ -101,7 +197,7 @@ fn maybe_prepare_handoff_from_hooks(
     let effective_budget = config.effective_budget(host_budget);
     if boundary_kind != HookBoundaryKind::None {
         let mut guard = state.lock().map_err(lock_err)?;
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id)?;
         task.latest_hook_boundary_at_unix = Some(now_unix_millis());
         task.latest_hook_boundary_kind = Some(format!("{boundary_kind:?}").to_ascii_lowercase());
         task.hook_soft_threshold_tokens = config
@@ -174,7 +270,7 @@ fn maybe_prepare_handoff_from_hooks(
             .or(status.latest_context_version);
         if prepared.handoff_ready {
             let mut guard = state.lock().map_err(lock_err)?;
-            let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+            let task = ensure_task_record_mut(&mut guard, task_id)?;
             task.latest_hook_handoff_reason = response.handoff_reason.clone();
             task.hook_threshold_exceeded = false;
             task.hook_window_est_tokens = 0;
@@ -362,6 +458,8 @@ fn cache_hit_for_packet(
     true
 }
 
+/// Stores an eligible reducer packet in the task's cache and prunes excess entries.
+///
 fn update_cache_for_packet(
     task: &mut TaskRecord,
     packet: &packet28_daemon_protocol::hooks::HookReducerPacket,
@@ -405,8 +503,57 @@ fn update_cache_for_packet(
             rust_epoch: task.hook_rust_epoch,
         },
     );
+    prune_hook_reducer_cache(task);
 }
 
+/// Upper bound on retained per-task hook reducer cache entries.
+///
+/// A long-lived session can otherwise accumulate thousands of distinct
+/// fingerprints, growing the task record past the paginated record-size limit
+/// and poisoning registry listing (see the daemon pagination bound). The cache
+/// is a best-effort dedup aid, so evicting the oldest entries is safe.
+const HOOK_REDUCER_CACHE_MAX_ENTRIES: usize = 256;
+const HOOK_REDUCER_CACHE_MAX_BYTES: usize = 256 * 1024;
+
+/// Prunes a task's hook reducer cache to the configured maximum size.
+///
+/// The oldest entries are removed first, with fingerprints providing deterministic
+/// ordering when entries have the same timestamp.
+///
+fn prune_hook_reducer_cache(task: &mut TaskRecord) {
+    let mut encoded_bytes =
+        serde_json::to_vec(&task.hook_reducer_cache).map_or(usize::MAX, |bytes| bytes.len());
+    if task.hook_reducer_cache.len() <= HOOK_REDUCER_CACHE_MAX_ENTRIES
+        && encoded_bytes <= HOOK_REDUCER_CACHE_MAX_BYTES
+    {
+        return;
+    }
+    let mut ordered: Vec<(u64, String)> = task
+        .hook_reducer_cache
+        .iter()
+        .map(|(key, entry)| (entry.occurred_at_unix, key.clone()))
+        .collect();
+    ordered.sort();
+    for (_, key) in ordered {
+        if task.hook_reducer_cache.len() <= HOOK_REDUCER_CACHE_MAX_ENTRIES
+            && encoded_bytes <= HOOK_REDUCER_CACHE_MAX_BYTES
+        {
+            break;
+        }
+        if let Some(entry) = task.hook_reducer_cache.remove(&key) {
+            let removed_bytes = serde_json::to_vec(&key).map_or(0, |bytes| bytes.len())
+                + serde_json::to_vec(&entry).map_or(0, |bytes| bytes.len())
+                + 1
+                + usize::from(!task.hook_reducer_cache.is_empty());
+            encoded_bytes = encoded_bytes.saturating_sub(removed_bytes);
+        }
+    }
+}
+
+/// Extracts a non-empty workspace fingerprint from a reducer packet.
+///
+/// Whitespace surrounding the fingerprint is preserved.
+///
 fn packet_workspace_fingerprint(
     packet: &packet28_daemon_protocol::hooks::HookReducerPacket,
 ) -> Option<&str> {
@@ -455,7 +602,7 @@ pub(crate) fn hook_ingest(
 
     {
         let mut guard = state.lock().map_err(lock_err)?;
-        let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+        let task = ensure_task_record_mut(&mut guard, task_id)?;
         task.latest_hook_session_id = request.session_id.clone();
         task.latest_hook_event_at_unix = Some(now_unix());
         task.hook_soft_threshold_tokens = prepare_threshold;
@@ -468,19 +615,20 @@ pub(crate) fn hook_ingest(
     let host_budget = request.host_context_budget_tokens;
 
     if matches!(request.event_kind, HookEventKind::SessionStart) {
+        let prepared = maybe_prepare_handoff_from_hooks(
+            state.clone(),
+            task_id,
+            HookBoundaryKind::None,
+            host_budget,
+            &config,
+        )?;
         let additional_context =
             hook_task_additional_context(&state, task_id, request.session_id.as_deref())?;
         return Ok(HookIngestResponse {
             task_id: task_id.to_string(),
             accepted: true,
             additional_context,
-            ..maybe_prepare_handoff_from_hooks(
-                state,
-                task_id,
-                HookBoundaryKind::None,
-                host_budget,
-                &config,
-            )?
+            ..prepared
         });
     }
 
@@ -494,8 +642,10 @@ pub(crate) fn hook_ingest(
         };
         {
             let mut guard = state.lock().map_err(lock_err)?;
-            let task = ensure_task_record_mut(&mut guard.tasks, task_id);
-            cache_hit = cache_hit_for_packet(task, packet);
+            let task = ensure_task_record_mut(&mut guard, task_id)?;
+            // Each completed execution is fresh evidence, even when output repeats.
+            cache_hit = !matches!(request.event_kind, HookEventKind::CommandFinished)
+                && cache_hit_for_packet(task, packet);
             if !cache_hit {
                 update_cache_for_packet(task, packet, artifact_id.clone());
             }
@@ -578,7 +728,7 @@ pub(crate) fn hook_ingest(
                 broker_write_state_batch(state.clone(), BrokerWriteStateBatchRequest { requests })?;
             {
                 let mut guard = state.lock().map_err(lock_err)?;
-                let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+                let task = ensure_task_record_mut(&mut guard, task_id)?;
                 task.hook_window_est_tokens = task
                     .hook_window_est_tokens
                     .saturating_add(packet.est_tokens);

@@ -935,6 +935,18 @@ impl ProcessHarness {
         self.process.diagnostics(&self.stdout)
     }
 
+    /// Reports whether the child has not exited yet, without blocking or
+    /// terminating it. The exit is reaped later by `wait` or `finish`.
+    pub fn is_running(&mut self) -> Result<bool, HarnessError> {
+        self.process
+            .observe_status()
+            .map(|status| status.is_none())
+            .map_err(|source| HarnessError::Io {
+                operation: "poll child process",
+                source,
+            })
+    }
+
     pub fn pid(&self) -> u32 {
         self.process.pid
     }

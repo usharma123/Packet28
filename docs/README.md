@@ -28,6 +28,8 @@ Start with the smallest document that matches what you are doing.
   built-ins, and the compatibility facade.
 - [Instruction rendering modes](instruction-rendering-modes.md): stable
   instruction prefix versus adaptive broker brief.
+- [Agent DX benchmark](agent-dx-benchmark.md): required agent workflow
+  outcomes, frozen explicit-CLI corpus, and reported diagnostics.
 - [Integration-test harness](integration-test-harness.md): bounded child-process,
   MCP, timeout, and cleanup ownership.
 - [Rust safety and panic policy](rust-safety-and-panic-policy.md): enforced

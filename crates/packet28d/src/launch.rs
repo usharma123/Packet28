@@ -262,7 +262,8 @@ pub(crate) fn spawn_owned_child_waiter(
                     .matches(&task_id, generation_for_waiter.id())
                     && !generation_for_waiter.is_cancelled()
                 {
-                    if let Some(task) = guard.tasks.tasks.get_mut(&task_id) {
+                    let mutable = guard.require_task_mutable(&task_id).is_ok();
+                    if let Some(task) = guard.tasks.tasks.get_mut(&task_id).filter(|_| mutable) {
                         if task.latest_agent_pid == Some(pid) {
                             task.latest_agent_completed_at_unix = Some(completed_at_unix);
                             task.latest_agent_exit_code = exit_code;
@@ -438,7 +439,7 @@ pub(crate) fn task_launch_agent(
     }
     let (root, generation, _launch_lease, _child_launch_lease) = {
         let mut guard = state.lock().map_err(lock_err)?;
-        ensure_task_record_mut(&mut guard.tasks, &request.task_id);
+        ensure_task_record_mut(&mut guard, &request.task_id)?;
         let generation = guard.task_generations.ensure(&request.task_id)?;
         let launch_lease = generation.acquire_operation().ok_or_else(|| {
             anyhow!(
@@ -623,6 +624,7 @@ pub(crate) fn task_launch_agent(
                     bootstrap.task_id
                 );
             }
+            guard.require_task_mutable(&bootstrap.task_id)?;
             let task = guard
                 .tasks
                 .tasks
@@ -701,7 +703,13 @@ pub(crate) fn task_launch_agent(
                 .matches(&bootstrap.task_id, generation.id())
                 && !generation.is_cancelled()
             {
-                if let Some(task) = guard.tasks.tasks.get_mut(&bootstrap.task_id) {
+                let mutable = guard.require_task_mutable(&bootstrap.task_id).is_ok();
+                if let Some(task) = guard
+                    .tasks
+                    .tasks
+                    .get_mut(&bootstrap.task_id)
+                    .filter(|_| mutable)
+                {
                     if task.latest_agent_pid == Some(pid) {
                         task.latest_agent_completed_at_unix = Some(now_unix());
                         task.latest_agent_exit_code = None;

@@ -1,15 +1,11 @@
 #![warn(clippy::needless_collect)]
 
 use super::json::filter_json_schema;
-use super::{analyze_logs, compact_for_log};
+use super::{analyze_logs, command_status_line, compact_for_log};
 
 pub(super) fn summarize_command_output(output: &str, command: &str, success: bool) -> String {
     let mut rendered = vec![
-        format!(
-            "{} Command: {}",
-            if success { "[ok]" } else { "[FAIL]" },
-            compact_for_log(command, 80)
-        ),
+        command_status_line(command, success),
         format!("   {} lines of output", output.lines().count()),
         String::new(),
     ];

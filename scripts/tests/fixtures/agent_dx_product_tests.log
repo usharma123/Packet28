@@ -1,0 +1,138 @@
+   Compiling serde_core v1.0.229
+   Compiling tokio v1.50.0
+   Compiling serde_json v1.0.151
+   Compiling tree-sitter v0.26.11
+   Compiling mapy-core v0.2.66 (/private/tmp/packet28-scope-closure/vitest-evidence-fix/crates/mapy-core)
+   Compiling context-kernel-builtins v0.2.66 (/private/tmp/packet28-scope-closure/vitest-evidence-fix/crates/context-kernel-builtins)
+   Compiling context-kernel-core v0.2.66 (/private/tmp/packet28-scope-closure/vitest-evidence-fix/crates/context-kernel-core)
+   Compiling packet28d v0.2.66 (/private/tmp/packet28-scope-closure/vitest-evidence-fix/crates/packet28d)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.65s
+     Running tests/daemon_lifecycle.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/daemon_lifecycle-87009df1b988f246)
+
+running 6 tests
+test active_delegated_launch_rejects_overlap_for_the_same_task ... ok
+test crash_between_spawn_and_ownership_checkpoint_never_releases_delegated_work ... ok
+test failed_initial_submission_can_retry_the_same_task_id ... ok
+test immediate_delegated_exit_records_started_before_completed ... ok
+test held_secondary_owner_lock_cannot_block_bounded_daemon_shutdown ... ok
+test stop_terminates_term_resistant_process_group_before_releasing_leases ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.91s
+
+     Running tests/registry_repair_startup.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/registry_repair_startup-0e2e09588becfce8)
+
+running 3 tests
+test repair_refuses_while_the_daemon_is_live ... ok
+test precommit_watch_crash_with_edited_base_task_is_restored_to_the_committed_base ... ok
+test whitespace_edit_of_a_daemon_committed_registry_is_repaired_and_startup_resumes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+     Running tests/status_pagination.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/status_pagination-65c4de9bce6d7ad4)
+
+running 2 tests
+test oversized_records_before_between_and_after_healthy_pages_are_all_reported ... ok
+test seeded_five_thousand_task_daemon_keeps_status_live_and_pages_every_task ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.47s
+
+     Running tests/task_record_archive.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/task_record_archive-3cf20631c8f09524)
+
+running 6 tests
+test archive_refuses_active_pointer_and_recovery_owners ... ok
+test crash_after_archive_publication_keeps_the_original_authoritative_and_retries_idempotently ... ok
+test crash_after_durable_tombstone_restarts_with_the_archive_as_authority ... ok
+test forward_fields_are_archived_sized_and_never_lost_through_restart ... ok
+test oversized_dormant_record_is_archived_online_and_survives_restart ... ok
+test raw_authority_drift_before_commit_refuses_without_mutation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.46s
+
+   Compiling suite-cli v0.2.66 (/private/tmp/packet28-scope-closure/vitest-evidence-fix/crates/suite-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.22s
+     Running tests/daemon_lifecycle_e2e.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/daemon_lifecycle_e2e-b6fc8a3470249508)
+
+running 16 tests
+test corrupt_daemon_instance_lock_fails_closed_for_stop_and_start ... ok
+test foreign_workspace_runtime_fails_closed_while_its_authority_is_held ... ok
+test concurrent_cli_and_packet28d_starters_share_one_slow_starting_daemon ... ok
+test start_fails_closed_on_corrupt_runtime_of_a_starting_owner ... ok
+test start_replaces_copied_foreign_runtime_after_authority_release ... ok
+test start_reuses_connected_starting_daemon_with_stable_identity ... ok
+test start_waits_for_spawned_daemon_held_past_authority_bound ... ok
+test start_timeout_for_existing_starting_daemon_is_bounded_and_leaves_it_running ... ok
+test stop_waits_for_daemon_authority_release_and_concurrent_start_succeeds ... ok
+test test_concurrent_daemon_clients_share_one_workspace_process ... ok
+test stop_timeout_fails_without_touching_runtime_files_of_a_live_owner ... ok
+test test_daemon_lifecycle_cli_index_rebuild_and_status ... ok
+test test_daemon_lifecycle_cli_start_status_stop_cycle ... ok
+test test_daemon_lifecycle_cli_stop_does_not_start_missing_daemon ... ok
+test test_daemon_lifecycle_forced_tcp_stop_exits_and_releases_endpoint ... ok
+test uninstall_stops_workspace_services_and_stale_hooks_cannot_restart_them ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 93.69s
+
+     Running tests/daemon_storage_repair_e2e.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/daemon_storage_repair_e2e-08bbb670ec794997)
+
+running 9 tests
+test storage_repair_completes_after_a_process_interruption ... ok
+test storage_repair_apply_repairs_all_logs_and_is_idempotent ... ok
+test storage_repair_dry_run_reports_corruption_without_mutating_it ... ok
+test storage_repair_on_clean_store_does_not_start_a_daemon ... ok
+test storage_repair_refuses_daemon_startup_before_a_socket_exists ... ok
+test storage_repair_rejects_legacy_journal_without_mutation ... ok
+test storage_repair_reports_no_safe_recovery_and_changes_nothing ... ok
+test storage_repair_restores_a_whitespace_edited_registry_exactly ... ok
+test storage_repair_resume_refuses_a_missing_archived_original ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+
+     Running tests/hook_runner_e2e.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/hook_runner_e2e-78fcf87057b7db22)
+
+running 6 tests
+test test_hook_runner_capture_setup_failure_executes_original_command ... ok
+test test_hook_runner_capture_rejection_executes_original_command ... ok
+test test_hook_runner_cli_busts_cache_after_out_of_band_file_edit ... ok
+test test_hook_runner_cli_executes_every_explicit_request ... ok
+test test_hook_runner_completion_capture_failure_preserves_result_without_rerun ... ok
+test test_hook_runner_preserves_signal_exit_code_with_and_without_capture ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.32s
+
+     Running tests/runtime_log_rotation_e2e.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/runtime_log_rotation_e2e-4e00137db16ac03c)
+
+running 4 tests
+test background_hook_server_rotates_its_own_log_after_setup_exits ... ok
+test background_daemon_rotates_its_own_log_after_the_launcher_exits ... ok
+test launcher_keeps_start_time_rotation_for_a_daemon_without_managed_logs ... ok
+test managed_daemon_reduces_legacy_logs_and_serializes_contending_owners ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.48s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.59s
+     Running unittests src/lib.rs (/private/tmp/packet28-fleet-targets/vitest-evidence-fix-b348e7974f/debug/deps/packet28_reducer_core-a3931d4e986a16fc)
+
+running 20 tests
+test github::tests::classify_github_declines_json_and_patch_variants ... ok
+test github::tests::list_summary_bounds_long_unicode_titles ... ok
+test github::tests::pr_view_preview_bounds_long_unicode_body_without_cutting_characters ... ok
+test github::tests::pr_view_preview_bounds_body_lines_and_discloses_filtered_content ... ok
+test github::tests::pr_view_preview_keeps_metadata_when_header_separator_is_absent ... ok
+test github::tests::pr_view_preview_keeps_plain_body_separator_without_recognized_header ... ok
+test github::tests::pr_view_preview_preserves_identity_without_duplicate_header ... ok
+test github::tests::pr_view_reduction_preserves_complete_failed_output_and_exit ... ok
+test github::tests::reduce_github_api_summarizes_json_payload ... ok
+test github::tests::reduce_github_list_summarizes_entries ... ok
+test github::tests::reduce_github_pr_checks_summarizes_status_counts ... ok
+test github::tests::reduce_github_pr_view_summarizes_metadata ... ok
+test github::tests::reduce_github_run_view_summarizes_jobs_and_annotations ... ok
+test github::tests::reduce_glab_mr_list_summarizes_entries ... ok
+test github::tests::reduce_rtk_release_and_glab_ci_status_forms ... ok
+test github::tests::run_view_counts_failed_job_without_its_steps_or_annotation_locations ... ok
+test github::tests::run_view_counts_multiline_annotations_artifacts_and_jobs_without_elapsed ... ok
+test github::tests::run_view_counts_successful_jobs_and_annotations ... ok
+test github::tests::run_view_counts_zero_annotations_when_section_is_absent ... ok
+test github::tests::run_view_omits_counts_it_cannot_parse ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 123 filtered out; finished in 0.00s
+

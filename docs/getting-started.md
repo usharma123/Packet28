@@ -55,6 +55,53 @@ Setup may create or update repository-local MCP, hook, and instruction files
 and user-level runtime configuration. Existing valid JSON/TOML is merged;
 invalid configuration is reported and left unchanged.
 
+Setup adds `.packet28/` to the repository's `.gitignore` when needed. This does
+not untrack runtime files that were already committed. Setup's own
+configuration and instruction changes do not block the full regex index: a full
+rebuild attests the Git `HEAD` commit and the content digest of every dirty or
+untracked path, provided they stay unchanged while the index builds. Queries
+then serve the index only while those digests still match, so a later edit the
+daemon has not indexed falls back to live search. Setup defers indexing with the
+reason when the working tree cannot be attested, for example when it changes
+during the build, contains a dirty symlink or oversized file, or uses Git
+`skip-worktree`/`assume-unchanged` flags. Resolve the condition, then run:
+
+```bash
+packet28 daemon index rebuild --root .
+packet28 daemon index status --root . --json
+```
+
+## Claude Code and Codex continuation
+
+Configure only the host you use:
+
+```bash
+packet28 setup --runtime claude --yes
+packet28 doctor --agent claude --root .
+
+packet28 setup --runtime codex --yes
+packet28 doctor --agent codex --root .
+```
+
+Claude Code setup installs MCP and lifecycle hooks. Codex setup installs MCP,
+`AGENTS.md` guidance, and project-local `.codex/hooks.json`. The user MCP
+configuration honors `CODEX_HOME` when set. In Codex, enable
+lifecycle hooks, trust the project, then review the generated handlers in
+`/hooks`. Setup does not change Codex approval rules or trust decisions.
+
+Codex hooks capture tool results and checkpoint task context without rewriting
+shell commands. This preserves the command identity used by Codex permission
+rules. Use explicit Packet28 CLI/MCP calls when you want reduced output.
+`doctor --agent codex` checks generated configuration and a local Packet28
+MCP round trip; it reports host hook enablement, trust, and execution as
+unverified.
+
+For either host, save the current objective with `packet28.write_intention`,
+prepare the latest handoff with `packet28.prepare_handoff`, and fetch it with
+`packet28.fetch_context` when continuing work. Daemon restarts retain task
+objectives, active decisions, and handoff artifacts. Hosts own model sessions
+and execution; Packet28 does not start a model provider during these checks.
+
 ## Start the daemon
 
 ```bash
@@ -171,3 +218,26 @@ view is insufficient.
 - [Operations](operations.md)
 - [Instruction rendering modes](instruction-rendering-modes.md)
 - [Task-store retention](task-store-retention.md)
+
+## Native command permissions
+
+Generated runtime integrations preserve the host's original command arguments.
+Hooks capture results and correlate task activity without returning rewritten
+commands or permission decisions. This also applies when an older
+`.packet28/daemon/hook-runtime-v1.json` contains `rewrite_enabled: true`; that legacy flag
+is inactive. `Packet28 hook rewrite status --json` reports actual capture-only
+behavior and the stored flag separately. `Packet28 hook rewrite on` returns an
+error without changing configuration. `Packet28 hook rewrite off` clears the old
+flag.
+
+Use explicit Packet28 CLI or MCP reduction when you want reduced output. An
+opaque wrapper changes which command a native host permission rule matches.
+Re-run setup for OpenCode or Hermes to replace previously installed automatic
+rewrite plugins with command-preserving adapters.
+
+`Packet28 rewrite` and `Packet28 compact rewrite` no longer return executable
+wrappers. JSON output retains route metadata with `applied: false` and
+`rewritten_command: null`; plain output is empty. This also makes previously
+installed OpenCode and Hermes rewrite plugins pass through original commands
+when they invoke the updated binary. Explicit executing reducers and MCP
+reduction remain available.

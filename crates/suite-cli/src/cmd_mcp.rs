@@ -31,6 +31,8 @@ mod config;
 mod core_tools;
 #[path = "cmd_mcp_fff.rs"]
 mod fff;
+#[path = "cmd_mcp_invocation.rs"]
+mod invocation;
 #[path = "cmd_mcp_memory_tools.rs"]
 mod memory_tools;
 #[path = "cmd_mcp_native.rs"]
@@ -130,12 +132,17 @@ fn read_validated_context_artifact(
     let task_id = validated_task_storage_id(task_id)?;
     let context_version = ContextVersionStorageId::try_from(context_version)?;
     let handle = artifact_io::ArtifactHandle::from_json_stem(context_version.as_str())?;
-    read_validated_named_task_artifact(
+    support::read_lineage_artifact(
         root,
-        task_id.as_str(),
-        artifact_io::ArtifactLocation::Versions,
-        handle.as_str(),
-    )
+        &task_id,
+        &[(artifact_io::ArtifactLocation::Versions, handle)],
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "stored context artifact does not exist for task {:?}",
+            task_id.as_str()
+        )
+    })
 }
 
 fn validate_context_artifact_identity(payload: &Value, requested_version: &str) -> Result<()> {
@@ -224,7 +231,7 @@ struct McpSessionState {
     upstream_resource_catalog_loaded: bool,
     resource_catalog_epoch: u64,
     proxy_task_id: Option<String>,
-    next_invocation_seq: u64,
+    invocations: invocation::InvocationAllocator,
     fff_client: Option<FffMcpClient>,
     #[cfg(unix)]
     daemon_client: Option<crate::cmd_daemon::PersistentDaemonClient>,

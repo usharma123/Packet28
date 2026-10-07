@@ -4,6 +4,7 @@ use super::*;
 #[serde(default)]
 struct AgentSnapshotRequest {
     task_id: String,
+    recovery_lineage: Option<Vec<String>>,
 }
 
 pub(crate) fn build_agent_state_packet(
@@ -135,7 +136,10 @@ pub(crate) fn run_agenty_state_snapshot(
     }
 
     let entries = ctx.cache_entries()?;
-    let payload = derive_agent_snapshot(&entries, &input.task_id);
+    let payload = match input.recovery_lineage {
+        Some(lineage) => derive_agent_snapshot_with_lineage(&entries, &input.task_id, lineage),
+        None => derive_agent_snapshot(&entries, &input.task_id),
+    };
     let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default().len();
     let envelope = suite_packet_core::EnvelopeV1 {
         version: "1".to_string(),
@@ -463,6 +467,19 @@ pub(crate) fn validate_agent_state_event(
                 return Err("intention_recorded requires non-empty text".to_string());
             }
         }
+        (
+            suite_packet_core::AgentStateEventKind::RecoveredFrom,
+            suite_packet_core::AgentStateEventData::RecoveredFrom {
+                predecessor_task_id,
+            },
+        ) => {
+            if predecessor_task_id.trim().is_empty() || *predecessor_task_id == event.task_id {
+                return Err(
+                    "recovered_from requires a predecessor_task_id distinct from task_id"
+                        .to_string(),
+                );
+            }
+        }
         _ => {
             return Err(format!(
                 "event kind '{:?}' does not match payload variant",
@@ -587,6 +604,12 @@ pub(crate) fn summarize_agent_state_event(
                 event.task_id, phase, text
             )
         }
+        suite_packet_core::AgentStateEventData::RecoveredFrom {
+            predecessor_task_id,
+        } => format!(
+            "recovered from task={} predecessor={}",
+            event.task_id, predecessor_task_id
+        ),
     }
 }
 
@@ -594,15 +617,41 @@ pub(crate) fn derive_agent_snapshot(
     entries: &[context_memory_core::PacketCacheEntry],
     task_id: &str,
 ) -> suite_packet_core::AgentSnapshotPayload {
-    let mut events = entries
+    let all_events = entries
         .iter()
         .flat_map(extract_agent_state_events)
-        .filter(|event| event.task_id == task_id)
+        .collect::<Vec<_>>();
+    let lineage = recovery_lineage(&all_events, task_id);
+    derive_agent_snapshot_with_lineage(entries, task_id, lineage)
+}
+
+fn derive_agent_snapshot_with_lineage(
+    entries: &[context_memory_core::PacketCacheEntry],
+    task_id: &str,
+    lineage: Vec<String>,
+) -> suite_packet_core::AgentSnapshotPayload {
+    let all_events = entries
+        .iter()
+        .flat_map(extract_agent_state_events)
+        .collect::<Vec<_>>();
+    // Oldest predecessor first; the task itself is last.
+
+    let generation = |owner: &str| lineage.iter().position(|task_id| task_id == owner);
+    let mut events = all_events
+        .into_iter()
+        .filter(|event| {
+            generation(&event.task_id).is_some()
+                && !matches!(
+                    event.data,
+                    suite_packet_core::AgentStateEventData::RecoveredFrom { .. }
+                )
+        })
         .collect::<Vec<_>>();
 
     events.sort_by(|a, b| {
-        a.occurred_at_unix
-            .cmp(&b.occurred_at_unix)
+        generation(&a.task_id)
+            .cmp(&generation(&b.task_id))
+            .then_with(|| a.occurred_at_unix.cmp(&b.occurred_at_unix))
             .then_with(|| decision_event_rank(a).cmp(&decision_event_rank(b)))
             .then_with(|| a.event_id.cmp(&b.event_id))
     });
@@ -640,6 +689,28 @@ pub(crate) fn derive_agent_snapshot(
         suite_packet_core::ToolKindSuccess,
     >::new();
     let mut latest_intention = None;
+
+    let mut evidence_artifact_owners = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for event in &events {
+        let artifact = match &event.data {
+            suite_packet_core::AgentStateEventData::DecisionAdded { artifact_id, .. }
+            | suite_packet_core::AgentStateEventData::ToolInvocationCompleted {
+                artifact_id, ..
+            } => artifact_id.as_ref(),
+            suite_packet_core::AgentStateEventData::EvidenceCaptured { artifact_id, .. } => {
+                Some(artifact_id)
+            }
+            _ => None,
+        };
+        if let Some(artifact) = artifact {
+            let owners = evidence_artifact_owners
+                .entry(artifact.clone())
+                .or_default();
+            if !owners.contains(&event.task_id) {
+                owners.push(event.task_id.clone());
+            }
+        }
+    }
 
     for event in &events {
         last_event_at_unix = Some(event.occurred_at_unix);
@@ -795,31 +866,35 @@ pub(crate) fn derive_agent_snapshot(
                 {
                     evidence_artifact_ids.insert(artifact_id.clone());
                 }
-                recent_tool_invocations.push(suite_packet_core::ToolInvocationSummary {
-                    invocation_id: invocation_id.clone(),
-                    sequence: *sequence,
-                    tool_name: tool_name.clone(),
-                    server_name: server_name.clone(),
-                    operation_kind: *operation_kind,
-                    request_summary: request_summary.clone(),
-                    result_summary: result_summary.clone(),
-                    compact_preview: compact_preview.clone(),
-                    request_fingerprint: request_fingerprint.clone(),
-                    compact_path: compact_path.clone(),
-                    passthrough_reason: passthrough_reason.clone(),
-                    raw_est_tokens: *raw_est_tokens,
-                    reduced_est_tokens: *reduced_est_tokens,
-                    search_query: search_query.clone(),
-                    command: command.clone(),
-                    artifact_id: artifact_id.clone(),
-                    raw_artifact_handle: raw_artifact_handle.clone(),
-                    raw_artifact_available: *raw_artifact_available,
-                    paths: event.paths.clone(),
-                    regions: regions.clone(),
-                    symbols: event.symbols.clone(),
-                    duration_ms: *duration_ms,
-                    occurred_at_unix: event.occurred_at_unix,
-                });
+                recent_tool_invocations.push((
+                    generation(&event.task_id),
+                    suite_packet_core::ToolInvocationSummary {
+                        owner_task_id: Some(event.task_id.clone()),
+                        invocation_id: invocation_id.clone(),
+                        sequence: *sequence,
+                        tool_name: tool_name.clone(),
+                        server_name: server_name.clone(),
+                        operation_kind: *operation_kind,
+                        request_summary: request_summary.clone(),
+                        result_summary: result_summary.clone(),
+                        compact_preview: compact_preview.clone(),
+                        request_fingerprint: request_fingerprint.clone(),
+                        compact_path: compact_path.clone(),
+                        passthrough_reason: passthrough_reason.clone(),
+                        raw_est_tokens: *raw_est_tokens,
+                        reduced_est_tokens: *reduced_est_tokens,
+                        search_query: search_query.clone(),
+                        command: command.clone(),
+                        artifact_id: artifact_id.clone(),
+                        raw_artifact_handle: raw_artifact_handle.clone(),
+                        raw_artifact_available: *raw_artifact_available,
+                        paths: event.paths.clone(),
+                        regions: regions.clone(),
+                        symbols: event.symbols.clone(),
+                        duration_ms: *duration_ms,
+                        occurred_at_unix: event.occurred_at_unix,
+                    },
+                ));
                 last_successful_tool_by_kind.insert(
                     *operation_kind,
                     suite_packet_core::ToolKindSuccess {
@@ -848,26 +923,30 @@ pub(crate) fn derive_agent_snapshot(
                 retryable,
                 duration_ms,
             } => {
-                tool_failures.push(suite_packet_core::ToolFailureSummary {
-                    invocation_id: invocation_id.clone(),
-                    sequence: *sequence,
-                    tool_name: tool_name.clone(),
-                    server_name: server_name.clone(),
-                    operation_kind: *operation_kind,
-                    request_summary: request_summary.clone(),
-                    error_class: error_class.clone(),
-                    error_message: error_message.clone(),
-                    request_fingerprint: request_fingerprint.clone(),
-                    compact_path: compact_path.clone(),
-                    passthrough_reason: passthrough_reason.clone(),
-                    raw_est_tokens: *raw_est_tokens,
-                    reduced_est_tokens: *reduced_est_tokens,
-                    raw_artifact_handle: raw_artifact_handle.clone(),
-                    raw_artifact_available: *raw_artifact_available,
-                    retryable: *retryable,
-                    duration_ms: *duration_ms,
-                    occurred_at_unix: event.occurred_at_unix,
-                });
+                tool_failures.push((
+                    generation(&event.task_id),
+                    suite_packet_core::ToolFailureSummary {
+                        owner_task_id: Some(event.task_id.clone()),
+                        invocation_id: invocation_id.clone(),
+                        sequence: *sequence,
+                        tool_name: tool_name.clone(),
+                        server_name: server_name.clone(),
+                        operation_kind: *operation_kind,
+                        request_summary: request_summary.clone(),
+                        error_class: error_class.clone(),
+                        error_message: error_message.clone(),
+                        request_fingerprint: request_fingerprint.clone(),
+                        compact_path: compact_path.clone(),
+                        passthrough_reason: passthrough_reason.clone(),
+                        raw_est_tokens: *raw_est_tokens,
+                        reduced_est_tokens: *reduced_est_tokens,
+                        raw_artifact_handle: raw_artifact_handle.clone(),
+                        raw_artifact_available: *raw_artifact_available,
+                        retryable: *retryable,
+                        duration_ms: *duration_ms,
+                        occurred_at_unix: event.occurred_at_unix,
+                    },
+                ));
             }
             suite_packet_core::AgentStateEventData::FocusInferred { .. } => {
                 for path in &event.paths {
@@ -880,6 +959,7 @@ pub(crate) fn derive_agent_snapshot(
             suite_packet_core::AgentStateEventData::EvidenceCaptured { artifact_id, .. } => {
                 evidence_artifact_ids.insert(artifact_id.clone());
             }
+            suite_packet_core::AgentStateEventData::RecoveredFrom { .. } => {}
             suite_packet_core::AgentStateEventData::IntentionRecorded {
                 text,
                 note,
@@ -905,9 +985,12 @@ pub(crate) fn derive_agent_snapshot(
         }
     }
 
-    recent_tool_invocations.sort_by(|a, b| {
-        a.sequence
-            .cmp(&b.sequence)
+    // Invocation sequences restart in every session, so a predecessor's
+    // invocations order before the successor's regardless of sequence.
+    recent_tool_invocations.sort_by(|(a_generation, a), (b_generation, b)| {
+        a_generation
+            .cmp(b_generation)
+            .then_with(|| a.sequence.cmp(&b.sequence))
             .then_with(|| a.occurred_at_unix.cmp(&b.occurred_at_unix))
             .then_with(|| a.invocation_id.cmp(&b.invocation_id))
     });
@@ -915,9 +998,14 @@ pub(crate) fn derive_agent_snapshot(
         let keep_from = recent_tool_invocations.len() - 12;
         recent_tool_invocations = recent_tool_invocations.split_off(keep_from);
     }
-    tool_failures.sort_by(|a, b| {
-        a.sequence
-            .cmp(&b.sequence)
+    let recent_tool_invocations = recent_tool_invocations
+        .into_iter()
+        .map(|(_, invocation)| invocation)
+        .collect::<Vec<_>>();
+    tool_failures.sort_by(|(a_generation, a), (b_generation, b)| {
+        a_generation
+            .cmp(b_generation)
+            .then_with(|| a.sequence.cmp(&b.sequence))
             .then_with(|| a.occurred_at_unix.cmp(&b.occurred_at_unix))
             .then_with(|| a.invocation_id.cmp(&b.invocation_id))
     });
@@ -925,6 +1013,10 @@ pub(crate) fn derive_agent_snapshot(
         let keep_from = tool_failures.len() - 8;
         tool_failures = tool_failures.split_off(keep_from);
     }
+    let tool_failures = tool_failures
+        .into_iter()
+        .map(|(_, failure)| failure)
+        .collect::<Vec<_>>();
 
     suite_packet_core::AgentSnapshotPayload {
         task_id: task_id.to_string(),
@@ -974,9 +1066,49 @@ pub(crate) fn derive_agent_snapshot(
             .map(|(tool_name, query)| suite_packet_core::SearchQuerySummary { tool_name, query })
             .collect(),
         evidence_artifact_ids: evidence_artifact_ids.into_iter().collect(),
+        evidence_artifact_owners,
         last_successful_tool_by_kind: last_successful_tool_by_kind.into_values().collect(),
         latest_intention,
     }
+}
+
+/// Returns `task_id` and its history-recovery predecessors, oldest first.
+///
+/// Each successor records one `recovered_from` link when daemon startup
+/// admits it. The chain stops at a task without a link. A cycle or conflicting
+/// links fall back to the requested task alone, so ambiguous history is never merged.
+pub(crate) fn recovery_lineage(
+    events: &[suite_packet_core::AgentStateEventPayload],
+    task_id: &str,
+) -> Vec<String> {
+    let mut predecessors =
+        std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+    for event in events {
+        if let suite_packet_core::AgentStateEventData::RecoveredFrom {
+            predecessor_task_id,
+        } = &event.data
+        {
+            predecessors
+                .entry(event.task_id.as_str())
+                .or_default()
+                .insert(predecessor_task_id.as_str());
+        }
+    }
+    let mut lineage = vec![task_id.to_string()];
+    let mut current = task_id;
+    while let Some(linked) = predecessors.get(current) {
+        let mut linked = linked.iter();
+        let (Some(predecessor), None) = (linked.next(), linked.next()) else {
+            return vec![task_id.to_string()];
+        };
+        if lineage.iter().any(|task_id| task_id == predecessor) {
+            return vec![task_id.to_string()];
+        }
+        lineage.push((*predecessor).to_string());
+        current = *predecessor;
+    }
+    lineage.reverse();
+    lineage
 }
 
 fn decision_event_rank(event: &suite_packet_core::AgentStateEventPayload) -> u8 {

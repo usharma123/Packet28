@@ -10,9 +10,45 @@ from pathlib import Path
 from benchmark_common import estimate_tokens, resolve_shell, run_capture
 
 
+def explicit_cli_args(root: Path, argv: list[str], task_id: str) -> list[str]:
+    """Choose existing explicit CLI routes without changing shell expressions."""
+    if not argv or any(token in {"|", "||", "&&", ";", "2>&1", ">", "<"} for token in argv):
+        raise ValueError("shell expressions have no equivalent explicit route in this benchmark")
+    if argv[0] in {"git", "cargo", "gh"}:
+        return argv.copy()
+    if argv[0] == "head" and len(argv) == 4 and argv[1] == "-n":
+        count = int(argv[2])
+        if count <= 0:
+            raise ValueError("head line count must be positive")
+        window = ["--line-start", "1", "--line-end", str(count)]
+        path = argv[3]
+    elif argv[0] == "cat" and len(argv) == 2:
+        window = []
+        path = argv[1]
+    else:
+        raise ValueError(f"no explicit benchmark route for {shlex.join(argv)}")
+    if path == "-" or path.startswith("-"):
+        raise ValueError("stdin and option-shaped paths have no equivalent explicit read route")
+    return [
+        "--via-daemon", "--daemon-root", str(root), "compact", "read",
+        "--root", str(root), "--task-id", task_id, "--cwd", str(root),
+        *window, path,
+    ]
+
+
+def is_capture_only(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    specific = payload.get("hookSpecificOutput", {})
+    return isinstance(specific, dict) and all(
+        key not in payload and key not in specific
+        for key in ("updatedInput", "permissionDecision", "decision")
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Compare raw Bash output against Packet28 hook rewrite output."
+        description="Compare raw Bash output against explicitly requested Packet28 CLI reduction."
     )
     parser.add_argument("--root", default=".", help="Repository root")
     parser.add_argument("--task-id", default=None, help="Optional task id")
@@ -26,7 +62,7 @@ def main() -> int:
     parser.add_argument(
         "--shell",
         default=None,
-        help="Shell binary to use for raw and rewritten command execution",
+        help="Shell binary to use for raw command execution",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to benchmark")
     args = parser.parse_args()
@@ -69,45 +105,50 @@ def main() -> int:
         "--root",
         str(root),
     ]
-    rewrite = run_capture(hook_cmd, root, pretool_payload)
-    if rewrite.returncode not in (0, 2):
-        raise SystemExit(
-            f"hook rewrite failed ({rewrite.returncode}): {rewrite.stderr or rewrite.stdout}"
-        )
-    if (
-        not rewrite.stdout.strip()
-        and "allowing runtime action after processing error" in rewrite.stderr
-    ):
-        raise SystemExit(f"hook processing failed: {rewrite.stderr.strip()}")
-    rewrite_payload = json.loads(rewrite.stdout.strip() or "{}")
-    rewritten = (
-        rewrite_payload.get("hookSpecificOutput", {})
-        .get("updatedInput", {})
-        .get("command")
-    )
+    hook = run_capture(hook_cmd, root, pretool_payload)
+    if hook.returncode != 0:
+        raise SystemExit(f"capture-only hook failed ({hook.returncode}): {hook.stderr or hook.stdout}")
+    if "allowing runtime action after processing error" in hook.stderr:
+        raise SystemExit(f"hook processing failed: {hook.stderr.strip()}")
+    hook_payload = json.loads(hook.stdout.strip() or "{}")
+    if not is_capture_only(hook_payload):
+        raise SystemExit("PreToolUse changed native input or permission authority")
+    try:
+        explicit_args = explicit_cli_args(root, args.command, task_id)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    explicit_cmd = ["cargo", "run", "-q", "-p", "suite-cli", "--bin", "Packet28", "--", *explicit_args]
     raw = run_capture([shell_path, "-lc", command_text], root)
+    reduced = run_capture(explicit_cmd, root)
     raw_visible = raw.stdout + raw.stderr
-    if rewritten:
-        reduced = run_capture([shell_path, "-lc", rewritten], root)
-        reduced_visible = reduced.stdout + reduced.stderr
-        reduced_exit_code = reduced.returncode
-        status = "ok"
-        compact_path = "hook_rewrite"
-        raw_output_recoverable = True
-    else:
-        reduced_visible = raw_visible
-        reduced_exit_code = raw.returncode
-        status = "passthrough"
-        compact_path = "passthrough"
-        raw_output_recoverable = False
-
+    reduced_visible = reduced.stdout + reduced.stderr
+    reduced_exit_code = reduced.returncode
+    integrity_error = None
+    if raw.returncode != reduced.returncode:
+        integrity_error = f"explicit CLI exit {reduced.returncode} differs from raw exit {raw.returncode}"
+    read_window_integrity = None
+    if args.command[0] == "head":
+        raw_lines = raw.stdout.splitlines()
+        expected = "\n".join(f"{index}|{line}" for index, line in enumerate(raw_lines, 1)) + "\n"
+        read_window_integrity = {
+            "passed": raw.returncode == reduced.returncode == 0 and reduced.stdout == expected,
+            "line_start": 1,
+            "line_end": int(args.command[2]),
+            "raw_line_count": len(raw_lines),
+        }
+        if not read_window_integrity["passed"]:
+            integrity_error = "explicit read changed the original head window, contents, or successful exit"
+    status = "error" if integrity_error else "ok"
     payload = {
         "status": status,
         "command": command_text,
-        "rewritten_command": rewritten,
+        "rewritten_command": None,
+        "explicit_command": shlex.join(["Packet28", *explicit_args]),
+        "pretool_capture_only": True,
         "chosen_shell": shell_path,
-        "compact_path": compact_path,
-        "raw_output_recoverable": raw_output_recoverable,
+        "compact_path": "explicit_cli",
+        "estimate_scope": "visible_cli_output",
+        "raw_output_recoverable": False,
         "raw_exit_code": raw.returncode,
         "reduced_exit_code": reduced_exit_code,
         "raw_bytes": len(raw_visible.encode("utf-8")),
@@ -117,6 +158,10 @@ def main() -> int:
         "raw_preview": raw_visible[:400],
         "reduced_preview": reduced_visible[:400],
     }
+    if integrity_error:
+        payload["error"] = integrity_error
+    if read_window_integrity is not None:
+        payload["read_window_integrity"] = read_window_integrity
     if payload["raw_est_tokens"]:
         payload["token_reduction_pct"] = round(
             100

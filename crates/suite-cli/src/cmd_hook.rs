@@ -33,9 +33,9 @@ use crate::memory_store::{
     record_hook_event, HookEventInput, PendingExtractionInput, TranscriptAppendInput,
 };
 use hook_runtime::{
-    build_runtime_pretool_rewrite, build_runtime_reducer_packet, external_runtime_name,
-    parse_runtime_event_kind, render_runtime_hook_output, runtime_command, runtime_matcher,
-    runtime_session_id, runtime_source, ExternalHookRuntime,
+    build_runtime_reducer_packet, external_runtime_name, parse_runtime_event_kind,
+    render_runtime_hook_output, runtime_command, runtime_matcher, runtime_session_id,
+    runtime_source, ExternalHookRuntime,
 };
 
 #[cfg(test)]
@@ -107,8 +107,11 @@ pub struct HookRewriteArgs {
 
 #[derive(Subcommand, Clone)]
 pub enum HookRewriteCommand {
+    /// Unsupported: automatic rewrites change native host permission matching.
     On,
+    /// Clear the legacy rewrite flag; result capture stays enabled.
     Off,
+    /// Report capture-only behavior and the stored legacy rewrite flag.
     Status(HookRewriteStatusArgs),
 }
 
@@ -126,6 +129,10 @@ pub struct HookHttpServerArgs {
     pub port: u16,
     #[arg(long)]
     pub token: String,
+    /// Own the workspace hook log and rotate it by size while running,
+    /// instead of writing diagnostics to stderr
+    #[arg(long)]
+    pub managed_log: bool,
 }
 
 #[derive(Args, Clone)]
@@ -166,8 +173,8 @@ pub struct ReduceFixtureArgs {
 
 pub fn run(args: HookArgs) -> Result<i32> {
     match args.command {
-        HookCommands::Claude(args) => run_claude(args),
-        HookCommands::Codex(args) => run_claude(args),
+        HookCommands::Claude(args) => run_compatible_hook(args, "claude"),
+        HookCommands::Codex(args) => run_compatible_hook(args, "codex"),
         HookCommands::Copilot(args) => run_runtime_hook(args, ExternalHookRuntime::Copilot),
         HookCommands::Cursor(args) => run_runtime_hook(args, ExternalHookRuntime::Cursor),
         HookCommands::Gemini(args) => run_runtime_hook(args, ExternalHookRuntime::Gemini),
@@ -191,7 +198,7 @@ struct RuntimeHookOutcome {
     body: Option<String>,
 }
 
-fn run_claude(args: ClaudeHookArgs) -> Result<i32> {
+fn run_compatible_hook(args: ClaudeHookArgs, runtime: &str) -> Result<i32> {
     let mut buffer = String::new();
     io::stdin().read_to_string(&mut buffer)?;
     let payload = if buffer.trim().is_empty() {
@@ -206,7 +213,13 @@ fn run_claude(args: ClaudeHookArgs) -> Result<i32> {
         }
     };
     let root = resolve_hook_root(&args, &payload);
-    match process_claude_hook_payload(&root, args.event.as_deref(), &payload, true) {
+    match process_compatible_hook_payload(
+        &root,
+        args.event.as_deref(),
+        &payload,
+        runtime == "claude",
+        runtime,
+    ) {
         Ok(outcome) => {
             if let Some(body) = outcome.body {
                 println!("{body}");
@@ -225,6 +238,24 @@ pub(crate) fn process_claude_hook_payload(
     event_override: Option<&str>,
     payload: &Value,
     bootstrap_http_server: bool,
+) -> Result<ClaudeHookOutcome> {
+    process_compatible_hook_payload(
+        root,
+        event_override,
+        payload,
+        bootstrap_http_server,
+        "claude",
+    )
+}
+
+// Codex uses the same lifecycle JSON envelope and canonical Bash tool name.
+// Keep runtime attribution separate from the shared event ingestion contract.
+fn process_compatible_hook_payload(
+    root: &Path,
+    event_override: Option<&str>,
+    payload: &Value,
+    bootstrap_http_server: bool,
+    runtime: &str,
 ) -> Result<ClaudeHookOutcome> {
     let runtime_config = load_hook_runtime_config(root)?;
     let event_kind = event_override
@@ -251,17 +282,9 @@ pub(crate) fn process_claude_hook_payload(
     let _writer_lease = acquire_task_store_writer_lease(root)?;
 
     let session_id = json_string(payload, "session_id");
-    let task_id = resolve_task_id(root, payload, session_id.as_deref())?;
+    let task_id = resolve_task_id(root, payload, session_id.as_deref(), runtime)?;
     let matcher = json_string(payload, "matcher");
     let source = json_string(payload, "source");
-    let rewrite = build_pretool_rewrite(
-        &runtime_config,
-        root,
-        payload,
-        event_kind,
-        &task_id,
-        session_id.as_deref(),
-    )?;
     let reducer_packet = build_reducer_packet(&runtime_config, payload, event_kind);
     let response = crate::broker_client::hook_ingest(
         root,
@@ -280,14 +303,14 @@ pub(crate) fn process_claude_hook_payload(
         },
     )?;
     record_hook_event(HookEventInput {
-        runtime: "claude",
+        runtime,
         event_kind: hook_event_name(event_kind),
         session_id: session_id.as_deref(),
         task_id: Some(&task_id),
         matcher: matcher.as_deref(),
         payload_json: &serde_json::to_string(payload)?,
     })?;
-    let _ = capture_hook_output("claude", root, event_kind, payload, session_id.as_deref());
+    let _ = capture_hook_output(runtime, root, event_kind, payload, session_id.as_deref());
     let additional_context = build_session_start_additional_context(
         root,
         event_kind,
@@ -298,13 +321,7 @@ pub(crate) fn process_claude_hook_payload(
         .unwrap_or_else(|_| Vec::new());
     Ok(ClaudeHookOutcome {
         exit_code: if response.block_stop { 2 } else { 0 },
-        body: render_hook_output(
-            event_kind,
-            rewrite,
-            &response,
-            additional_context,
-            &action_critic,
-        )?,
+        body: render_hook_output(event_kind, &response, additional_context, &action_critic)?,
     })
 }
 
@@ -368,15 +385,6 @@ fn process_runtime_hook_payload(
     let session_id = runtime_session_id(runtime, &payload);
     let task_id = resolve_runtime_task_id(&root, &payload, session_id.as_deref(), runtime)?;
     let matcher = runtime_matcher(runtime, &payload, event_kind);
-    let rewrite = build_runtime_pretool_rewrite(
-        runtime,
-        &runtime_config,
-        &root,
-        &payload,
-        event_kind,
-        &task_id,
-        session_id.as_deref(),
-    )?;
     let reducer_packet = build_runtime_reducer_packet(runtime, &payload, event_kind);
 
     let _response = crate::broker_client::hook_ingest(
@@ -410,7 +418,7 @@ fn process_runtime_hook_payload(
     );
     Ok(RuntimeHookOutcome {
         exit_code: 0,
-        body: render_runtime_hook_output(runtime, event_kind, &payload, rewrite)?,
+        body: render_runtime_hook_output(runtime, event_kind)?,
     })
 }
 
@@ -537,7 +545,24 @@ fn resolve_hook_root(args: &ClaudeHookArgs, payload: &Value) -> PathBuf {
         .unwrap_or_else(|| crate::broker_client::resolve_root("."))
 }
 
-fn resolve_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Result<String> {
+// Claude Code and Codex hooks share this resolver. Fresh task identities
+// retain their runtime namespace; recovered tasks adopt their linked successor.
+fn resolve_task_id(
+    root: &Path,
+    payload: &Value,
+    session_id: Option<&str>,
+    runtime: &str,
+) -> Result<String> {
+    let task_id = select_task_id(root, payload, session_id, runtime)?;
+    crate::task_runtime::adopt_task_continuation(root, task_id, session_id)
+}
+
+fn select_task_id(
+    root: &Path,
+    payload: &Value,
+    session_id: Option<&str>,
+    runtime: &str,
+) -> Result<String> {
     if let Some(task_id) = json_string(payload, "task_id").filter(|value| !value.trim().is_empty())
     {
         crate::task_runtime::store_active_task(
@@ -556,8 +581,10 @@ fn resolve_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Re
         }
     }
     let task_id = session_id
-        .map(crate::task_runtime::derive_claude_task_id)
-        .unwrap_or_else(|| crate::broker_client::derive_task_id("claude-project"));
+        .map(|session| {
+            crate::broker_client::derive_task_id(&format!("{runtime}-session:{session}"))
+        })
+        .unwrap_or_else(|| crate::broker_client::derive_task_id(&format!("{runtime}-project")));
     crate::task_runtime::store_active_task(
         root,
         &ActiveTaskRecord {
@@ -570,6 +597,16 @@ fn resolve_task_id(root: &Path, payload: &Value, session_id: Option<&str>) -> Re
 }
 
 fn resolve_runtime_task_id(
+    root: &Path,
+    payload: &Value,
+    session_id: Option<&str>,
+    runtime: ExternalHookRuntime,
+) -> Result<String> {
+    let task_id = select_runtime_task_id(root, payload, session_id, runtime)?;
+    crate::task_runtime::adopt_task_continuation(root, task_id, session_id)
+}
+
+fn select_runtime_task_id(
     root: &Path,
     payload: &Value,
     session_id: Option<&str>,
@@ -679,7 +716,6 @@ fn hook_event_name(kind: HookEventKind) -> &'static str {
 
 fn render_hook_output(
     event_kind: HookEventKind,
-    rewrite: Option<Value>,
     response: &packet28_daemon_protocol::hooks::HookIngestResponse,
     session_start_context: Option<String>,
     action_critic: &[String],
@@ -696,25 +732,11 @@ fn render_hook_output(
             }
         }
         HookEventKind::PreToolUse => {
-            let critic_reason = render_action_critic_reason(action_critic);
-            if let Some(updated_input) = rewrite {
-                let mut hook_output = json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "updatedInput": updated_input,
-                    }
-                });
-                if let Some(reason) = critic_reason {
-                    hook_output["hookSpecificOutput"]["permissionDecisionReason"] = json!(reason);
-                }
-                return Ok(Some(serde_json::to_string(&hook_output)?));
-            }
-            if let Some(reason) = critic_reason {
+            if let Some(context) = render_action_critic_reason(action_critic) {
                 return Ok(Some(serde_json::to_string(&json!({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "permissionDecisionReason": reason,
+                        "additionalContext": context,
                     }
                 }))?));
             }
@@ -723,13 +745,13 @@ fn render_hook_output(
             if response.relaunch_requested {
                 // Daemon is handling relaunch — allow the stop to proceed.
                 // The next session will bootstrap from the handoff artifact.
-                eprintln!(
+                crate::runtime_log::diagnostic(&format!(
                     "packet28: context threshold reached, daemon relaunch queued (artifact={})",
                     response
                         .latest_handoff_artifact_id
                         .as_deref()
                         .unwrap_or("pending")
-                );
+                ));
             } else if response.block_stop {
                 return Ok(Some(serde_json::to_string(&json!({
                     "decision": "block",
@@ -828,91 +850,6 @@ fn build_session_start_additional_context(
     Ok(Some(context))
 }
 
-fn build_pretool_rewrite(
-    runtime_config: &HookRuntimeConfig,
-    root: &Path,
-    payload: &Value,
-    event_kind: HookEventKind,
-    task_id: &str,
-    session_id: Option<&str>,
-) -> Result<Option<Value>> {
-    if !matches!(event_kind, HookEventKind::PreToolUse) || !runtime_config.rewrite_enabled {
-        return Ok(None);
-    }
-    if json_string(payload, "tool_name").as_deref() != Some("Bash") {
-        return Ok(None);
-    }
-    let Some(tool_input) = payload.get("tool_input") else {
-        return Ok(None);
-    };
-    let Some(command) = json_string(tool_input, "command") else {
-        return Ok(None);
-    };
-    let hook_cwd = json_string(payload, "cwd").unwrap_or_else(|| root.display().to_string());
-    let hook_cwd_path = std::path::Path::new(&hook_cwd);
-    let mut decision = crate::route_registry::decide_command_route_with_cwd_and_root(
-        &command,
-        hook_cwd_path,
-        root,
-    );
-
-    // In hook context, promote NativeTool → ReducerRewrite when the reducer-core
-    // also classifies the command (e.g. head/cat/sed → fs family).
-    if matches!(decision.kind, crate::route_registry::RouteKind::NativeTool)
-        && !decision
-            .native_tool
-            .as_ref()
-            .is_some_and(|tool| matches!(tool.kind, crate::route_registry::NativeToolKind::Grep))
-    {
-        if let Some(spec) = packet28_reducer_core::classify_command_argv(&command, &decision.argv) {
-            decision = crate::route_registry::RouteDecision {
-                kind: crate::route_registry::RouteKind::ReducerRewrite,
-                reason: None,
-                argv: decision.argv,
-                env_assignments: decision.env_assignments,
-                reducer_spec: Some(spec),
-                native_tool: None,
-                original_argv: decision.original_argv,
-                wrapper_prefix: decision.wrapper_prefix,
-                original_command: decision.original_command,
-            };
-        }
-    }
-
-    // Only allow compact local rewrites through hooks. ProxyPassthrough and
-    // RawPassthrough are not rewritten in the hook path.
-    let proceed = match &decision.kind {
-        crate::route_registry::RouteKind::ReducerRewrite => {
-            decision.reducer_spec.as_ref().is_some_and(|spec| {
-                runtime_config
-                    .reducer_allowlist
-                    .iter()
-                    .any(|entry| entry == &spec.family)
-            })
-        }
-        crate::route_registry::RouteKind::NativeTool => true,
-        crate::route_registry::RouteKind::TomlFilterRewrite => true,
-        crate::route_registry::RouteKind::CompoundRewrite => true,
-        _ => false,
-    };
-    if !proceed {
-        return Ok(None);
-    }
-
-    let mut updated_input = tool_input.clone();
-    let Some(rewritten) =
-        crate::route_registry::build_route_rewrite(root, task_id, session_id, &hook_cwd, &decision)
-    else {
-        return Ok(None);
-    };
-    if let Some(object) = updated_input.as_object_mut() {
-        object.insert("command".to_string(), Value::String(rewritten));
-    } else {
-        updated_input = json!({ "command": rewritten });
-    }
-    Ok(Some(updated_input))
-}
-
 fn load_hook_runtime_config(root: &Path) -> Result<HookRuntimeConfig> {
     let path = hook_runtime_config_path(root);
     let raw = match fs::read_to_string(&path) {
@@ -934,10 +871,8 @@ fn run_hook_rewrite(args: HookRewriteArgs) -> Result<i32> {
     let root = PathBuf::from(args.root);
     match args.command {
         HookRewriteCommand::On => {
-            set_hook_rewrite_enabled(&root, true)?;
-            println!(
-                "Packet28 hook command rewriting is enabled for {}",
-                root.display()
+            anyhow::bail!(
+                "automatic host-hook command rewriting is unsupported because it changes native permission matching; hooks capture results without modifying commands. Use explicit Packet28 CLI/MCP reduction instead"
             );
         }
         HookRewriteCommand::Off => {
@@ -954,20 +889,17 @@ fn run_hook_rewrite(args: HookRewriteArgs) -> Result<i32> {
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "root": root,
-                        "rewrite_enabled": config.rewrite_enabled,
+                        "rewrite_enabled": false,
+                        "legacy_rewrite_enabled": config.rewrite_enabled,
+                        "mode": "capture_only",
                         "hooks_enabled": config.hooks_enabled,
                         "fallback_post_tool_capture": config.fallback_post_tool_capture
                     }))?
                 );
             } else {
-                let state = if config.rewrite_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                };
                 println!(
-                    "Packet28 hook command rewriting is {state} for {}",
-                    root.display()
+                    "Packet28 host hooks capture results without rewriting commands for {} (legacy rewrite_enabled={}; inactive). Use explicit Packet28 CLI/MCP reduction instead.",
+                    root.display(), config.rewrite_enabled
                 );
             }
         }

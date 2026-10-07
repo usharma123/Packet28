@@ -40,6 +40,7 @@ deliberate coverage, not an undocumented omission.
 | packet28-daemon-protocol | frame | covered | protocol-frame-runnable |
 | packet28-daemon-protocol | hooks | excluded | hook-ingest-json-tests |
 | packet28-daemon-protocol | index | excluded | index-state-process-tests |
+| packet28-daemon-protocol | logging | excluded | runtime-log-rotation-process-tests |
 | packet28-daemon-protocol | message | excluded | request-response-json-tests |
 | packet28-daemon-protocol | paths | excluded | path-endpoint-tests |
 | packet28-daemon-protocol | process | excluded | session-detach-process-tests |
@@ -55,6 +56,8 @@ deliberate coverage, not an undocumented omission.
 | packet28-daemon-core | trust | excluded | trust-platform-tests |
 | packet28-daemon-core | root_compatibility | excluded | exact-182-name-frozen-v0-inventory |
 | packet28d | serve | excluded | non-hermetic-process-lifecycle-owner |
+| packet28d | serve_with_managed_log | excluded | non-hermetic-process-lifecycle-owner |
+| packet28d | start | excluded | p28-bootstrap-authority-process-tests |
 | packet28d | shared_repository_scan | covered | packet28d-shared-scan-no_run+feature-shared-repository-scan |
 
 <!-- packet28d-public owner=packet28-daemon-protocol item=broker classification=excluded evidence=wire-dto-json-compat-tests -->
@@ -63,6 +66,7 @@ deliberate coverage, not an undocumented omission.
 <!-- packet28d-public owner=packet28-daemon-protocol item=frame classification=covered evidence=protocol-frame-runnable -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=hooks classification=excluded evidence=hook-ingest-json-tests -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=index classification=excluded evidence=index-state-process-tests -->
+<!-- packet28d-public owner=packet28-daemon-protocol item=logging classification=excluded evidence=runtime-log-rotation-process-tests -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=message classification=excluded evidence=request-response-json-tests -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=paths classification=excluded evidence=path-endpoint-tests -->
 <!-- packet28d-public owner=packet28-daemon-protocol item=process classification=excluded evidence=session-detach-process-tests -->
@@ -78,13 +82,47 @@ deliberate coverage, not an undocumented omission.
 <!-- packet28d-public owner=packet28-daemon-core item=trust classification=excluded evidence=trust-platform-tests -->
 <!-- packet28d-public owner=packet28-daemon-core item=root_compatibility classification=excluded evidence=exact-182-name-frozen-v0-inventory -->
 <!-- packet28d-public owner=packet28d item=serve classification=excluded evidence=non-hermetic-process-lifecycle-owner -->
+<!-- packet28d-public owner=packet28d item=serve_with_managed_log classification=excluded evidence=non-hermetic-process-lifecycle-owner -->
+<!-- packet28d-public owner=packet28d item=start classification=excluded evidence=p28-bootstrap-authority-process-tests -->
 <!-- packet28d-public owner=packet28d item=shared_repository_scan classification=covered evidence=packet28d-shared-scan-no_run+feature-shared-repository-scan -->
 
-`packet28d::serve` is intentionally excluded from a runnable happy-path
-doctest. It changes the process working directory, acquires workspace leases,
-publishes runtime files, binds a listener, and blocks until shutdown, so a
-runnable doctest would not be hermetic. Lifecycle and process tests cover that
-boundary instead.
+`packet28d::serve` and `packet28d::serve_with_managed_log` are intentionally
+excluded from a runnable happy-path doctest. They change the process working
+directory, acquire workspace leases, publish runtime files, bind a listener,
+and block until shutdown, so a runnable doctest would not be hermetic.
+Lifecycle and process tests cover that boundary instead. The managed-log
+variant additionally owns the size-rotated workspace log described in
+[operations](operations.md#logs-and-troubleshooting).
+
+`packet28d::start` (`packet28d start --root`) is excluded for the same reason:
+it takes the startup lease, waits for a stopping daemon to release the instance
+lease, and spawns `serve --managed-log` from its own executable with null
+standard streams, so the started daemon owns the same bounded, size-rotated
+workspace log as a CLI-started daemon. It is the bootstrap path for `p28`,
+which may not link `packet28-daemon-core`. The `p28` daemon process tests cover
+a held shutdown, the bounded authority timeout and the managed-log bound.
+
+Bootstrap, in `packet28d start` and the Packet28 CLI, keeps two phases with
+separate fixed deadlines. An instance-lease owner that is neither serving nor
+starting, such as a stopping daemon, gets 10 s to release authority. A daemon
+that bootstrap spawned, or an owner whose authenticated runtime metadata has no
+readiness time and whose endpoint accepts connections, gets 30 s to answer
+bounded V1 status with the same pid and workspace root. Each status request,
+including the TCP capability exchange, re-arms its socket timeout with the time
+left in its phase before every read and write, so a peer trickling bytes cannot
+extend it, and a response completed after the deadline is rejected. Runtime
+metadata only selects what to wait for; cleanup and spawn still require the
+released instance lease, and unauthentic or malformed metadata fails closed.
+Metadata must name the requested workspace, compared by canonical path so a
+symlinked spelling still matches. While the workspace's instance lease is
+held, metadata naming another workspace fails immediately without contacting
+its endpoint; after release it is stale and is replaced by a new daemon. The
+CLI and `p28` status fast paths never contact such an endpoint, and the CLI
+refuses to send any request, including Stop, through it. A timed-out caller leaves a
+starting daemon running. Startup-lease acquisition precedes both deadlines and
+blocks behind another bootstrap or an explicit stop, so neither phase bounds a
+whole call. Gated-startup process tests in `p28` and the CLI hold a real
+registry lock to keep startup pending past 10 s.
 
 The checker also requires each source anchor below to resolve to exactly one
 Rustdoc fence of the declared kind and to contain the relevant API operations.
@@ -198,6 +236,28 @@ the same task is rejected until the owned child waiter has recorded completion
 and removed the child. If the daemon crashes or persistence fails between spawn
 and the ownership barrier, closing the gate pipe makes the shim exit without
 executing delegated work.
+
+Startup compares the event tail with the committed checkpoint and registry WAL.
+A corrupt log, or a missing or valid truncated log behind that committed high-water,
+fences its task before the persistence owner starts. Existing bytes move to the
+reserved quarantine name after the file identity and observed tail are rechecked
+under an exclusive log lock. A missing log has no evidence file to move. A log
+whose tail is ahead of the registry follows ordinary forward reconciliation.
+The damaged task becomes a terminal `superseded_by` record, and work
+continues under a newly admitted linked successor with a fresh event sequence;
+see [Corrupt event-log recovery](task-store-retention.md#corrupt-event-log-recovery).
+Startup records constant-size recovery links before readiness. Successor snapshots
+read predecessor packets in place using the authenticated registry lineage. Continuation requests and subscriptions that name a
+superseded task are rejected with an error naming its successor.
+
+An interrupted move resumes the existing reciprocal link and reserved quarantine
+name. It does not create another successor or reuse event numbers on the damaged
+identity. Startup still fails if the final reconciliation sees an unexplained
+registry-ahead tail after recovery.
+
+A pending replan without its stored sequence becomes idle with an explanatory
+`last_error`, and that change is durable before readiness. An uncompleted agent
+whose persisted process group is still live continues to block startup.
 
 Detailed retention, journal, corruption, and descriptor-confinement guarantees
 are in [Task-store retention](task-store-retention.md).

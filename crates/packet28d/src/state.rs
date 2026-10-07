@@ -130,6 +130,8 @@ pub(crate) struct DaemonState {
     pub(crate) source_file_cache: BTreeMap<String, CachedSourceFile>,
     pub(crate) interactive_index: InteractiveIndexRuntime,
     pub(crate) index_tx: crate::index::IndexIngress,
+    /// Serializes index request admission; see `index::with_index_admission`.
+    pub(crate) index_admission: Arc<std::sync::Mutex<()>>,
     pub(crate) background_tx: tokio::sync::mpsc::Sender<BackgroundCommand>,
     pub(crate) persistence: crate::persistence::PersistenceHandle,
     #[cfg(test)]
@@ -137,6 +139,8 @@ pub(crate) struct DaemonState {
     pub(crate) shutdown: crate::runtime::ShutdownSignal,
     pub(crate) changes: crate::runtime::StateChangeSignal,
     pub(crate) shutting_down: bool,
+    pub(crate) task_maintenance: crate::task_maintenance::TaskMaintenance,
+    pub(crate) record_sizes: crate::task_maintenance::RecordSizeIndex,
 }
 
 impl DaemonState {
@@ -260,6 +264,18 @@ impl TaskGenerationToken {
             .values()
             .copied()
             .collect()
+    }
+
+    /// Returns whether no operation, child launch, or child process is active.
+    pub(crate) fn is_idle(&self) -> bool {
+        let activity = self
+            .activity
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        activity.active_operations == 0
+            && !activity.child_launch_in_progress
+            && activity.children.is_empty()
     }
 
     pub(crate) fn wait_for_children(&self, timeout: Duration) -> bool {

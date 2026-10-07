@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use packet28_daemon_protocol::hooks::HookRuntimeConfig;
-use packet28_daemon_protocol::paths::daemon_dir;
+use packet28_daemon_protocol::logging::{HOOK_HTTP_LOG_FILE_NAME, MANAGED_LOG_FLAG};
 use serde_json::{json, Value};
 
 use crate::cmd_hook::{process_claude_hook_payload, HookHttpServerArgs};
@@ -42,6 +42,24 @@ struct HttpClientResponse {
 
 pub(crate) fn run_hook_http_server(args: HookHttpServerArgs) -> Result<i32> {
     let root = crate::broker_client::resolve_root(&args.root);
+    if args.managed_log {
+        crate::runtime_log::install_managed_log(
+            &root,
+            HOOK_HTTP_LOG_FILE_NAME,
+            "packet28-hook-http",
+        );
+    }
+    let result = serve_hook_http(&root, &args);
+    if let Err(error) = &result {
+        // Foreground callers already print the returned error to stderr.
+        crate::runtime_log::record_if_managed(&format!(
+            "Packet28 hook HTTP server exited with error: {error:#}"
+        ));
+    }
+    result
+}
+
+fn serve_hook_http(root: &Path, args: &HookHttpServerArgs) -> Result<i32> {
     // This server outlives the hook invocation that spawned it; detach from
     // that hook's process group/session so host cleanup does not kill it.
     packet28_daemon_protocol::process::detach_from_parent_session();
@@ -51,11 +69,13 @@ pub(crate) fn run_hook_http_server(args: HookHttpServerArgs) -> Result<i32> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let root = root.clone();
+                let root = root.to_path_buf();
                 let token = args.token.clone();
                 thread::spawn(move || {
                     if let Err(err) = handle_hook_http_connection(stream, &root, &token) {
-                        eprintln!("packet28 hook http request failed: {err:#}");
+                        crate::runtime_log::diagnostic(&format!(
+                            "packet28 hook http request failed: {err:#}"
+                        ));
                     }
                 });
             }
@@ -159,21 +179,8 @@ fn hook_http_settings(runtime_config: &HookRuntimeConfig) -> Option<HookHttpSett
 
 fn start_hook_http_server(root: &Path, settings: &HookHttpSettings) -> Result<()> {
     let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
-    let log_path = daemon_dir(root).join("packet28-hook-http.log");
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create hook log dir '{}'", parent.display()))?;
-    }
-    let stdout = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open hook log '{}'", log_path.display()))?;
-    let stderr = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open hook log '{}'", log_path.display()))?;
+    // The server owns, writes, and rotates its workspace log; it never depends
+    // on this hook invocation or on inherited descriptors staying alive.
     let mut child = Command::new(exe)
         .arg("hook")
         .arg("serve-http")
@@ -183,9 +190,10 @@ fn start_hook_http_server(root: &Path, settings: &HookHttpSettings) -> Result<()
         .arg(settings.port.to_string())
         .arg("--token")
         .arg(&settings.token)
+        .arg(MANAGED_LOG_FLAG)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .context("failed to spawn Packet28 hook HTTP server")?;
     // Reap the child if it exits while this process is still alive (for

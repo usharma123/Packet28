@@ -160,6 +160,39 @@ When startup reports corruption:
 
 Do not delete or rewrite task registries to make the daemon start.
 
+### Registry bytes that match no checkpoint phase
+
+If startup reports that canonical registry bytes do not match a journaled
+checkpoint publication phase, or that checkpoint generations disagree, stop the
+daemon and classify the state first:
+
+```bash
+packet28 daemon stop --root .
+packet28 daemon storage repair --root . --json --pretty
+packet28 daemon storage repair --root . --apply
+```
+
+Repair restores only bytes the checkpoint already authenticates:
+
+- a committed image whose strict, duplicate-key-rejecting re-encoding has the
+  exact byte length and BLAKE3 digest in the commit manifest, such as a
+  whitespace-only reformat;
+- the retained journal base image while that base is still the committed
+  checkpoint after an interrupted publication, and only when the registry
+  delta WAL replays from the base revision.
+
+Before writing, `--apply` copies every affected registry image and the
+checkpoint manifest, journal, and journal images to an owner-only
+`.packet28/daemon/registry-repair/repair-*` archive with a hashed receipt. A
+durable repair journal makes startup refuse until the repair is complete; rerun
+`--apply` after an interruption. The WAL, manifest, and journal are never
+deleted or rewritten.
+
+A substantive edit, a missing committed image, or unusable checkpoint metadata
+is reported as `NO SAFE RECOVERY` with exit status `1`. Nothing is changed and
+edited content is never adopted; restore the file from a backup instead. Corrupt
+task event logs are inspected only after the registry resolves.
+
 ## Search and index
 
 Setup builds the repository indexes. Check status through:
@@ -181,6 +214,39 @@ The workspace daemon log is normally:
 ```text
 .packet28/daemon/packet28d.log
 ```
+
+The Claude HTTP hook server writes `.packet28/daemon/packet28-hook-http.log`.
+
+A background daemon or hook server started by Packet28 owns its log file and
+rotates it by size while it runs: when the next record would push the active
+file past the threshold, the process renames it to `<log>.1`, shifts older
+generations up to `<log>.3`, drops the oldest, and reopens a fresh file. The
+threshold defaults to 16 MiB and can be changed with
+`PACKET28_DAEMON_LOG_MAX_BYTES`, read from the launching environment. One record
+is capped at 64 KiB and marked `[truncated]`.
+
+Every process writing the same log, including a second daemon that loses
+startup authority, takes an advisory lock on the empty sidecar `<log>.lock`
+around each size check, rotation, and write, so concurrent owners cannot
+overshoot the threshold. The wait for that lock is bounded (250 ms, 50 ms
+while recording a panic); a record that cannot be serialized in time is
+dropped rather than delaying the process.
+
+When a managed process starts, and after each rotation, any generation larger
+than the threshold, such as a log left by an earlier unbounded launcher or one
+written under a larger threshold, is replaced by its most recent bytes behind
+a `[log] older diagnostics discarded` line. Older diagnostic bytes in those
+generations are deleted. Together these keep the active file and each backup
+within the threshold, so retained logs stay within four times the threshold.
+If a rotation fails, the active file is truncated in place; the failure notice
+and the record share the threshold, and the notice is omitted when the
+threshold is too small for both. Logging failures never stop the daemon.
+Panics are recorded in the log. Other output a background process writes
+directly to stdout or stderr is discarded. A daemon run in the foreground
+(`packet28d serve`) keeps ordinary stderr diagnostics.
+When the resolved `packet28d` binary predates managed logs, the launcher keeps
+the earlier behavior: it rotates `packet28d.log` once at start and appends the
+child's stdout and stderr to it.
 
 Useful checks:
 

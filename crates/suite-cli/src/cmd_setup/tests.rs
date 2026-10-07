@@ -286,6 +286,134 @@ fn generated_packet28_hook_command_exits_zero_when_binary_is_missing() {
 }
 
 #[test]
+fn claude_hook_merge_preserves_mixed_http_handlers_and_entry_metadata() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let generated: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let owned = generated["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+    let endpoint = owned["url"].as_str().unwrap();
+    let token = owned["headers"]["X-Packet28-Hook-Token"].as_str().unwrap();
+    let user_handlers = vec![
+        json!({"type": "command", "command": "user-audit"}),
+        json!({"type": "http", "url": format!("{endpoint}?user=1"), "headers": {"X-Packet28-Hook-Token": token}}),
+        json!({"type": "http", "url": "https://user.example/packet28/claude-hook", "headers": {"X-Packet28-Hook-Token": token}}),
+        json!({"type": "http", "url": endpoint}),
+        json!({"type": "http", "url": endpoint, "headers": {"X-Packet28-Hook-Token": "user-token"}}),
+    ];
+    let mut mixed = user_handlers.clone();
+    mixed.insert(1, owned);
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "env": {"KEEP": "yes"},
+            "allowedHttpHookUrls": ["https://user.example/hooks"],
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "userMetadata": "keep", "hooks": mixed}]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(merged["env"]["KEEP"], "yes");
+    let preserved = &merged["hooks"]["PreToolUse"][0];
+    assert_eq!(preserved["matcher"], "Bash");
+    assert_eq!(preserved["userMetadata"], "keep");
+    assert_eq!(preserved["hooks"], json!(user_handlers));
+    assert!(merged["allowedHttpHookUrls"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("https://user.example/hooks")));
+    assert_eq!(merged["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    let status = setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        merged
+    );
+}
+
+#[test]
+fn claude_hook_merge_preserves_user_wrappers_and_migrates_exact_generated_commands() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    let guarded = super::setup_commands::guarded_packet28_hook_command(
+        "/missing/Packet28",
+        "claude",
+        Path::new("/old/workspace"),
+    );
+    let direct_operator = "Packet28 hook claude --root /old;user-audit";
+    let guarded_operator = format!("{guarded};user-audit");
+    assert_eq!(shell_words::split(direct_operator).unwrap().len(), 5);
+    assert_eq!(shell_words::split(&guarded_operator).unwrap().len(), 6);
+    let user_handlers = vec![
+        json!({"type": "command", "command": direct_operator}),
+        json!({"type": "command", "command": guarded_operator}),
+        json!({"type": "command", "command": "echo Packet28 hook claude --root /user"}),
+        json!({"type": "command", "command": "sh -c 'printf %s \"Packet28 hook claude --root user\"'"}),
+        json!({"type": "command", "command": "user-audit"}),
+    ];
+    let mut mixed = user_handlers.clone();
+    mixed.push(json!({"type": "command", "command": guarded}));
+    mixed.push(json!({"type": "command", "command": "/missing/Packet28 hook claude --root /old/workspace"}));
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "hooks": {"SessionStart": [{"matcher": "user-matcher", "timeout": 42, "hooks": mixed}]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let entries = merged["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["matcher"], "user-matcher");
+    assert_eq!(entries[0]["timeout"], 42);
+    assert_eq!(entries[0]["hooks"], json!(user_handlers));
+    let command = entries[1]["hooks"][0]["command"].as_str().unwrap();
+    assert!(command.contains("${CLAUDE_PROJECT_DIR}"));
+    assert!(!command.contains("/old/workspace"));
+    assert_eq!(entries[2]["hooks"][0]["type"], "http");
+}
+
+#[test]
+fn generated_hook_command_ownership_requires_exact_outer_shell_serialization() {
+    for runtime in ["claude", "codex"] {
+        let guarded = super::setup_commands::guarded_packet28_hook_command(
+            "/missing/Packet28",
+            runtime,
+            Path::new("/old workspace"),
+        );
+        assert!(super::setup_commands::is_generated_packet28_hook_command(
+            &guarded, runtime
+        ));
+        let generated =
+            super::setup_commands::generated_packet28_hook_command(runtime, Path::new("/root"));
+        assert!(super::setup_commands::is_generated_packet28_hook_command(
+            &generated, runtime
+        ));
+        for suffix in [
+            ";user-audit",
+            "&&user-audit",
+            "|user-audit",
+            " >user.log",
+            "$(user-audit)",
+            "`user-audit`",
+        ] {
+            assert!(
+                !super::setup_commands::is_generated_packet28_hook_command(
+                    &format!("{guarded}{suffix}"),
+                    runtime
+                ),
+                "suffix {suffix:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn write_claude_hook_config_replaces_legacy_command_hooks() {
     let dir = tempdir().unwrap();
     let path = dir.path().join(".claude").join("settings.json");
@@ -410,7 +538,7 @@ fn write_copilot_hook_config_installs_packet28_pretool_hook() {
 }
 
 #[test]
-fn write_opencode_plugin_installs_packet28_rewrite_plugin() {
+fn write_opencode_plugin_installs_command_preserving_adapter() {
     let dir = tempdir().unwrap();
     let path = dir
         .path()
@@ -421,16 +549,17 @@ fn write_opencode_plugin_installs_packet28_rewrite_plugin() {
     let status = setup_plugins::write_opencode_plugin(&path, true).unwrap();
     assert!(matches!(status, McpConfigStatus::Written));
     let content = fs::read_to_string(&path).unwrap();
-    assert!(content.contains("Packet28 rewrite"));
+    assert!(content.contains("Packet28 preserves native command arguments"));
     assert!(content.contains("tool.execute.before"));
-    assert!(content.contains("args as Record<string, unknown>).command = rewritten"));
+    assert!(!content.contains(".command ="));
+    assert!(!content.contains("Packet28 rewrite"));
 
     let status = setup_plugins::write_opencode_plugin(&path, true).unwrap();
     assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
 }
 
 #[test]
-fn opencode_plugin_smoke_rewrites_and_passes_through_empty_stdout() {
+fn opencode_plugin_smoke_preserves_commands_without_running_wrappers() {
     if std::process::Command::new("node")
         .arg("--version")
         .output()
@@ -474,6 +603,7 @@ code += `
   const passthroughArgs = { command: "htop" }
   await plugin["tool.execute.before"]({ tool: "bash" }, { args: rewriteArgs })
   await plugin["tool.execute.before"]({ tool: "shell" }, { args: passthroughArgs })
+  if (calls.length !== 0) throw new Error("unexpected subprocess wrapper")
   console.log(rewriteArgs.command)
   console.log(passthroughArgs.command)
 })().catch((err) => { console.error(err); process.exit(1) })
@@ -493,7 +623,7 @@ eval(code)
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "rewritten git status\nhtop\n"
+        "git status --short\nhtop\n"
     );
 }
 
@@ -508,7 +638,7 @@ fn write_hermes_plugin_installs_plugin_and_enables_config() {
     let manifest = fs::read_to_string(plugin_dir.join("plugin.yaml")).unwrap();
     let config =
         fs::read_to_string(crate::runtime_integrations::hermes::config_path(dir.path())).unwrap();
-    assert!(init.contains("Packet28 rewrite"));
+    assert!(init.contains("Packet28 preserves native command arguments"));
     assert!(manifest.contains("packet28-rewrite"));
     assert!(setup_plugins::hermes_config_enables_packet28(&config).unwrap());
 
@@ -518,7 +648,7 @@ fn write_hermes_plugin_installs_plugin_and_enables_config() {
 
 #[test]
 #[cfg(unix)]
-fn hermes_plugin_smoke_rewrites_and_passes_through_empty_stdout() {
+fn hermes_plugin_smoke_preserves_commands_without_running_wrappers() {
     if std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -537,17 +667,9 @@ import sys
 spec = importlib.util.spec_from_file_location("packet28_rewrite", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-class FakeResult:
-    def __init__(self, stdout="", stderr="", returncode=0):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-def fake_run(argv, **kwargs):
-    assert argv[0:2] == ["Packet28", "rewrite"]
-    if argv[2] == "git status --short":
-        return FakeResult("rewritten git status\n")
-    return FakeResult("")
-mod.subprocess.run = fake_run
+def forbidden_run(*args, **kwargs):
+    raise AssertionError("unexpected subprocess wrapper")
+subprocess.run = forbidden_run
 rewrite_args = {"command": "git status --short"}
 mod._pre_tool_call(tool_name="terminal", args=rewrite_args)
 passthrough_args = {"command": "htop"}
@@ -568,7 +690,7 @@ print(passthrough_args["command"])
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "rewritten git status\nhtop\n"
+        "git status --short\nhtop\n"
     );
 }
 
@@ -698,6 +820,347 @@ fn setup_never_enables_daemon_managed_relaunch_by_default() {
     assert!(!config.daemon_relaunch_enabled());
 }
 
+#[test]
+fn write_hook_runtime_config_re_enables_stale_kill_switch() {
+    let dir = tempdir().unwrap();
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Simulate the kill switch left engaged by a prior `packet28 uninstall`,
+    // while HTTP hook settings are already present so only `hooks_enabled`
+    // needs fixing.
+    let disabled = HookRuntimeConfig {
+        hooks_enabled: false,
+        http_hook_port: Some(45123),
+        http_hook_token: Some("existing-token".to_string()),
+        ..HookRuntimeConfig::default()
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&disabled).unwrap()),
+    )
+    .unwrap();
+
+    let status = write_hook_runtime_config(dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::Written));
+
+    let written: HookRuntimeConfig =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        written.hooks_enabled,
+        "setup must re-enable hook ingest when configuring a hook runtime"
+    );
+    // Existing HTTP settings are preserved rather than regenerated.
+    assert_eq!(written.http_hook_port, Some(45123));
+    assert_eq!(written.http_hook_token.as_deref(), Some("existing-token"));
+}
+
+#[cfg(unix)]
+#[test]
+fn write_hook_runtime_config_keeps_private_token_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join(".packet28");
+    let daemon_dir = state_dir.join("daemon");
+    fs::create_dir_all(&daemon_dir).unwrap();
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    let config = HookRuntimeConfig {
+        hooks_enabled: false,
+        http_hook_port: Some(45123),
+        http_hook_token: Some("synthetic-private-token".to_string()),
+        ..HookRuntimeConfig::default()
+    };
+    fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(matches!(
+        write_hook_runtime_config(dir.path(), true).unwrap(),
+        McpConfigStatus::Written
+    ));
+
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let written: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(written.hooks_enabled);
+    assert_eq!(written.http_hook_token, config.http_hook_token);
+    // Privacy must come from the file, even when existing ancestors are public.
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_create_private_token_copy_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let parent = dir.path().join(".claude");
+    fs::create_dir(&parent).unwrap();
+    for directory in [dir.path(), parent.as_path()] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = parent.join("settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let runtime: HookRuntimeConfig = serde_json::from_slice(
+        &fs::read(packet28_daemon_protocol::paths::hook_runtime_config_path(
+            dir.path(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["headers"]["X-Packet28-Hook-Token"].as_str(),
+        runtime.http_hook_token.as_deref(),
+    );
+    for directory in [dir.path(), parent.as_path()] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_rewrite_private_and_public_files_without_losing_user_handlers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in [0o600, 0o644] {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join(".claude");
+        fs::create_dir(&parent).unwrap();
+        for directory in [dir.path(), parent.as_path()] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = parent.join("settings.json");
+        let user_handler = json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "user-audit"}]
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "theme": "dark",
+                "hooks": {"PreToolUse": [user_handler.clone()]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["hooks"]["PreToolUse"][0], user_handler);
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_normalize_existing_token_copy_permissions_without_changing_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    let original = fs::read(&path).unwrap();
+    for directory in [dir.path(), path.parent().unwrap()] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let status = setup_hooks::write_claude_hook_config(&path, dir.path(), true).unwrap();
+    assert!(matches!(status, McpConfigStatus::AlreadyConfigured));
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_reject_linked_token_files_before_initializing_runtime() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        let original = br#"{"theme":"dark"}"#;
+        let outside_path = outside.path().join("settings.json");
+        fs::write(&outside_path, original).unwrap();
+        if hard_link {
+            fs::hard_link(&outside_path, &path).unwrap();
+        } else {
+            symlink(&outside_path, &path).unwrap();
+        }
+        assert!(setup_hooks::write_claude_hook_config(&path, dir.path(), true).is_err());
+        assert_eq!(fs::read(&outside_path).unwrap(), original);
+        assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_reject_linked_parent_before_initializing_runtime() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    symlink(outside.path(), dir.path().join(".claude")).unwrap();
+    assert!(setup_hooks::write_claude_hook_config(
+        &dir.path().join(".claude/settings.json"),
+        dir.path(),
+        true,
+    )
+    .is_err());
+    assert!(!outside.path().join("settings.json").exists());
+    assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+}
+
+#[test]
+fn claude_settings_reject_paths_outside_workspace() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let path = outside.path().join("settings.json");
+    let original = br#"{"theme":"dark"}"#;
+    fs::write(&path, original).unwrap();
+    assert!(setup_hooks::write_claude_hook_config(&path, dir.path(), true).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path()).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_setup_creates_private_runtime_config_in_traversable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join(".packet28");
+    let daemon_dir = state_dir.join("daemon");
+    fs::create_dir_all(&daemon_dir).unwrap();
+    for parent in [dir.path(), state_dir.as_path(), daemon_dir.as_path()] {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let settings = dir.path().join(".claude/settings.json");
+    setup_hooks::write_claude_hook_config(&settings, dir.path(), true).unwrap();
+
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let written: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(written.http_hook_token.is_some());
+    assert_eq!(
+        fs::metadata(&daemon_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn claude_http_settings_preserve_disabled_ingest_until_hook_opt_in() {
+    let dir = tempdir().unwrap();
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        serde_json::to_vec(&HookRuntimeConfig {
+            hooks_enabled: false,
+            ..HookRuntimeConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    setup_hooks::write_claude_hook_config(
+        &dir.path().join(".claude/settings.json"),
+        dir.path(),
+        true,
+    )
+    .unwrap();
+    let initialized: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(!initialized.hooks_enabled);
+    assert!(initialized.http_hook_token.is_some());
+    let unchanged = fs::read(&path).unwrap();
+    assert!(matches!(
+        write_hook_runtime_config(dir.path(), false).unwrap(),
+        McpConfigStatus::Declined
+    ));
+    assert_eq!(fs::read(&path).unwrap(), unchanged);
+
+    write_hook_runtime_config(dir.path(), true).unwrap();
+    let enabled: HookRuntimeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(enabled.hooks_enabled);
+    assert_eq!(enabled.http_hook_token, initialized.http_hook_token);
+    assert_eq!(enabled.http_hook_port, initialized.http_hook_port);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_hook_runtime_config_rejects_linked_token_files() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let path = packet28_daemon_protocol::paths::hook_runtime_config_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::to_vec(&HookRuntimeConfig {
+            hooks_enabled: false,
+            ..HookRuntimeConfig::default()
+        })
+        .unwrap();
+        let outside_path = outside.path().join("runtime.json");
+        fs::write(&outside_path, &original).unwrap();
+        if hard_link {
+            fs::hard_link(&outside_path, &path).unwrap();
+        } else {
+            symlink(&outside_path, &path).unwrap();
+        }
+
+        assert!(write_hook_runtime_config(dir.path(), true).is_err());
+        assert_eq!(fs::read(&outside_path).unwrap(), original);
+    }
+}
+
+/// Creates an index-status fixture with the specified manifest and readiness values.
+///
+/// # Examples
+///
+/// ```
+/// let status = setup_index_status("ready", None, true);
+/// assert!(status.ready);
+/// assert!(status.manifest.regex_status.is_none());
+/// ```
+///
+/// # Arguments
+///
+/// * `status` - Manifest status to parse into the fixture.
+/// * `regex_status` - Optional regex index status and associated metadata.
+/// * `ready` - Whether the overall index is ready.
 fn setup_index_status(
     status: &str,
     regex_status: Option<&str>,
@@ -743,7 +1206,29 @@ fn classify_setup_index_status_reports_building_while_index_is_in_progress() {
 }
 
 #[test]
-fn setup_defers_dirty_git_index_without_masking_corruption() {
+fn setup_defers_unattestable_workspace_index_without_masking_corruption() {
+    let dir = tempdir().unwrap();
+    let mut response = setup_index_status("queued", Some("building"), false);
+    response.manifest.last_error = Some(
+        "index publication failed; queued full retry: failed to build regex search index: regex search index is not ready: Git workspace changed while rebuilding the full regex index; retry once HEAD and the working tree are stable"
+            .to_string(),
+    );
+    match classify_setup_index_status(dir.path(), &response, true) {
+        SetupIndexVerification::Deferred { reason } => assert_eq!(
+            reason,
+            "Git workspace changed while rebuilding the full regex index; retry once HEAD and the working tree are stable"
+        ),
+        other => panic!("expected deferred setup classification, got {other:?}"),
+    }
+    response.manifest.regex_status = Some("corrupt".to_string());
+    assert!(matches!(
+        classify_setup_index_status(dir.path(), &response, false),
+        SetupIndexVerification::Failed { .. }
+    ));
+}
+
+#[test]
+fn setup_still_defers_the_legacy_daemon_clean_tree_rejection() {
     let dir = tempdir().unwrap();
     let mut response = setup_index_status("queued", Some("building"), false);
     response.manifest.last_error = Some(
@@ -752,9 +1237,9 @@ fn setup_defers_dirty_git_index_without_masking_corruption() {
     );
     assert!(matches!(
         classify_setup_index_status(dir.path(), &response, true),
-        SetupIndexVerification::Deferred
+        SetupIndexVerification::Deferred { .. }
     ));
-    response.manifest.regex_status = Some("corrupt".to_string());
+    response.manifest.status = "corrupt".parse().unwrap();
     assert!(matches!(
         classify_setup_index_status(dir.path(), &response, false),
         SetupIndexVerification::Failed { .. }
@@ -785,4 +1270,228 @@ fn classify_setup_index_status_reports_failure_when_repo_index_claims_ready_with
         }
         other => panic!("expected failed setup classification, got {other:?}"),
     }
+}
+
+#[test]
+fn gitignore_coverage_recognizes_common_spellings() {
+    for spelling in [
+        ".packet28",
+        ".packet28/",
+        "/.packet28",
+        "/.packet28/",
+        ".packet28/*",
+        ".packet28/**",
+    ] {
+        assert!(
+            gitignore_covers_packet28_dir(&format!("target/\n{spelling}\n*.log\n")),
+            "spelling {spelling} should be recognized as covering .packet28"
+        );
+    }
+    assert!(gitignore_covers_packet28_dir(".packet28/  \n"));
+    assert!(!gitignore_covers_packet28_dir("target/\n.packet28x/\n"));
+    assert!(!gitignore_covers_packet28_dir(""));
+}
+
+#[test]
+fn gitignore_coverage_preserves_leading_spaces() {
+    assert!(!gitignore_covers_packet28_dir(" .packet28/\n"));
+}
+
+#[test]
+fn gitignore_coverage_matches_git_trailing_space_semantics() {
+    use std::process::Command;
+
+    for (pattern, expected) in [
+        (".packet28/\t\n", false),
+        (".packet28/\u{a0}\n", false),
+        (".packet28/\\ \n", false),
+        (".packet28/\\  \n", false),
+        (".packet28/ \t \n", false),
+        (".packet28/  \n", true),
+        (".packet28/\r\n", true),
+    ] {
+        let dir = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", dir.path().join("no-global-config"))
+                .status()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet", "--template="]).success());
+        fs::write(dir.path().join(".gitignore"), pattern).unwrap();
+        let check = git(&["check-ignore", "--quiet", ".packet28/daemon/runtime.json"]);
+        assert_eq!(check.code(), Some(if expected { 0 } else { 1 }));
+        assert_eq!(
+            gitignore_covers_packet28_dir(pattern),
+            expected,
+            "{pattern:?}"
+        );
+
+        let updated = ensure_packet28_gitignore(dir.path()).unwrap();
+        assert_eq!(updated.is_none(), expected, "{pattern:?}");
+        assert!(git(&["check-ignore", "--quiet", ".packet28/daemon/runtime.json"]).success());
+        assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_none());
+    }
+}
+
+#[test]
+fn gitignore_coverage_rejects_patterns_that_do_not_ignore_the_runtime_directory() {
+    for pattern in [
+        "!.packet28/",
+        "# .packet28/",
+        "\t.packet28/",
+        ".packet28/cache",
+        "nested/.packet28/",
+        ".packet280/",
+    ] {
+        assert!(
+            !gitignore_covers_packet28_dir(pattern),
+            "pattern {pattern:?} must not be treated as covering .packet28/"
+        );
+    }
+}
+
+#[test]
+fn ensure_gitignore_is_noop_outside_git_repo() {
+    let dir = tempdir().unwrap();
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+    assert!(!dir.path().join(".gitignore").exists());
+}
+
+#[test]
+fn ensure_gitignore_creates_entry_in_git_repo() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+
+    let created = ensure_packet28_gitignore(dir.path()).unwrap();
+    assert_eq!(created, Some(dir.path().join(".gitignore")));
+    let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(
+        content,
+        "# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+
+    // Idempotent: a second run makes no change and reports nothing added.
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        content
+    );
+}
+
+#[test]
+fn ensure_gitignore_appends_and_preserves_existing_content() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    // Existing content without a trailing newline must be preserved intact.
+    fs::write(dir.path().join(".gitignore"), "target/\n/dist").unwrap();
+
+    let created = ensure_packet28_gitignore(dir.path()).unwrap();
+    assert!(created.is_some());
+    let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(
+        content,
+        "target/\n/dist\n\n# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+}
+
+#[test]
+fn ensure_gitignore_respects_preexisting_coverage() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".gitignore"), "/.packet28/\n").unwrap();
+    assert_eq!(ensure_packet28_gitignore(dir.path()).unwrap(), None);
+}
+
+#[test]
+fn ensure_gitignore_supports_git_file_marker_used_by_worktrees() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join(".git"), "gitdir: /tmp/example-worktree\n").unwrap();
+
+    assert_eq!(
+        ensure_packet28_gitignore(dir.path()).unwrap(),
+        Some(dir.path().join(".gitignore"))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "# Packet28 daemon runtime and index state\n.packet28/\n"
+    );
+}
+
+#[test]
+fn ensure_gitignore_rejects_invalid_utf8_without_replacing_the_file() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let original = b"target/\n\xff\xfe\n";
+    fs::write(dir.path().join(".gitignore"), original).unwrap();
+
+    let error = ensure_packet28_gitignore(dir.path()).unwrap_err();
+
+    assert!(error.to_string().contains("as UTF-8"));
+    assert_eq!(fs::read(dir.path().join(".gitignore")).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_gitignore_rejects_symlink_without_writing_outside_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let outside_gitignore = outside.path().join("outside.gitignore");
+    fs::write(&outside_gitignore, "outside content\n").unwrap();
+    symlink(&outside_gitignore, dir.path().join(".gitignore")).unwrap();
+
+    assert!(ensure_packet28_gitignore(dir.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(&outside_gitignore).unwrap(),
+        "outside content\n"
+    );
+    assert!(fs::symlink_metadata(dir.path().join(".gitignore"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_gitignore_rejects_hard_link_without_writing_outside_workspace() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let outside_gitignore = outside.path().join("outside.gitignore");
+    fs::write(&outside_gitignore, "outside content\n").unwrap();
+    fs::hard_link(&outside_gitignore, dir.path().join(".gitignore")).unwrap();
+
+    assert!(ensure_packet28_gitignore(dir.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(&outside_gitignore).unwrap(),
+        "outside content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "outside content\n"
+    );
+}
+
+#[test]
+fn gitignore_coverage_respects_later_negations() {
+    assert!(!gitignore_covers_packet28_dir(".packet28/\n!.packet28/\n"));
+    assert!(!gitignore_covers_packet28_dir(
+        ".packet28/**\n!.packet28/task.json\n"
+    ));
+    assert!(!gitignore_covers_packet28_dir(".packet28/*\n!*\n"));
+    assert!(gitignore_covers_packet28_dir("!.packet28/\n.packet28/\n"));
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".gitignore"), ".packet28/\n!.packet28/\n").unwrap();
+    assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_some());
+    assert!(gitignore_covers_packet28_dir(
+        &fs::read_to_string(dir.path().join(".gitignore")).unwrap()
+    ));
+    assert!(ensure_packet28_gitignore(dir.path()).unwrap().is_none());
 }

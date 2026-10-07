@@ -262,6 +262,29 @@ pub enum DaemonCoreError {
         message: String,
     },
 
+    /// A task's event history was quarantined and its continuation moved to a
+    /// linked successor; the superseded identity accepts no further events.
+    #[error(
+        "task {task_id:?} was superseded by {successor_task_id:?} after its event history was quarantined"
+    )]
+    TaskSuperseded {
+        /// Fenced task identifier that was addressed.
+        task_id: String,
+        /// Linked task that continues the work.
+        successor_task_id: String,
+    },
+
+    /// A task record is an archived tombstone and cannot be continued.
+    #[error(
+        "task {task_id:?} is an archived record tombstone; its original record is preserved by {archive_file:?}"
+    )]
+    TaskArchived {
+        /// Fenced task identifier that was addressed.
+        task_id: String,
+        /// Digest-named archive file relative to the workspace state directory.
+        archive_file: String,
+    },
+
     /// A durable mutation completed before its storage authority was lost.
     ///
     /// The mutation must not be retried blindly: its bytes may already be
@@ -440,6 +463,12 @@ impl DaemonCoreError {
             }
             Self::InvalidTaskEventFrame { .. } => {
                 "Repair or restore the event log so every complete frame is valid, task-bound, and sequence-contiguous."
+            }
+            Self::TaskSuperseded { .. } => {
+                "Continue with the successor task; the superseded task keeps its quarantined history for inspection."
+            }
+            Self::TaskArchived { .. } => {
+                "Start a new task; inspect the archived original with `Packet28 daemon storage show-archived-record`."
             }
             Self::StorageMutationAuthorityLost { .. } => {
                 "Do not retry blindly; inspect the canonical file and registry under an authenticated lock first."

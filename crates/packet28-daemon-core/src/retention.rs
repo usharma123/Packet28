@@ -23,6 +23,7 @@ use packet28_daemon_protocol::paths::{
     task_events_dir, task_registry_path, TaskStorageId, READY_FILE_NAME, TASK_EVENT_LOG_SUFFIX,
     TASK_REGISTRY_FILE_NAME,
 };
+use packet28_daemon_protocol::registry::{TaskRecordSizeLevel, TaskRecordSizeWarningV1};
 use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry};
 use serde::{Deserialize, Serialize};
 
@@ -372,6 +373,10 @@ pub struct TaskStoreReport {
     pub actions: Vec<RetentionAction>,
     /// Non-fatal safety and corruption observations.
     pub issues: Vec<TaskStoreIssue>,
+    /// Registry records approaching or above the per-record pagination bound,
+    /// largest first. Target them with `daemon storage archive-record`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub record_size_warnings: Vec<TaskRecordSizeWarningV1>,
 }
 
 /// Result of startup recovery for durable retention quarantine groups.
@@ -843,6 +848,7 @@ fn retain_task_store_with_lease_observers(
         (&left.kind, &left.path, &left.message).cmp(&(&right.kind, &right.path, &right.message))
     });
     snapshot.issues.dedup();
+    let record_size_warnings = record_size_warnings(&snapshot);
 
     Ok(TaskStoreReport {
         schema_version: TASK_STORE_REPORT_SCHEMA_VERSION,
@@ -876,7 +882,32 @@ fn retain_task_store_with_lease_observers(
         },
         actions: plan.actions,
         issues: snapshot.issues,
+        record_size_warnings,
     })
+}
+
+/// Classifies every registry record by its exact on-disk compact size.
+fn record_size_warnings(snapshot: &StoreSnapshot) -> Vec<TaskRecordSizeWarningV1> {
+    let mut warnings = snapshot
+        .candidates
+        .values()
+        .flat_map(|candidate| &candidate.record_values)
+        .filter_map(|(task_id, value)| {
+            let encoded_bytes = serde_json::to_vec(value).ok()?.len() as u64;
+            TaskRecordSizeLevel::classify(encoded_bytes).map(|level| TaskRecordSizeWarningV1 {
+                task_id: task_id.clone(),
+                encoded_bytes,
+                level,
+            })
+        })
+        .collect::<Vec<_>>();
+    warnings.sort_by(|left, right| {
+        right
+            .encoded_bytes
+            .cmp(&left.encoded_bytes)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    warnings
 }
 
 fn saturating_sum_u64(values: impl IntoIterator<Item = u64>) -> u64 {
@@ -3487,6 +3518,18 @@ fn active_storage_keys(
         .collect::<BTreeSet<_>>();
     if let Some(task_id) = active_task_id {
         active.insert(storage_key_for_task(root, task_id));
+    }
+    // A retained successor can still read its predecessors' immutable artifacts.
+    // Protect every referenced namespace until its referring record is removed.
+    for record in registry.tasks.values() {
+        if let Some(link) = &record.recovered_from {
+            active.insert(storage_key_for_task(root, &link.predecessor_task_id));
+        }
+        for handoff in &record.handoffs {
+            if handoff.task_id != record.task_id {
+                active.insert(storage_key_for_task(root, &handoff.task_id));
+            }
+        }
     }
     active
 }
@@ -6855,6 +6898,49 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn retention_preserves_recovery_artifact_owners_across_two_generations() {
+        use packet28_daemon_protocol::task::TaskHistoryRecovery;
+        let root = tempdir().unwrap();
+        let mut records = ["old", "mid", "new"].map(|task_id| TaskRecord {
+            task_id: task_id.to_string(),
+            last_completed_at_unix: Some(1),
+            ..TaskRecord::default()
+        });
+        for index in 0..2 {
+            let link = TaskHistoryRecovery {
+                predecessor_task_id: records[index].task_id.clone(),
+                successor_task_id: records[index + 1].task_id.clone(),
+                ..TaskHistoryRecovery::default()
+            };
+            records[index].superseded_by = Some(link.clone());
+            records[index + 1].recovered_from = Some(link);
+        }
+        records[2].lifecycle = TaskLifecycle::Running;
+        write_paired_registry(root.path(), records);
+        let old = write_artifact(root.path(), "old", b"old evidence", 1);
+        let mid = write_artifact(root.path(), "mid", b"mid evidence", 1);
+        retain_task_store(
+            root.path(),
+            100,
+            RetentionOptions {
+                max_age_seconds: Some(1),
+                max_bytes: Some(0),
+                apply: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(old).unwrap(), b"old evidence");
+        assert_eq!(fs::read(mid).unwrap(), b"mid evidence");
+        assert_eq!(
+            crate::storage::load_task_registry(root.path())
+                .unwrap()
+                .tasks
+                .len(),
+            3
+        );
+    }
+
     fn task_artifact_dir(root: &Path, task_id: &str) -> PathBuf {
         match TaskStorageId::try_from(task_id) {
             Ok(task_id) => typed_task_artifact_dir(root, &task_id),
@@ -7126,6 +7212,46 @@ mod tests {
         assert_eq!(
             report.metrics_before.managed_task_allocated_bytes,
             report.metrics_before.task_artifact_allocated_bytes
+        );
+    }
+
+    #[test]
+    fn inspection_warns_for_near_limit_and_unlistable_records_largest_first() {
+        use packet28_daemon_protocol::registry::{
+            MAX_REGISTRY_PAGE_ITEM_BYTES, TASK_RECORD_SIZE_WARNING_BYTES,
+        };
+        let root = tempdir().unwrap();
+        let with_error = |task_id: &str, bytes: usize| TaskRecord {
+            last_error: Some("x".repeat(bytes)),
+            ..inactive_record(task_id, 10)
+        };
+        write_registry(
+            root.path(),
+            [
+                inactive_record("healthy", 10),
+                with_error("near", TASK_RECORD_SIZE_WARNING_BYTES),
+                with_error("over", MAX_REGISTRY_PAGE_ITEM_BYTES),
+            ],
+        );
+
+        let report = inspect_task_store(root.path(), 100).unwrap();
+
+        let observed = report
+            .record_size_warnings
+            .iter()
+            .map(|warning| (warning.task_id.as_str(), warning.level))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            vec![
+                ("over", TaskRecordSizeLevel::OverPageLimit),
+                ("near", TaskRecordSizeLevel::Warning),
+            ]
+        );
+        assert!(report.record_size_warnings[0].encoded_bytes > MAX_REGISTRY_PAGE_ITEM_BYTES as u64);
+        assert!(
+            report.actions.is_empty(),
+            "inspection never selects records"
         );
     }
 

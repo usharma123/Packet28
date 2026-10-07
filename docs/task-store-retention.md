@@ -67,6 +67,80 @@ size-based candidate is selected when managed bytes equal the size limit.
 Size cleanup selects the oldest eligible candidates first. Applying an
 age-based plan may also bring the store below a configured size bound.
 
+## Oversized task records
+
+A task record whose compact JSON exceeds 1 MiB cannot be carried by a registry
+page: listings omit it (`omitted_oversized`) so the rest of the store stays
+available, but the record itself becomes hard to inspect. Packet28 warns
+before that point. Every record at or above 512 KiB is reported:
+
+- by `daemon storage inspect` as `record_size_warnings` (largest first, with
+  `warning` or `over_page_limit` levels), with or without a running daemon;
+- by the daemon's bounded status (`record_size_warning_count` and up to 32
+  `record_size_warnings`), refreshed on every task write;
+- in `packet28d.log` once per threshold crossing, with the command to plan
+  archival.
+
+`cleanup --max-bytes` is a whole-task, oldest-first deletion bound and requires
+a stopped daemon, so it can select older healthy tasks before the oversized one
+and cannot run beside a live daemon. Targeted record archival is the online,
+evidence-preserving alternative:
+
+```console
+# Plan (no changes) for one exact task, or every record of at least 64 KiB.
+Packet28 daemon storage archive-record --root . --task-id task-big
+Packet28 daemon storage archive-record --root . --min-record-bytes 524288 --json
+
+# Archive while packet28d keeps serving every other task.
+Packet28 daemon storage archive-record --root . --task-id task-big --apply
+
+# Retrieve and verify the complete original record.
+Packet28 daemon storage show-archived-record --root . --task-id task-big \
+  --output task-big.record.json
+```
+
+Archival never deletes evidence. The serving daemon writes the complete
+original record to `.packet28/task/<task-id>/record-archive/<blake3>.task-record.json`
+(owner-only, synchronized, read back, never replaced), then replaces the
+registry record with a compact tombstone through the registry WAL. The
+tombstone keeps the task identity, lifecycle, event high-water, watch
+relationships, recovery links, and every top-level value of at most 4 KiB; an
+`archived` pointer records the blake3 digest and exact length of the archive,
+the omitted field names and sizes, the reason, and the inspection command. The
+event log and task artifacts are untouched, and unselected records are not
+rewritten.
+
+Records written by a newer Packet28 may carry top-level forward fields that
+this build does not model. The committed registry checkpoint is their only
+authority, so archival reads them from it, under the registry lock, for every
+selected record. The archive holds the known fields and every forward field.
+Forward bytes count toward size warnings, the size selector, and the 64 KiB
+floor. A forward value is shed from the tombstone by the same rule as any
+unprotected value: it is listed in `omitted_fields`, and checkpoint
+preservation never carries it back. Small forward values stay in the
+tombstone. Before commit, the forward fields are reread and must match what
+the archive holds. If the raw authority cannot be read or has changed, the
+record is reported as failed and left unchanged; it is never archived without
+its forward fields.
+
+Size selection never goes below 64 KiB, and exact targeting refuses records
+below that floor. Archival refuses running, cancelling, replan-pending, and
+agent-active tasks; the agent's active task; tasks with active watches or
+in-progress daemon work; recovery predecessors and successors; and tasks named
+by another record's handoff or bootstrap ownership. A per-task maintenance
+fence is admitted only when no client request names the task and blocks every
+later mutation of it; the daemon lock is never held across archive I/O. An
+archived task is terminal: continuation, event appends (including standalone
+writers), and re-registration of its identity are rejected; status, listing,
+and idempotent cancellation still return the tombstone.
+
+A crash before the tombstone is durable leaves the original record
+authoritative and at most an unreferenced archive, which a retry reuses. Once
+the tombstone is durable, its pointer is the only authority for the original.
+Whole-task retention removes an archive together with the task's registry
+record, event log, and artifacts, because the archive lives in that task's
+artifact namespace.
+
 ## Safety model
 
 Retention resolves the workspace and requires `.packet28` to be a real
@@ -402,3 +476,79 @@ capability-relative revalidation use the same aggregation rules. Retention
 keeps candidate selection, authenticated registry snapshots, lease admission,
 and quarantine mutations. A successful scan supplies measurements; it does not
 authorize deletion or replace revalidation under the retention lease.
+
+## Corrupt event-log recovery
+
+Startup quarantines at most 64 corrupt admitted task event logs per attempt.
+The strict event reader still rejects malformed frames, gaps, cross-task frames,
+and oversized frames. Filesystem, namespace, lease, and lock errors still fail
+closed, and healthy tasks are unchanged.
+
+A damaged task never continues under its own identity. Resetting its sequence
+and appending again would restart at 1 and hide the new events from any
+subscriber or MCP session whose cursor was already past the old high-water.
+Instead, one WAL delta, written before any rename:
+
+- fences the damaged task: lifecycle `Cancelled`, high-water 0 (its log is
+  absent after the move), a `last_error` explanation, and a `superseded_by`
+  link;
+- admits a new successor task, `<id>-recovered-<n>` (digest-shortened for long
+  identifiers, skipping registered, aliasing, and pre-existing namespaces),
+  with a `recovered_from` link;
+- reserves an exact unused quarantine name,
+  `*.events.jsonl.corrupt-<timestamp>[-<collision>]`, in both links.
+
+Both links record the predecessor, successor, integrity failure, prior
+high-water, recovery time, and reserved file name, so either record still
+identifies the evidence if retention later removes the other. The log is then
+moved to exactly the reserved name with a no-replace rename. If startup stops
+before the rename, the next attempt reuses the durable link and retries the
+same name without creating another successor. An occupied reserved name fails
+closed rather than being overwritten or replaced by an unrecorded name. The
+quarantined file is an unrecognized event entry, so retention reports and
+protects it and never deletes it.
+
+Every event writer refuses the superseded identity with `TaskSuperseded`. The
+standalone and legacy writers check the replayed checkpoint+WAL image under the
+registry lock, because the link is first durable only in the WAL; a torn final
+WAL frame makes them fail closed until daemon startup repairs it. The daemon
+rejects continuation requests (sequence submission, hooks, broker reads and
+writes, handoff waits, agent launch, and subscriptions) for a superseded task
+with an error that names the successor. Status, task listings, watch listings,
+and idempotent cancellation still show the fenced record and its link. Restart
+reconciliation treats the fenced task as cancelled: it removes its watches,
+restores no replan, and still refuses to start while a persisted agent process
+group is live rather than signal an unauthenticated PID.
+
+The successor is seeded only from trusted state, never from the quarantined log.
+From the predecessor's authenticated registry record it inherits the objective
+request (without a stale `since_version`), linked decisions, resolved
+questions, question texts, and the latest ready or consumed handoff descriptor.
+That descriptor keeps the predecessor `task_id`, which names the namespace
+owning its untouched artifact, and handoff reuse loads the artifact from that
+owner. Startup publishes one constant-size recovery link for each successor.
+Snapshots read predecessor packet-cache events in place using the authenticated
+registry lineage, retaining each artifact owner. No aggregate history copy is
+written, so histories exceeding a cache-record limit cannot block startup.
+Artifact fetches preserve explicit task IDs and can search authenticated
+predecessors; ambiguous inherited handles require the original owner ID.
+Retention protects namespaces referenced by recovery links and handoff
+descriptors. Lifecycle, watches, sequence, agent process, hook session, and
+context-version pointers are not inherited.
+
+Claude Code hooks, MCP sessions (including Codex integrations), the reducer runner, and
+`packet28-agent` resolve a superseded identifier through its links after the
+daemon is ready and adopt the successor as the active task. The daemon
+checkpoints the links before publishing readiness. Wrappers and MCP task
+selection ensure daemon readiness before resolving a continuation, including
+the first cold start. Idle MCP notification sessions deliver a
+`packet28.task_recovered` receipt before transferring tracking to the successor
+with its own sequence and byte cursor. A strict read failure is retried only
+after readiness confirms a reciprocal recovery link to a different identity.
+
+The root cause of the corrupt logs observed so far is not established. One
+unconfirmed candidate is a log written before sequence allocation moved into the
+event log: earlier binaries appended caller-assigned sequences from the
+in-memory registry high-water before persisting the registry. A crash between
+those writes could leave a stale high-water for the next startup. This source
+evidence does not establish the cause of any particular damaged log.

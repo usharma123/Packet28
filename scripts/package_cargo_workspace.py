@@ -24,6 +24,7 @@ import check_cargo_publish_policy as publish_policy
 
 
 ROOT = SCRIPT_DIR.parent
+TARGET_DIRECTORY_VARIABLES = ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")
 PRIVATE_PUBLISH_LINE = re.compile(
     r"(?m)^publish(?:\.workspace)?\s*=\s*(?:true|false|\[\])\s*$"
 )
@@ -101,7 +102,13 @@ def prepare_verification_manifests(
         mirror_manifest.write_text(verification_manifest(text), encoding="utf-8")
 
 
-def package_command() -> tuple[str, ...]:
+def target_dir_arguments(target_dir: Path | None) -> tuple[str, ...]:
+    """Bind Cargo output explicitly, overriding inherited environment or config."""
+
+    return () if target_dir is None else ("--target-dir", str(target_dir))
+
+
+def package_command(target_dir: Path | None = None) -> tuple[str, ...]:
     """Return the exact locked package-assembly command."""
 
     return (
@@ -113,10 +120,10 @@ def package_command() -> tuple[str, ...]:
         "--offline",
         "--no-verify",
         "--allow-dirty",
-    )
+    ) + target_dir_arguments(target_dir)
 
 
-def packaged_check_command() -> tuple[str, ...]:
+def packaged_check_command(target_dir: Path | None = None) -> tuple[str, ...]:
     """Return the check that compiles only source recovered from archives."""
 
     return (
@@ -127,7 +134,7 @@ def packaged_check_command() -> tuple[str, ...]:
         "--all-features",
         "--locked",
         "--offline",
-    )
+    ) + target_dir_arguments(target_dir)
 
 
 def archive_relative_path(member_name: str, prefix: str) -> Path | None:
@@ -182,6 +189,7 @@ def prepare_packaged_workspace(
     mirror: Path,
     destination: Path,
     packages: Mapping[str, Mapping[str, object]],
+    archive_directory: Path,
 ) -> None:
     """Rebuild a workspace exclusively from the generated package archives."""
 
@@ -199,7 +207,7 @@ def prepare_packaged_workspace(
         relative_manifest = Path(manifest_path).relative_to(source_root)
         crate_destination = destination / relative_manifest.parent
         prefix = f"{name}-{version}"
-        archive = mirror / "target" / "package" / f"{prefix}.crate"
+        archive = archive_directory / f"{prefix}.crate"
         if not archive.is_file():
             raise ValueError(f"{name}: Cargo package archive is missing")
         unpack_package_archive(archive, crate_destination, prefix)
@@ -247,8 +255,11 @@ def verify_packages(root: Path) -> None:
         environment = os.environ.copy()
         environment.pop("CARGO_REGISTRY_TOKEN", None)
         environment.pop("CARGO_REGISTRIES_CRATES_IO_TOKEN", None)
+        for variable in TARGET_DIRECTORY_VARIABLES:
+            environment.pop(variable, None)
+        package_target = Path(directory) / "package-target"
         result = subprocess.run(
-            package_command(),
+            package_command(package_target),
             cwd=mirror,
             env=environment,
             check=False,
@@ -264,12 +275,10 @@ def verify_packages(root: Path) -> None:
             mirror,
             packaged_workspace,
             packages,
-        )
-        environment["CARGO_TARGET_DIR"] = str(
-            root / "target" / "cargo-package-archive-check"
+            package_target / "package",
         )
         result = subprocess.run(
-            packaged_check_command(),
+            packaged_check_command(root / "target" / "cargo-package-archive-check"),
             cwd=packaged_workspace,
             env=environment,
             check=False,

@@ -558,7 +558,11 @@ fn compact(value: &str, limit: usize) -> String {
     if compact.len() <= limit {
         compact
     } else {
-        format!("{}...", &compact[..limit.saturating_sub(3)])
+        let mut end = limit.saturating_sub(3);
+        while !compact.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &compact[..end])
     }
 }
 
@@ -618,19 +622,39 @@ fn fingerprint(family: &str, kind: &str, argv: &[String]) -> String {
     crate::cache_fingerprint(family, kind, argv)
 }
 
+/// Keeps each `FAIL <file> > <test>` header with the first line of its error.
+/// Falls back to the reporter's failed-test markers when no header is present.
 fn compact_vitest_failures(output: &str) -> String {
     let mut failures = Vec::new();
+    let mut markers = Vec::new();
+    let mut awaiting_message = false;
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("FAIL")
-            || trimmed.starts_with('\u{2715}')
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("FAIL") {
+            failures.push(trimmed.to_string());
+            awaiting_message = true;
+        } else if trimmed.starts_with('\u{2715}')
             || trimmed.starts_with('\u{00d7}')
             || trimmed.starts_with('\u{2717}')
         {
-            failures.push(trimmed.to_string());
+            markers.push(trimmed.to_string());
+            awaiting_message = false;
+        } else if awaiting_message {
+            // A separator means the block ended without a message.
+            if !trimmed.starts_with('\u{23af}') {
+                failures.push(format!("  {}", compact(trimmed, 220)));
+            }
+            awaiting_message = false;
         }
     }
-    failures.join("\n")
+    if failures.is_empty() {
+        markers.join("\n")
+    } else {
+        failures.join("\n")
+    }
 }
 
 fn compact_tsc_errors(output: &str) -> String {
@@ -765,6 +789,72 @@ mod tests {
             1,
         );
         assert_eq!(reduction.summary, "vitest: 1 failed, 7 passed");
+    }
+
+    fn reduce_vitest_run(stdout: &str, stderr: &str, exit_code: i32) -> CommandReduction {
+        let argv = vec!["vitest".to_string(), "run".to_string()];
+        let spec = classify_javascript_command("vitest run", &argv).unwrap();
+        reduce_javascript_command(&spec, stdout, stderr, exit_code)
+    }
+
+    const VITEST_ONE_FAILURE: &str = " RUN  v2.1.0 /workspace\n\n \u{2713} src/math.test.ts (4)\n \u{2713} src/string.test.ts (3)\n \u{276f} src/api.test.ts (1)\n   \u{00d7} returns error payload\n\n\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af} Failed Tests 1 \u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\n\n FAIL  src/api.test.ts > returns error payload\nAssertionError: expected 500 to be 200\n\n Test Files  2 passed | 1 failed (3)\n      Tests  7 passed | 1 failed (8)\n";
+
+    #[test]
+    fn reduce_vitest_failure_keeps_test_identity_and_assertion() {
+        let reduction = reduce_vitest_run(VITEST_ONE_FAILURE, "", 1);
+        assert_eq!(
+            reduction.summary,
+            "vitest: 1 failed, 7 passed; src/api.test.ts"
+        );
+        assert_eq!(
+            reduction.compact_preview,
+            "FAIL  src/api.test.ts > returns error payload\n  AssertionError: expected 500 to be 200"
+        );
+        assert!(reduction.failed);
+        assert_eq!(reduction.exit_code, 1);
+    }
+
+    #[test]
+    fn reduce_vitest_multiple_failures_keep_each_first_message() {
+        let stdout = " Test Files  1 passed | 2 failed (3)\n      Tests  6 passed | 3 failed (9)\n";
+        let stderr = "\u{23af}\u{23af} Failed Tests 3 \u{23af}\u{23af}\n\n FAIL  src/api.test.ts > returns error payload\nAssertionError: expected 500 to be 200\n \u{276f} src/api.test.ts:12:20\n\n\u{23af}\u{23af}[1/3]\u{23af}\n\n FAIL  src/api.test.ts > rejects bad token\nError: token missing\n\n\u{23af}\u{23af}[2/3]\u{23af}\n\n FAIL  src/db.test.ts > migrates schema\n\u{23af}\u{23af}[3/3]\u{23af}\n";
+        let reduction = reduce_vitest_run(stdout, stderr, 1);
+        assert_eq!(
+            reduction.summary,
+            "vitest: 3 failed, 6 passed; src/api.test.ts"
+        );
+        assert_eq!(
+            reduction.compact_preview,
+            "FAIL  src/api.test.ts > returns error payload\n  AssertionError: expected 500 to be 200\nFAIL  src/api.test.ts > rejects bad token\n  Error: token missing\nFAIL  src/db.test.ts > migrates schema"
+        );
+    }
+
+    #[test]
+    fn reduce_vitest_markers_remain_when_no_fail_header_is_present() {
+        let reduction = reduce_vitest_run(
+            " \u{276f} src/api.test.ts (1)\n   \u{00d7} returns error payload\n      Tests  1 failed (1)\n",
+            "",
+            1,
+        );
+        assert_eq!(reduction.compact_preview, "\u{00d7} returns error payload");
+    }
+
+    #[test]
+    fn reduce_vitest_success_counts_tests_not_files() {
+        let reduction = reduce_vitest_run(
+            " Test Files  2 passed (2)\n      Tests  7 passed (7)\n",
+            "",
+            0,
+        );
+        assert_eq!(reduction.summary, "javascript tests passed (7 tests)");
+        assert!(reduction.compact_preview.is_empty());
+        assert!(!reduction.failed);
+    }
+
+    #[test]
+    fn compact_truncates_on_char_boundary() {
+        let value = format!("{}\u{23af}tail", "a".repeat(5));
+        assert_eq!(compact(&value, 9), "aaaaa...");
     }
 
     #[test]

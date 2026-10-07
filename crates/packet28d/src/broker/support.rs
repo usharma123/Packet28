@@ -15,7 +15,7 @@ use packet28_daemon_protocol::message::{DaemonEvent, DaemonResponse, DaemonStatu
 use packet28_daemon_protocol::registry::{
     DaemonRegistryResponseV1, DaemonStatusV1, MAX_DAEMON_STATUS_V1_RESPONSE_BYTES,
 };
-use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry};
+use packet28_daemon_protocol::task::TaskRecord;
 use serde_json::{json, Value};
 
 use crate::index::build_index_status;
@@ -115,7 +115,13 @@ pub(crate) fn build_registry_status_v1(state: &DaemonState) -> Result<DaemonStat
         registry_revision: Some(state.registry_revision()),
         index_truncated: false,
         index: Some(build_index_status(&state.interactive_index)),
+        record_size_warning_count: 0,
+        record_size_warnings: Vec::new(),
     };
+    (
+        status.record_size_warning_count,
+        status.record_size_warnings,
+    ) = state.record_sizes.status_warnings();
     bound_registry_status_index_details(&mut status)?;
     Ok(status)
 }
@@ -208,6 +214,7 @@ fn emit_task_event_ordered(
     let (_activity_lease, required_revision, require_checkpoint, prepare_lock_hold) = {
         let mut guard = state.lock().map_err(lock_err)?;
         let lock_acquired = Instant::now();
+        guard.require_task_mutable(task_id)?;
         if !guard.tasks.tasks.contains_key(task_id) {
             if !create_task {
                 return Ok(false);
@@ -264,6 +271,7 @@ fn emit_task_event_ordered(
 
     let mut guard = state.lock().map_err(lock_err)?;
     let lock_acquired = Instant::now();
+    guard.require_task_mutable(task_id)?;
     let task = guard
         .tasks
         .tasks
@@ -379,6 +387,7 @@ pub(crate) fn complete_task_cancellation_for_generation(
     if current.id() != generation || !current.is_cancelled() {
         anyhow::bail!("task '{task_id}' generation changed after cancellation was recorded");
     }
+    guard.require_task_mutable(task_id)?;
     let task =
         guard.tasks.tasks.get_mut(task_id).ok_or_else(|| {
             anyhow!("task '{task_id}' disappeared after cancellation was recorded")
@@ -471,6 +480,7 @@ pub(crate) fn refresh_task_context_summary_for_generation(
     if current.id() != generation || current.is_cancelled() {
         return Ok(None);
     }
+    guard.require_task_mutable(task_id)?;
     if let Some(task) = guard.tasks.tasks.get_mut(task_id) {
         task.last_context_refresh_at_unix = Some(now_unix());
         task.working_set_est_tokens = envelope.payload.budget.working_set_tokens;
@@ -491,17 +501,26 @@ pub(crate) fn broker_default_budget_bytes() -> usize {
     DEFAULT_CONTEXT_MANAGE_BUDGET_BYTES
 }
 
+/// Returns the mutable record for `task_id`, creating an empty record when
+/// absent.
+///
+/// # Errors
+///
+/// Fails when the task is fenced for record maintenance or is an archived
+/// tombstone; see [`DaemonState::require_task_mutable`].
 pub(crate) fn ensure_task_record_mut<'a>(
-    tasks: &'a mut TaskRegistry,
+    state: &'a mut DaemonState,
     task_id: &str,
-) -> &'a mut TaskRecord {
-    tasks
+) -> Result<&'a mut TaskRecord> {
+    state.require_task_mutable(task_id)?;
+    Ok(state
+        .tasks
         .tasks
         .entry(task_id.to_string())
         .or_insert_with(|| TaskRecord {
             task_id: task_id.to_string(),
             ..TaskRecord::default()
-        })
+        }))
 }
 
 fn next_context_version(current: Option<&str>) -> String {
@@ -526,7 +545,7 @@ pub(crate) fn bump_context_version(
     task_id: &str,
 ) -> Result<String> {
     let mut guard = state.lock().map_err(lock_err)?;
-    let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+    let task = ensure_task_record_mut(&mut guard, task_id)?;
     let version = next_context_version(task.latest_context_version.as_deref());
     task.latest_context_version = Some(version.clone());
     persist_task(&guard, task_id)?;
@@ -539,7 +558,7 @@ pub(crate) fn set_context_reason(
     reason: impl Into<String>,
 ) -> Result<()> {
     let mut guard = state.lock().map_err(lock_err)?;
-    let task = ensure_task_record_mut(&mut guard.tasks, task_id);
+    let task = ensure_task_record_mut(&mut guard, task_id)?;
     task.latest_context_reason = Some(reason.into());
     persist_task(&guard, task_id)?;
     Ok(())
@@ -558,6 +577,7 @@ pub(crate) fn set_context_reason_for_generation(
     if current.id() != generation || current.is_cancelled() {
         return Ok(false);
     }
+    guard.require_task_mutable(task_id)?;
     let Some(task) = guard.tasks.tasks.get_mut(task_id) else {
         return Ok(false);
     };
@@ -571,7 +591,7 @@ pub(crate) fn current_context_version(
     task_id: &str,
 ) -> Result<String> {
     let mut guard = state.lock().map_err(lock_err)?;
-    let version = ensure_context_version(ensure_task_record_mut(&mut guard.tasks, task_id));
+    let version = ensure_context_version(ensure_task_record_mut(&mut guard, task_id)?);
     persist_task(&guard, task_id)?;
     Ok(version)
 }
@@ -581,7 +601,7 @@ pub(crate) fn update_broker_link_state(
     request: &BrokerWriteStateRequest,
 ) -> Result<()> {
     let mut guard = state.lock().map_err(lock_err)?;
-    let task = ensure_task_record_mut(&mut guard.tasks, &request.task_id);
+    let task = ensure_task_record_mut(&mut guard, &request.task_id)?;
     let mut changed = false;
     match request.op.unwrap_or(BrokerWriteOp::FileRead) {
         BrokerWriteOp::QuestionOpen => {
@@ -637,6 +657,52 @@ pub(crate) fn update_broker_link_state(
     Ok(())
 }
 
+/// Publishes constant-size recovery links from the trusted registry.
+/// Historical packets retain their original owner and are read at snapshot time.
+/// Repeating the exact write is idempotent, including after interrupted startup.
+pub(crate) fn inherit_recovered_agent_state(state: &Arc<Mutex<DaemonState>>) -> Result<()> {
+    let (kernel, links) = {
+        let guard = state.lock().map_err(lock_err)?;
+        let links = guard
+            .tasks
+            .tasks
+            .values()
+            .filter_map(|task| {
+                task.recovered_from
+                    .as_ref()
+                    .map(|link| (task.task_id.clone(), link.predecessor_task_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        (guard.kernel.clone(), links)
+    };
+    for (task_id, predecessor_task_id) in links {
+        kernel
+            .execute(KernelRequest {
+                target: "agenty.state.write".to_string(),
+                reducer_input: json!({
+                    "task_id": task_id,
+                    "event_id": format!("history-recovery:{predecessor_task_id}"),
+                    "occurred_at_unix": 0,
+                    "actor": "packet28d",
+                    "kind": "recovered_from",
+                    "data": {"type": "recovered_from", "predecessor_task_id": predecessor_task_id},
+                }),
+                ..KernelRequest::default()
+            })
+            .with_context(|| {
+                format!(
+                    "failed to inherit agent state from '{predecessor_task_id}' for '{task_id}'"
+                )
+            })?;
+        state
+            .lock()
+            .map_err(lock_err)?
+            .agent_snapshots
+            .remove(&task_id);
+    }
+    Ok(())
+}
+
 pub(crate) fn load_agent_snapshot_for_task(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
@@ -650,10 +716,36 @@ pub(crate) fn load_agent_snapshot_for_task(
     {
         return Ok(snapshot);
     }
-    let kernel = state.lock().map_err(lock_err)?.kernel.clone();
+    let (kernel, lineage) = {
+        let guard = state.lock().map_err(lock_err)?;
+        let mut lineage = vec![task_id.to_string()];
+        let mut current = task_id;
+        while let Some(link) = guard
+            .tasks
+            .tasks
+            .get(current)
+            .and_then(|task| task.recovered_from.as_ref())
+        {
+            if link.successor_task_id != current
+                || guard
+                    .tasks
+                    .tasks
+                    .get(&link.predecessor_task_id)
+                    .and_then(|task| task.superseded_by.as_ref())
+                    != Some(link)
+                || lineage.contains(&link.predecessor_task_id)
+            {
+                anyhow::bail!("invalid recovery lineage for task {task_id:?}");
+            }
+            lineage.push(link.predecessor_task_id.clone());
+            current = &link.predecessor_task_id;
+        }
+        lineage.reverse();
+        (guard.kernel.clone(), lineage)
+    };
     let response = kernel.execute(KernelRequest {
         target: "agenty.state.snapshot".to_string(),
-        reducer_input: json!({ "task_id": task_id }),
+        reducer_input: json!({ "task_id": task_id, "recovery_lineage": lineage }),
         ..KernelRequest::default()
     })?;
     let packet = response

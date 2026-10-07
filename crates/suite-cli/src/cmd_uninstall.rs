@@ -88,7 +88,7 @@ pub(crate) fn uninstall_workspace(
                 .push(format!("could not stop Claude HTTP hook server: {err:#}")),
         }
         match crate::cmd_daemon_client::stop_daemon_and_wait(root) {
-            Ok(stopped) => report.daemon_stopped = stopped,
+            Ok(acknowledgement) => report.daemon_stopped = acknowledgement.is_some(),
             Err(err) => report
                 .warnings
                 .push(format!("could not stop packet28d: {err:#}")),

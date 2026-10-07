@@ -224,6 +224,7 @@ pub(crate) fn register_task_and_watches(
     let mut replaced_task = None;
     let generation = {
         let mut guard = state.lock().map_err(lock_err)?;
+        guard.require_task_mutable(&spec.task_id)?;
         if let Some(existing) = guard.tasks.tasks.get(&spec.task_id) {
             if !existing.lifecycle.is_cancelled() {
                 anyhow::bail!(
@@ -496,6 +497,7 @@ where
                 }
                 .into());
             };
+            guard.require_task_mutable(task_id)?;
             let task = guard
                 .tasks
                 .tasks
@@ -565,6 +567,7 @@ where
                 }
                 .into());
             }
+            guard.require_task_mutable(task_id)?;
             let task = guard
                 .tasks
                 .tasks
@@ -780,11 +783,13 @@ pub(crate) fn cancel_task(
         let Some(existing) = guard.tasks.tasks.get(task_id) else {
             return Ok((None, Vec::new()));
         };
-        if existing.lifecycle.is_cancelled() {
+        if existing.lifecycle.is_cancelled() || existing.archived.is_some() {
             return Ok((Some(existing.clone()), Vec::new()));
         }
+        guard.require_task_mutable(task_id)?;
         let generation = guard.task_generations.ensure(task_id)?;
         generation.request_cancel();
+        guard.require_task_mutable(task_id)?;
         let task = guard
             .tasks
             .tasks
@@ -960,6 +965,15 @@ pub(crate) fn remove_watch(
     watch_id: &str,
 ) -> Result<Option<WatchRegistration>> {
     let mut guard = state.lock().map_err(lock_err)?;
+    if let Some(task_id) = guard
+        .watches
+        .watches
+        .iter()
+        .find(|watch| watch.watch_id == watch_id)
+        .map(|watch| watch.spec.task_id.clone())
+    {
+        guard.require_task_mutable(&task_id)?;
+    }
     guard.watcher_handles.remove(watch_id);
     let removed = guard
         .watches
@@ -1264,6 +1278,7 @@ fn process_watch_event(
         if !guard.task_generations.matches(&task_id, generation.id()) || generation.is_cancelled() {
             return Ok(());
         }
+        guard.require_task_mutable(&task_id)?;
         let should_start = guard
             .tasks
             .tasks

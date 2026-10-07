@@ -73,9 +73,19 @@ pub struct RegexIndexManifest {
     /// Git commit whose clean working tree was observed before and after the full rebuild.
     ///
     /// A missing value on a Git-backed index means the persisted generation
-    /// cannot authenticate the current workspace contents.
+    /// cannot authenticate the current workspace contents unless
+    /// [`Self::workspace_attested_commit`] is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_clean_commit: Option<String>,
+    /// Git commit whose dirty working tree was attested by the full rebuild.
+    ///
+    /// The generation record binds the content digest of every Git-dirty path
+    /// observed unchanged before and after the build. A clean build records
+    /// [`Self::workspace_clean_commit`] instead; a manifest declaring both is
+    /// rejected. Binaries that predate this field cannot authenticate such a
+    /// generation and treat it as unusable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_attested_commit: Option<String>,
     /// Reason the index cannot currently serve queries.
     pub stale_reason: Option<String>,
     /// Unix timestamp at which the latest build started.
@@ -86,13 +96,42 @@ pub struct RegexIndexManifest {
     pub last_error: Option<String>,
 }
 
+impl RegexIndexManifest {
+    /// Returns the Git commit whose workspace this generation authenticated.
+    pub(crate) fn authenticated_workspace_commit(
+        &self,
+        base: &str,
+    ) -> std::result::Result<&str, String> {
+        let commit = match (
+            self.workspace_clean_commit.as_deref(),
+            self.workspace_attested_commit.as_deref(),
+        ) {
+            (Some(commit), None) | (None, Some(commit)) => commit,
+            (None, None) => return Err(
+                "workspace freshness could not be authenticated; rebuild the regex index from a stable Git working tree"
+                    .to_string(),
+            ),
+            (Some(_), Some(_)) => return Err(
+                "workspace freshness attestation declares both a clean and a dirty working tree"
+                    .to_string(),
+            ),
+        };
+        if commit != base {
+            return Err(format!(
+                "workspace freshness attestation does not match the indexed base commit (base={base}, attested={commit})"
+            ));
+        }
+        Ok(commit)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub(crate) struct OverlayState {
     pub(crate) shadowed_paths: BTreeSet<String>,
     pub(crate) deleted_paths: BTreeSet<String>,
     pub(crate) owners: BTreeMap<String, u64>,
-    /// Content digests for every Git-dirty path authenticated by an incremental publication.
+    /// Content digests for every Git-dirty path authenticated by the latest publication.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) workspace_entries: BTreeMap<String, String>,
 }

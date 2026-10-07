@@ -1,6 +1,4 @@
 use std::ffi::OsString;
-#[cfg(unix)]
-use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -22,9 +20,7 @@ use packet28_daemon_protocol::message::{
     DaemonRequest, DaemonResponse, Packet28SearchGuardResponse,
     Packet28SearchRequest as DaemonPacket28SearchRequest,
 };
-use packet28_daemon_protocol::paths::{
-    log_path, ready_path, resolve_workspace_root, socket_path, workspace_socket_path,
-};
+use packet28_daemon_protocol::paths::resolve_workspace_root;
 use packet28_daemon_protocol::registry::{DaemonRegistryRequestV1, DaemonRegistryResponseV1};
 use packet28_reducer_core::{parse_region_for_path, SearchRequest, SearchResult};
 use packet28_reducer_core::{SearchEngineStats, SearchGroup, SearchMatch};
@@ -1243,93 +1239,145 @@ impl TransportMode {
 
 #[cfg(unix)]
 fn ensure_daemon(root: &Path) -> Result<()> {
+    use packet28_daemon_client::runtime_discovery::read_runtime_info_if_present;
+    use packet28_daemon_client::transport::workspace_root_matches;
+
     let root = resolve_workspace_root(root);
-    if daemon_status_existing(&root).is_ok() {
+    // A starting daemon accepts connections but answers only once ready, so
+    // `packet28d start` awaits it under its startup-readiness deadline rather
+    // than this fast path's socket timeout. Metadata naming another workspace
+    // is never contacted; `packet28d start` fails closed on it unless this
+    // workspace's authority was released. Read failures are left to
+    // `packet28d start`, which fails closed on them.
+    let fast_path = match read_runtime_info_if_present(&root) {
+        Ok(Some(runtime)) => {
+            runtime.ready_at_unix.is_some()
+                && workspace_root_matches(&root, &runtime.workspace_root)
+        }
+        Ok(None) | Err(_) => true,
+    };
+    if fast_path && daemon_status_existing(&root).is_ok() {
         return Ok(());
     }
-    let endpoint = packet28_daemon_client::transport::discover_endpoint(&root)?;
-    if packet28_daemon_client::transport::endpoint_may_have_stale_socket(&endpoint)
-        && packet28_daemon_client::transport::connect_endpoint(&endpoint, DAEMON_SOCKET_TIMEOUT)
-            .is_err()
-    {
-        cleanup_unreachable_runtime_files(&root)?;
-    }
+    // An unreachable endpoint does not mean the previous daemon has exited: a
+    // stopping daemon withdraws its endpoint before it finishes persistence and
+    // cleanup. Stale-file cleanup and spawn need the daemon startup and
+    // instance leases, which p28 does not link, so `packet28d start` performs
+    // them under the same authority as the Packet28 CLI.
     start_daemon(&root)?;
     wait_for_daemon(&root, Duration::from_secs(10))
 }
 
+/// Runs the lease-guarded `packet28d start` bootstrap for `root`.
+///
+/// It returns once a daemon answers status, or fails without touching the
+/// runtime files of a daemon that has not released workspace authority in
+/// time. A daemon that is still starting gets the longer startup-readiness
+/// allowance and is left running if it misses it.
 #[cfg(unix)]
 fn start_daemon(root: &Path) -> Result<()> {
     let binary = packet28d_binary()?;
-    let root_arg = root.to_string_lossy().to_string();
-    let log_path = log_path(root);
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create daemon log dir '{}'", parent.display()))?;
-    }
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))?;
-    let mut child = Command::new(binary)
-        .arg("serve")
+    let output = Command::new(binary)
+        .arg("start")
         .arg("--root")
-        .arg(root_arg)
+        .arg(root)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("failed to spawn packet28d")?;
-    // Reap the daemon if it exits while p28 is still running (for example a
-    // bind failure because another daemon won the startup race) so it does
-    // not linger as a zombie for the lifetime of this process.
-    let pid = child.id();
-    thread::Builder::new()
-        .name(format!("packet28d-reaper-{pid}"))
-        .spawn(move || {
-            let _ = child.wait();
-        })
-        .context("failed to start packet28d child reaper")?;
-    Ok(())
+        .output()
+        .context("failed to run packet28d start")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "packet28d start failed with {}: {}",
+        output.status,
+        stderr.trim()
+    ))
 }
 
+/// Confirms that the daemon selected by `packet28d start` answers status for
+/// `root` with its published pid.
+///
+/// Each status request is bounded by the time remaining before `timeout`.
+/// Unauthentic runtime discovery, or metadata naming another workspace, fails
+/// immediately.
 #[cfg(unix)]
 fn wait_for_daemon(root: &Path, timeout: Duration) -> Result<()> {
-    let start = StdInstant::now();
-    while start.elapsed() < timeout {
-        if daemon_status_existing(root).is_ok() {
-            return Ok(());
+    use packet28_daemon_client::runtime_discovery::read_runtime_info_if_present;
+    use packet28_daemon_client::transport::{
+        discover_endpoint, request_status_v1, verify_runtime_workspace, workspace_root_matches,
+        DaemonEndpoint,
+    };
+
+    let deadline = StdInstant::now() + timeout;
+    let mut last_error = None;
+    while StdInstant::now() < deadline {
+        let runtime = read_runtime_info_if_present(root)?;
+        let endpoint = match &runtime {
+            Some(runtime) => {
+                verify_runtime_workspace(root, runtime)?;
+                DaemonEndpoint::from_runtime(root, runtime)?
+            }
+            None => discover_endpoint(root)?,
+        };
+        match request_status_v1(&endpoint, deadline) {
+            Ok(status)
+                if workspace_root_matches(root, &status.workspace_root)
+                    && runtime
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.pid == status.pid) =>
+            {
+                return Ok(());
+            }
+            Ok(status) => {
+                last_error = Some(format!(
+                    "status identity pid {} root '{}' does not match workspace '{}'",
+                    status.pid,
+                    status.workspace_root,
+                    root.display()
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
         }
         thread::sleep(Duration::from_millis(10));
     }
+    let last_error = last_error.unwrap_or_else(|| "none".to_string());
     if let Ok(Some(runtime)) =
         packet28_daemon_client::runtime_discovery::read_runtime_info_if_present(root)
     {
         return Err(anyhow!(
-            "packet28d did not become ready; runtime file exists for pid {} at {} (log: {})",
+            "packet28d did not answer status; runtime file exists for pid {} at {} (log: {}; \
+             last probe: {last_error})",
             runtime.pid,
             runtime.socket_path,
             runtime.log_path
         ));
     }
-    Err(anyhow!("packet28d did not become ready"))
+    Err(anyhow!(
+        "packet28d did not answer status (last probe: {last_error})"
+    ))
 }
 
+/// Confirms that an existing daemon answers status for `root`.
 #[cfg(unix)]
 fn daemon_status_existing(root: &Path) -> Result<()> {
+    let serves_root = |workspace_root: &str| {
+        if packet28_daemon_client::transport::workspace_root_matches(root, workspace_root) {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "daemon status names workspace '{workspace_root}', not '{}'",
+                root.display()
+            ))
+        }
+    };
     match send_registry_request_existing_daemon(root, &DaemonRegistryRequestV1::Status) {
-        Ok(DaemonRegistryResponseV1::Status { .. }) => Ok(()),
+        Ok(DaemonRegistryResponseV1::Status { status }) => serves_root(&status.workspace_root),
         Ok(DaemonRegistryResponseV1::Error { message })
             if daemon_error_indicates_protocol_mismatch(&message) =>
         {
             match send_request_existing_daemon(root, &DaemonRequest::Status) {
-                Ok(DaemonResponse::Status { .. }) => Ok(()),
+                Ok(DaemonResponse::Status { status }) => serves_root(&status.workspace_root),
                 Ok(DaemonResponse::Error { message }) => Err(anyhow!(message)),
                 Ok(other) => Err(anyhow!(
                     "unexpected legacy daemon status response: {other:?}"
@@ -1372,22 +1420,6 @@ fn send_request_existing_daemon(root: &Path, request: &DaemonRequest) -> Result<
     let mut reader = BufReader::new(reader_stream);
     write_frame(&mut writer, request)?;
     Ok(read_frame(&mut reader)?)
-}
-
-#[cfg(unix)]
-fn cleanup_unreachable_runtime_files(root: &Path) -> Result<()> {
-    for path in [
-        socket_path(root),
-        workspace_socket_path(root),
-        ready_path(root),
-    ] {
-        if path.exists() {
-            std::fs::remove_file(&path).with_context(|| {
-                format!("failed to remove stale runtime file '{}'", path.display())
-            })?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(unix)]

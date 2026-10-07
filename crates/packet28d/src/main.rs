@@ -16,6 +16,16 @@ enum Commands {
     Serve {
         #[arg(long, default_value = ".")]
         root: String,
+        /// Own the workspace packet28d.log and rotate it by size while
+        /// running, instead of writing diagnostics to stderr
+        #[arg(long)]
+        managed_log: bool,
+    },
+    /// Start the daemon for a workspace unless one is already serving it,
+    /// waiting for a stopping daemon to release workspace authority first
+    Start {
+        #[arg(long, default_value = ".")]
+        root: String,
     },
 }
 
@@ -29,6 +39,14 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Serve { root } => packet28d::serve(PathBuf::from(root)),
+        Commands::Serve {
+            root,
+            managed_log: true,
+        } => packet28d::serve_with_managed_log(PathBuf::from(root)),
+        Commands::Serve {
+            root,
+            managed_log: false,
+        } => packet28d::serve(PathBuf::from(root)),
+        Commands::Start { root } => packet28d::start(PathBuf::from(root)),
     }
 }

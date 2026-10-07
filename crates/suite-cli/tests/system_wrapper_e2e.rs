@@ -135,7 +135,8 @@ fn test_system_wrapper_language_tool_commands_wrap_common_rtk_tools() {
         .assert()
         .code(1)
         .stdout(predicate::str::contains("[FAIL] Command: vitest run"))
-        .stdout(predicate::str::contains("[FAIL] 1 failed"));
+        .stdout(predicate::str::contains("vitest: 1 failed, 7 passed"))
+        .stdout(predicate::str::contains("FAIL src/app.test.ts > app"));
 
     suite_cmd()
         .current_dir(root.path())

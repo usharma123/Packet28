@@ -3,9 +3,38 @@ mod support;
 use std::fs;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
+use std::time::{Duration, Instant};
 
 use predicates::prelude::*;
 use support::{cli, output, stderr_text, stdout_text, write_fixture};
+
+/// Stops the daemon an auto-transport search started for a fixture workspace,
+/// including when a failing assertion unwinds. The daemon detaches into its
+/// own session, so it would otherwise outlive the temporary workspace.
+struct StopWorkspaceDaemon<'a>(&'a Path);
+
+impl Drop for StopWorkspaceDaemon<'_> {
+    fn drop(&mut self) {
+        use packet28_daemon_protocol::frame::{read_frame, write_frame};
+        use packet28_daemon_protocol::message::{DaemonRequest, DaemonResponse};
+
+        let runtime = packet28_daemon_protocol::paths::runtime_path(self.0);
+        if !runtime.exists() {
+            return;
+        }
+        if let Ok(mut stream) =
+            packet28_daemon_client::transport::connect(self.0, Duration::from_secs(5))
+        {
+            let _ = write_frame(&mut stream, &DaemonRequest::Stop);
+            let _ = read_frame::<_, DaemonResponse>(&mut stream);
+        }
+        // The daemon removes its runtime metadata as its last cleanup step.
+        let started = Instant::now();
+        while runtime.exists() && started.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
 
 fn initialize_git_repository(root: &Path) {
     fs::write(root.join(".gitignore"), ".packet28/\n").unwrap();
@@ -50,6 +79,7 @@ fn debug_build_prints_generation_and_file_count() {
 fn p28_searches_from_repo_root_with_rg_style_output() {
     let dir = tempfile::tempdir().unwrap();
     write_fixture(dir.path());
+    let _daemon = StopWorkspaceDaemon(dir.path());
 
     cli()
         .current_dir(dir.path())
@@ -63,6 +93,7 @@ fn p28_searches_from_repo_root_with_rg_style_output() {
 fn p28_filters_paths_from_current_directory() {
     let dir = tempfile::tempdir().unwrap();
     write_fixture(dir.path());
+    let _daemon = StopWorkspaceDaemon(dir.path());
 
     cli()
         .current_dir(dir.path())
@@ -79,6 +110,7 @@ fn p28_filters_paths_from_current_directory() {
 fn p28_stats_go_to_stderr_while_hits_stay_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
     write_fixture(dir.path());
+    let _daemon = StopWorkspaceDaemon(dir.path());
 
     cli()
         .args(["debug", "build", dir.path().to_str().unwrap()])
@@ -254,6 +286,7 @@ fn inproc_auto_falls_back_after_a_tracked_file_is_renamed() {
 #[test]
 fn p28_handles_anchored_line_start_regexes() {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = StopWorkspaceDaemon(dir.path());
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(
         dir.path().join("src/main.rs"),

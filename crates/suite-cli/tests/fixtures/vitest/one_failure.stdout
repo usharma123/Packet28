@@ -1,0 +1,14 @@
+ RUN  v2.1.0 /workspace
+
+ ✓ src/math.test.ts (4)
+ ✓ src/string.test.ts (3)
+ ❯ src/api.test.ts (1)
+   × returns error payload
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/api.test.ts > returns error payload
+AssertionError: expected 500 to be 200
+
+ Test Files  2 passed | 1 failed (3)
+      Tests  7 passed | 1 failed (8)

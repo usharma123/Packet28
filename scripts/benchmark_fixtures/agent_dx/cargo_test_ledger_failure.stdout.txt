@@ -1,0 +1,57 @@
+
+running 38 tests
+test tests::discount_of_zero_is_identity ... ok
+test tests::total_of_02_items_matches_sum ... ok
+test tests::total_of_01_items_matches_sum ... ok
+test tests::total_of_04_items_matches_sum ... ok
+test tests::total_of_05_items_matches_sum ... ok
+test tests::total_of_03_items_matches_sum ... ok
+test tests::total_of_06_items_matches_sum ... ok
+test tests::total_of_07_items_matches_sum ... ok
+test tests::total_of_08_items_matches_sum ... ok
+test tests::total_of_09_items_matches_sum ... ok
+test tests::total_of_10_items_matches_sum ... ok
+test tests::discount_rounds_to_nearest_cent ... FAILED
+test tests::total_of_11_items_matches_sum ... ok
+test tests::total_of_12_items_matches_sum ... ok
+test tests::total_of_13_items_matches_sum ... ok
+test tests::total_of_14_items_matches_sum ... ok
+test tests::total_of_15_items_matches_sum ... ok
+test tests::total_of_16_items_matches_sum ... ok
+test tests::total_of_17_items_matches_sum ... ok
+test tests::total_of_18_items_matches_sum ... ok
+test tests::total_of_19_items_matches_sum ... ok
+test tests::total_of_20_items_matches_sum ... ok
+test tests::total_of_21_items_matches_sum ... ok
+test tests::total_of_22_items_matches_sum ... ok
+test tests::total_of_23_items_matches_sum ... ok
+test tests::total_of_24_items_matches_sum ... ok
+test tests::total_of_25_items_matches_sum ... ok
+test tests::total_of_26_items_matches_sum ... ok
+test tests::total_of_27_items_matches_sum ... ok
+test tests::total_of_28_items_matches_sum ... ok
+test tests::total_of_29_items_matches_sum ... ok
+test tests::total_of_30_items_matches_sum ... ok
+test tests::total_of_31_items_matches_sum ... ok
+test tests::total_of_32_items_matches_sum ... ok
+test tests::total_of_33_items_matches_sum ... ok
+test tests::total_of_34_items_matches_sum ... ok
+test tests::total_of_35_items_matches_sum ... ok
+test tests::total_of_36_items_matches_sum ... ok
+
+failures:
+
+---- tests::discount_rounds_to_nearest_cent stdout ----
+
+thread 'tests::discount_rounds_to_nearest_cent' (18967413) panicked at src/lib.rs:233:9:
+assertion `left == right` failed: 15% off 999 cents
+  left: 850
+ right: 849
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::discount_rounds_to_nearest_cent
+
+test result: FAILED. 37 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

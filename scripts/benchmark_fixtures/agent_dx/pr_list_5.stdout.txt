@@ -1,0 +1,5 @@
+74	fix(storage): recover registry checkpoints from authenticated evidence	fix/scope-closure-registry-recovery	OPEN	2026-10-07T03:14:01Z
+72	feat: recover linked tasks across Claude Code and Codex	test/fleet-integration	OPEN	2026-10-06T01:57:20Z
+71	feat: integrate native Codex lifecycle continuation hooks	test/fleet-continuation	OPEN	2026-10-05T22:49:01Z
+70	fix: preserve native command permission authority in hooks	fix/fleet-host-authority	OPEN	2026-10-05T22:37:29Z
+69	Preserve explicit command execution and capture results	fix/fleet-command-evidence	OPEN	2026-10-05T22:02:36Z

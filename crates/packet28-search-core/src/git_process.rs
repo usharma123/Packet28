@@ -3,8 +3,6 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,11 +10,14 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_GIT_METADATA_BYTES: usize = 32 * 1024 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(test)]
-static GIT_COMMAND_COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Per-thread so concurrently running Git-backed tests cannot skew counts.
+    static GIT_COMMAND_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub(crate) fn run_git(root: &Path, args: &[&str]) -> std::result::Result<Output, String> {
     #[cfg(test)]
-    GIT_COMMAND_COUNT.fetch_add(1, Ordering::Relaxed);
+    GIT_COMMAND_COUNT.set(GIT_COMMAND_COUNT.get() + 1);
     let operation = args.first().copied().unwrap_or("command");
     let label = format!("git {operation}");
     let mut command = Command::new("git");
@@ -204,12 +205,12 @@ mod tests {
             fixed_string: true,
             ..SearchRequest::default()
         };
-        GIT_COMMAND_COUNT.store(0, Ordering::Relaxed);
+        GIT_COMMAND_COUNT.set(0);
 
         crate::query::load_and_guarded_indexed_search(root, &request("unique_attestation_needle"))
             .unwrap();
-        assert_eq!(GIT_COMMAND_COUNT.load(Ordering::Relaxed), 2);
-        GIT_COMMAND_COUNT.store(0, Ordering::Relaxed);
+        assert_eq!(GIT_COMMAND_COUNT.get(), 2);
+        GIT_COMMAND_COUNT.set(0);
         let error = crate::query::load_and_guarded_indexed_search(
             root,
             &SearchRequest {
@@ -219,10 +220,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, crate::SearchError::IndexNotReady { .. }));
-        assert_eq!(GIT_COMMAND_COUNT.load(Ordering::Relaxed), 2);
+        assert_eq!(GIT_COMMAND_COUNT.get(), 2);
 
         let runtime = crate::generation::load_runtime(root).unwrap();
-        GIT_COMMAND_COUNT.store(0, Ordering::Relaxed);
+        GIT_COMMAND_COUNT.set(0);
         let primary = [request("unique_attestation_needle")];
         let deferred = [request("second_attestation_needle"), request("x")];
         let mut session = crate::BrokerInternalGuardedIndexedSearchSession::new();
@@ -238,7 +239,7 @@ mod tests {
             "one-byte query must not verify every indexed file"
         );
         assert_eq!(
-            GIT_COMMAND_COUNT.load(Ordering::Relaxed),
+            GIT_COMMAND_COUNT.get(),
             4,
             "each exposed result batch must perform one two-command attestation"
         );

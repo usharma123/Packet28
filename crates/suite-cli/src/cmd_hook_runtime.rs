@@ -1,8 +1,6 @@
-use std::path::Path;
-
 use anyhow::Result;
-use packet28_daemon_protocol::hooks::{HookEventKind, HookReducerPacket, HookRuntimeConfig};
-use serde_json::{json, Value};
+use packet28_daemon_protocol::hooks::{HookEventKind, HookReducerPacket};
+use serde_json::Value;
 
 use crate::cmd_hook_packets::packet_from_parts;
 use crate::cmd_hook_support::{
@@ -115,10 +113,6 @@ fn copilot_cli_command(payload: &Value) -> Option<String> {
     json_string(&parsed, "command")
 }
 
-fn is_copilot_cli_payload(payload: &Value) -> bool {
-    payload.get("toolName").is_some() || payload.get("toolArgs").is_some()
-}
-
 pub(super) fn build_runtime_reducer_packet(
     runtime: ExternalHookRuntime,
     payload: &Value,
@@ -132,129 +126,12 @@ pub(super) fn build_runtime_reducer_packet(
     }
 }
 
-pub(super) fn build_runtime_pretool_rewrite(
-    runtime: ExternalHookRuntime,
-    runtime_config: &HookRuntimeConfig,
-    root: &Path,
-    payload: &Value,
-    event_kind: HookEventKind,
-    task_id: &str,
-    session_id: Option<&str>,
-) -> Result<Option<Value>> {
-    if !matches!(
-        runtime,
-        ExternalHookRuntime::Copilot | ExternalHookRuntime::Cursor | ExternalHookRuntime::Gemini
-    ) {
-        return Ok(None);
-    }
-    if !matches!(event_kind, HookEventKind::PreToolUse) {
-        return Ok(None);
-    }
-    let command = match runtime {
-        ExternalHookRuntime::Copilot if is_copilot_cli_payload(payload) => {
-            let Some(command) = copilot_cli_command(payload) else {
-                return Ok(None);
-            };
-            command
-        }
-        ExternalHookRuntime::Copilot => {
-            let tool_name = json_string(payload, "tool_name");
-            if !matches!(
-                tool_name.as_deref(),
-                Some("runTerminalCommand") | Some("Bash") | Some("bash")
-            ) {
-                return Ok(None);
-            }
-            let Some(command) = runtime_command(payload) else {
-                return Ok(None);
-            };
-            command
-        }
-        ExternalHookRuntime::Gemini => {
-            if json_string(payload, "tool_name").as_deref() != Some("run_shell_command") {
-                return Ok(None);
-            }
-            let Some(command) = runtime_command(payload) else {
-                return Ok(None);
-            };
-            command
-        }
-        _ => {
-            let Some(command) = runtime_command(payload) else {
-                return Ok(None);
-            };
-            command
-        }
-    };
-    let normalized = json!({
-        "tool_name": "Bash",
-        "cwd": json_string(payload, "cwd")
-            .or_else(|| json_nested_string(payload, &["tool_info", "cwd"]))
-            .or_else(|| json_string(payload, "workspace_root"))
-            .unwrap_or_else(|| root.display().to_string()),
-        "tool_input": {
-            "command": command
-        }
-    });
-    super::build_pretool_rewrite(
-        runtime_config,
-        root,
-        &normalized,
-        event_kind,
-        task_id,
-        session_id,
-    )
-}
-
 pub(super) fn render_runtime_hook_output(
     runtime: ExternalHookRuntime,
     event_kind: HookEventKind,
-    payload: &Value,
-    rewrite: Option<Value>,
 ) -> Result<Option<String>> {
-    match (runtime, event_kind, rewrite) {
-        (ExternalHookRuntime::Copilot, HookEventKind::PreToolUse, Some(updated_input))
-            if is_copilot_cli_payload(payload) =>
-        {
-            let command = json_string(&updated_input, "command").unwrap_or_default();
-            Ok(Some(serde_json::to_string(&json!({
-                "permissionDecision": "deny",
-                "permissionDecisionReason": format!(
-                    "Token savings: use `{}` instead (Packet28 reduces command output tokens)",
-                    command
-                ),
-            }))?))
-        }
-        (ExternalHookRuntime::Copilot, HookEventKind::PreToolUse, Some(updated_input)) => {
-            Ok(Some(serde_json::to_string(&json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "updatedInput": updated_input,
-                },
-            }))?))
-        }
-        (ExternalHookRuntime::Copilot, HookEventKind::PreToolUse, None)
-            if is_copilot_cli_payload(payload) =>
-        {
-            Ok(None)
-        }
-        (ExternalHookRuntime::Copilot, HookEventKind::PreToolUse, None) => Ok(None),
-        (ExternalHookRuntime::Cursor, HookEventKind::PreToolUse, Some(updated_input)) => {
-            Ok(Some(serde_json::to_string(&json!({
-                "updated_input": updated_input,
-            }))?))
-        }
-        (ExternalHookRuntime::Cursor, HookEventKind::PreToolUse, None) => {
-            Ok(Some("{}".to_string()))
-        }
-        (ExternalHookRuntime::Gemini, HookEventKind::PreToolUse, Some(updated_input)) => {
-            Ok(Some(serde_json::to_string(&json!({
-                "hookSpecificOutput": {
-                    "tool_input": updated_input,
-                },
-            }))?))
-        }
-        (ExternalHookRuntime::Gemini, HookEventKind::PreToolUse, None) => Ok(None),
+    match (runtime, event_kind) {
+        (ExternalHookRuntime::Cursor, HookEventKind::PreToolUse) => Ok(Some("{}".to_string())),
         _ => Ok(None),
     }
 }

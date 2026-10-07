@@ -55,12 +55,15 @@ pub(crate) fn daemon_test_state_with_persistence_debounce(
         source_file_cache: BTreeMap::new(),
         interactive_index: InteractiveIndexRuntime::default(),
         index_tx,
+        index_admission: Arc::new(Mutex::new(())),
         background_tx,
         persistence,
         _persistence_owner: Some(persistence_owner),
         shutdown: ShutdownSignal::new(),
         changes: StateChangeSignal::new(),
         shutting_down: false,
+        task_maintenance: Default::default(),
+        record_sizes: Default::default(),
     }));
     TestDaemonState {
         state,

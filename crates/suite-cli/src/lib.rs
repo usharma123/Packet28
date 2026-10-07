@@ -75,6 +75,7 @@ mod memory_store_types;
 pub mod packet28_agent;
 pub mod route_registry;
 mod runtime_integrations;
+mod runtime_log;
 mod savings_analytics;
 pub mod task_runtime;
 pub(crate) mod toml_filters;

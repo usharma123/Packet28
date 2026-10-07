@@ -153,8 +153,8 @@ pub(crate) fn load_runtime_from_manifest(
 /// Returns [`SearchError::Io`], [`SearchError::BinaryEncode`],
 /// [`SearchError::BinaryDecode`], or [`SearchError::Json`] (possibly wrapped in
 /// [`SearchError::Context`]) when discovery, index construction, validation, or
-/// publication fails. [`SearchError::IndexNotReady`] rejects a Git workspace
-/// that is dirty or changes during the build. [`SearchError::FailureProvenance`] reports the rarer case
+/// publication fails. [`SearchError::IndexNotReady`] rejects a Git workspace whose
+/// HEAD or dirty bytes change during the build. [`SearchError::FailureProvenance`] reports the rarer case
 /// where both the build and recording its failure fail.
 pub fn rebuild_full_index(root: &Path, include_tests: bool) -> Result<RegexIndexRuntime> {
     rebuild_full_index_with_progress(root, include_tests, |_, _| {})
@@ -184,7 +184,6 @@ where
         .or_else(|| load_runtime(root).ok().filter(RegexIndexRuntime::is_loaded))
         .map(|runtime| durable_manifest(&runtime.manifest));
     let generation = reserve_generation(root, &_writer)?;
-    let overlay_state = OverlayState::default();
     let mut manifest = RegexIndexManifest {
         schema_version: REGEX_INDEX_SCHEMA_VERSION,
         weight_table_version: WEIGHT_TABLE_VERSION,
@@ -192,7 +191,6 @@ where
         include_tests,
         status: "ready".to_string(),
         last_build_started_at_unix: Some(started),
-        overlay_state_digest: Some(overlay_state_digest(&overlay_state)?),
         ..RegexIndexManifest::default()
     };
 
@@ -215,14 +213,14 @@ where
         .iter()
         .map(|doc| (doc.path.clone(), doc.fingerprint.clone()))
         .collect::<BTreeMap<_, _>>();
-    let clean_commit = workspace::authenticate_full_build_workspace(
+    let overlay_state = workspace::authenticate_full_build_workspace(
         root,
         workspace_before.as_ref(),
         &reported_paths,
         &fingerprints,
+        &mut manifest,
     )?;
-    manifest.base_commit = clean_commit.clone();
-    manifest.workspace_clean_commit = clean_commit;
+    manifest.overlay_state_digest = Some(overlay_state_digest(&overlay_state)?);
     manifest.last_build_completed_at_unix = Some(now_unix());
     let mut record = RegexGenerationRecord {
         schema_version: REGEX_INDEX_SCHEMA_VERSION,

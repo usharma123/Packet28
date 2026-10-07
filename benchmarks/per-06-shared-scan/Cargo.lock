@@ -220,9 +220,9 @@ dependencies = [
 
 [[package]]
 name = "comfy-table"
-version = "7.2.2"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958c5d6ecf1f214b4c2bbbbf6ab9523a864bd136dcf71a7e8904799acfe1ad47"
+checksum = "136c8c4c3823846e8ba6d4bda011b4e5d5827b8bb0ac26c31f9ab31abe9f54f2"
 dependencies = [
  "crossterm",
  "unicode-segmentation",
@@ -837,6 +837,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "packet28-daemon-client"
+version = "0.2.66"
+dependencies = [
+ "libc",
+ "packet28-daemon-protocol",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "packet28-daemon-core"
 version = "0.2.66"
 dependencies = [
@@ -939,10 +949,12 @@ dependencies = [
  "libc",
  "mapy-core",
  "notify",
+ "packet28-daemon-client",
  "packet28-daemon-core",
  "packet28-daemon-protocol",
  "packet28-reducer-core",
  "packet28-search-core",
+ "packet28-state-fs",
  "serde",
  "serde_json",
  "suite-foundation-core",
@@ -1581,9 +1593,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-javascript"
-version = "0.23.1"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf40bf599e0416c16c125c3cec10ee5ddc7d1bb8b0c60fa5c4de249ad34dc1b1"
+checksum = "68204f2abc0627a90bdf06e605f5c470aa26fdcb2081ea553a04bdad756693f5"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -1597,9 +1609,9 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
 name = "tree-sitter-python"
-version = "0.23.6"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d065aaa27f3aaceaf60c1f0e0ac09e1cb9eb8ed28e7bcdaa52129cffc7f4b04"
+checksum = "6bf85fd39652e740bf60f46f4cda9492c3a9ad75880575bf14960f775cb74a1c"
 dependencies = [
  "cc",
  "tree-sitter-language",

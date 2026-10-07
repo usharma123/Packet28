@@ -1,50 +1,53 @@
 {
   "schema_version": 1,
-  "captured_at": "2026-07-30",
+  "captured_at": "2026-10-07",
   "source": {
-    "snapshot_commit": "e3c6de3040683f791d744eb82b9514539895d0ac",
-    "snapshot_tree": "89c080087490fd1dca6154bcaca62eb3ef7fc5fb",
+    "snapshot_commit": "be6edbbcc5bc7b305b4c43e094bcfa3e4f8ac56e",
+    "snapshot_tree": "a010b5c41c4111cdbeedf92c2f299e281466b01f",
     "files": {
       "crates/mapy-core/examples/per03_incremental_index.rs": "ec9f288c8b7161d7344171940d5565bc736c88ae1f4fc4211e45c725c63cf4b6",
       "crates/mapy-core/src/generation.rs": "88729ec25083274106696785195bfc404f3cf42f81af6eac5c579637c13165af",
-      "crates/packet28-state-fs/src/lib.rs": "eda392e61ddc26547b400318ecd1416827044d11c531f3d5c82666b67a77157c",
+      "crates/packet28-state-fs/src/lib.rs": "7e0f175aaac0f775312684674ad144d10b1156254f5819940ba98161f6cb1e7a",
       "crates/packet28-state-fs/src/platform.rs": "299f21f9db7aedcd1e6d5fe5ba6330ed37c5d97cf0cb28addf822e4dc1a0a6d9",
       "crates/packet28-state-fs/src/platform_fallback.rs": "ce77b6fd64b58b5167210bb29e56823ff00108604ba837fd76f76806c0ea28f0",
-      "crates/packet28-search-core/src/generation.rs": "a5705da3e8adda41a43b4ebbb76549bc061ee9444fc155b9ef9eb1fc1b74f430",
+      "crates/packet28-search-core/src/generation.rs": "54ac0e5c2706a7b612fc68de477a01efde0172f3dd99c1ce2ab98997fe875903",
       "crates/packet28-search-core/src/layer.rs": "004e25ccb30bca8a04a9504237032f40fca92259738782d70418cd0f0c035719",
-      "crates/packet28-search-core/src/publication.rs": "3fb4292669185c03e3ebb46d50144d92c87465ddac5b7459575741a20b384065"
-    }
+      "crates/packet28-search-core/src/publication.rs": "3fb4292669185c03e3ebb46d50144d92c87465ddac5b7459575741a20b384065",
+      "crates/packet28-state-fs/src/rotating_log.rs": "6e7461ea7490e288a4de54e675c6c5ec80b5c3e1a203ece81a631b5bf0f3d34f"
+    },
+    "measurement_binding": "Measured staged tree; snapshot_commit preserves exactly the measured tree."
   },
   "environment": {
     "os": "Darwin 24.6.0",
     "arch": "arm64",
     "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
-    "cargo": "cargo 1.93.1 (083ac5135 2025-12-15)"
+    "cargo": "cargo 1.93.1 (083ac5135 2025-12-15)",
+    "concurrent_work": "Delivery policy checks on the same host; timings are not isolated latency estimates."
   },
   "invocations": [
     {
-      "mapy_whole_snapshot_us": 4987,
-      "mapy_incremental_us": 68220,
-      "mapy_compaction_us": 82213,
-      "regex_full_overlay_us": 401029,
-      "regex_incremental_us": 124914,
-      "regex_compaction_us": 399112
+      "mapy_whole_snapshot_us": 5142,
+      "mapy_incremental_us": 74586,
+      "mapy_compaction_us": 76483,
+      "regex_full_overlay_us": 403313,
+      "regex_incremental_us": 129657,
+      "regex_compaction_us": 406064
     },
     {
-      "mapy_whole_snapshot_us": 5230,
-      "mapy_incremental_us": 72382,
-      "mapy_compaction_us": 77728,
-      "regex_full_overlay_us": 382606,
-      "regex_incremental_us": 120730,
-      "regex_compaction_us": 400677
+      "mapy_whole_snapshot_us": 4782,
+      "mapy_incremental_us": 64649,
+      "mapy_compaction_us": 77059,
+      "regex_full_overlay_us": 384760,
+      "regex_incremental_us": 121913,
+      "regex_compaction_us": 392936
     },
     {
-      "mapy_whole_snapshot_us": 4904,
-      "mapy_incremental_us": 71133,
-      "mapy_compaction_us": 71290,
-      "regex_full_overlay_us": 377099,
-      "regex_incremental_us": 126967,
-      "regex_compaction_us": 398276
+      "mapy_whole_snapshot_us": 4782,
+      "mapy_incremental_us": 71158,
+      "mapy_compaction_us": 78674,
+      "regex_full_overlay_us": 387995,
+      "regex_incremental_us": 142007,
+      "regex_compaction_us": 374720
     }
   ],
   "published_bytes": {

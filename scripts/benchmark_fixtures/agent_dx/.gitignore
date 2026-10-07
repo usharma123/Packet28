@@ -1,0 +1,2 @@
+# Frozen command output is required benchmark input despite the repository *.txt ignore.
+!*.txt

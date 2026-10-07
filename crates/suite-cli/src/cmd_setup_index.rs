@@ -14,7 +14,9 @@ use crate::cmd_setup_render::{format_setup_badge, SetupBadgeStyle};
 pub(crate) enum SetupIndexVerification {
     Ready(DaemonIndexStatusResponse),
     Building(DaemonIndexStatusResponse),
-    Deferred,
+    Deferred {
+        reason: String,
+    },
     Failed {
         response: Option<DaemonIndexStatusResponse>,
         reason: String,
@@ -32,7 +34,7 @@ pub(crate) fn verify_setup_index(root: &Path) -> Result<SetupIndexVerification> 
     let first_response = fetch_index_status(root)?;
     match classify_setup_index_status(root, &first_response, false) {
         SetupIndexVerification::Ready(_)
-        | SetupIndexVerification::Deferred
+        | SetupIndexVerification::Deferred { .. }
         | SetupIndexVerification::Failed { .. } => {
             return Ok(classify_setup_index_status(root, &first_response, false));
         }
@@ -49,7 +51,7 @@ pub(crate) fn verify_setup_index(root: &Path) -> Result<SetupIndexVerification> 
         let response = fetch_index_status(root)?;
         match classify_setup_index_status(root, &response, false) {
             SetupIndexVerification::Ready(_)
-            | SetupIndexVerification::Deferred
+            | SetupIndexVerification::Deferred { .. }
             | SetupIndexVerification::Failed { .. } => {
                 finish_setup_index_progress_line(&mut rendered_progress)?;
                 return Ok(classify_setup_index_status(root, &response, false));
@@ -183,19 +185,21 @@ pub(crate) fn classify_setup_index_status(
         return SetupIndexVerification::Ready(response.clone());
     }
 
-    // Setup itself writes configuration into the working tree. That must not
-    // turn a successful installation into an error or claim the index is ready.
+    // Full builds attest setup's own working-tree changes. A workspace that
+    // still cannot be attested (for example, it changed during the build or
+    // exceeds the bounded attestation limits) defers indexing rather than
+    // turning a successful installation into an error or claiming readiness.
     if response.manifest.status != DaemonIndexState::Corrupt
         && response.manifest.regex_status.as_deref() != Some("corrupt")
-        && response
+    {
+        if let Some(reason) = response
             .manifest
             .last_error
             .as_deref()
-            .is_some_and(|error| {
-                error.contains("full regex index rebuild requires a clean Git working tree")
-            })
-    {
-        return SetupIndexVerification::Deferred;
+            .and_then(deferred_workspace_reason)
+        {
+            return SetupIndexVerification::Deferred { reason };
+        }
     }
 
     if let Some(reason) = setup_index_failure_reason(root, response, timed_out) {
@@ -206,6 +210,18 @@ pub(crate) fn classify_setup_index_status(
     }
 
     SetupIndexVerification::Building(response.clone())
+}
+
+fn deferred_workspace_reason(error: &str) -> Option<String> {
+    const NOT_READY: &str = "regex search index is not ready: ";
+    // Daemons that predate dirty-workspace attestation report this reason.
+    const LEGACY_DIRTY: &str = "full regex index rebuild requires a clean Git working tree";
+    if let Some((_, reason)) = error.split_once(NOT_READY) {
+        return Some(reason.to_string());
+    }
+    error
+        .contains(LEGACY_DIRTY)
+        .then(|| LEGACY_DIRTY.to_string())
 }
 
 fn setup_index_ready(root: &Path, response: &DaemonIndexStatusResponse) -> bool {

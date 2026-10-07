@@ -299,33 +299,14 @@ mod platform {
             Ok(Some(file))
         }
 
-        fn reject_unsafe_existing_file(&self, name: &str) -> Result<()> {
-            let name = c_string(name)?;
-            let Some(stat) = stat_at_nofollow(self.file.as_raw_fd(), &name)? else {
-                return Ok(());
-            };
-            if !directory_contains_exact_name(self.file.as_raw_fd(), &name)? {
-                return Err(anyhow!(
-                    "refusing artifact component whose filesystem spelling is not exact"
-                ));
-            }
-            if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-                return Err(anyhow!(
-                    "refusing to replace a non-regular artifact component"
-                ));
-            }
-            if stat.st_nlink != 1 {
-                return Err(anyhow!(
-                    "refusing to replace an artifact with {} hard links",
-                    stat.st_nlink
-                ));
-            }
-            Ok(())
-        }
-
-        fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<()> {
-            self.reject_unsafe_existing_file(name)?;
+        /// Durably publishes a new artifact. Evidence is immutable: an
+        /// existing entry of any kind is never replaced, followed or modified,
+        /// including one created concurrently after the first check.
+        fn write_new(&self, name: &str, bytes: &[u8]) -> Result<()> {
             let destination = c_string(name)?;
+            if stat_at_nofollow(self.file.as_raw_fd(), &destination)?.is_some() {
+                return Err(existing_artifact_error());
+            }
             let temporary_name = format!(
                 ".p28-artifact-{}-{}.tmp",
                 std::process::id(),
@@ -346,19 +327,11 @@ mod platform {
             let write_result = (|| -> Result<()> {
                 file.write_all(bytes)?;
                 file.sync_all()?;
-                self.reject_unsafe_existing_file(name)?;
-                // SAFETY: both directory descriptors are live and both names
-                // are NUL-terminated single components.
-                let result = unsafe {
-                    libc::renameat(
-                        self.file.as_raw_fd(),
-                        temporary.as_ptr(),
-                        self.file.as_raw_fd(),
-                        destination.as_ptr(),
-                    )
-                };
-                if result != 0 {
-                    return Err(io::Error::last_os_error().into());
+                match rename_no_replace(self.file.as_raw_fd(), &temporary, &destination) {
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        return Err(existing_artifact_error());
+                    }
+                    result => result?,
                 }
                 self.file.sync_all()?;
                 Ok(())
@@ -375,6 +348,94 @@ mod platform {
         }
     }
 
+    fn existing_artifact_error() -> anyhow::Error {
+        anyhow!("refusing to replace existing task artifact; artifacts are immutable evidence")
+    }
+
+    /// Atomically renames `source` to `destination` within one directory,
+    /// failing with `AlreadyExists` instead of replacing an existing entry.
+    #[cfg(target_vendor = "apple")]
+    fn rename_no_replace(directory: RawFd, source: &CStr, destination: &CStr) -> io::Result<()> {
+        // SAFETY: the directory descriptor is live and both names are
+        // NUL-terminated single components for the duration of the call.
+        let result = unsafe {
+            libc::renameatx_np(
+                directory,
+                source.as_ptr(),
+                directory,
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            // Filesystems without RENAME_EXCL keep the create-only contract
+            // through an exclusive hard link.
+            Some(libc::ENOTSUP | libc::EINVAL) => link_no_replace(directory, source, destination),
+            _ => Err(error),
+        }
+    }
+
+    /// Atomically renames `source` to `destination` within one directory,
+    /// failing with `AlreadyExists` instead of replacing an existing entry.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn rename_no_replace(directory: RawFd, source: &CStr, destination: &CStr) -> io::Result<()> {
+        // SAFETY: the directory descriptor is live and both names are
+        // NUL-terminated single components for the duration of the call.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                directory,
+                source.as_ptr(),
+                directory,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            // Kernels or filesystems without RENAME_NOREPLACE keep the
+            // create-only contract through an exclusive hard link.
+            Some(libc::EINVAL | libc::ENOSYS) => link_no_replace(directory, source, destination),
+            _ => Err(error),
+        }
+    }
+
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    fn rename_no_replace(directory: RawFd, source: &CStr, destination: &CStr) -> io::Result<()> {
+        link_no_replace(directory, source, destination)
+    }
+
+    /// Publishes by exclusive hard link, then removes the temporary name.
+    /// Readers require exactly one link, so a failed removal is reported.
+    fn link_no_replace(directory: RawFd, source: &CStr, destination: &CStr) -> io::Result<()> {
+        // SAFETY: the directory descriptor is live and both names are
+        // NUL-terminated single components for the duration of the call.
+        if unsafe {
+            libc::linkat(
+                directory,
+                source.as_ptr(),
+                directory,
+                destination.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above; the published name keeps the inode alive.
+        if unsafe { libc::unlinkat(directory, source.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub(super) fn write_task_artifact(
         root: &Path,
         task_id: &TaskStorageId,
@@ -385,7 +446,7 @@ mod platform {
         let directory = task_location(root, task_id, location, true)?
             .ok_or_else(|| anyhow!("failed to create anchored task artifact directory"))?;
         directory
-            .write_atomic(handle.as_str(), bytes)
+            .write_new(handle.as_str(), bytes)
             .with_context(|| {
                 format!(
                     "failed to write task artifact '{}'",
@@ -518,6 +579,12 @@ mod platform {
             return Err(error);
         }
 
+        // The duplicate shares its offset with `parent`; rewind so an
+        // earlier scan of the same descriptor cannot hide entries.
+        // SAFETY: `stream` is a live directory stream owned by this function.
+        unsafe {
+            libc::rewinddir(stream);
+        }
         let mut entries = 0_usize;
         let mut found = false;
         loop {
@@ -584,6 +651,47 @@ mod platform {
         }
         Err(error)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn hard_link_fallback_publishes_create_only() {
+            let root = tempfile::tempdir().unwrap();
+            let directory = AnchoredDir::open_root(root.path()).unwrap();
+            let descriptor = directory.file.as_raw_fd();
+            let (temporary, destination) = (c_string("t.tmp").unwrap(), c_string("a").unwrap());
+
+            std::fs::write(root.path().join("t.tmp"), b"first").unwrap();
+            link_no_replace(descriptor, &temporary, &destination).unwrap();
+            assert!(!root.path().join("t.tmp").exists());
+            let published = std::fs::metadata(root.path().join("a")).unwrap();
+            assert_eq!(published.nlink(), 1);
+
+            std::fs::write(root.path().join("t.tmp"), b"second").unwrap();
+            let error = link_no_replace(descriptor, &temporary, &destination).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(root.path().join("a")).unwrap(), b"first");
+        }
+
+        #[test]
+        fn exact_name_scan_rewinds_a_shared_directory_offset() {
+            let root = tempfile::tempdir().unwrap();
+            for name in ["a.json", "b.json", "c.json"] {
+                std::fs::write(root.path().join(name), b"{}").unwrap();
+            }
+            let directory = AnchoredDir::open_root(root.path()).unwrap();
+            for name in ["a.json", "b.json", "c.json", "a.json"] {
+                let name = c_string(name).unwrap();
+                for _ in 0..2 {
+                    assert!(
+                        directory_contains_exact_name(directory.file.as_raw_fd(), &name).unwrap()
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -618,13 +726,18 @@ mod platform {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        if path.exists() {
-            fs::remove_file(&path)?;
+        let written = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        // A hard link publishes create-only: an existing artifact is never
+        // replaced. The temporary name is removed either way.
+        let published = written.and_then(|()| fs::hard_link(&temporary, &path));
+        let _ = fs::remove_file(&temporary);
+        match published {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
+                "refusing to replace existing task artifact; artifacts are immutable evidence"
+            )),
+            result => Ok(result.map(|()| path)?),
         }
-        fs::rename(&temporary, &path)?;
-        Ok(path)
     }
 
     pub(super) fn read_task_artifact(
@@ -760,6 +873,93 @@ mod tests {
         assert_eq!(path, read_path);
         assert_eq!(bytes, br#"{"ok":true}"#);
         assert!(path.starts_with(task_artifact_dir(root.path(), &task_id)));
+    }
+
+    #[test]
+    fn existing_artifact_is_never_replaced() {
+        let root = tempdir().unwrap();
+        let task_id = TaskStorageId::try_from("task").unwrap();
+        let handle = ArtifactHandle::from_invocation("invocation-1", "result").unwrap();
+        let path = write_task_artifact(
+            root.path(),
+            &task_id,
+            ArtifactLocation::ToolEvidence,
+            &handle,
+            br#"{"first":true}"#,
+        )
+        .unwrap();
+
+        let error = write_task_artifact(
+            root.path(),
+            &task_id,
+            ArtifactLocation::ToolEvidence,
+            &handle,
+            br#"{"second":true}"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("refusing to replace existing task artifact"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), br#"{"first":true}"#);
+        let entries = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from(handle.as_str())]);
+    }
+
+    #[test]
+    fn concurrent_writers_of_one_handle_publish_exactly_one_artifact() {
+        const WRITERS: usize = 8;
+        let root = tempdir().unwrap();
+        let task_id = TaskStorageId::try_from("task").unwrap();
+        let handle = ArtifactHandle::from_invocation("invocation-1", "result").unwrap();
+        let barrier = std::sync::Barrier::new(WRITERS);
+        let results = std::thread::scope(|scope| {
+            let workers = (0..WRITERS)
+                .map(|writer| {
+                    let (root, task_id, handle, barrier) =
+                        (root.path(), &task_id, &handle, &barrier);
+                    scope.spawn(move || {
+                        let bytes = format!(r#"{{"writer":{writer}}}"#).into_bytes();
+                        barrier.wait();
+                        let result = write_task_artifact(
+                            root,
+                            task_id,
+                            ArtifactLocation::ToolEvidence,
+                            handle,
+                            &bytes,
+                        );
+                        (bytes, result)
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let mut winners = results.iter().filter(|(_, result)| result.is_ok());
+        let (winner_bytes, winner) = winners.next().expect("one writer publishes");
+        assert!(winners.next().is_none(), "only one writer may publish");
+        for (_, result) in &results {
+            if let Err(error) = result {
+                assert!(
+                    format!("{error:#}").contains("refusing to replace existing task artifact"),
+                    "{error:#}"
+                );
+            }
+        }
+        let path = winner.as_ref().unwrap();
+        assert_eq!(&fs::read(path).unwrap(), winner_bytes);
+        let entries = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from(handle.as_str())]);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use context_kernel_core::{Kernel, PersistConfig};
 use packet28_daemon_core::retention::recover_task_store_quarantine_and_acquire_daemon_lease;
 use packet28_daemon_core::storage::{
     ensure_daemon_dir, ensure_daemon_socket_dir,
-    load_task_watch_registry_with_deltas_and_event_tails, now_unix, remove_runtime_files,
+    load_task_watch_registry_recovering_corrupt_event_logs, now_unix, remove_runtime_files,
     write_runtime_info,
 };
 use packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease;
@@ -41,23 +41,62 @@ use crate::{
     reconcile_task_event_high_waters, resolve_root, TASK_PERSISTENCE_DEBOUNCE_MS,
 };
 
-/// Runs one Packet28 daemon instance for `root` until shutdown completes.
+/// Runs [`serve`] as a background daemon that owns its workspace log.
 ///
-/// The nearest ancestor containing `.git` becomes the workspace root. This
-/// function changes the process working directory, acquires the workspace's
-/// daemon and task-store leases, binds its configured transport, and blocks
-/// while the owned runtime serves requests. Call it at most once per process.
-///
-/// Shutdown withdraws readiness, cancels active generations, joins runtime
-/// owners, flushes kernel and task persistence, removes runtime files, and only
-/// then releases the lifecycle leases.
+/// The size-rotated `packet28d.log` for the resolved workspace root is opened
+/// before any startup work. Daemon diagnostics, panics, and the terminal error
+/// are recorded there instead of stderr, and the file is rotated in-process
+/// while the daemon runs. Logging failures never stop the daemon. Launchers
+/// select this mode with `packet28d serve --managed-log` and detach stdout and
+/// stderr; output written directly to those streams is not captured.
 ///
 /// # Errors
 ///
-/// Returns an error when root resolution, recovery, lease acquisition,
-/// transport startup, request orchestration, persistence shutdown, or
-/// runtime-file cleanup cannot complete safely. Corrupt or conflicted durable
-/// state fails closed before readiness is published.
+/// Returns the same errors as [`serve`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use packet28d::serve_with_managed_log;
+/// let root = std::env::current_dir()?;
+/// serve_with_managed_log(root)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn serve_with_managed_log(root: PathBuf) -> Result<()> {
+    let root = resolve_root(&root);
+    crate::logging::install_managed_log(&root);
+    let result = serve(root);
+    if let Err(error) = &result {
+        daemon_log(&format!("packet28d exited with error: {error:#}"));
+    }
+    result
+}
+
+/// Runs one Packet28 daemon instance for `root` until shutdown completes.
+///
+/// Resolves the workspace root, acquires lifecycle leases, initializes the daemon,
+/// and serves requests until shutdown. During shutdown, it withdraws readiness,
+/// stops active work, flushes persistence, removes runtime files, and releases
+/// lifecycle leases.
+///
+/// # Examples
+///
+/// ```no_run
+/// use packet28d::serve;
+/// let root = std::env::current_dir()?;
+/// serve(root)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if workspace resolution, recovery, lease acquisition,
+/// transport startup, runtime operation, persistence shutdown, or runtime-file
+/// cleanup fails. A recoverable corrupt event log is quarantined during
+/// startup; its task is fenced and continues under a linked successor.
+/// Unrecoverable or conflicting durable state prevents readiness.
+///
+///
 pub fn serve(root: PathBuf) -> Result<()> {
     let root = resolve_root(&root);
 
@@ -121,8 +160,20 @@ pub fn serve(root: PathBuf) -> Result<()> {
         kernel.clone(),
         config.max_persistent_roots,
     )?);
-    let (loaded_registry, event_tails) =
-        load_task_watch_registry_with_deltas_and_event_tails(&root)?;
+    let (loaded_registry, event_tails, quarantined_event_logs) =
+        load_task_watch_registry_recovering_corrupt_event_logs(&root)?;
+    for record in &quarantined_event_logs {
+        let moved_to = record
+            .quarantined_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the log was already absent".to_string());
+        daemon_log(&format!(
+            "recovered damaged event history for task '{}': {}; moved aside to {}; \
+             the task is superseded and work continues as linked task '{}'",
+            record.task_id, record.reason, moved_to, record.successor_task_id
+        ));
+    }
     let checkpoint_revision = loaded_registry.checkpoint_revision;
     let replayed_revision = loaded_registry.replayed_revision;
     let durable_tasks = loaded_registry.tasks;
@@ -131,7 +182,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
     // persistence owner has authenticated it and assumed revision ownership.
     let mut tasks = durable_tasks.clone();
     let mut watches = durable_watches.clone();
-    preflight_restart_recovery(&tasks)?;
+    let preflight_healed = preflight_restart_recovery(&mut tasks)?;
     let event_high_water_changes = reconcile_task_event_high_waters(&mut tasks, &event_tails)?;
     let restart_reconciliation =
         reconcile_interrupted_task_lifecycles(&mut tasks, &mut watches, now_unix())?;
@@ -160,6 +211,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
     for task_id in event_high_water_changes
         .iter()
         .chain(&restart_reconciliation.changed_task_ids)
+        .chain(&preflight_healed)
     {
         let task = tasks
             .tasks
@@ -173,6 +225,20 @@ pub fn serve(root: PathBuf) -> Result<()> {
     }
     persistence.stage_and_flush(startup_delta)?;
     persistence.checkpoint_current()?;
+    // Size every record once so near-limit and unlistable records are logged
+    // and reported by status from the first request.
+    let record_sizes = crate::task_maintenance::RecordSizeIndex::default();
+    match packet28_daemon_core::storage::load_task_record_forward_fields(&root) {
+        Ok(forward_fields) => record_sizes.set_forward_fields(forward_fields),
+        // Sizing is diagnostic; archival reloads the raw authority itself and
+        // refuses when it cannot.
+        Err(error) => daemon_log(&format!(
+            "failed to load forward task-record fields for size warnings: {error}"
+        )),
+    }
+    for task in tasks.tasks.values() {
+        record_sizes.observe(task);
+    }
     let manifest = load_index_manifest_file(&root);
     let interactive_index = load_index_runtime_files(&root, manifest);
     let (index_tx, index_rx) = IndexIngress::new();
@@ -195,6 +261,7 @@ pub fn serve(root: PathBuf) -> Result<()> {
         source_file_cache: BTreeMap::new(),
         interactive_index,
         index_tx,
+        index_admission: Arc::new(Mutex::new(())),
         background_tx,
         persistence,
         #[cfg(test)]
@@ -202,7 +269,10 @@ pub fn serve(root: PathBuf) -> Result<()> {
         shutdown: shutdown.clone(),
         changes: StateChangeSignal::new(),
         shutting_down: false,
+        task_maintenance: Default::default(),
+        record_sizes,
     }));
+    crate::broker::inherit_recovered_agent_state(&state)?;
     let recovered_replans =
         prepare_recovered_replans(&state, restart_reconciliation.replan_task_ids)?;
 
@@ -511,9 +581,10 @@ pub(crate) async fn supervise_daemon_tasks(
     let deadline = Instant::now() + grace;
     let (first_task, mut result) = match trigger {
         DaemonRuntimeTrigger::Shutdown => (None, Ok(())),
-        DaemonRuntimeTrigger::TaskExit(task, exit) => {
-            (Some(task), classify_first_runtime_exit(task, exit))
-        }
+        DaemonRuntimeTrigger::TaskExit(task, exit) => (
+            Some(task),
+            classify_first_runtime_exit(task, exit, shutdown.is_requested()),
+        ),
     };
 
     shutdown.request();
@@ -643,8 +714,14 @@ fn begin_daemon_shutdown(state: &Arc<Mutex<DaemonState>>) -> DaemonShutdownStart
 fn classify_first_runtime_exit(
     task: DaemonRuntimeTask,
     exit: std::result::Result<Result<()>, tokio::task::JoinError>,
+    shutdown_requested: bool,
 ) -> Result<()> {
     classify_runtime_join(task.name(), exit)?;
+    // select! may observe the worker after polling the shutdown arm Pending.
+    // An accepted Stop permits a clean exit, but never hides worker errors.
+    if shutdown_requested {
+        return Ok(());
+    }
     anyhow::bail!("{} exited before daemon shutdown", task.name())
 }
 
@@ -1360,4 +1437,39 @@ fn read_daemon_random_bytes(purpose: &str) -> Result<[u8; DAEMON_TRANSPORT_SECRE
             format!("failed to read daemon {purpose} from operating-system random source")
         })?;
     Ok(secret)
+}
+
+#[cfg(test)]
+mod shutdown_race_tests {
+    use super::*;
+
+    #[test]
+    fn worker_exit_after_stop_wins_selection_is_clean() {
+        // A worker can finish after the select's shutdown arm was polled Pending
+        // but before its own JoinHandle is polled Ready. Classify the completed
+        // worker using the shutdown state at that boundary.
+        for task in [
+            DaemonRuntimeTask::Transport,
+            DaemonRuntimeTask::Watch,
+            DaemonRuntimeTask::Background,
+            DaemonRuntimeTask::Index,
+        ] {
+            classify_first_runtime_exit(task, Ok(Ok(())), true)
+                .expect("accepted Stop must permit a successful worker exit");
+        }
+    }
+
+    #[test]
+    fn stop_race_preserves_worker_failures_and_unrequested_exits() {
+        let error = classify_first_runtime_exit(
+            DaemonRuntimeTask::Index,
+            Ok(Err(anyhow!("injected worker failure"))),
+            true,
+        )
+        .expect_err("Stop must not hide a worker failure");
+        assert!(format!("{error:#}").contains("injected worker failure"));
+        let error = classify_first_runtime_exit(DaemonRuntimeTask::Index, Ok(Ok(())), false)
+            .expect_err("an unexpected successful exit must remain fatal");
+        assert!(error.to_string().contains("exited before daemon shutdown"));
+    }
 }

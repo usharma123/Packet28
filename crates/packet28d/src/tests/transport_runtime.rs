@@ -260,6 +260,76 @@ async fn early_index_worker_failure_withdraws_readiness_and_stops_peer_owners() 
     assert!(!ready_path(&root).exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unexpected_successful_index_exit_before_shutdown_remains_fatal() {
+    let state = daemon_test_state();
+    let root = state.lock().unwrap().root.clone();
+    std::fs::write(ready_path(&root), b"ready\n").unwrap();
+    let shutdown = state.lock().unwrap().shutdown.clone();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervise_daemon_tasks(
+            state.clone(),
+            shutdown.clone(),
+            BlockingPool::new(1),
+            Duration::from_millis(250),
+            DaemonRuntimeTasks {
+                transport: shutdown_waiter(shutdown.clone()),
+                watch: shutdown_waiter(shutdown.clone()),
+                background: shutdown_waiter(shutdown),
+                index: tokio::task::spawn_blocking(|| Ok(())),
+            },
+        ),
+    )
+    .await
+    .expect("unexpected successful index exit did not stop daemon owners");
+    let error = outcome
+        .result
+        .expect_err("unexpected successful index exit was hidden");
+    assert!(error
+        .to_string()
+        .contains("index worker exited before daemon shutdown"));
+    assert!(!ready_path(&root).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_index_shutdown_worker_exit_is_clean_for_supervisor() {
+    let state = daemon_test_state();
+    let root = state.lock().unwrap().root.clone();
+    std::fs::write(ready_path(&root), b"ready\n").unwrap();
+    let shutdown = state.lock().unwrap().shutdown.clone();
+    let (ingress, receiver) = IndexIngress::new();
+    state.lock().unwrap().index_tx = ingress.clone();
+    ingress
+        .request_shutdown(|| shutdown.request())
+        .expect("accept Stop shutdown");
+    receiver.discard_until_shutdown();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervise_daemon_tasks(
+            state.clone(),
+            shutdown.clone(),
+            BlockingPool::new(1),
+            Duration::from_millis(250),
+            DaemonRuntimeTasks {
+                transport: shutdown_waiter(shutdown.clone()),
+                watch: shutdown_waiter(shutdown.clone()),
+                background: shutdown_waiter(shutdown),
+                index: tokio::task::spawn_blocking(|| Ok(())),
+            },
+        ),
+    )
+    .await
+    .expect("accepted shutdown did not join daemon owners");
+
+    outcome
+        .result
+        .expect("supervisor rejected an already accepted index shutdown");
+    assert!(!ready_path(&root).exists());
+}
+
 #[test]
 fn production_cache_finalizer_is_bounded_and_retryable_when_root_lock_is_blocked() {
     let state = daemon_test_state();

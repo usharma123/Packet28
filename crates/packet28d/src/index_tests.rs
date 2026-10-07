@@ -142,6 +142,78 @@ impl Drop for IndexFixture {
 }
 
 #[test]
+fn accepted_index_shutdown_is_idempotent_after_worker_exit() {
+    for queue_already_full in [false, true] {
+        let (ingress, receiver) = IndexIngress::new();
+        if queue_already_full {
+            ingress
+                .send(IndexCommand::RebuildFull)
+                .expect("fill wake queue");
+        }
+        ingress
+            .send(IndexCommand::Shutdown)
+            .expect("queue shutdown");
+        let batch = receiver.recv_debounced().expect("receive shutdown");
+        assert!(batch.shutdown_epoch.is_some());
+        drop(receiver);
+
+        ingress
+            .send(IndexCommand::Shutdown)
+            .expect("repeat accepted shutdown");
+        let error = ingress
+            .send(IndexCommand::RebuildFull)
+            .expect_err("shutdown worker accepted new work");
+        assert!(error.to_string().contains("shutting down"));
+    }
+}
+
+#[test]
+fn index_shutdown_preserves_a_worker_dead_before_first_send() {
+    let (ingress, receiver) = IndexIngress::new();
+    drop(receiver);
+
+    for _ in 0..2 {
+        let error = ingress
+            .send(IndexCommand::Shutdown)
+            .expect_err("dead worker was treated as an accepted shutdown");
+        assert!(error.to_string().contains("index worker is not running"));
+        assert!(ingress.pending.lock().unwrap().shutdown_epoch.is_none());
+    }
+}
+
+#[test]
+fn index_shutdown_publishes_daemon_intent_before_batch_consumption() {
+    let (ingress, receiver) = IndexIngress::new();
+    let shutdown = crate::runtime::ShutdownSignal::new();
+    let worker_shutdown = shutdown.clone();
+    let worker = thread::spawn(move || {
+        let batch = receiver.recv_debounced().expect("receive shutdown");
+        assert!(batch.shutdown_epoch.is_some());
+        assert!(
+            worker_shutdown.is_requested(),
+            "index exited before daemon shutdown intent"
+        );
+    });
+
+    ingress
+        .request_shutdown(|| {
+            assert!(
+                matches!(
+                    ingress.pending.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "shutdown batch can be consumed before daemon intent is published"
+            );
+            shutdown.request();
+        })
+        .expect("queue shutdown and publish daemon intent");
+    worker.join().expect("join index worker");
+    ingress
+        .send(IndexCommand::Shutdown)
+        .expect("supervisor repeats shutdown");
+}
+
+#[test]
 fn bounded_index_ingress_promotes_a_path_flood_to_one_full_rebuild() {
     let (ingress, receiver) = IndexIngress::new();
     for index in 0..(MAX_PENDING_INDEX_PATHS + 10_000) {
@@ -394,6 +466,222 @@ fn clear_immediately_before_commit_prevents_ready_publication() {
         load_index_runtime_files(&fixture.root, load_index_manifest_file(&fixture.root));
     assert_eq!(restarted.manifest.status, DaemonIndexState::Missing);
     assert!(index_clear_is_complete(&fixture.root));
+}
+
+/// Request admission used to record durable index intent under the retained
+/// index directory lease while holding `DaemonState`, and the builder holds
+/// that lease across progress checkpoints that take the state mutex. That
+/// cycle held admission until its lock timeout rejected the request, which is
+/// how `setup` lost the rebuild it requests right after starting the daemon.
+/// Admission now persists intent under the clear-state lease without the
+/// state mutex, so a checkpoint parked inside the builder cannot delay it.
+#[test]
+fn rebuild_admission_succeeds_while_a_builder_checkpoint_holds_the_index_lease() {
+    let fixture = IndexFixture::new(&[("src/a.rs", "pub fn alpha() {}\n")]);
+    let (ingress, receiver) = IndexIngress::new();
+    fixture.state.lock().expect("state").index_tx = ingress;
+    enqueue_full_index_rebuild(&fixture.state).expect("queue the initial rebuild");
+    let initial = receiver
+        .recv_debounced()
+        .expect("receive the initial rebuild");
+    let initial_epoch = initial.full_rebuild_epoch.expect("initial epoch");
+    let checkpoint_reached = Arc::new(Barrier::new(2));
+    let release_builder = Arc::new(Barrier::new(2));
+
+    let builder = std::thread::spawn({
+        let state = fixture.state.clone();
+        let checkpoint_reached = checkpoint_reached.clone();
+        let release_builder = release_builder.clone();
+        move || {
+            let mut first_checkpoint = true;
+            perform_full_index_rebuild_with_checkpoint_hook(
+                &state,
+                None,
+                Some(initial_epoch),
+                IndexFollowUp::default(),
+                || Ok(()),
+                || Ok(()),
+                || {
+                    if first_checkpoint {
+                        first_checkpoint = false;
+                        checkpoint_reached.wait();
+                        release_builder.wait();
+                    }
+                },
+            )
+        }
+    });
+    checkpoint_reached.wait();
+    // The builder holds the retained index lease inside its first checkpoint
+    // and cannot reach the state mutex until it is released below.
+    let started = Instant::now();
+    enqueue_full_index_rebuild(&fixture.state)
+        .expect("admit a rebuild while a builder checkpoint holds the index lease");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < crate::runtime_files::INDEX_CLEAR_LOCK_TIMEOUT,
+        "admission waited {elapsed:?} on a lease-held checkpoint"
+    );
+    release_builder.wait();
+    builder
+        .join()
+        .expect("join builder")
+        .expect("finish the overlapped full build");
+    assert_eq!(
+        fixture
+            .state
+            .lock()
+            .expect("state")
+            .interactive_index
+            .manifest
+            .status,
+        DaemonIndexState::Queued,
+        "the admitted rebuild must supersede the overlapped publication"
+    );
+
+    let admitted = receiver
+        .recv_debounced()
+        .expect("receive the admitted rebuild");
+    assert!(admitted.epoch > initial.epoch);
+    assert_eq!(
+        process_index_batch_with_recovery(&fixture.state, &admitted, None)
+            .expect("complete the admitted rebuild"),
+        IndexBatchStatus::Complete
+    );
+    let guard = fixture.state.lock().expect("state");
+    assert_eq!(
+        guard.interactive_index.manifest.status,
+        DaemonIndexState::Ready
+    );
+    assert!(!guard.interactive_index.needs_rebuild());
+    assert_eq!(
+        guard.interactive_index.manifest.indexed_files,
+        guard.interactive_index.manifest.total_files
+    );
+}
+
+/// Admission must not depend on the generation lease at all. A builder that
+/// holds the retained index lease for longer than the clear-state lock
+/// timeout still admits full, clear, and incremental requests immediately,
+/// their durable intent is readable meanwhile, and the queued order (rebuild,
+/// clear, paths) supersedes the overlapped publication and then completes.
+#[test]
+fn admission_does_not_wait_for_a_long_build_holding_the_index_lease() {
+    let fixture = IndexFixture::new(&[("src/a.rs", "pub fn alpha() {}\n")]);
+    let (ingress, receiver) = IndexIngress::new();
+    fixture.state.lock().expect("state").index_tx = ingress;
+    enqueue_full_index_rebuild(&fixture.state).expect("queue the initial rebuild");
+    let initial = receiver
+        .recv_debounced()
+        .expect("receive the initial rebuild");
+    let initial_epoch = initial.full_rebuild_epoch.expect("initial epoch");
+    let lease_held = Arc::new(Barrier::new(2));
+    let release_builder = Arc::new(Barrier::new(2));
+
+    let builder = std::thread::spawn({
+        let state = fixture.state.clone();
+        let lease_held = lease_held.clone();
+        let release_builder = release_builder.clone();
+        move || {
+            let mut first_checkpoint = true;
+            perform_full_index_rebuild_with_checkpoint_hook(
+                &state,
+                None,
+                Some(initial_epoch),
+                IndexFollowUp::default(),
+                || Ok(()),
+                || Ok(()),
+                || {
+                    if first_checkpoint {
+                        first_checkpoint = false;
+                        lease_held.wait();
+                        release_builder.wait();
+                    }
+                },
+            )
+        }
+    });
+    lease_held.wait();
+    let held_since = Instant::now();
+    let timeout = crate::runtime_files::INDEX_CLEAR_LOCK_TIMEOUT;
+    let admit = |label: &str, request: &dyn Fn() -> Result<()>| {
+        let started = Instant::now();
+        request().unwrap_or_else(|error| panic!("{label} was rejected: {error:#}"));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < timeout,
+            "{label} waited {elapsed:?} on a held lease"
+        );
+    };
+    let path = "src/a.rs".to_string();
+    admit("full rebuild", &|| {
+        enqueue_full_index_rebuild(&fixture.state)
+    });
+    admit("clear", &|| {
+        daemon_index_clear(fixture.state.clone()).map(|_| ())
+    });
+    assert!(
+        index_clear_is_pending(&fixture.root),
+        "clear intent must be readable while the build holds the lease"
+    );
+    admit("incremental paths", &|| {
+        enqueue_incremental_index_paths(&fixture.state, std::slice::from_ref(&path)).map(|_| ())
+    });
+    assert!(
+        index_clear_requires_rebuild(&fixture.root),
+        "paths admitted after the clear must record the rebuild durably"
+    );
+    // Keep the lease held past the admission deadline before releasing it.
+    let minimum_hold = timeout + Duration::from_millis(250);
+    if let Some(remaining) = minimum_hold.checked_sub(held_since.elapsed()) {
+        std::thread::sleep(remaining);
+    }
+    release_builder.wait();
+    builder
+        .join()
+        .expect("join builder")
+        .expect("finish the overlapped full build");
+    {
+        let guard = fixture.state.lock().expect("state");
+        assert_eq!(
+            guard.interactive_index.manifest.status,
+            DaemonIndexState::Queued,
+            "the admitted clear must supersede the overlapped publication"
+        );
+        assert_eq!(
+            guard.interactive_index.manifest.regex_status.as_deref(),
+            Some("clear_pending")
+        );
+    }
+
+    let mut processed = 0;
+    while let Some(batch) = receiver
+        .recv_debounced_timeout(Duration::from_secs(5))
+        .expect("receive queued work")
+    {
+        assert_eq!(
+            process_index_batch_with_recovery(&fixture.state, &batch, None)
+                .expect("process queued work"),
+            IndexBatchStatus::Complete
+        );
+        processed += 1;
+        let guard = fixture.state.lock().expect("state");
+        if guard.interactive_index.manifest.status == DaemonIndexState::Ready
+            && guard.interactive_index.manifest.queued_paths.is_empty()
+        {
+            break;
+        }
+    }
+    assert!(processed > 0, "no queued work was delivered");
+    assert!(!index_clear_is_pending(&fixture.root));
+    let guard = fixture.state.lock().expect("state");
+    assert_eq!(
+        guard.interactive_index.manifest.status,
+        DaemonIndexState::Ready
+    );
+    assert!(guard.interactive_index.manifest.dirty_paths.is_empty());
+    assert!(guard.interactive_index.manifest.queued_paths.is_empty());
+    assert!(!guard.interactive_index.needs_rebuild());
 }
 
 #[test]
@@ -1018,7 +1306,10 @@ fn clear_state_lock_serializes_processes_and_is_released_after_a_crash() {
     while !ready.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(ready.exists(), "helper did not acquire the directory lock");
+    assert!(
+        ready.exists(),
+        "helper did not acquire the clear-state lock"
+    );
 
     let blocked_at = Instant::now();
     let error = persist_index_clear_pending(&root)
@@ -1313,6 +1604,584 @@ fn clear_state_read_rejects_same_directory_replacement_after_identity_check() {
         fs::read(index_dir(&root).join("clear-state-v1")).expect("read replacement state"),
         b"pending 99\n"
     );
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[cfg(unix)]
+fn clear_state_lock_path(root: &Path) -> PathBuf {
+    index_dir(root).join(".index-clear-state.lock")
+}
+
+#[cfg(unix)]
+fn file_identity(file: &fs::File) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().expect("lock descriptor metadata");
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(unix)]
+fn path_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).expect("lock entry metadata");
+    (metadata.dev(), metadata.ino())
+}
+
+/// Opens (creating if needed) the file at `path` and holds an exclusive
+/// `flock` on it through a descriptor that is independent from the one the
+/// production lease opens, so the lease must contend with it.
+#[cfg(unix)]
+fn hold_exclusive_lock(path: &Path) -> fs::File {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .expect("open lock file to hold");
+    fs2::FileExt::lock_exclusive(&file).expect("hold exclusive lock");
+    file
+}
+
+#[cfg(unix)]
+fn assert_no_clear_state_temporaries(root: &Path) {
+    let temporaries = fs::read_dir(index_dir(root))
+        .expect("read index dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".clear-state-v1.")
+        })
+        .count();
+    assert_eq!(temporaries, 0, "clear-state temporaries were left behind");
+}
+
+/// Runs a clear-state writer on its own thread and reports the identity of
+/// every lock descriptor it opens, each before the writer's bounded lock wait
+/// begins (the production barrier is the thread-local test hook, not a
+/// pathname observation or an external process inspector).
+#[cfg(unix)]
+type ObservedWriter<T> = (
+    std::sync::mpsc::Receiver<(u64, u64)>,
+    std::thread::JoinHandle<(T, Duration)>,
+);
+
+#[cfg(unix)]
+fn run_writer_observing_lock_descriptors<T: Send + 'static>(
+    writer: impl FnOnce() -> T + Send + 'static,
+) -> ObservedWriter<T> {
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        // The process-wide write mutex can queue this fixture behind other
+        // tests before its lock deadline exists. Measure from the first lock
+        // observation, without resetting the clock when a detached lock is reopened.
+        let started = std::rc::Rc::new(std::cell::OnceCell::new());
+        let hook_started = std::rc::Rc::clone(&started);
+        set_clear_state_lock_wait_hook_for_test(Some(Box::new(move |file: &fs::File| {
+            hook_started.get_or_init(Instant::now);
+            let _ = opened_tx.send(file_identity(file));
+        })));
+        let result = writer();
+        set_clear_state_lock_wait_hook_for_test(None);
+        let elapsed = started
+            .get()
+            .expect("writer did not attempt a lock")
+            .elapsed();
+        (result, elapsed)
+    });
+    (opened_rx, handle)
+}
+
+#[cfg(unix)]
+fn drain_last_identity(
+    receiver: &std::sync::mpsc::Receiver<(u64, u64)>,
+    mut last: (u64, u64),
+) -> (u64, u64) {
+    while let Ok(identity) = receiver.try_recv() {
+        last = identity;
+    }
+    last
+}
+
+/// Three writers start together but serialize on the process-wide write
+/// mutex. Each lock attempt gets its own one-second deadline; time queued
+/// behind the other fixtures must not be charged to that attempt.
+#[cfg(unix)]
+#[test]
+fn clear_state_writer_deadline_measurement_excludes_other_writers() {
+    let start = Arc::new(Barrier::new(4));
+    let mut writers = Vec::new();
+    for _ in 0..3 {
+        let state = daemon_test_state();
+        let root = daemon_test_root(&state);
+        fs::create_dir_all(index_dir(&root)).expect("create index dir");
+        let held = hold_exclusive_lock(&clear_state_lock_path(&root));
+        let (opened, writer) = run_writer_observing_lock_descriptors({
+            let root = root.clone();
+            let start = start.clone();
+            move || {
+                start.wait();
+                persist_index_clear_pending(&root)
+            }
+        });
+        writers.push((state, root, held, opened, writer));
+    }
+    start.wait();
+    for (_state, root, held, opened, writer) in writers {
+        let (result, elapsed) = writer.join().expect("join contending writer");
+        let error = result.expect_err("writer acquired a held fixture lock");
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(opened.recv().expect("opened lock"), file_identity(&held));
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(3),
+            "lock deadline measurement included time queued behind other writers: {elapsed:?}"
+        );
+        fs2::FileExt::unlock(&held).expect("release fixture lock");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+}
+
+/// Reproduces the reviewed serialization bypass: writer A opens the current
+/// lock X while X is held, X is renamed away and a new lock Y is installed
+/// and held under the same name, then X is released. A must not publish a
+/// revision through the displaced X; it contends on Y and times out at the
+/// original deadline, and the existing marker is preserved byte for byte.
+#[cfg(unix)]
+#[test]
+fn clear_state_writer_does_not_publish_through_a_lock_renamed_during_its_wait() {
+    let state = daemon_test_state();
+    let root = daemon_test_root(&state);
+    persist_index_clear_pending(&root).expect("persist pending clear");
+    complete_index_clear(&root).expect("complete clear");
+    let marker = index_dir(&root).join("clear-state-v1");
+    let before = fs::read(&marker).expect("read existing marker");
+    assert_eq!(before, b"complete 1\n");
+    let lock_path = clear_state_lock_path(&root);
+    let held = hold_exclusive_lock(&lock_path);
+    let held_identity = file_identity(&held);
+
+    let (opened, writer) = run_writer_observing_lock_descriptors({
+        let root = root.clone();
+        move || persist_index_clear_pending(&root)
+    });
+    let observed = opened
+        .recv_timeout(Duration::from_secs(10))
+        .expect("writer did not open the clear-state lock");
+    assert_eq!(
+        observed, held_identity,
+        "writer opened a descriptor other than the held lock"
+    );
+    fs::rename(
+        &lock_path,
+        index_dir(&root).join(".index-clear-state.lock-displaced"),
+    )
+    .expect("rename the held lock away");
+    let replacement = hold_exclusive_lock(&lock_path);
+    let replacement_identity = file_identity(&replacement);
+    assert_ne!(replacement_identity, held_identity);
+    // Let the writer enter its bounded wait on the displaced descriptor; the
+    // outcome does not depend on this, only the shape of the wait does.
+    std::thread::sleep(Duration::from_millis(50));
+    fs2::FileExt::unlock(&held).expect("release the displaced lock");
+
+    let (result, elapsed) = writer.join().expect("join writer");
+    let error = result.expect_err("writer published through a displaced lock while Y was held");
+    assert!(
+        format!("{error:#}").contains("timed out"),
+        "unexpected displaced-lock error: {error:#}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(3),
+        "writer was not bounded by the original deadline: {elapsed:?}"
+    );
+    assert_eq!(
+        fs::read(&marker).expect("read marker after writer"),
+        before,
+        "existing marker changed through a displaced lock"
+    );
+    assert_no_clear_state_temporaries(&root);
+    assert_eq!(
+        drain_last_identity(&opened, observed),
+        replacement_identity,
+        "writer did not contend on the current lock entry"
+    );
+
+    fs2::FileExt::unlock(&replacement).expect("release the current lock");
+    let revision =
+        persist_index_clear_pending(&root).expect("publish once the current lock is free");
+    assert_eq!(revision, 2);
+    assert_eq!(fs::read(&marker).expect("read marker"), b"pending 2\n");
+    assert_eq!(path_identity(&lock_path), replacement_identity);
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+/// Unlink variant: the displaced descriptor has zero links, a new held lock
+/// occupies the name, and no marker may appear at all.
+#[cfg(unix)]
+#[test]
+fn clear_state_writer_does_not_publish_through_a_lock_unlinked_during_its_wait() {
+    use std::os::unix::fs::MetadataExt;
+
+    let state = daemon_test_state();
+    let root = daemon_test_root(&state);
+    fs::create_dir_all(index_dir(&root)).expect("create index dir");
+    let marker = index_dir(&root).join("clear-state-v1");
+    let lock_path = clear_state_lock_path(&root);
+    let held = hold_exclusive_lock(&lock_path);
+    let held_identity = file_identity(&held);
+
+    let (opened, writer) = run_writer_observing_lock_descriptors({
+        let root = root.clone();
+        move || persist_index_clear_pending(&root)
+    });
+    let observed = opened
+        .recv_timeout(Duration::from_secs(10))
+        .expect("writer did not open the clear-state lock");
+    assert_eq!(observed, held_identity);
+    fs::remove_file(&lock_path).expect("unlink the held lock");
+    assert_eq!(
+        held.metadata().expect("held metadata").nlink(),
+        0,
+        "unlinked lock still has a link"
+    );
+    let replacement = hold_exclusive_lock(&lock_path);
+    let replacement_identity = file_identity(&replacement);
+    assert_ne!(replacement_identity, held_identity);
+    std::thread::sleep(Duration::from_millis(50));
+    fs2::FileExt::unlock(&held).expect("release the unlinked lock");
+
+    let (result, elapsed) = writer.join().expect("join writer");
+    let error = result.expect_err("writer published through an unlinked lock while Y was held");
+    assert!(
+        format!("{error:#}").contains("timed out"),
+        "unexpected unlinked-lock error: {error:#}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(3),
+        "writer was not bounded by the original deadline: {elapsed:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "a marker was published through an unlinked lock"
+    );
+    assert_no_clear_state_temporaries(&root);
+    assert_eq!(
+        drain_last_identity(&opened, observed),
+        replacement_identity,
+        "writer did not contend on the current lock entry"
+    );
+
+    fs2::FileExt::unlock(&replacement).expect("release the current lock");
+    assert_eq!(
+        persist_index_clear_pending(&root).expect("publish once the current lock is free"),
+        1
+    );
+    assert_eq!(fs::read(&marker).expect("read marker"), b"pending 1\n");
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+/// Stable-name control: a held current lock still bounds the writer at the
+/// configured deadline, the existing marker is untouched, and the next
+/// writer after release continues the revision sequence.
+#[cfg(unix)]
+#[test]
+fn clear_state_writer_times_out_on_a_held_stable_lock_and_preserves_the_marker() {
+    let state = daemon_test_state();
+    let root = daemon_test_root(&state);
+    persist_index_clear_pending(&root).expect("persist pending clear");
+    complete_index_clear(&root).expect("complete clear");
+    let marker = index_dir(&root).join("clear-state-v1");
+    let before = fs::read(&marker).expect("read existing marker");
+    let lock_path = clear_state_lock_path(&root);
+    let held = hold_exclusive_lock(&lock_path);
+    let held_identity = file_identity(&held);
+
+    let (opened, writer) = run_writer_observing_lock_descriptors({
+        let root = root.clone();
+        move || persist_index_clear_pending(&root)
+    });
+    let observed = opened
+        .recv_timeout(Duration::from_secs(10))
+        .expect("writer did not open the clear-state lock");
+    assert_eq!(observed, held_identity);
+    let (result, elapsed) = writer.join().expect("join writer");
+    let error = result.expect_err("held stable lock did not bound the writer");
+    assert!(
+        format!("{error:#}").contains("timed out"),
+        "unexpected stable-lock error: {error:#}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(3),
+        "stable lock wait was not bounded near its deadline: {elapsed:?}"
+    );
+    assert_eq!(fs::read(&marker).expect("read marker"), before);
+    assert_no_clear_state_temporaries(&root);
+    assert_eq!(
+        drain_last_identity(&opened, observed),
+        held_identity,
+        "stable lock wait reopened a different descriptor"
+    );
+
+    fs2::FileExt::unlock(&held).expect("release the stable lock");
+    assert_eq!(
+        persist_index_clear_pending(&root).expect("publish after release"),
+        2
+    );
+    assert_eq!(fs::read(&marker).expect("read marker"), b"pending 2\n");
+    assert_eq!(path_identity(&lock_path), held_identity);
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+/// After acquisition, replacing or unlinking the lock entry before the
+/// publishing rename must fail the writer without touching the marker: the
+/// revision writer and the clear acknowledgement both revalidate attachment
+/// before publishing.
+#[cfg(unix)]
+#[test]
+fn clear_state_writers_detect_a_lock_replaced_after_acquisition_before_publishing() {
+    for mutation in ["rename", "unlink"] {
+        let state = daemon_test_state();
+        let root = daemon_test_root(&state);
+        persist_index_clear_pending(&root).expect("persist pending clear");
+        let marker = index_dir(&root).join("clear-state-v1");
+        assert_eq!(fs::read(&marker).expect("read marker"), b"pending 1\n");
+        let lock_path = clear_state_lock_path(&root);
+        let mutate = |index: &Path| -> Result<()> {
+            let lock = index.join(".index-clear-state.lock");
+            if mutation == "rename" {
+                fs::rename(&lock, index.join(".index-clear-state.lock-displaced"))
+                    .context("rename held lock")?;
+                fs::write(&lock, b"").context("install replacement lock")?;
+            } else {
+                fs::remove_file(&lock).context("unlink held lock")?;
+            }
+            Ok(())
+        };
+
+        let error = complete_index_clear_with_transition_hook_for_test(&root, mutate)
+            .expect_err("clear acknowledgement published through a detached lock");
+        assert!(
+            error
+                .to_string()
+                .contains("lock detached before publishing"),
+            "unexpected acknowledgement error ({mutation}): {error:#}"
+        );
+        assert_eq!(
+            fs::read(&marker).expect("read marker"),
+            b"pending 1\n",
+            "clear acknowledgement changed the marker through a detached lock ({mutation})"
+        );
+        assert_no_clear_state_temporaries(&root);
+
+        // Restore a current lock entry for the writer path (the hook detached it).
+        if !lock_path.exists() {
+            fs::write(&lock_path, b"").expect("restore lock entry");
+        }
+        let error = persist_index_clear_pending_with_parent_hook_for_test(&root, mutate)
+            .expect_err("revision writer published through a detached lock");
+        assert!(
+            error
+                .to_string()
+                .contains("lock detached before publishing"),
+            "unexpected writer error ({mutation}): {error:#}"
+        );
+        assert_eq!(
+            fs::read(&marker).expect("read marker"),
+            b"pending 1\n",
+            "revision writer changed the marker through a detached lock ({mutation})"
+        );
+        assert_no_clear_state_temporaries(&root);
+        assert!(
+            index_clear_is_pending(&root),
+            "durable pending state was lost ({mutation})"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+}
+
+/// A reader that acquired the shared lease must not accept `complete` once
+/// the lock entry has been replaced beneath it; it fails closed to pending.
+#[cfg(unix)]
+#[test]
+fn clear_state_reader_rejects_a_lock_replaced_after_acquisition() {
+    let state = daemon_test_state();
+    let root = daemon_test_root(&state);
+    persist_index_clear_pending(&root).expect("persist pending clear");
+    complete_index_clear(&root).expect("complete clear");
+    assert!(
+        !index_clear_is_pending_with_read_hook_for_test(&root, |_| Ok(())),
+        "control read did not observe the completed clear"
+    );
+
+    let treated_as_pending = index_clear_is_pending_with_read_hook_for_test(&root, |index| {
+        let lock = index.join(".index-clear-state.lock");
+        fs::rename(&lock, index.join(".index-clear-state.lock-displaced"))
+            .context("rename held lock")?;
+        fs::write(&lock, b"").context("install replacement lock")?;
+        Ok(())
+    });
+
+    assert!(
+        treated_as_pending,
+        "reader accepted a completed clear through a replaced lock entry"
+    );
+    assert_eq!(
+        fs::read(index_dir(&root).join("clear-state-v1")).expect("read marker"),
+        b"complete 1\n"
+    );
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+/// Special lock leaves (directory, FIFO, hard-linked file, symlink) are
+/// rejected without blocking and without touching anything outside the
+/// index directory; readers fail closed to pending for the same leaves.
+#[cfg(unix)]
+#[test]
+fn clear_state_lock_rejects_special_leaves_without_blocking() {
+    for leaf in ["directory", "fifo", "hardlink", "symlink"] {
+        let state = daemon_test_state();
+        let root = daemon_test_root(&state);
+        persist_index_clear_pending(&root).expect("persist pending clear");
+        complete_index_clear(&root).expect("complete clear");
+        let marker = index_dir(&root).join("clear-state-v1");
+        let before = fs::read(&marker).expect("read marker");
+        let lock_path = clear_state_lock_path(&root);
+        fs::remove_file(&lock_path).expect("remove the real lock entry");
+        let outside = root.with_extension(format!("outside-{leaf}-lock"));
+        fs::write(&outside, b"sentinel").expect("write outside sentinel");
+        match leaf {
+            "directory" => fs::create_dir(&lock_path).expect("plant directory leaf"),
+            "fifo" => {
+                let status = Command::new("mkfifo")
+                    .arg(&lock_path)
+                    .status()
+                    .expect("run mkfifo");
+                assert!(status.success(), "mkfifo failed");
+            }
+            "hardlink" => {
+                let alias = index_dir(&root).join(".index-clear-state.lock-alias");
+                fs::write(&alias, b"").expect("write alias");
+                fs::hard_link(&alias, &lock_path).expect("plant hard-linked leaf");
+            }
+            _ => std::os::unix::fs::symlink(&outside, &lock_path).expect("plant symlink leaf"),
+        }
+        let planted = fs::symlink_metadata(&lock_path).expect("planted metadata");
+
+        // A blocking FIFO open would never return (there is no peer); the
+        // bound below only has to exceed the in-process writer mutex wait
+        // that concurrent tests can add (at most one lock timeout each).
+        let started = Instant::now();
+        let error =
+            persist_index_clear_pending(&root).expect_err("writer accepted a special lock leaf");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "special leaf '{leaf}' blocked the writer: {elapsed:?}"
+        );
+        let chain = format!("{error:#}");
+        let expected_rejection = match leaf {
+            "directory" | "fifo" => "not a regular file",
+            "hardlink" => "multiple hard links",
+            _ => "Too many levels",
+        };
+        assert!(
+            error.to_string().contains("lock index clear state")
+                && chain.contains(expected_rejection)
+                && !chain.contains("timed out"),
+            "unexpected special-leaf error ({leaf}): {chain}"
+        );
+        assert_eq!(fs::read(&marker).expect("read marker"), before);
+        assert_no_clear_state_temporaries(&root);
+        assert!(
+            index_clear_is_pending(&root),
+            "reader accepted a completed clear through a special lock leaf ({leaf})"
+        );
+        let after = fs::symlink_metadata(&lock_path).expect("planted metadata after");
+        assert_eq!(
+            after.file_type(),
+            planted.file_type(),
+            "planted leaf type changed ({leaf})"
+        );
+        assert_eq!(
+            fs::read(&outside).expect("read outside sentinel"),
+            b"sentinel",
+            "special leaf '{leaf}' reached outside the index directory"
+        );
+        fs::remove_file(&outside).expect("remove outside sentinel");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+}
+
+/// The same physical workspace reached through different path spellings
+/// (a symlinked alias, and `/private/...` versus its macOS alias) shares one
+/// lock entry and one revision sequence after canonicalization.
+#[cfg(unix)]
+#[test]
+fn clear_state_lock_is_shared_across_canonical_path_aliases() {
+    let state = daemon_test_state();
+    let root = daemon_test_root(&state);
+    let canonical = fs::canonicalize(&root).expect("canonicalize root");
+    let symlinked = root.with_extension("alias-root");
+    std::os::unix::fs::symlink(&canonical, &symlinked).expect("symlink alias root");
+    let mut aliases = vec![root.clone(), symlinked.clone()];
+    if let Ok(stripped) = canonical.strip_prefix("/private") {
+        let stripped = Path::new("/").join(stripped);
+        if stripped.exists() && fs::canonicalize(&stripped).is_ok_and(|path| path == canonical) {
+            aliases.push(stripped);
+        }
+    }
+
+    let mut expected = 0;
+    for alias in &aliases {
+        expected += 1;
+        assert_eq!(
+            persist_index_clear_pending(alias).expect("publish through alias"),
+            expected,
+            "alias {} did not continue one revision sequence",
+            alias.display()
+        );
+    }
+    let lock_identity = path_identity(&clear_state_lock_path(&canonical));
+    for alias in &aliases {
+        assert_eq!(path_identity(&clear_state_lock_path(alias)), lock_identity);
+        assert_eq!(
+            pending_index_clear(alias),
+            Some((expected, false)),
+            "alias {} (canonical {:?}) read marker {:?}",
+            alias.display(),
+            fs::canonicalize(alias),
+            fs::read_to_string(index_dir(alias).join("clear-state-v1"))
+        );
+    }
+
+    let held = hold_exclusive_lock(&clear_state_lock_path(&symlinked));
+    let started = Instant::now();
+    let error = persist_index_clear_pending(&root)
+        .expect_err("a lock held through an alias did not bound the canonical writer");
+    assert!(
+        format!("{error:#}").contains("timed out"),
+        "unexpected alias-lock error: {error:#}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    // The lease is still held through the alias, so a locked read would fail
+    // closed here; compare the published bytes directly instead.
+    assert_eq!(
+        fs::read(index_dir(&root).join("clear-state-v1")).expect("read marker"),
+        format!("pending {expected}\n").into_bytes()
+    );
+    fs2::FileExt::unlock(&held).expect("release alias lock");
+    assert_eq!(pending_index_clear(&root), Some((expected, false)));
+    assert_eq!(
+        persist_index_clear_pending(&root).expect("publish after release"),
+        expected + 1
+    );
+    fs::remove_file(symlinked).expect("remove alias symlink");
     fs::remove_dir_all(root).expect("remove fixture");
 }
 

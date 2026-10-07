@@ -11,9 +11,7 @@ use packet28_daemon_protocol::paths::{task_state_json_path, TaskStorageId};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::route_registry::{
-    build_route_rewrite, decide_command_route_with_cwd_and_root, NativeToolKind, RouteKind,
-};
+use crate::route_registry::{decide_command_route_with_cwd_and_root, NativeToolKind, RouteKind};
 
 #[path = "cmd_compact_session.rs"]
 mod compact_session;
@@ -799,13 +797,6 @@ pub fn run_rewrite_command(args: RewriteArgs) -> Result<i32> {
     let command = args.command_argv.join(" ");
     let cwd_path = std::path::Path::new(&args.cwd);
     let decision = decide_command_route_with_cwd_and_root(&command, cwd_path, &root);
-    let rewritten = build_route_rewrite(
-        &root,
-        &args.task_id,
-        args.session_id.as_deref(),
-        &args.cwd,
-        &decision,
-    );
     let native_kind = decision.native_tool.as_ref().map(|tool| match tool.kind {
         NativeToolKind::Tree => "tree",
         NativeToolKind::Read => "read",
@@ -825,7 +816,9 @@ pub fn run_rewrite_command(args: RewriteArgs) -> Result<i32> {
         "reason": decision.reason,
         "env_assignments": decision.env_assignments,
         "native_tool": native_kind,
-        "rewritten_command": rewritten,
+        "rewritten_command": null,
+        "applied": false,
+        "rewrite_status": "automatic_host_rewrite_unsupported",
         "reducer_family": decision.reducer_spec.as_ref().map(|spec| spec.family.clone()),
         "reducer_kind": decision
             .reducer_spec

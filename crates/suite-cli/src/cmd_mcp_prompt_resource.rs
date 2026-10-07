@@ -1,7 +1,7 @@
 use super::*;
 use packet28_daemon_protocol::registry::{
-    DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1, RegistryRevisionV1,
-    TaskListPageRequestV1, WatchListPageRequestV1, MAX_REGISTRY_PAGE_LIMIT,
+    DaemonRegistryRequestV1, DaemonRegistryResponseV1, DaemonStatusV1, OversizedTaskRecordV1,
+    RegistryRevisionV1, TaskListPageRequestV1, WatchListPageRequestV1, MAX_REGISTRY_PAGE_LIMIT,
 };
 
 pub(crate) fn prompt_descriptors() -> Vec<Value> {
@@ -71,11 +71,11 @@ pub(crate) fn handle_prompt_get(
             let prompt = format!(
                 "Start Packet28 task `{task_id}` for: {task}\n\n\
 Use Packet28 as the primary context broker for this task.\n\
-- Let Claude hooks rewrite supported Bash commands through Packet28 reducers and capture native tool activity automatically; do not call reducer MCP tools in the active loop.\n\
+- Let hooks capture native tool activity without changing commands or native permission matching. Use explicit Packet28 CLI/MCP tools when reduced output is needed.\n\
 - Use `packet28.write_intention` when the current objective or next step changes materially.\n\
 - Keep one mutable Packet28 context block and replace older briefs when a newer brief supersedes them.\n\
 - If Packet28 is fronting upstream MCP tools via proxy, prefer those proxied tools so activity is auto-captured into the next brief.\n\
-- During the active turn, keep MCP usage to intent and explicit handoff/context inspection only.\n\
+- During the active turn, use MCP for intent, explicit reduction, and handoff/context inspection.\n\
 - For long-running work, record the current objective with `packet28.write_intention`, then let the daemon assemble handoff at threshold or stop boundaries.\n\
 - Use `packet28.fetch_context` only when you explicitly need to inspect a stored handoff/context artifact.\n\
 - If Packet28 is unavailable, fall back to direct reads and commands."
@@ -169,8 +169,9 @@ pub(crate) fn resolve_requested_or_current_task_id(
 ) -> Result<String> {
     if let Some(task_id) = requested_task_id {
         validated_task_storage_id(task_id)?;
-        track_task(session, root, task_id)?;
-        return Ok(task_id.to_string());
+        let task_id = crate::task_runtime::resolve_task_continuation(root, task_id)?;
+        track_task(session, root, &task_id)?;
+        return Ok(task_id);
     }
     resolve_current_task_id(root, session)
 }
@@ -179,22 +180,30 @@ pub(crate) fn resolve_current_task_id(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
 ) -> Result<String> {
+    crate::broker_client::ensure_daemon(root)?;
     if let Ok(guard) = session.lock() {
         if let Some(task_id) = guard.current_task_id.clone() {
+            drop(guard);
             validated_task_storage_id(&task_id)?;
-            return Ok(task_id);
+            let resolved = crate::task_runtime::resolve_task_continuation(root, &task_id)?;
+            if resolved != task_id {
+                track_task(session, root, &resolved)?;
+            }
+            return Ok(resolved);
         }
     }
     if let Some(active) = crate::task_runtime::load_active_task(root)? {
         validated_task_storage_id(&active.task_id)?;
-        track_task(session, root, &active.task_id)?;
-        return Ok(active.task_id);
+        let task_id = crate::task_runtime::resolve_task_continuation(root, &active.task_id)?;
+        track_task(session, root, &task_id)?;
+        return Ok(task_id);
     }
     let status = daemon_status(root)?;
     let current = select_current_task(&status.tasks)
         .map(|task| task.task_id.clone())
         .ok_or_else(|| anyhow!("no Packet28 task is available for current-task resources"))?;
     validated_task_storage_id(&current)?;
+    let current = crate::task_runtime::resolve_task_continuation(root, &current)?;
     track_task(session, root, &current)?;
     Ok(current)
 }
@@ -202,13 +211,22 @@ pub(crate) fn resolve_current_task_id(
 pub(crate) fn daemon_status(
     root: &Path,
 ) -> Result<packet28_daemon_protocol::message::DaemonStatus> {
+    daemon_status_with_omissions(root).map(|(status, _)| status)
+}
+
+fn daemon_status_with_omissions(
+    root: &Path,
+) -> Result<(
+    packet28_daemon_protocol::message::DaemonStatus,
+    Vec<OversizedTaskRecordV1>,
+)> {
     let mut client = crate::cmd_daemon::PersistentDaemonClient::connect(root)?;
     let status = match client.send_registry_request(&DaemonRegistryRequestV1::Status)? {
         DaemonRegistryResponseV1::Status { status } => *status,
         DaemonRegistryResponseV1::Error { message }
             if registry_extension_is_unsupported(&message) =>
         {
-            return legacy_daemon_status(root);
+            return legacy_daemon_status(root).map(|status| (status, Vec::new()));
         }
         DaemonRegistryResponseV1::Error { message } => return Err(anyhow!(message)),
         other => return Err(anyhow!("unexpected daemon registry response: {other:?}")),
@@ -227,24 +245,29 @@ pub(crate) fn daemon_status(
         registry_revision,
         index_truncated: _,
         index,
+        record_size_warning_count: _,
+        record_size_warnings: _,
     } = status;
     let revision =
         registry_revision.ok_or_else(|| anyhow!("daemon registry status omitted its revision"))?;
-    let tasks = load_all_task_pages(&mut client, &revision, task_count)?;
+    let (tasks, omitted_oversized) = load_all_task_pages(&mut client, &revision, task_count)?;
     let watches = load_all_watch_pages(&mut client, &revision, watch_count)?;
-    Ok(packet28_daemon_protocol::message::DaemonStatus {
-        pid,
-        version,
-        socket_path,
-        workspace_root,
-        started_at_unix,
-        ready_at_unix,
-        log_path,
-        uptime_secs,
-        tasks,
-        watches,
-        index,
-    })
+    Ok((
+        packet28_daemon_protocol::message::DaemonStatus {
+            pid,
+            version,
+            socket_path,
+            workspace_root,
+            started_at_unix,
+            ready_at_unix,
+            log_path,
+            uptime_secs,
+            tasks,
+            watches,
+            index,
+        },
+        omitted_oversized,
+    ))
 }
 
 fn legacy_daemon_status(root: &Path) -> Result<packet28_daemon_protocol::message::DaemonStatus> {
@@ -257,17 +280,40 @@ fn legacy_daemon_status(root: &Path) -> Result<packet28_daemon_protocol::message
     }
 }
 
+/// Detects whether an error message indicates an unsupported registry extension.
+///
+/// # Returns
+///
+/// `true` if the message reports an unknown variant and lists expected variants, `false` otherwise.
+///
 fn registry_extension_is_unsupported(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("unknown variant") && lower.contains("expected one of")
 }
 
+/// Loads all task records from a consistent registry snapshot.
+///
+/// Oversized records omitted by the daemon are counted for completeness validation
+/// and returned separately from healthy task records for caller diagnostics.
+///
+/// # Examples
+///
+/// ```ignore
+/// let (tasks, omissions) = load_all_task_pages(&mut client, &snapshot_revision, expected_total)?;
+/// assert!(tasks.len() <= expected_total);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn load_all_task_pages(
     client: &mut crate::cmd_daemon::PersistentDaemonClient,
     snapshot_revision: &RegistryRevisionV1,
     expected_total: usize,
-) -> Result<Vec<TaskRecord>> {
+) -> Result<(Vec<TaskRecord>, Vec<OversizedTaskRecordV1>)> {
     let mut tasks = Vec::new();
+    // Records the daemon skipped because they exceed the per-record pagination
+    // bound. They still count toward `total`, so account for them when checking
+    // completeness; otherwise a single oversized record would look like the
+    // registry changed mid-pagination.
+    let mut omitted_oversized = Vec::new();
     let mut after_task_id = None;
     loop {
         let response = client.send_registry_request(&DaemonRegistryRequestV1::TaskListPage {
@@ -287,14 +333,15 @@ fn load_all_task_pages(
                 "daemon task registry changed during pagination; retry the request"
             ));
         }
+        omitted_oversized.extend(page.omitted_oversized);
         tasks.extend(page.tasks);
         let Some(next) = page.next_after_task_id else {
-            if tasks.len() != expected_total {
+            if tasks.len() + omitted_oversized.len() != expected_total {
                 return Err(anyhow!(
                     "daemon task registry changed during pagination; retry the request"
                 ));
             }
-            return Ok(tasks);
+            return Ok((tasks, omitted_oversized));
         };
         if after_task_id
             .as_ref()
@@ -374,7 +421,7 @@ pub(crate) fn handle_resources_list(
     root: &Path,
     session: &Arc<Mutex<McpSessionState>>,
 ) -> Result<Value> {
-    let status = daemon_status(root)?;
+    let (status, omitted_oversized) = daemon_status_with_omissions(root)?;
     let mut resources = Vec::new();
     let current_task_id = session
         .lock()
@@ -416,7 +463,14 @@ pub(crate) fn handle_resources_list(
             "mimeType": "text/markdown"
         }));
     }
-    Ok(json!({ "resources": resources }))
+    let mut result = json!({ "resources": resources });
+    if !omitted_oversized.is_empty() {
+        result["_meta"] = json!({
+            "omitted_oversized_count": omitted_oversized.len(),
+            "omitted_oversized": omitted_oversized,
+        });
+    }
+    Ok(result)
 }
 
 pub(crate) fn handle_resource_read(
@@ -538,6 +592,14 @@ fn materialize_task_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_extension_fallback_only_matches_unknown_variant_errors() {
+        assert!(registry_extension_is_unsupported(
+            "unknown variant `tasks`, expected one of `status`, `watch`"
+        ));
+        assert!(!registry_extension_is_unsupported("connection failed"));
+    }
 
     #[test]
     fn continue_task_prompt_uses_brief_pointer_instead_of_embedded_context() {

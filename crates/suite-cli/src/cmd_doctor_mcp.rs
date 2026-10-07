@@ -191,19 +191,40 @@ impl Drop for McpHarness {
     }
 }
 
-fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, String)> {
+/// Detects whether durable hook ingestion is disabled in the runtime configuration.
+///
+/// # Parameters
+///
+/// * `root` - Root directory containing the hook runtime configuration.
+///
+/// # Returns
+///
+/// The hook runtime configuration path when the configuration parses successfully
+/// and `hooks_enabled` is `false`; otherwise, `None`.
+///
+fn disabled_hook_runtime_config(root: &Path) -> Option<std::path::PathBuf> {
+    let path = packet28_daemon_protocol::paths::hook_runtime_config_path(root);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let config =
+        serde_json::from_str::<packet28_daemon_protocol::hooks::HookRuntimeConfig>(&raw).ok()?;
+    (!config.hooks_enabled).then_some(path)
+}
+
+/// Runs the selected native hook with a JSON payload and captures its result.
+/// Exit code 2 is an accepted hook result; other unsuccessful exits are errors.
+fn run_hook_with_output(root: &Path, runtime: &str, payload: &Value) -> Result<(i32, String)> {
     let exe = std::env::current_exe().context("failed to resolve current Packet28 binary")?;
     let mut child = Command::new(exe)
         .current_dir(root)
         .arg("hook")
-        .arg("claude")
+        .arg(runtime)
         .arg("--root")
         .arg(root.to_str().unwrap_or("."))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to start Packet28 Claude hook for doctor")?;
+        .with_context(|| format!("failed to start Packet28 {runtime} hook for doctor"))?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(serde_json::to_string(payload)?.as_bytes())?;
     }
@@ -211,7 +232,7 @@ fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, Str
     let status = output.status;
     if !status.success() && status.code() != Some(2) {
         return Err(anyhow!(
-            "claude hook exited with status {:?}",
+            "{runtime} hook exited with status {:?}",
             status.code()
         ));
     }
@@ -221,8 +242,8 @@ fn run_claude_hook_with_output(root: &Path, payload: &Value) -> Result<(i32, Str
     ))
 }
 
-fn run_claude_hook(root: &Path, payload: &Value) -> Result<i32> {
-    Ok(run_claude_hook_with_output(root, payload)?.0)
+fn run_hook(root: &Path, runtime: &str, payload: &Value) -> Result<i32> {
+    Ok(run_hook_with_output(root, runtime, payload)?.0)
 }
 
 fn wait_for_handoff_ready(
@@ -260,7 +281,18 @@ fn wait_for_handoff_ready(
     }
 }
 
+/// Runs the MCP doctor smoke tests for handshake, reducer ingestion, push notifications, and handoff round trips.
+///
+/// `root` identifies the project whose MCP server and hook runtime are tested.
+///
+/// # Returns
+///
+/// The results of the four MCP doctor checks.
 pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
+    check_mcp_round_trip_for_runtime(root, "claude")
+}
+
+pub(super) fn check_mcp_round_trip_for_runtime(root: &Path, runtime: &str) -> McpRoundTripChecks {
     let timeout = Duration::from_secs(10);
     let task_id = format!(
         "doctor-smoke-task-{}-{}",
@@ -352,6 +384,37 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
             ),
         };
 
+        // A durably disabled hook runtime (`hooks_enabled: false`, typically a
+        // stale kill switch from a prior `packet28 uninstall`) makes packet28d
+        // reject every hook ingest with `accepted: false`. Without this early
+        // check the reducer/handoff smoke would fail with an opaque
+        // "reducer ingest missing" dump. Report the real cause explicitly and
+        // skip the dependent hook probes.
+        if let Some(config_path) = disabled_hook_runtime_config(root) {
+            reducer_round_trip = DoctorCheck {
+                name: "reducer_round_trip",
+                ok: false,
+                required: true,
+                detail: format!(
+                    "hook ingest is disabled: {} has hooks_enabled=false, so packet28d rejects every hook ingest. Re-run `packet28 setup` for your agent runtime to re-enable hook ingest.",
+                    config_path.display()
+                ),
+            };
+            push_notifications = DoctorCheck {
+                name: "push_notifications",
+                ok: false,
+                required: true,
+                detail: "skipped because hook ingest is disabled (hooks_enabled=false)".to_string(),
+            };
+            handoff_round_trip = DoctorCheck {
+                name: "handoff_round_trip",
+                ok: false,
+                required: true,
+                detail: "skipped because hook ingest is disabled (hooks_enabled=false)".to_string(),
+            };
+            return Ok(());
+        }
+
         harness.send(&json!({
             "jsonrpc":"2.0",
             "id":3,
@@ -369,8 +432,9 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         if intention["result"]["structuredContent"]["accepted"] != json!(true) {
             return Err(anyhow!("write_intention was not accepted"));
         }
-        let hook_status = run_claude_hook(
+        let hook_status = run_hook(
             root,
+            runtime,
             &json!({
                 "hook_event_name":"PostToolUse",
                 "task_id": task_id,
@@ -378,7 +442,7 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
                 "cwd": root.display().to_string(),
                 "tool_name":"Bash",
                 "tool_input":{"command":"git status --short src/lib.rs"},
-                "tool_response":{"stdout":" M src/lib.rs\n","stderr":"","is_error":false}
+                "tool_response": if runtime == "codex" { json!(" M src/lib.rs\n") } else { json!({"stdout":" M src/lib.rs\n","stderr":"","is_error":false}) }
             }),
         )?;
         harness.send(&json!({
@@ -453,8 +517,9 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         }))?;
         let _ = handoff_harness.read_response(1, timeout)?;
 
-        run_claude_hook(
+        run_hook(
             root,
+            runtime,
             &json!({
                 "hook_event_name":"Stop",
                 "task_id":task_id,
@@ -526,8 +591,9 @@ pub(super) fn check_mcp_round_trip(root: &Path) -> McpRoundTripChecks {
         }
 
         let resume_session_id = format!("{task_id}-resume");
-        let (resume_status, resume_stdout) = run_claude_hook_with_output(
+        let (resume_status, resume_stdout) = run_hook_with_output(
             root,
+            runtime,
             &json!({
                 "hook_event_name":"SessionStart",
                 "task_id":task_id,

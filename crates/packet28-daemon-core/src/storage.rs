@@ -23,7 +23,7 @@ use packet28_daemon_protocol::paths::{
     MAX_TASK_STORAGE_ID_BYTES, PID_FILE_NAME, RUNTIME_FILE_NAME, TASK_ARTIFACTS_DIR_NAME,
     TASK_EVENTS_DIR_NAME, TASK_EVENT_LOG_SUFFIX, TASK_REGISTRY_FILE_NAME, WATCH_REGISTRY_FILE_NAME,
 };
-use packet28_daemon_protocol::task::{TaskRegistry, WatchRegistry};
+use packet28_daemon_protocol::task::{TaskRecord, TaskRegistry, WatchRegistry};
 use unicode_casefold::UnicodeCaseFold as _;
 use unicode_normalization::UnicodeNormalization as _;
 
@@ -39,7 +39,9 @@ use crate::{DaemonCoreError, Result};
 
 mod checkpoint;
 mod event_tail;
+pub mod record_archive;
 mod registry_delta;
+mod registry_repair;
 
 pub use event_tail::{
     append_next_task_event, append_next_task_event_with_authority,
@@ -55,17 +57,26 @@ use event_tail::{
 pub(crate) use registry_delta::REGISTRY_DELTA_WAL_HEADER_BYTES;
 pub use registry_delta::{
     append_task_watch_registry_delta, append_task_watch_registry_delta_with_authority,
-    load_registry_admission_authority, load_task_watch_registry_with_deltas,
-    load_task_watch_registry_with_deltas_and_event_tails, registry_delta_wal_path,
+    inspect_corrupt_task_event_logs, inspect_offline_corrupt_task_event_logs,
+    load_registry_admission_authority, load_task_watch_registry_recovering_corrupt_event_logs,
+    load_task_watch_registry_with_deltas, load_task_watch_registry_with_deltas_and_event_tails,
+    registry_delta_wal_path, repair_corrupt_task_event_logs,
     save_task_watch_registry_checkpoint_at_revision,
     save_task_watch_registry_checkpoint_at_revision_with_authority, LoadedTaskWatchRegistry,
-    RegistryAdmissionAuthority, RegistryDeltaBatch, RegistryDeltaValidationError, RegistryRevision,
-    RegistryRevisionRange, MAX_REGISTRY_DELTA_FRAME_BYTES, MAX_REGISTRY_DELTA_WAL_BYTES,
+    QuarantinedCorruptTaskEventLog, RegistryAdmissionAuthority, RegistryDeltaBatch,
+    RegistryDeltaValidationError, RegistryRevision, RegistryRevisionRange,
+    MAX_REGISTRY_DELTA_FRAME_BYTES, MAX_REGISTRY_DELTA_WAL_BYTES,
 };
 #[cfg(unix)]
 pub(crate) use registry_delta::{
     load_retained_registry_snapshot_under_task_lock,
     remove_retained_registry_records_under_task_lock, REGISTRY_DELTA_WAL_FILE_NAME,
+};
+pub use registry_repair::{
+    inspect_task_watch_registry_checkpoint_repair, repair_task_watch_registry_checkpoint,
+    RegistryArtifactDigest, RegistryCheckpointAuthority, RegistryCheckpointRepairReport,
+    RegistryCheckpointRepairStatus, RegistryRepairCandidateSource, RegistryRepairFileReport,
+    RegistryRepairFileState, RegistryWalReplayVerification, REGISTRY_REPAIR_ARCHIVE_DIR_NAME,
 };
 
 #[cfg(any(not(unix), test))]
@@ -1050,6 +1061,79 @@ pub fn load_task_registry(root: &Path) -> Result<TaskRegistry> {
     load_task_registry_portable(root)
 }
 
+/// Returns the forward fields of every committed task record that carries any.
+///
+/// Forward fields are top-level record values that a newer build persisted and
+/// this build does not model. The committed task-registry checkpoint is their
+/// only authority: registry deltas carry typed records, and checkpoint encoding
+/// carries forward fields over from the previous checkpoint. They are read here
+/// under the shared registry lock, through the same journal-aware resolution
+/// as [`load_task_registry`]. Records without forward fields are absent.
+///
+/// # Errors
+///
+/// Returns the same locking, read, and authority-decoding errors as
+/// [`load_task_registry`].
+pub fn load_task_record_forward_fields(
+    root: &Path,
+) -> Result<BTreeMap<String, record_archive::TaskRecordForwardFields>> {
+    let path = task_registry_path(root);
+    #[cfg(unix)]
+    let task_bytes = with_anchored_task_registry_lock(
+        root,
+        RegistryLockMode::Shared,
+        || Ok(()),
+        |daemon| {
+            Ok(
+                load_task_watch_registry_checkpoint_with_delta_revision_under_task_lock(
+                    root, daemon,
+                )?
+                .task_bytes,
+            )
+        },
+    )?;
+    #[cfg(not(unix))]
+    let task_bytes = with_registry_lock(root, &path, RegistryLockMode::Shared, || {
+        Ok(
+            load_task_watch_registry_checkpoint_with_delta_revision_portable_under_task_lock(root)?
+                .task_bytes,
+        )
+    })?;
+    let value =
+        decode_json_value_without_duplicate_keys(&task_bytes, AuthorityJsonProfile::TaskRegistry)
+            .map_err(|error| {
+            map_authority_json_error(
+                &path,
+                AuthorityJsonProfile::TaskRegistry,
+                "failed to decode task registry forward fields from",
+                error,
+            )
+        })?;
+    let tasks = value
+        .get("tasks")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            DaemonCoreError::json(
+                "failed to decode task registry forward fields from",
+                &path,
+                <serde_json::Error as serde::de::Error>::custom(
+                    "persisted task registry must contain an object-valued tasks field",
+                ),
+            )
+        })?;
+    let mut forward = BTreeMap::new();
+    for (task_id, record) in tasks {
+        let Some(record) = record.as_object() else {
+            continue;
+        };
+        let fields = record_archive::task_record_forward_fields(record);
+        if !fields.is_empty() {
+            forward.insert(task_id.clone(), fields);
+        }
+    }
+    Ok(forward)
+}
+
 #[cfg(unix)]
 fn task_registry_read_error(
     daemon: &CapabilityDir,
@@ -1623,6 +1707,19 @@ fn validate_encoded_task_registry(
     Ok(())
 }
 
+/// Known task-record fields whose absent value is represented by omission.
+/// Every other known field is always serialized, so any persisted top-level
+/// key outside the serialized schema and this list is a forward field written
+/// by a newer build, which checkpoint encoding preserves.
+pub(crate) const KNOWN_OPTIONAL_TASK_RECORD_FIELDS: &[&str] = &[
+    "cancelled",
+    "recovered_replan",
+    "superseded_by",
+    "recovered_from",
+    "handoffs",
+    "archived",
+];
+
 fn encode_task_registry_preserving_existing(
     root: &Path,
     path: &Path,
@@ -1644,8 +1741,12 @@ fn encode_task_registry_preserving_existing(
     // A present authority must be strict and supported before it can influence
     // a replacement. This prevents a normal save from laundering corrupt or
     // legacy-ambiguous state into a newly trusted registry.
-    let existing_registry = decode_task_registry(path, existing_raw)?;
-    let _ = registry_checkpoint_generation(path, existing_raw, AuthorityJsonProfile::TaskRegistry)?;
+    // The typed registry, generation and unknown-field preservation all read one
+    // guarded decode of the same bytes; errors keep the previous precedence.
+    let existing_value = decode_task_registry_value(path, existing_raw)?;
+    let existing_generation = registry_checkpoint_generation_from_value(path, &existing_value);
+    let existing_registry = task_registry_from_value(path, existing_value.clone())?;
+    existing_generation?;
     validate_task_registry_namespace_bindings(
         root,
         registry,
@@ -1653,16 +1754,7 @@ fn encode_task_registry_preserving_existing(
         wal_admitted_task_ids,
         path,
     )?;
-    let mut root =
-        decode_json_value_without_duplicate_keys(existing_raw, AuthorityJsonProfile::TaskRegistry)
-            .map_err(|error| {
-                map_authority_json_error(
-                    path,
-                    AuthorityJsonProfile::TaskRegistry,
-                    "failed to decode task registry before preserving unknown fields from",
-                    error,
-                )
-            })?;
+    let mut root = existing_value;
     let root_object = root.as_object_mut().ok_or_else(|| {
         DaemonCoreError::json(
             "failed to preserve task registry root from",
@@ -1703,12 +1795,23 @@ fn encode_task_registry_preserving_existing(
             .and_then(serde_json::Value::as_object)
             .cloned()
             .unwrap_or_default();
-        // These additive lifecycle markers are known fields even when their
-        // false value is represented by omission. Remove an older true marker
-        // before overlaying the newly serialized record so forward-field
-        // preservation cannot resurrect a completed transition.
-        for known_optional_field in ["cancelled", "recovered_replan"] {
-            merged.remove(known_optional_field);
+        // An archived tombstone deliberately sheds the original's large
+        // values, known or forward; its archive holds them. Forward-field
+        // preservation keeps every retained forward field but must not copy a
+        // shed one back from the previous checkpoint.
+        if let Some(archive) = &record.archived {
+            for omitted in archive.omitted_fields.keys() {
+                merged.remove(omitted);
+            }
+        }
+        // These additive lifecycle markers, history links, and omitted-when-
+        // empty collections are known fields even when their absent value is
+        // represented by omission. Remove an older value before overlaying the
+        // newly serialized record so forward-field preservation cannot
+        // resurrect a completed transition, stale provenance, or discarded
+        // handoff descriptors on a replaced record.
+        for known_optional_field in KNOWN_OPTIONAL_TASK_RECORD_FIELDS {
+            merged.remove(*known_optional_field);
         }
         for (field, value) in known {
             merged.insert(field, value);
@@ -1966,9 +2069,13 @@ pub(super) fn decode_task_registry_with_checkpoint_generation(
     path: &Path,
     raw: &[u8],
 ) -> Result<(TaskRegistry, Option<u64>)> {
-    let registry = decode_task_registry(path, raw)?;
-    let generation = registry_checkpoint_generation(path, raw, AuthorityJsonProfile::TaskRegistry)?;
-    Ok((registry, generation))
+    let value = decode_task_registry_value(path, raw)?;
+    // Read the generation from the same guarded value instead of validating and
+    // parsing the raw bytes a second time. Its error is reported only after the
+    // typed record decode, preserving the previous error precedence.
+    let generation = registry_checkpoint_generation_from_value(path, &value);
+    let registry = task_registry_from_value(path, value)?;
+    Ok((registry, generation?))
 }
 
 fn registry_checkpoint_generation(
@@ -2317,6 +2424,11 @@ fn validate_task_registry_namespace_bindings(
 }
 
 fn decode_task_registry(path: &Path, raw: &[u8]) -> Result<TaskRegistry> {
+    let value = decode_task_registry_value(path, raw)?;
+    task_registry_from_value(path, value)
+}
+
+fn decode_task_registry_value(path: &Path, raw: &[u8]) -> Result<serde_json::Value> {
     let value = decode_json_value_without_duplicate_keys(raw, AuthorityJsonProfile::TaskRegistry)
         .map_err(|error| {
         map_authority_json_error(
@@ -2334,6 +2446,10 @@ fn decode_task_registry(path: &Path, raw: &[u8]) -> Result<TaskRegistry> {
             source,
         ));
     }
+    Ok(value)
+}
+
+fn task_registry_from_value(path: &Path, value: serde_json::Value) -> Result<TaskRegistry> {
     let registry = serde_json::from_value(value).map_err(|source| {
         DaemonCoreError::json("failed to decode task registry from", path, source)
     })?;
@@ -3139,7 +3255,9 @@ pub(crate) fn remove_task_registry_records_if_unchanged(
 ///
 /// Returns an error without changing the event namespace when the frame task
 /// identifier is invalid, has not already been admitted by the durable task
-/// registry, or does not continue a fully valid existing log. Returns
+/// registry, was superseded by a linked history recovery
+/// ([`DaemonCoreError::TaskSuperseded`]), or does not continue a fully valid
+/// existing log. Returns
 /// [`DaemonCoreError::Json`] if `frame` cannot be encoded. Returns
 /// [`DaemonCoreError::Io`] if the event directory or log cannot be opened,
 /// locked, appended, synchronized, or unlocked.
@@ -3157,8 +3275,9 @@ pub fn append_task_event(root: &Path, frame: &DaemonEventFrame) -> Result<()> {
 /// # Errors
 ///
 /// Returns [`DaemonCoreError::InvalidTaskRegistry`] if `task_id` has not been
-/// durably admitted, or [`DaemonCoreError::InvalidTaskEventFrame`] if it does
-/// not exactly match `frame.task_id`. Returns
+/// durably admitted, [`DaemonCoreError::TaskSuperseded`] if it was superseded
+/// by a linked history recovery, or [`DaemonCoreError::InvalidTaskEventFrame`]
+/// if it does not exactly match `frame.task_id`. Returns
 /// [`DaemonCoreError::AuthorityJsonLimitExceeded`] if the encoded frame
 /// exceeds structural or line-size budgets. Returns [`DaemonCoreError::Io`]
 /// for capability, lock, append, durability, or unlock failures.
@@ -3173,7 +3292,7 @@ pub fn append_task_event_for(
     let writer_lease = acquire_task_store_writer_lease(root)?;
     let _registry_admission = acquire_registry_writer_admission(&writer_lease)?;
     let file_name = event_log_file_name(task_id);
-    with_registered_task_storage_id(root, task_id, || {
+    registry_delta::with_continuable_task_admission(root, task_id, &writer_lease, || {
         #[cfg(unix)]
         {
             let events = open_task_events_capability_for_write(root)?;
@@ -3613,7 +3732,7 @@ fn event_log_file_name(task_id: &TaskStorageId) -> String {
     format!("{}{TASK_EVENT_LOG_SUFFIX}", task_id.as_str())
 }
 
-fn require_registered_task_storage_id(
+pub(super) fn require_registered_task_storage_id(
     registry: &TaskRegistry,
     registry_path: &Path,
     task_id: &TaskStorageId,
@@ -3632,6 +3751,34 @@ fn require_registered_task_storage_id(
             task_id.as_str()
         ),
     })
+}
+
+/// Requires that `task` was not superseded by a linked history recovery.
+///
+/// A superseded record is a terminal, fenced identity: event appends and
+/// continuation requests must target its successor instead.
+///
+/// # Errors
+///
+/// Returns [`DaemonCoreError::TaskSuperseded`] naming the successor when
+/// `task.superseded_by` is present.
+///
+/// An archived record tombstone is equally terminal and returns
+/// [`DaemonCoreError::TaskArchived`].
+pub fn require_continuable_task(task: &TaskRecord) -> Result<()> {
+    if let Some(link) = &task.superseded_by {
+        return Err(DaemonCoreError::TaskSuperseded {
+            task_id: task.task_id.clone(),
+            successor_task_id: link.successor_task_id.clone(),
+        });
+    }
+    if let Some(archive) = &task.archived {
+        return Err(DaemonCoreError::TaskArchived {
+            task_id: task.task_id.clone(),
+            archive_file: archive.archive_file.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn with_registered_task_storage_id<T>(
@@ -4421,6 +4568,10 @@ impl<'a> AnchoredFileLock<'a> {
     }
 
     pub(crate) fn validate_attachment(&self) -> std::io::Result<()> {
+        self.validate_named_attachment(&self.name)
+    }
+
+    fn validate_named_attachment(&self, name: &OsStr) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
 
         let metadata = self.file.metadata()?;
@@ -4434,7 +4585,7 @@ impl<'a> AnchoredFileLock<'a> {
             ));
         }
         self.parent.authenticate_regular_file_with_link_count(
-            &self.name,
+            name,
             crate::retention::FileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
@@ -4453,6 +4604,20 @@ impl<'a> AnchoredFileLock<'a> {
 
     pub(crate) fn finish(mut self) -> std::result::Result<(), AnchoredFileLockFinishError> {
         let attachment = self.validate_attachment();
+        let unlock = FileExt::unlock(&self.file);
+        self.locked = false;
+        match (attachment, unlock) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(source), _) => Err(AnchoredFileLockFinishError::Attachment(source)),
+            (Ok(()), Err(source)) => Err(AnchoredFileLockFinishError::Unlock(source)),
+        }
+    }
+
+    pub(crate) fn finish_renamed(
+        mut self,
+        destination_name: &OsStr,
+    ) -> std::result::Result<(), AnchoredFileLockFinishError> {
+        let attachment = self.validate_named_attachment(destination_name);
         let unlock = FileExt::unlock(&self.file);
         self.locked = false;
         match (attachment, unlock) {
@@ -5367,6 +5532,122 @@ mod tests {
                 ..
             } if task_generation == generation
         ));
+    }
+
+    /// The pre-optimization composition: a full guarded task decode followed by
+    /// a second, independent guarded generation decode of the same bytes.
+    fn decode_task_registry_with_checkpoint_generation_reference(
+        path: &Path,
+        raw: &[u8],
+    ) -> Result<(TaskRegistry, Option<u64>)> {
+        let registry = decode_task_registry(path, raw)?;
+        let generation =
+            registry_checkpoint_generation(path, raw, AuthorityJsonProfile::TaskRegistry)?;
+        Ok((registry, generation))
+    }
+
+    fn assert_task_registry_generation_decode_parity(path: &Path, raw: &[u8]) {
+        let actual = decode_task_registry_with_checkpoint_generation(path, raw);
+        let expected = decode_task_registry_with_checkpoint_generation_reference(path, raw);
+        match (actual, expected) {
+            (Ok((actual, actual_generation)), Ok((expected, expected_generation))) => {
+                assert_eq!(actual_generation, expected_generation);
+                assert_eq!(
+                    serde_json::to_value(&actual).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+            }
+            (Err(actual), Err(expected)) => {
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                assert_eq!(actual.to_string(), expected.to_string());
+            }
+            (actual, expected) => panic!(
+                "decode parity diverged for {}: actual={:?}, expected={:?}",
+                String::from_utf8_lossy(raw),
+                actual.map(|(_, generation)| generation),
+                expected.map(|(_, generation)| generation)
+            ),
+        }
+    }
+
+    #[test]
+    fn shared_task_registry_generation_decode_matches_the_two_pass_decode() {
+        let root = tempdir().unwrap();
+        let path = task_registry_path(root.path());
+        let nested_depth = format!(
+            r#"{{"tasks":{{}},"extension":{}0{}}}"#,
+            "[".repeat(MAX_AUTHORITY_JSON_DEPTH + 1),
+            "]".repeat(MAX_AUTHORITY_JSON_DEPTH + 1)
+        );
+        let cases: Vec<&[u8]> = vec![
+            br#"{"tasks":{}}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":7}"#,
+            br#"{"tasks":{"a":{"task_id":"a","future_field":{"kept":[1,2]}}},"future_root":true,"task_watch_checkpoint_generation":18446744073709551615}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":-1}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":1.5}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":"7"}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":18446744073709551616}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":null}"#,
+            br#"{"task_watch_checkpoint_generation":"bad"}"#,
+            br#"{"tasks":[],"task_watch_checkpoint_generation":"bad"}"#,
+            br#"{"tasks":{"a":{"task_id":7}},"task_watch_checkpoint_generation":"bad"}"#,
+            br#"{"tasks":{"a":{"task_id":"b"}},"task_watch_checkpoint_generation":"bad"}"#,
+            br#"{"tasks":{},"task_watch_checkpoint_generation":1,"task_watch_checkpoint_generation":1}"#,
+            br#"{"tasks":{"a":{"task_id":"a","last_error":"x","last_error":"y"}}}"#,
+            br#"{"tasks":{}} trailing"#,
+            br#"{"tasks":{"a":{"task_id":"\ud800"}}}"#,
+            br#"[]"#,
+            br#"7"#,
+            b"",
+            nested_depth.as_bytes(),
+        ];
+        for raw in &cases {
+            assert_task_registry_generation_decode_parity(&path, raw);
+        }
+
+        // A replacement save validates the present authority through the same
+        // shared decode and must reject it with the two-pass decode's error.
+        let replacement = TaskRegistry::default();
+        for raw in &cases {
+            let Err(expected) =
+                decode_task_registry_with_checkpoint_generation_reference(&path, raw)
+            else {
+                continue;
+            };
+            let actual = encode_task_registry_preserving_existing(
+                root.path(),
+                &path,
+                &replacement,
+                Some(raw),
+                encode_task_registry(&path, &replacement).unwrap(),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
+
+        let tasks = TaskRegistry {
+            tasks: (0..5_000)
+                .map(|index| {
+                    let task_id = format!("seed-task-{index:04}");
+                    (
+                        task_id.clone(),
+                        TaskRecord {
+                            task_id,
+                            ..TaskRecord::default()
+                        },
+                    )
+                })
+                .collect(),
+        };
+        save_task_watch_registry_checkpoint(root.path(), &tasks, &WatchRegistry::default())
+            .unwrap();
+        let raw = fs::read(&path).unwrap();
+        assert_task_registry_generation_decode_parity(&path, &raw);
+        let (decoded, generation) =
+            decode_task_registry_with_checkpoint_generation(&path, &raw).unwrap();
+        assert_eq!(decoded.tasks.len(), 5_000);
+        assert!(generation.is_some());
     }
 
     #[test]
@@ -8483,6 +8764,40 @@ mod tests {
             load_task_registry(root.path()).unwrap().tasks["recovered"].lifecycle,
             TaskLifecycle::Idle
         );
+    }
+
+    #[test]
+    fn paired_checkpoint_does_not_resurrect_cleared_history_links() {
+        let root = tempdir().unwrap();
+        let link = packet28_daemon_protocol::task::TaskHistoryRecovery {
+            predecessor_task_id: "old".to_string(),
+            successor_task_id: "linked".to_string(),
+            ..Default::default()
+        };
+        let mut registry = TaskRegistry {
+            tasks: BTreeMap::from([(
+                "linked".to_string(),
+                TaskRecord {
+                    task_id: "linked".to_string(),
+                    superseded_by: Some(link.clone()),
+                    recovered_from: Some(link),
+                    ..TaskRecord::default()
+                },
+            )]),
+        };
+        save_task_watch_registry_checkpoint(root.path(), &registry, &WatchRegistry::default())
+            .unwrap();
+
+        let task = registry.tasks.get_mut("linked").unwrap();
+        task.superseded_by = None;
+        task.recovered_from = None;
+        save_task_watch_registry_checkpoint(root.path(), &registry, &WatchRegistry::default())
+            .unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(task_registry_path(root.path())).unwrap()).unwrap();
+        assert!(raw["tasks"]["linked"].get("superseded_by").is_none());
+        assert!(raw["tasks"]["linked"].get("recovered_from").is_none());
     }
 
     #[test]

@@ -15,6 +15,8 @@ use crate::runtime_integrations::{
     antigravity, claude, cline, copilot, cursor, gemini, hermes, kilocode, opencode, roo, windsurf,
 };
 
+#[path = "cmd_doctor_codex.rs"]
+mod doctor_codex;
 #[path = "cmd_doctor_mcp.rs"]
 mod doctor_mcp;
 use doctor_mcp::check_mcp_round_trip;
@@ -107,9 +109,17 @@ fn build_report(root: &Path, agent: Option<&str>) -> DoctorReport {
     }
     let daemon = check_daemon(root);
     let index = check_index(root);
-    let mcp_config = collect_mcp_config_checks(root);
+    let mcp_config = if matches!(agent, Some("codex")) {
+        vec![doctor_codex::mcp_config(root, &dirs_home())]
+    } else {
+        collect_mcp_config_checks(root)
+    };
     let mcp_config_summary = summarize_mcp_config(root, &mcp_config);
-    let mcp_round_trip = check_mcp_round_trip(root);
+    let mcp_round_trip = if matches!(agent, Some("codex")) {
+        doctor_mcp::check_mcp_round_trip_for_runtime(root, "codex")
+    } else {
+        check_mcp_round_trip(root)
+    };
     let experiment_manifest = check_experiment_manifest(root);
     let mut checks = vec![
         daemon.clone(),
@@ -124,6 +134,14 @@ fn build_report(root: &Path, agent: Option<&str>) -> DoctorReport {
     if matches!(agent, Some("claude")) {
         checks.insert(2, check_claude_hook_config(root));
         checks.insert(3, check_claude_hook_service(root));
+    }
+    if matches!(agent, Some("codex")) {
+        checks.extend(doctor_codex::hook_checks(root));
+        checks.push(check_instruction_file(
+            "codex",
+            "Codex",
+            &crate::runtime_integrations::codex::prompt_path(root),
+        ));
     }
     let ok = checks
         .iter()
@@ -398,7 +416,7 @@ fn build_copilot_report(root: &Path) -> DoctorReport {
         detail: "GitHub Copilot uses a project PreToolUse hook, not Packet28 MCP setup".to_string(),
     };
     let reducer_round_trip = DoctorCheck {
-        name: "runtime_rewrite_support",
+        name: "runtime_capture_support",
         ok: hook_config.ok,
         required: true,
         detail: hook_config.detail.clone(),
@@ -707,7 +725,7 @@ fn build_gemini_report(root: &Path) -> DoctorReport {
         detail: "Gemini CLI uses a BeforeTool hook, not Packet28 MCP setup".to_string(),
     };
     let reducer_round_trip = DoctorCheck {
-        name: "runtime_rewrite_support",
+        name: "runtime_capture_support",
         ok: hook_config.ok,
         required: true,
         detail: hook_config.detail.clone(),
@@ -825,7 +843,7 @@ fn build_opencode_report(root: &Path) -> DoctorReport {
         detail: "OpenCode uses a local TypeScript plugin, not Packet28 MCP setup".to_string(),
     };
     let reducer_round_trip = DoctorCheck {
-        name: "runtime_rewrite_support",
+        name: "runtime_command_preservation",
         ok: plugin.ok,
         required: true,
         detail: plugin.detail.clone(),
@@ -875,13 +893,15 @@ fn check_opencode_plugin() -> DoctorCheck {
     let result = (|| -> Result<String> {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
-        if !content.contains("Packet28 rewrite") || !content.contains("tool.execute.before") {
+        if !content.contains("Packet28 preserves native command arguments")
+            || !content.contains("tool.execute.before")
+        {
             return Err(anyhow!(
-                "Packet28 OpenCode rewrite plugin is not configured"
+                "Packet28 OpenCode command-preserving plugin is not configured"
             ));
         }
         Ok(format!(
-            "OpenCode rewrite plugin configured at {}",
+            "OpenCode command-preserving plugin configured at {}",
             path.display()
         ))
     })();
@@ -924,7 +944,7 @@ fn build_hermes_report(root: &Path) -> DoctorReport {
         detail: "Hermes uses a local Python plugin, not Packet28 MCP setup".to_string(),
     };
     let reducer_round_trip = DoctorCheck {
-        name: "runtime_rewrite_support",
+        name: "runtime_command_preservation",
         ok: plugin.ok,
         required: true,
         detail: plugin.detail.clone(),
@@ -986,7 +1006,9 @@ fn check_hermes_plugin_at(home: &Path) -> DoctorCheck {
             .with_context(|| format!("failed to read '{}'", manifest_path.display()))?;
         let config = fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read '{}'", config_path.display()))?;
-        if !init.contains("Packet28 rewrite") || !manifest.contains("packet28-rewrite") {
+        if !init.contains("Packet28 preserves native command arguments")
+            || !manifest.contains("packet28-rewrite")
+        {
             return Err(anyhow!("Packet28 Hermes plugin files are not configured"));
         }
         let enabled = crate::cmd_setup::setup_plugins::hermes_config_enables_packet28(&config)
@@ -995,7 +1017,7 @@ fn check_hermes_plugin_at(home: &Path) -> DoctorCheck {
             return Err(anyhow!("Hermes config does not enable packet28-rewrite"));
         }
         Ok(format!(
-            "Hermes rewrite plugin configured at {}",
+            "Hermes command-preserving plugin configured at {}",
             plugin_dir.display()
         ))
     })();
@@ -1258,9 +1280,11 @@ fn check_windsurf_rules(root: &Path) -> DoctorCheck {
     let result = (|| -> Result<String> {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
-        if !content.contains("Windsurf command rewrite is not guaranteed") {
+        if !content.contains("Windsurf hooks preserve native commands and permissions")
+            || !content.contains("use explicit Packet28 CLI/MCP tools for reduced output")
+        {
             return Err(anyhow!(
-                "rules do not state Windsurf command rewrite limitations"
+                "rules do not state native command preservation and explicit reduction guidance"
             ));
         }
         Ok(format!("rules present at {}", path.display()))
@@ -1397,11 +1421,37 @@ mod tests {
     fn write_hermes_fixture(home: &Path, config: &str) {
         let plugin_dir = hermes::plugin_dir(home);
         fs::create_dir_all(&plugin_dir).unwrap();
-        fs::write(plugin_dir.join("__init__.py"), "# Packet28 rewrite\n").unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            "# Packet28 preserves native command arguments\n",
+        )
+        .unwrap();
         fs::write(plugin_dir.join("plugin.yaml"), "name: packet28-rewrite\n").unwrap();
         let config_path = hermes::config_path(home);
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(config_path, config).unwrap();
+    }
+
+    #[test]
+    fn windsurf_rules_accept_generated_capture_only_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        let path = windsurf::rule_path(root.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let guidance = crate::agent_surface::render_prompt_fragment(
+            crate::agent_surface::AgentPromptFormat::WindsurfRule,
+            None,
+        );
+        fs::write(path, guidance).unwrap();
+        assert!(check_windsurf_rules(root.path()).ok);
+    }
+
+    #[test]
+    fn windsurf_rules_reject_legacy_rewrite_only_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        let path = windsurf::rule_path(root.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "Windsurf command rewrite is not guaranteed\n").unwrap();
+        assert!(!check_windsurf_rules(root.path()).ok);
     }
 
     #[test]

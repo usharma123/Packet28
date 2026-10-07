@@ -189,6 +189,8 @@ pub struct HookIngestResponse {
 #[serde(default)]
 pub struct HookRuntimeConfig {
     pub hooks_enabled: bool,
+    /// Legacy setting retained for config compatibility. Host hooks never
+    /// rewrite commands; use explicit Packet28 CLI/MCP reduction instead.
     pub rewrite_enabled: bool,
     pub fallback_post_tool_capture: bool,
     /// Loopback TCP port for the long-lived Claude HTTP hook server.
@@ -322,7 +324,7 @@ impl Default for HookRuntimeConfig {
     fn default() -> Self {
         Self {
             hooks_enabled: true,
-            rewrite_enabled: true,
+            rewrite_enabled: false,
             fallback_post_tool_capture: true,
             http_hook_port: None,
             http_hook_token: None,

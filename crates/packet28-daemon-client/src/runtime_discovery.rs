@@ -46,6 +46,17 @@ pub enum RuntimeDiscoveryError {
         /// Expected runtime metadata path.
         path: PathBuf,
     },
+    /// The authenticated runtime leaf was unlinked while it was being read.
+    ///
+    /// Bytes read from the detached leaf are discarded, never decoded. A
+    /// caller already waiting for a daemon to release workspace authority may
+    /// treat this as metadata withdrawn by a stopping owner; it is not
+    /// published metadata.
+    #[error("daemon runtime metadata was withdrawn during discovery: `{path}`")]
+    Withdrawn {
+        /// Authenticated runtime metadata path.
+        path: PathBuf,
+    },
 }
 
 impl RuntimeDiscoveryError {
@@ -68,6 +79,17 @@ struct RuntimeRead {
     mode: libc::mode_t,
 }
 
+/// Outcome of reading the runtime leaf through the platform layer.
+enum RuntimeLeaf {
+    /// No real runtime state entry exists.
+    Absent,
+    /// An authenticated leaf was unlinked during the read.
+    #[cfg(unix)]
+    Withdrawn,
+    /// Authenticated bytes of the attached leaf.
+    Read(RuntimeRead),
+}
+
 /// Loads authenticated daemon runtime metadata when real state entries exist.
 ///
 /// On Unix, the workspace, `.packet28`, `daemon`, and `runtime.json` entries
@@ -82,20 +104,30 @@ struct RuntimeRead {
 ///
 /// Returns [`RuntimeDiscoveryError::Io`] when the workspace or runtime state
 /// cannot be authenticated, or [`RuntimeDiscoveryError::Json`] when
-/// authenticated bytes are not valid [`DaemonRuntimeInfo`].
+/// authenticated bytes are not valid [`DaemonRuntimeInfo`]. Returns
+/// [`RuntimeDiscoveryError::Withdrawn`] when the authenticated runtime leaf
+/// was unlinked during the read, without decoding the detached bytes.
 pub fn read_runtime_info_if_present(
     root: &Path,
 ) -> Result<Option<DaemonRuntimeInfo>, RuntimeDiscoveryError> {
-    let path = runtime_path(root);
-    let Some(read) = platform::read_runtime(root).map_err(|source| {
+    decode_runtime(runtime_path(root), platform::read_runtime(root))
+}
+
+fn decode_runtime(
+    path: PathBuf,
+    leaf: io::Result<RuntimeLeaf>,
+) -> Result<Option<DaemonRuntimeInfo>, RuntimeDiscoveryError> {
+    let read = match leaf.map_err(|source| {
         RuntimeDiscoveryError::io(
             "failed to read authenticated daemon runtime metadata",
             &path,
             source,
         )
-    })?
-    else {
-        return Ok(None);
+    })? {
+        RuntimeLeaf::Absent => return Ok(None),
+        #[cfg(unix)]
+        RuntimeLeaf::Withdrawn => return Err(RuntimeDiscoveryError::Withdrawn { path }),
+        RuntimeLeaf::Read(read) => read,
     };
 
     let runtime = serde_json::from_slice::<DaemonRuntimeInfo>(&read.bytes).map_err(|source| {
@@ -147,7 +179,7 @@ mod platform {
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::{Component, Path, PathBuf};
 
-    use super::{io, RuntimeRead, MAX_DAEMON_RUNTIME_INFO_BYTES};
+    use super::{io, RuntimeLeaf, RuntimeRead, MAX_DAEMON_RUNTIME_INFO_BYTES};
 
     const STATE_DIRECTORY_NAME: &str = ".packet28";
     const DAEMON_DIRECTORY_NAME: &str = "daemon";
@@ -169,32 +201,90 @@ mod platform {
         path: PathBuf,
     }
 
-    pub(super) fn read_runtime(root: &Path) -> io::Result<Option<RuntimeRead>> {
-        read_runtime_with_after_authenticated_read(root, |_| Ok(()))
+    /// Guarded steps of the runtime leaf read, in order.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum LeafPhase {
+        /// Before the preflight name lookup.
+        Preflight,
+        /// After preflight validation, before the no-follow open.
+        Open,
+        /// After the open, before the descriptor is validated.
+        OpenedValidation,
+        /// After the bounded read, before the descriptor is revalidated.
+        FinalValidation,
+        /// After the final descriptor validation, before the name is
+        /// revalidated in the retained daemon directory.
+        AttachedValidation,
+    }
+
+    /// Link state of a runtime inode that passed every static check.
+    enum RuntimeLinks {
+        Attached,
+        Detached,
+    }
+
+    /// Name lookups of the runtime leaf in the retained daemon directory.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum NameLookup {
+        /// Preflight lookup before the open.
+        Preflight,
+        /// Final lookup proving the read leaf is still attached.
+        Attached,
+        /// Lookup proving a zero-linked descriptor's name was withdrawn.
+        Withdrawal,
+    }
+
+    /// Observation points around the runtime leaf read.
+    ///
+    /// Production uses [`Unobserved`]. Tests change the leaf between steps
+    /// and model kernel unlink windows, in which a name still resolves to a
+    /// zero-linked inode, that userspace cannot hold open.
+    pub(super) trait LeafSeam {
+        /// Runs before each guarded step.
+        fn before(&mut self, phase: LeafPhase, path: &Path) -> io::Result<()>;
+        /// Observes the result of a name lookup.
+        fn looked_up(&mut self, lookup: NameLookup, stat: &mut Option<libc::stat>);
+    }
+
+    struct Unobserved;
+
+    impl LeafSeam for Unobserved {
+        fn before(&mut self, _phase: LeafPhase, _path: &Path) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn looked_up(&mut self, _lookup: NameLookup, _stat: &mut Option<libc::stat>) {}
+    }
+
+    /// Validated state of the opened runtime descriptor.
+    enum Descriptor {
+        Attached(libc::stat),
+        Withdrawn,
+    }
+
+    pub(super) fn read_runtime(root: &Path) -> io::Result<RuntimeLeaf> {
+        read_runtime_with_seam(root, &mut Unobserved)
     }
 
     #[cfg(test)]
-    pub(super) fn read_runtime_after_authenticated_read_for_test(
+    pub(super) fn read_runtime_with_seam_for_test(
         root: &Path,
-        after_authenticated_read: impl FnOnce(&Path) -> io::Result<()>,
-    ) -> io::Result<Option<RuntimeRead>> {
-        read_runtime_with_after_authenticated_read(root, after_authenticated_read)
+        seam: &mut impl LeafSeam,
+    ) -> io::Result<RuntimeLeaf> {
+        read_runtime_with_seam(root, seam)
     }
 
-    fn read_runtime_with_after_authenticated_read(
-        root: &Path,
-        after_authenticated_read: impl FnOnce(&Path) -> io::Result<()>,
-    ) -> io::Result<Option<RuntimeRead>> {
+    fn read_runtime_with_seam(root: &Path, seam: &mut impl LeafSeam) -> io::Result<RuntimeLeaf> {
         let workspace = open_authenticated_workspace(root)?;
         let Some(state) = open_authenticated_child_directory(&workspace, STATE_DIRECTORY_NAME)?
         else {
-            return Ok(None);
+            return Ok(RuntimeLeaf::Absent);
         };
         let Some(daemon) = open_authenticated_child_directory(&state, DAEMON_DIRECTORY_NAME)?
         else {
-            return Ok(None);
+            return Ok(RuntimeLeaf::Absent);
         };
-        read_authenticated_runtime_file(&daemon, after_authenticated_read)
+        read_authenticated_runtime_file(&daemon, seam)
     }
 
     fn open_authenticated_workspace(root: &Path) -> io::Result<RetainedDirectory> {
@@ -364,8 +454,8 @@ mod platform {
 
     fn read_authenticated_runtime_file(
         daemon: &RetainedDirectory,
-        after_authenticated_read: impl FnOnce(&Path) -> io::Result<()>,
-    ) -> io::Result<Option<RuntimeRead>> {
+        seam: &mut impl LeafSeam,
+    ) -> io::Result<RuntimeLeaf> {
         let name = CString::new(RUNTIME_FILE_NAME).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -373,26 +463,38 @@ mod platform {
             )
         })?;
         let path = daemon.path.join(RUNTIME_FILE_NAME);
-        let Some(preflight) = fstatat_nofollow_if_present(daemon.fd.as_raw_fd(), &name)? else {
-            return Ok(None);
+        seam.before(LeafPhase::Preflight, &path)?;
+        let Some(preflight) = lookup_leaf(seam, daemon, &name, NameLookup::Preflight)? else {
+            return Ok(RuntimeLeaf::Absent);
         };
-        validate_runtime_file(&preflight, daemon.identity.device, &path)?;
+        // A name can still resolve to an inode whose unlink is in progress.
+        // Such a preflight must pass every static check, and the descriptor
+        // checks below decide whether it was withdrawn.
+        validate_runtime_inode(&preflight, daemon.identity.device, &path)?;
         require_bounded_size(&preflight, &path)?;
         let expected = identity(&preflight);
 
+        seam.before(LeafPhase::Open, &path)?;
         // SAFETY: `name` is live and NUL-terminated, `daemon` retains a valid
         // directory descriptor, the flags request no creation operation (and
         // therefore require no variadic mode argument), and the returned fd is
-        // immediately owned.
+        // checked before ownership is transferred to `OwnedFd`.
         let raw_fd = unsafe { libc::openat(daemon.fd.as_raw_fd(), name.as_ptr(), FILE_OPEN_FLAGS) };
-        let fd = owned_fd(raw_fd)?;
-        let opened = fstat(fd.as_raw_fd())?;
-        validate_runtime_file(&opened, daemon.identity.device, &path)?;
-        require_bounded_size(&opened, &path)?;
-        if identity(&opened) != expected {
-            return Err(identity_changed(&path));
+        if raw_fd < 0 {
+            let source = io::Error::last_os_error();
+            // The no-follow lookup in the retained daemon directory proves the
+            // preflight-authenticated leaf was unlinked; nothing was opened.
+            if source.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(RuntimeLeaf::Withdrawn);
+            }
+            return Err(source);
         }
-        require_empty_acl(&fd, &path, "daemon runtime metadata")?;
+        let fd = owned_fd(raw_fd)?;
+        seam.before(LeafPhase::OpenedValidation, &path)?;
+        let opened = match validate_runtime_descriptor(seam, &fd, daemon, &name, &path, expected)? {
+            Descriptor::Attached(stat) => stat,
+            Descriptor::Withdrawn => return Ok(RuntimeLeaf::Withdrawn),
+        };
 
         let initial_capacity = usize::try_from(opened.st_size).map_err(|_| {
             io::Error::new(
@@ -426,24 +528,78 @@ mod platform {
         }
 
         let fd = reader.into_inner();
-        let after = fstat(fd.as_raw_fd())?;
-        validate_runtime_file(&after, daemon.identity.device, &path)?;
-        require_bounded_size(&after, &path)?;
-        if identity(&after) != expected {
-            return Err(identity_changed(&path));
+        seam.before(LeafPhase::FinalValidation, &path)?;
+        let after = match validate_runtime_descriptor(seam, &fd, daemon, &name, &path, expected)? {
+            Descriptor::Attached(stat) => stat,
+            Descriptor::Withdrawn => return Ok(RuntimeLeaf::Withdrawn),
+        };
+        seam.before(LeafPhase::AttachedValidation, &path)?;
+        if let Some(attached) = lookup_leaf(seam, daemon, &name, NameLookup::Attached)? {
+            let links = validate_runtime_inode(&attached, daemon.identity.device, &path)?;
+            require_bounded_size(&attached, &path)?;
+            if identity(&attached) != expected {
+                return Err(identity_changed(&path));
+            }
+            if let RuntimeLinks::Attached = links {
+                return Ok(RuntimeLeaf::Read(RuntimeRead {
+                    bytes,
+                    mode: after.st_mode & 0o777,
+                }));
+            }
         }
-        require_empty_acl(&fd, &path, "daemon runtime metadata")?;
-        after_authenticated_read(&path)?;
-        let attached = fstatat_nofollow(daemon.fd.as_raw_fd(), &name)?;
-        validate_runtime_file(&attached, daemon.identity.device, &path)?;
-        if identity(&attached) != expected {
-            return Err(identity_changed(&path));
+        // The name is gone or resolves to the inode whose unlink is in
+        // progress. Only an inode unlinked everywhere was withdrawn; one moved
+        // to another name still fails closed.
+        match validate_runtime_descriptor(seam, &fd, daemon, &name, &path, expected)? {
+            Descriptor::Withdrawn => Ok(RuntimeLeaf::Withdrawn),
+            Descriptor::Attached(_) => Err(entry_disappeared()),
         }
+    }
 
-        Ok(Some(RuntimeRead {
-            bytes,
-            mode: after.st_mode & 0o777,
-        }))
+    fn lookup_leaf(
+        seam: &mut impl LeafSeam,
+        daemon: &RetainedDirectory,
+        name: &CString,
+        lookup: NameLookup,
+    ) -> io::Result<Option<libc::stat>> {
+        let mut stat = fstatat_nofollow_if_present(daemon.fd.as_raw_fd(), name)?;
+        seam.looked_up(lookup, &mut stat);
+        Ok(stat)
+    }
+
+    /// Validates the opened runtime inode against its preflight identity.
+    ///
+    /// An inode with no remaining links is withdrawn only after it passes
+    /// every static check and the retained daemon directory proves the name
+    /// absent or still resolving to that same zero-linked inode, so unsafe
+    /// metadata or a replacement still fails closed.
+    fn validate_runtime_descriptor(
+        seam: &mut impl LeafSeam,
+        fd: &impl AsRawFd,
+        daemon: &RetainedDirectory,
+        name: &CString,
+        path: &Path,
+        expected: FileIdentity,
+    ) -> io::Result<Descriptor> {
+        let stat = fstat(fd.as_raw_fd())?;
+        let links = validate_runtime_inode(&stat, daemon.identity.device, path)?;
+        require_bounded_size(&stat, path)?;
+        if identity(&stat) != expected {
+            return Err(identity_changed(path));
+        }
+        require_empty_acl(fd, path, "daemon runtime metadata")?;
+        match links {
+            RuntimeLinks::Attached => Ok(Descriptor::Attached(stat)),
+            RuntimeLinks::Detached => {
+                match lookup_leaf(seam, daemon, name, NameLookup::Withdrawal)? {
+                    None => Ok(Descriptor::Withdrawn),
+                    Some(named) if identity(&named) == expected && named.st_nlink == 0 => {
+                        Ok(Descriptor::Withdrawn)
+                    }
+                    Some(_) => Err(identity_changed(path)),
+                }
+            }
+        }
     }
 
     fn validate_state_directory(
@@ -455,11 +611,12 @@ mod platform {
         require_no_non_owner_write(stat, path, "runtime state directory")
     }
 
-    fn validate_runtime_file(
+    /// Checks a runtime inode, classifying its link count last.
+    fn validate_runtime_inode(
         stat: &libc::stat,
         expected_device: libc::dev_t,
         path: &Path,
-    ) -> io::Result<()> {
+    ) -> io::Result<RuntimeLinks> {
         if file_kind(stat) != libc::S_IFREG {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -489,16 +646,6 @@ mod platform {
                 ),
             ));
         }
-        if stat.st_nlink != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "daemon runtime metadata has {} links; expected exactly one: {}",
-                    stat.st_nlink,
-                    path.display()
-                ),
-            ));
-        }
         let mode = stat.st_mode & 0o777;
         if (mode & 0o400) == 0 || (mode & 0o022) != 0 {
             return Err(io::Error::new(
@@ -510,7 +657,22 @@ mod platform {
                 ),
             ));
         }
-        Ok(())
+        match stat.st_nlink {
+            1 => Ok(RuntimeLinks::Attached),
+            0 => Ok(RuntimeLinks::Detached),
+            _ => Err(unexpected_link_count(stat, path)),
+        }
+    }
+
+    fn unexpected_link_count(stat: &libc::stat, path: &Path) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "daemon runtime metadata has {} links; expected exactly one: {}",
+                stat.st_nlink,
+                path.display()
+            ),
+        )
     }
 
     fn require_bounded_size(stat: &libc::stat, path: &Path) -> io::Result<()> {
@@ -682,12 +844,14 @@ mod platform {
     }
 
     fn fstatat_nofollow(parent: RawFd, name: &CString) -> io::Result<libc::stat> {
-        fstatat_nofollow_if_present(parent, name)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "authenticated runtime entry disappeared during discovery",
-            )
-        })
+        fstatat_nofollow_if_present(parent, name)?.ok_or_else(entry_disappeared)
+    }
+
+    fn entry_disappeared() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authenticated runtime entry disappeared during discovery",
+        )
     }
 
     fn openat_directory(parent: RawFd, name: &OsStr) -> io::Result<OwnedFd> {
@@ -1005,11 +1169,13 @@ mod platform {
 
     use super::*;
 
-    pub(super) fn read_runtime(root: &Path) -> io::Result<Option<RuntimeRead>> {
+    pub(super) fn read_runtime(root: &Path) -> io::Result<RuntimeLeaf> {
         let path = runtime_path(root);
         let preflight = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(RuntimeLeaf::Absent)
+            }
             Err(source) => return Err(source),
         };
         if !preflight.is_file() {
@@ -1057,7 +1223,7 @@ mod platform {
                 ),
             ));
         }
-        Ok(Some(RuntimeRead { bytes }))
+        Ok(RuntimeLeaf::Read(RuntimeRead { bytes }))
     }
 }
 
@@ -1081,6 +1247,7 @@ mod tests {
         use super::*;
         use packet28_daemon_protocol::message::DaemonTransportAuth;
         use packet28_daemon_protocol::paths::daemon_dir;
+        use platform::{LeafPhase, NameLookup};
 
         #[test]
         fn missing_real_state_directory_returns_none() {
@@ -1370,12 +1537,12 @@ mod tests {
             fs::write(&replacement_path, &bytes_before).unwrap();
             fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o644)).unwrap();
 
-            let error = platform::read_runtime_after_authenticated_read_for_test(
+            let error = platform::read_runtime_with_seam_for_test(
                 root.path(),
-                |runtime_path| {
-                    fs::rename(runtime_path, &authenticated_path)?;
-                    fs::rename(&replacement_path, runtime_path)
-                },
+                &mut TestSeam::changing_at(LeafPhase::AttachedValidation, |runtime_path| {
+                    fs::rename(runtime_path, &authenticated_path).unwrap();
+                    fs::rename(&replacement_path, runtime_path).unwrap();
+                }),
             )
             .err()
             .expect("runtime identity replacement unexpectedly authenticated");
@@ -1385,6 +1552,447 @@ mod tests {
                 .to_string()
                 .contains("changed identity during discovery"));
             assert_eq!(fs::read(authenticated_path).unwrap(), bytes_before);
+        }
+
+        const DESCRIPTOR_PHASES: [LeafPhase; 3] = [
+            LeafPhase::OpenedValidation,
+            LeafPhase::FinalValidation,
+            LeafPhase::AttachedValidation,
+        ];
+        /// Phases after the preflight lookup authenticated the leaf.
+        const AUTHENTICATED_PHASES: [LeafPhase; 4] = [
+            LeafPhase::Open,
+            LeafPhase::OpenedValidation,
+            LeafPhase::FinalValidation,
+            LeafPhase::AttachedValidation,
+        ];
+        const LEAF_PHASES: [LeafPhase; 5] = [
+            LeafPhase::Preflight,
+            LeafPhase::Open,
+            LeafPhase::OpenedValidation,
+            LeafPhase::FinalValidation,
+            LeafPhase::AttachedValidation,
+        ];
+
+        /// Changes the leaf once when the read reaches `phase`, and lets a
+        /// test rewrite name lookups to model kernel unlink windows.
+        struct TestSeam<C, L> {
+            phase: LeafPhase,
+            change: Option<C>,
+            looked_up: L,
+            preflight: Option<libc::stat>,
+        }
+
+        impl<C: FnOnce(&Path)> TestSeam<C, fn(NameLookup, &mut Option<libc::stat>, Option<libc::stat>)> {
+            fn changing_at(phase: LeafPhase, change: C) -> Self {
+                TestSeam {
+                    phase,
+                    change: Some(change),
+                    looked_up: |_, _, _| {},
+                    preflight: None,
+                }
+            }
+        }
+
+        impl<C, L> platform::LeafSeam for TestSeam<C, L>
+        where
+            C: FnOnce(&Path),
+            L: FnMut(NameLookup, &mut Option<libc::stat>, Option<libc::stat>),
+        {
+            fn before(&mut self, phase: LeafPhase, path: &Path) -> io::Result<()> {
+                if phase == self.phase {
+                    if let Some(change) = self.change.take() {
+                        change(path);
+                    }
+                }
+                Ok(())
+            }
+
+            fn looked_up(&mut self, lookup: NameLookup, stat: &mut Option<libc::stat>) {
+                if self.preflight.is_none() {
+                    self.preflight = *stat;
+                }
+                (self.looked_up)(lookup, stat, self.preflight);
+            }
+        }
+
+        fn discover_with<C, L>(
+            root: &Path,
+            seam: &mut TestSeam<C, L>,
+        ) -> Result<Option<DaemonRuntimeInfo>, RuntimeDiscoveryError>
+        where
+            C: FnOnce(&Path),
+            L: FnMut(NameLookup, &mut Option<libc::stat>, Option<libc::stat>),
+        {
+            let leaf = platform::read_runtime_with_seam_for_test(root, seam);
+            decode_runtime(runtime_path(root), leaf)
+        }
+
+        /// Reads runtime metadata, changing the leaf once when the read
+        /// reaches `phase`.
+        fn discover_changing_leaf_at(
+            root: &Path,
+            phase: LeafPhase,
+            change: impl FnOnce(&Path),
+        ) -> Result<Option<DaemonRuntimeInfo>, RuntimeDiscoveryError> {
+            let mut seam = TestSeam::changing_at(phase, change);
+            let result = discover_with(root, &mut seam);
+            assert!(seam.change.is_none(), "read never reached {phase:?}");
+            result
+        }
+
+        fn zero_linked(mut stat: libc::stat) -> Option<libc::stat> {
+            stat.st_nlink = 0;
+            Some(stat)
+        }
+
+        fn assert_withdrawn(
+            root: &Path,
+            context: &str,
+            result: Result<Option<DaemonRuntimeInfo>, RuntimeDiscoveryError>,
+        ) {
+            match result {
+                Err(RuntimeDiscoveryError::Withdrawn { path }) => {
+                    assert_eq!(path, runtime_path(root), "{context}");
+                }
+                other => panic!("{context}: expected withdrawal, got {other:?}"),
+            }
+        }
+
+        fn io_error_at(
+            phase: LeafPhase,
+            result: Result<Option<DaemonRuntimeInfo>, RuntimeDiscoveryError>,
+        ) -> io::Error {
+            match result {
+                Err(RuntimeDiscoveryError::Io { source, .. }) => source,
+                other => panic!("{phase:?}: expected an authentication error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn runtime_unlinked_at_each_leaf_phase_is_withdrawn_without_decoding() {
+            for phase in LEAF_PHASES {
+                let root = TempDir::new().unwrap();
+                create_state_directories(root.path());
+                // Malformed bytes would fail decoding if they were ever used.
+                fs::write(runtime_path(root.path()), b"{").unwrap();
+                fs::set_permissions(runtime_path(root.path()), fs::Permissions::from_mode(0o644))
+                    .unwrap();
+
+                let result = discover_changing_leaf_at(root.path(), phase, |path| {
+                    fs::remove_file(path).unwrap();
+                });
+
+                if phase == LeafPhase::Preflight {
+                    // Unlinked before the lookup: genuinely absent.
+                    assert!(result.unwrap().is_none());
+                } else {
+                    assert_withdrawn(root.path(), &format!("{phase:?}"), result);
+                }
+                assert!(read_runtime_info_if_present(root.path()).unwrap().is_none());
+            }
+        }
+
+        /// Models the Linux unlink window: the inode's link count is already
+        /// zero while lookups through the retained directory still resolve
+        /// the name to it, at every lookup the read performs.
+        #[test]
+        fn zero_linked_name_during_unlink_is_withdrawn_at_each_window() {
+            // Windows 1, 3, 4, and 5: the unlink completes before the descriptor
+            // checks, but each lookup still reports the zero-linked inode.
+            for phase in DESCRIPTOR_PHASES {
+                let root = TempDir::new().unwrap();
+                create_state_directories(root.path());
+                fs::write(runtime_path(root.path()), b"{").unwrap();
+                fs::set_permissions(runtime_path(root.path()), fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                let mut unlinked = false;
+                let mut seam = TestSeam {
+                    phase,
+                    change: Some(|path: &Path| fs::remove_file(path).unwrap()),
+                    looked_up: |lookup: NameLookup,
+                                stat: &mut Option<libc::stat>,
+                                preflight: Option<libc::stat>| {
+                        if lookup == NameLookup::Preflight {
+                            *stat = zero_linked(preflight.unwrap());
+                        } else if stat.is_none() {
+                            unlinked = true;
+                            *stat = zero_linked(preflight.unwrap());
+                        }
+                    },
+                    preflight: None,
+                };
+
+                let result = discover_with(root.path(), &mut seam);
+
+                assert_withdrawn(root.path(), &format!("{phase:?}"), result);
+                assert!(unlinked, "{phase:?}: no lookup observed the unlinked name");
+            }
+
+            // Window 1 then 2: a zero-linked preflight whose name is gone by
+            // the open.
+            let root = TempDir::new().unwrap();
+            write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+            let mut seam = TestSeam {
+                phase: LeafPhase::Open,
+                change: Some(|path: &Path| fs::remove_file(path).unwrap()),
+                looked_up: |lookup: NameLookup,
+                            stat: &mut Option<libc::stat>,
+                            preflight: Option<libc::stat>| {
+                    if lookup == NameLookup::Preflight {
+                        *stat = zero_linked(preflight.unwrap());
+                    }
+                },
+                preflight: None,
+            };
+            assert_withdrawn(
+                root.path(),
+                "zero-linked preflight",
+                discover_with(root.path(), &mut seam),
+            );
+        }
+
+        #[test]
+        fn zero_linked_name_still_requires_static_authentication() {
+            type Corrupt = fn(&mut libc::stat);
+            let cases: [(&str, Corrupt); 5] = [
+                ("mode 666 is not owner-readable", |stat| {
+                    stat.st_mode = libc::S_IFREG | 0o666;
+                }),
+                ("is not a regular file", |stat| {
+                    stat.st_mode = libc::S_IFIFO | 0o644;
+                }),
+                ("is owned by uid", |stat| {
+                    stat.st_uid = stat.st_uid.wrapping_add(1);
+                }),
+                ("is on a different filesystem", |stat| {
+                    stat.st_dev = stat.st_dev.wrapping_add(1);
+                }),
+                ("daemon runtime metadata exceeds", |stat| {
+                    stat.st_size = (MAX_DAEMON_RUNTIME_INFO_BYTES + 1) as libc::off_t;
+                }),
+            ];
+            for lookup_at in [NameLookup::Preflight, NameLookup::Attached] {
+                for (expected, corrupt) in cases {
+                    let root = TempDir::new().unwrap();
+                    write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+                    let mut seam = TestSeam {
+                        phase: LeafPhase::AttachedValidation,
+                        change: Some(|path: &Path| fs::remove_file(path).unwrap()),
+                        looked_up:
+                            |lookup: NameLookup,
+                             stat: &mut Option<libc::stat>,
+                             preflight: Option<libc::stat>| {
+                                if lookup == lookup_at {
+                                    let mut zero = zero_linked(preflight.unwrap());
+                                    corrupt(zero.as_mut().unwrap());
+                                    *stat = zero;
+                                }
+                            },
+                        preflight: None,
+                    };
+
+                    let error = io_error_at(
+                        LeafPhase::AttachedValidation,
+                        discover_with(root.path(), &mut seam),
+                    );
+
+                    assert!(
+                        error.to_string().contains(expected),
+                        "{lookup_at:?}: {error}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn zero_linked_replacement_during_unlink_is_not_withdrawn() {
+            for lookup_at in [NameLookup::Attached, NameLookup::Withdrawal] {
+                let root = TempDir::new().unwrap();
+                write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+                let mut seam = TestSeam {
+                    phase: LeafPhase::AttachedValidation,
+                    change: Some(|path: &Path| fs::remove_file(path).unwrap()),
+                    looked_up: |lookup: NameLookup,
+                                stat: &mut Option<libc::stat>,
+                                preflight: Option<libc::stat>| {
+                        if lookup == lookup_at {
+                            let mut other = zero_linked(preflight.unwrap());
+                            other.as_mut().unwrap().st_ino ^= 1;
+                            *stat = other;
+                        }
+                    },
+                    preflight: None,
+                };
+
+                let error = io_error_at(
+                    LeafPhase::AttachedValidation,
+                    discover_with(root.path(), &mut seam),
+                );
+
+                assert!(
+                    error
+                        .to_string()
+                        .contains("changed identity during discovery"),
+                    "{lookup_at:?}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn runtime_replaced_at_each_leaf_phase_is_not_withdrawn() {
+            for phase in AUTHENTICATED_PHASES {
+                let root = TempDir::new().unwrap();
+                write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+                let replacement = daemon_dir(root.path()).join("replacement-runtime.json");
+                fs::write(&replacement, fs::read(runtime_path(root.path())).unwrap()).unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o644)).unwrap();
+
+                let result = discover_changing_leaf_at(root.path(), phase, |path| {
+                    fs::rename(&replacement, path).unwrap();
+                });
+
+                let error = io_error_at(phase, result);
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{phase:?}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("changed identity during discovery"),
+                    "{phase:?}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn runtime_symlinked_at_each_leaf_phase_is_not_withdrawn() {
+            for phase in AUTHENTICATED_PHASES {
+                let root = TempDir::new().unwrap();
+                write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+                let target = root.path().join("symlink-target.json");
+                fs::write(&target, fs::read(runtime_path(root.path())).unwrap()).unwrap();
+
+                let result = discover_changing_leaf_at(root.path(), phase, |path| {
+                    fs::remove_file(path).unwrap();
+                    symlink(&target, path).unwrap();
+                });
+
+                let error = io_error_at(phase, result);
+                if phase == LeafPhase::Open {
+                    assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{error}");
+                } else if phase == LeafPhase::AttachedValidation {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("daemon runtime metadata is not a regular file"),
+                        "{phase:?}: {error}"
+                    );
+                } else {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("changed identity during discovery"),
+                        "{phase:?}: {error}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn runtime_hard_linked_at_each_leaf_phase_is_not_withdrawn() {
+            for phase in LEAF_PHASES {
+                let root = TempDir::new().unwrap();
+                write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+                let hard_link = root.path().join("runtime-hard-link.json");
+
+                let result = discover_changing_leaf_at(root.path(), phase, |path| {
+                    fs::hard_link(path, &hard_link).unwrap();
+                });
+
+                let error = io_error_at(phase, result);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("has 2 links; expected exactly one"),
+                    "{phase:?}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn runtime_moved_after_open_is_not_withdrawn() {
+            for phase in DESCRIPTOR_PHASES {
+                let root = TempDir::new().unwrap();
+                write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+                let moved = daemon_dir(root.path()).join("moved-runtime.json");
+
+                let result = discover_changing_leaf_at(root.path(), phase, |path| {
+                    fs::rename(path, &moved).unwrap();
+                });
+
+                let error = io_error_at(phase, result);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("authenticated runtime entry disappeared during discovery"),
+                    "{phase:?}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn unsafe_runtime_unlinked_after_open_is_not_withdrawn() {
+            for phase in DESCRIPTOR_PHASES {
+                let root = TempDir::new().unwrap();
+                write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+                let result = discover_changing_leaf_at(root.path(), phase, |path| {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o666)).unwrap();
+                    fs::remove_file(path).unwrap();
+                });
+                let error = io_error_at(phase, result);
+                assert!(
+                    error.to_string().contains("mode 666 is not owner-readable"),
+                    "{phase:?}: {error}"
+                );
+
+                let root = TempDir::new().unwrap();
+                write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+                let result = discover_changing_leaf_at(root.path(), phase, |path| {
+                    fs::write(path, vec![b' '; MAX_DAEMON_RUNTIME_INFO_BYTES + 1]).unwrap();
+                    fs::remove_file(path).unwrap();
+                });
+                let error = io_error_at(phase, result);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("daemon runtime metadata exceeds"),
+                    "{phase:?}: {error}"
+                );
+            }
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn runtime_with_acl_unlinked_after_open_is_not_withdrawn() {
+            for phase in DESCRIPTOR_PHASES {
+                let root = TempDir::new().unwrap();
+                write_runtime(root.path(), &DaemonRuntimeInfo::default(), 0o644);
+
+                let result = discover_changing_leaf_at(root.path(), phase, |path| {
+                    #[cfg(target_os = "linux")]
+                    set_linux_acl_xattr(&fs::File::open(path).unwrap(), LINUX_ACCESS_ACL, 0o644);
+                    #[cfg(target_os = "macos")]
+                    add_macos_acl(path, "everyone allow read");
+                    fs::remove_file(path).unwrap();
+                });
+
+                let error = io_error_at(phase, result);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("daemon runtime metadata has an extended ACL"),
+                    "{phase:?}: {error}"
+                );
+            }
         }
 
         #[test]

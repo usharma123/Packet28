@@ -226,6 +226,7 @@ fn manifest_json_contract_round_trips_every_public_field() {
         overlay_state_digest: Some("overlay-digest".to_string()),
         base_commit: Some("deadbeef".to_string()),
         workspace_clean_commit: Some("deadbeef".to_string()),
+        workspace_attested_commit: Some("deadbeef".to_string()),
         stale_reason: Some("fixture-stale".to_string()),
         last_build_started_at_unix: Some(101),
         last_build_completed_at_unix: Some(102),
@@ -249,6 +250,7 @@ fn manifest_json_contract_round_trips_every_public_field() {
             "overlay_state_digest": "overlay-digest",
             "base_commit": "deadbeef",
             "workspace_clean_commit": "deadbeef",
+            "workspace_attested_commit": "deadbeef",
             "stale_reason": "fixture-stale",
             "last_build_started_at_unix": 101,
             "last_build_completed_at_unix": 102,
@@ -514,24 +516,248 @@ fn full_rebuild_skips_non_utf8_paths_that_alias_utf8_index_keys() {
 }
 
 #[cfg(unix)]
+fn fixture_head(root: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("read fixture HEAD");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[cfg(unix)]
+fn fixed(query: &str) -> SearchRequest {
+    SearchRequest {
+        query: query.to_string(),
+        fixed_string: true,
+        ..SearchRequest::default()
+    }
+}
+
+#[cfg(unix)]
+fn write_stable_dirty_workspace(root: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn committed_original() {}\n").unwrap();
+    fs::write(root.join("src/removed.rs"), "pub fn removed_marker() {}\n").unwrap();
+    fs::write(root.join("src/moved.rs"), "pub fn moved_marker_body() {}\n").unwrap();
+    initialize_clean_git_fixture(root);
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn modified_file_attested_marker() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("NOTES.md"),
+        "new_file_attested_marker in user notes\n",
+    )
+    .unwrap();
+    fs::remove_file(root.join("src/removed.rs")).unwrap();
+    run_fixture_git(root, &["mv", "src/moved.rs", "src/renamed.rs"]);
+}
+
+#[cfg(unix)]
 #[test]
-fn full_rebuild_rejects_a_dirty_git_workspace_without_replacing_the_ready_generation() {
+fn full_rebuild_attests_a_stable_dirty_git_workspace_and_rejects_later_unreported_edits() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    write_stable_dirty_workspace(root);
+    let head = fixture_head(root);
+
+    let runtime = rebuild_full_index(root, true).expect("stable dirty workspace rebuild");
+
+    assert_eq!(runtime.manifest.base_commit.as_deref(), Some(head.as_str()));
+    assert_eq!(
+        runtime.manifest.workspace_attested_commit.as_deref(),
+        Some(head.as_str())
+    );
+    assert_eq!(
+        runtime.manifest.workspace_clean_commit, None,
+        "a dirty build must never be labeled clean"
+    );
+    for (query, expected) in [
+        ("modified_file_attested_marker", 1),
+        ("new_file_attested_marker", 1),
+        ("moved_marker_body", 1),
+        ("committed_original", 0),
+        ("removed_marker", 0),
+    ] {
+        let result = indexed_search(root, &runtime, &fixed(query)).unwrap();
+        assert_eq!(result.match_count, expected, "{query}");
+        if expected > 0 {
+            guarded_indexed_search(root, &runtime, &fixed(query)).unwrap();
+        }
+    }
+
+    let reloaded = load_runtime(root).unwrap();
+    assert!(reloaded.is_loaded(), "{:?}", reloaded.manifest.stale_reason);
+    assert_eq!(reloaded.manifest.generation, runtime.manifest.generation);
+    let result = load_and_guarded_indexed_search(root, &fixed("modified_file_attested_marker"))
+        .expect("reloaded dirty attestation");
+    assert_eq!(result.match_count, 1);
+
+    fs::write(root.join("src/lib.rs"), "pub fn unreported_edit() {}\n").unwrap();
+    assert!(matches!(
+        guarded_indexed_search(root, &runtime, &fixed("modified_file_attested_marker")),
+        Err(SearchError::IndexNotReady { .. })
+    ));
+    let stale = load_runtime(root).unwrap();
+    assert!(!stale.is_loaded(), "unreported edit reloaded as fresh");
+    assert_eq!(stale.manifest.status, "stale");
+    assert!(matches!(
+        update_overlay_index(root, Some(&runtime), &["NOTES.md".to_string()]),
+        Err(SearchError::IndexNotReady { .. })
+    ));
+
+    let updated = update_overlay_index(root, Some(&runtime), &["src/lib.rs".to_string()])
+        .expect("reported change on an attested generation");
+    assert_eq!(
+        updated.manifest.workspace_attested_commit.as_deref(),
+        Some(head.as_str())
+    );
+    assert_eq!(updated.manifest.workspace_clean_commit, None);
+    let result = guarded_indexed_search(root, &updated, &fixed("unreported_edit")).unwrap();
+    assert_eq!(result.match_count, 1);
+    assert!(load_runtime(root).unwrap().is_loaded());
+
+    run_fixture_git(root, &["add", "-A"]);
+    run_fixture_git(root, &["commit", "--quiet", "--no-gpg-sign", "-m", "move"]);
+    assert!(
+        !load_runtime(root).unwrap().is_loaded(),
+        "a HEAD change kept the dirty attestation"
+    );
+}
+
+#[cfg(unix)]
+type WorkspaceMutation = Box<dyn Fn(&Path)>;
+
+#[cfg(unix)]
+#[test]
+fn full_rebuild_rejects_a_dirty_workspace_that_changes_during_the_build_without_replacing_the_ready_generation(
+) {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    let source = root.join("src/lib.rs");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(&source, "pub fn original() {}\n").unwrap();
+    initialize_clean_git_fixture(root);
+    let ready = rebuild_full_index(root, true).unwrap();
+    assert_eq!(ready.manifest.workspace_attested_commit, None);
+    fs::write(&source, "pub fn dirty() {}\n").unwrap();
+
+    let mutations: [(&str, WorkspaceMutation); 4] = [
+        (
+            "dirty tracked edit",
+            Box::new(|root: &Path| fs::write(root.join("src/lib.rs"), "pub fn x() {}\n").unwrap()),
+        ),
+        (
+            "new untracked file",
+            Box::new(|root: &Path| fs::write(root.join("late.rs"), "pub fn late() {}\n").unwrap()),
+        ),
+        (
+            "dirty path reverted",
+            Box::new(|root: &Path| run_fixture_git(root, &["checkout", "--", "src/lib.rs"])),
+        ),
+        (
+            "HEAD change",
+            Box::new(|root: &Path| {
+                run_fixture_git(
+                    root,
+                    &[
+                        "commit",
+                        "--quiet",
+                        "--no-gpg-sign",
+                        "--allow-empty",
+                        "-m",
+                        "late",
+                    ],
+                )
+            }),
+        ),
+    ];
+    for (label, mutate) in mutations {
+        fs::write(&source, "pub fn dirty() {}\n").unwrap();
+        let _ = fs::remove_file(root.join("late.rs"));
+        let error = rebuild_full_index_with_progress(root, true, |completed, _| {
+            if completed == 0 {
+                mutate(root);
+            }
+        })
+        .expect_err(label);
+
+        assert!(
+            matches!(error, SearchError::IndexNotReady { .. }),
+            "{label}"
+        );
+        assert_eq!(
+            load_manifest_generation(root),
+            ready.manifest.generation,
+            "{label}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn load_manifest_generation(root: &Path) -> u64 {
+    let raw = fs::read(root.join(".packet28/index/regex-v1/manifest.json")).unwrap();
+    serde_json::from_slice::<RegexIndexManifest>(&raw)
+        .unwrap()
+        .generation
+}
+
+#[cfg(unix)]
+#[test]
+fn full_rebuild_rejects_dirty_workspace_aba_bytes() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    let source = root.join("src/lib.rs");
+    let dirty = "pub fn dirty_attested_bytes() {}\n";
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(&source, "pub fn committed() {}\n").unwrap();
+    initialize_clean_git_fixture(root);
+    fs::write(&source, dirty).unwrap();
+    let ready = rebuild_full_index(root, true).unwrap();
+
+    let error = rebuild_full_index_with_progress(root, true, |completed, total| {
+        if completed == 0 {
+            fs::write(&source, "pub fn transient_dirty_bytes() {}\n").unwrap();
+        } else if completed == total {
+            fs::write(&source, dirty).unwrap();
+        }
+    })
+    .expect_err("dirty-build ABA bytes unexpectedly published");
+
+    assert!(matches!(error, SearchError::IndexNotReady { .. }));
+    let retained = load_runtime(root).unwrap();
+    assert!(retained.is_loaded());
+    assert_eq!(retained.manifest.generation, ready.manifest.generation);
+}
+
+#[cfg(unix)]
+#[test]
+fn full_rebuild_keeps_git_index_flag_and_symlink_rejection_for_dirty_workspaces() {
     let directory = tempdir().unwrap();
     let root = directory.path();
     fs::create_dir_all(root.join("src")).unwrap();
-    fs::write(root.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn committed() {}\n").unwrap();
+    fs::write(root.join("AGENTS.md"), "committed instructions\n").unwrap();
     initialize_clean_git_fixture(root);
-    let ready = rebuild_full_index(root, true).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn dirty() {}\n").unwrap();
+    run_fixture_git(root, &["update-index", "--skip-worktree", "AGENTS.md"]);
+    fs::write(root.join("AGENTS.md"), "hidden instructions\n").unwrap();
 
-    let error = rebuild_full_index(root, true)
-        .expect_err("dirty workspace unexpectedly published a ready generation");
+    assert!(matches!(
+        rebuild_full_index(root, true),
+        Err(SearchError::IndexNotReady { .. })
+    ));
 
-    assert!(matches!(error, SearchError::IndexNotReady { .. }));
-    assert_eq!(
-        load_runtime(root).unwrap().manifest.generation,
-        ready.manifest.generation
-    );
+    run_fixture_git(root, &["update-index", "--no-skip-worktree", "AGENTS.md"]);
+    std::os::unix::fs::symlink("src/lib.rs", root.join("alias.rs")).unwrap();
+    assert!(matches!(
+        rebuild_full_index(root, true),
+        Err(SearchError::IndexNotReady { .. })
+    ));
 }
 
 #[cfg(unix)]

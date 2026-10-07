@@ -1,0 +1,412 @@
+{
+  "schema_version": 1,
+  "description": "Frozen raw command output, each replayed once through the real explicit `Packet28 <tool> ...` route behind a stub executable that must be invoked exactly once with the recorded arguments. `verbose` cases keep their derived contract and get smaller in bytes and estimated tokens; `correctness` cases keep their contract and may expand. Savings are reported, never gated.",
+  "cases": [
+    {
+      "case": "gh_pr_view_long_description",
+      "role": "verbose",
+      "contract": "gh_pr_view",
+      "argv": [
+        "gh",
+        "pr",
+        "view",
+        "71",
+        "--repo",
+        "usharma123/Packet28"
+      ],
+      "stdout": "pr_view_71_long.stdout.txt",
+      "stderr": null,
+      "exit_code": 0,
+      "provenance": {
+        "kind": "captured",
+        "captured_at": "2026-10-07T13:46:52Z",
+        "gh_version": "2.86.0",
+        "tty": false,
+        "description": "Unmodified non-TTY `gh pr view` of PR #71, a human-written description of ordinary length. First frozen by the PR #74 benchmark correction."
+      },
+      "stdout_sha256": "c60123317d7c5382cfe96288b2743d049f394f6e3cdf162314f6aac6bb93e06b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "gh_pr_view_short_description",
+      "role": "correctness",
+      "contract": "gh_pr_view",
+      "argv": [
+        "gh",
+        "pr",
+        "view",
+        "74",
+        "--repo",
+        "usharma123/Packet28"
+      ],
+      "stdout": "pr_view_74_captured.stdout.txt",
+      "stderr": null,
+      "exit_code": 0,
+      "provenance": {
+        "kind": "captured",
+        "captured_at": "2026-10-07T13:36:14Z (file mtime)",
+        "gh_version": "2.86.0",
+        "tty": false,
+        "description": "Unmodified capture of PR #74, whose short description made the retired 80% live gate fail at 69.2%. Fixed identity, URL, preview and notice dominate; reduction is reported, not gated."
+      },
+      "stdout_sha256": "f376a24be955dcb8071b5c2f963207d28a54955d69c5dc253a943b65e1656bf1",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "gh_pr_view_ci_author_reconstruction",
+      "role": "correctness",
+      "contract": "gh_pr_view",
+      "argv": [
+        "gh",
+        "pr",
+        "view",
+        "74",
+        "--repo",
+        "usharma123/Packet28"
+      ],
+      "stdout": "pr_view_74_ci_reconstruction.stdout.txt",
+      "stderr": null,
+      "exit_code": 0,
+      "provenance": {
+        "kind": "reconstruction",
+        "derived_from": "pr_view_74_captured.stdout.txt",
+        "description": "CI-compatible reconstruction, not recovered CI bytes: the PR #74 capture with the author rendered as `usharma123 (Utsav Sharma )`, as logged by failed job 112613078067."
+      },
+      "stdout_sha256": "4d102a407eea051dc251dacb9a6001ed89830d9fecabe1a261e8cd15aef96757",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "gh_pr_view_failed_exit7",
+      "role": "correctness",
+      "contract": "gh_pr_view",
+      "argv": [
+        "gh",
+        "pr",
+        "view",
+        "74",
+        "--repo",
+        "usharma123/Packet28"
+      ],
+      "stdout": "pr_view_74_ci_reconstruction.stdout.txt",
+      "stderr": "pr_view_74_failed_exit7.stderr.txt",
+      "exit_code": 7,
+      "provenance": {
+        "kind": "synthetic",
+        "derived_from": "pr_view_74_ci_reconstruction.stdout.txt",
+        "description": "Synthetic failure: reconstruction stdout plus a synthetic HTTP 503 stderr, exit 7. A failed read keeps all stdout, stderr and the exit, so it may expand."
+      },
+      "stdout_sha256": "4d102a407eea051dc251dacb9a6001ed89830d9fecabe1a261e8cd15aef96757",
+      "stderr_sha256": "14ad7e00708b20b21755a0a65d3a4b82c3e0d61698284945539358d963de0d09"
+    },
+    {
+      "case": "gh_pr_list_5",
+      "role": "verbose",
+      "contract": "gh_pr_list",
+      "argv": [
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        "usharma123/Packet28",
+        "--limit",
+        "5"
+      ],
+      "stdout": "pr_list_5.stdout.txt",
+      "stderr": null,
+      "exit_code": 0,
+      "provenance": {
+        "kind": "captured",
+        "captured_at": "2026-10-07T13:46:52Z",
+        "gh_version": "2.86.0",
+        "tty": false,
+        "description": "Unmodified non-TTY `gh pr list --limit 5` of this repository."
+      },
+      "stdout_sha256": "25fda36435b753a0a5e847bcd158b433179f92f06baf4b70c24d07fa27aa24f5",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "gh_run_list_5",
+      "role": "verbose",
+      "contract": "gh_run_list",
+      "argv": [
+        "gh",
+        "run",
+        "list",
+        "--repo",
+        "usharma123/Packet28",
+        "--limit",
+        "5"
+      ],
+      "stdout": "run_list_5.stdout.txt",
+      "stderr": null,
+      "exit_code": 0,
+      "provenance": {
+        "kind": "captured",
+        "captured_at": "2026-10-07T13:46:52Z",
+        "gh_version": "2.86.0",
+        "tty": false,
+        "description": "Unmodified non-TTY `gh run list --limit 5` of this repository."
+      },
+      "stdout_sha256": "6659aa758e256c7569c45632e33757f933cff08935d6f02558170a6fcaf9fa2b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "gh_run_view_failed_benchmark_run",
+      "role": "verbose",
+      "contract": "gh_run_view",
+      "argv": [
+        "gh",
+        "run",
+        "view",
+        "37565793313",
+        "--repo",
+        "usharma123/Packet28"
+      ],
+      "stdout": "run_view_37565793313_failed.stdout.txt",
+      "stderr": null,
+      "exit_code": 0,
+      "provenance": {
+        "kind": "captured",
+        "captured_at": "2026-10-07T13:46:52Z",
+        "gh_version": "2.86.0",
+        "tty": false,
+        "description": "Unmodified non-TTY `gh run view` of the failed Hook Benchmark Suite run for PR #74: one failed job with 18 steps and two annotations. Before the run-view count fix (30e7a4bc) the reducer reported 19 jobs and 6 annotations here."
+      },
+      "stdout_sha256": "84cf323b06600b2f98302c6446b7110de58be827a262ef6f133a4bc836f7fa0a",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "cargo_test_one_failure",
+      "role": "verbose",
+      "contract": "cargo_test",
+      "argv": [
+        "cargo",
+        "test"
+      ],
+      "stdout": "cargo_test_ledger_failure.stdout.txt",
+      "stderr": "cargo_test_ledger_failure.stderr.txt",
+      "exit_code": 101,
+      "provenance": {
+        "kind": "captured",
+        "captured_at": "2026-10-07T14:23:13Z (file mtime)",
+        "cargo_version": "cargo 1.93.1 (083ac5135 2025-12-15)",
+        "tty": false,
+        "description": "Unmodified `CARGO_TERM_COLOR=never cargo test --offline` of a 38-test fixture crate with one deliberately failing assertion (37 passed, 1 failed, exit 101). Recorded under the equivalent `cargo test` argv."
+      },
+      "stdout_sha256": "7c0bcdf2675d1b7eb80e5faf0c0a118c15b4a72ef5737b1e6e164dacdf8f420b",
+      "stderr_sha256": "3ec5e8606241c35066de5931457778f210d9bd74ccae768dcd4fbd1ad35be63a"
+    },
+    {
+      "case": "pytest_one_failure",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "pytest",
+        "tests"
+      ],
+      "stdout": "../python/pytest_fail.stdout.txt",
+      "stderr": null,
+      "exit_code": 1,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "tests/test_demo.py::test_example_fail",
+        "assert 2 == 3"
+      ],
+      "stdout_sha256": "fa657bbec87e7097aace5f87c9897513f75d3777111ce322f52ea266a6c6a58e",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "ruff_two_errors",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "ruff",
+        "check",
+        "src"
+      ],
+      "stdout": "../python/ruff_check.stdout.txt",
+      "stderr": null,
+      "exit_code": 1,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "src/demo.py:4:5: F841",
+        "src/demo.py:8:1: E402"
+      ],
+      "stdout_sha256": "7d840b1558f257252aa27059c8b0b921f527b2212d793c11b833a66c2469f817",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "tsc_two_errors",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "tsc",
+        "--noEmit"
+      ],
+      "stdout": null,
+      "stderr": "../javascript/tsc_fail.stderr.txt",
+      "exit_code": 2,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "src/index.ts:4:1 - error TS2322",
+        "src/index.ts:9:7 - error TS2304"
+      ],
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "4d1abe8460c86bc50ea7cc4d09f534ccf16819c8b2f7cb128eb99585bb7a30e0"
+    },
+    {
+      "case": "eslint_two_errors",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "npx",
+        "eslint",
+        "src"
+      ],
+      "stdout": "../javascript/eslint_fail.stdout.txt",
+      "stderr": null,
+      "exit_code": 1,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "/workspace/src/app.ts",
+        "4:7  error  'unused' is assigned a value but never used",
+        "9:1  error  Unexpected console statement"
+      ],
+      "stdout_sha256": "0f992ab776e3f3b8ad805bbe2d59b421b01fe32dc2ba39c253d50bcee7c50b7d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "vitest_one_failure",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "vitest",
+        "run"
+      ],
+      "stdout": "../javascript/vitest_fail.stdout.txt",
+      "stderr": null,
+      "exit_code": 1,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "src/api.test.ts > returns error payload",
+        "expected 500 to be 200"
+      ],
+      "stdout_sha256": "6fb966383816c6ff8d44582880f1a997774490b032bb2c98c493566057ced934",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "go_test_two_failures",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "go",
+        "test",
+        "./..."
+      ],
+      "stdout": "../go/go_test.stdout.txt",
+      "stderr": null,
+      "exit_code": 1,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "TestCreateUser",
+        "api_test.go:42: expected status 201, got 500",
+        "TestDeleteUser",
+        "api_test.go:78: unexpected error: context deadline exceeded"
+      ],
+      "stdout_sha256": "e9e66da7042a786573aa312540a71a26ae939cde6c31a6b0fe3cddc264cf6c19",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "golangci_lint_two_issues",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "golangci-lint",
+        "run"
+      ],
+      "stdout": null,
+      "stderr": "../go/golangci_lint.stderr.txt",
+      "exit_code": 1,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "pkg/service/service.go:17:2: undefined: missingHelper",
+        "pkg/service/service.go:22:9: Error return value of `w.Write` is not checked"
+      ],
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "04a4549ff44350137a5517436705b11689e231600252a1c87910cc857b0751fa"
+    },
+    {
+      "case": "kubectl_pending_pod",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "kubectl",
+        "get",
+        "pods"
+      ],
+      "stdout": "../infra/kubectl_get.stdout.txt",
+      "stderr": null,
+      "exit_code": 0,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "cron-processor-6bf7fd9f"
+      ],
+      "stdout_sha256": "b9331087efac9a38994f37481810c8189e2b9fecc39f248d854ddc6fe031493c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "case": "curl_html_page",
+      "role": "correctness",
+      "contract": "diagnostic_facts",
+      "argv": [
+        "curl",
+        "https://example.com"
+      ],
+      "stdout": "../infra/curl_fetch.stdout.txt",
+      "stderr": null,
+      "exit_code": 0,
+      "provenance": {
+        "kind": "synthetic",
+        "origin": "scripts/benchmark_fixtures (commit 0bd9bc43, 2026-03-14)",
+        "description": "Small hand-written diagnostic sample from the retired hook suite. Previously measured only through `hook reduce-fixture` (summary field). Now replayed through the real explicit route; gated on its failure facts and exit, never on savings."
+      },
+      "facts": [
+        "Packet28 Fixture"
+      ],
+      "stdout_sha256": "1fd06c6cf81dd766f80ea0d65ff0a7676286576276e5fefbf6e4143642b54346",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}
