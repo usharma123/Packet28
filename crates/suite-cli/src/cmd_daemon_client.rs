@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 #[cfg(unix)]
-use packet28_daemon_client::runtime_discovery::read_runtime_info_if_present;
+use packet28_daemon_client::runtime_discovery::{
+    read_runtime_info_if_present, RuntimeDiscoveryError,
+};
 #[cfg(unix)]
 use packet28_daemon_client::transport::{
     endpoint_accepts_connections, request_status_v1, verify_runtime_workspace,
@@ -591,16 +593,30 @@ enum DaemonOwner {
     Unavailable,
 }
 
+/// Runtime metadata discovery used to observe the instance-lease owner.
+#[cfg(unix)]
+type DiscoverRuntime<'a> =
+    &'a mut dyn FnMut(&Path) -> Result<Option<DaemonRuntimeInfo>, RuntimeDiscoveryError>;
+
 /// Reads runtime metadata while another daemon may own the workspace.
 ///
-/// A stopping owner removes its metadata, and a read that races the removal
-/// fails. The removal cannot fail a second read, so one retry tells it apart
-/// from unauthentic or malformed metadata, which still fails closed.
+/// A stopping owner unlinks its metadata, and a read can race the removal.
+/// Only typed withdrawal, which proves the authenticated leaf was unlinked and
+/// discards its bytes, is treated like absent metadata; the authority loop
+/// observes the owner again on its next poll. Unauthentic or malformed
+/// metadata still fails closed.
 #[cfg(unix)]
-fn read_owner_runtime(root: &Path) -> Result<Option<DaemonRuntimeInfo>> {
-    read_runtime_info_if_present(root)
-        .or_else(|_| read_runtime_info_if_present(root))
-        .context("failed to read packet28d runtime metadata while the daemon owns the workspace")
+fn read_owner_runtime(
+    root: &Path,
+    discover: DiscoverRuntime<'_>,
+) -> Result<Option<DaemonRuntimeInfo>> {
+    match discover(root) {
+        Ok(runtime) => Ok(runtime),
+        Err(RuntimeDiscoveryError::Withdrawn { .. }) => Ok(None),
+        Err(error) => Err(error).context(
+            "failed to read packet28d runtime metadata while the daemon owns the workspace",
+        ),
+    }
 }
 
 /// Classifies the instance-lease owner from authenticated runtime metadata.
@@ -609,8 +625,12 @@ fn read_owner_runtime(root: &Path) -> Result<Option<DaemonRuntimeInfo>> {
 /// cleanup. Unauthentic or malformed metadata, or metadata naming another
 /// workspace, fails closed before its endpoint is used.
 #[cfg(unix)]
-fn observe_daemon_owner(root: &Path, deadline: Instant) -> Result<DaemonOwner> {
-    let Some(runtime) = read_owner_runtime(root)? else {
+fn observe_daemon_owner(
+    root: &Path,
+    deadline: Instant,
+    discover: DiscoverRuntime<'_>,
+) -> Result<DaemonOwner> {
+    let Some(runtime) = read_owner_runtime(root, discover)? else {
         return Ok(DaemonOwner::Unavailable);
     };
     verify_runtime_workspace(root, &runtime)?;
@@ -968,12 +988,21 @@ enum DaemonAuthority {
 /// deadline of [`DAEMON_STARTUP_TIMEOUT`].
 #[cfg(unix)]
 fn wait_for_daemon_authority(root: &Path, timeout: Duration) -> Result<DaemonAuthority> {
+    wait_for_daemon_authority_with(root, timeout, &mut read_runtime_info_if_present)
+}
+
+#[cfg(unix)]
+fn wait_for_daemon_authority_with(
+    root: &Path,
+    timeout: Duration,
+    discover: DiscoverRuntime<'_>,
+) -> Result<DaemonAuthority> {
     let deadline = Instant::now() + timeout;
     loop {
         if daemon_instance_released(root)? {
             return Ok(DaemonAuthority::Released);
         }
-        match observe_daemon_owner(root, deadline)? {
+        match observe_daemon_owner(root, deadline, discover)? {
             DaemonOwner::Serving => return Ok(DaemonAuthority::Serving),
             DaemonOwner::Starting(candidate) => {
                 return wait_for_existing_daemon_startup(root, &candidate)
@@ -1117,6 +1146,137 @@ mod tests {
         assert!(error
             .to_string()
             .contains("refusing legacy unauthenticated daemon TCP endpoint"));
+    }
+
+    #[cfg(unix)]
+    fn withdrawn(root: &Path) -> RuntimeDiscoveryError {
+        RuntimeDiscoveryError::Withdrawn {
+            path: runtime_path(root),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn withdrawn_or_missing_owner_metadata_waits_for_held_instance_authority() {
+        use packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease;
+
+        for withdraw in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let lease = acquire_daemon_instance_lease(&root).unwrap();
+            let (held_sender, held_receiver) = mpsc::channel();
+            let (release_sender, release_receiver) = mpsc::channel();
+            let waiter = {
+                let root = root.clone();
+                thread::spawn(move || {
+                    let (held, release) = (held_sender, release_receiver);
+                    let mut observations = 0;
+                    let authority = wait_for_daemon_authority_with(
+                        &root,
+                        Duration::from_secs(10),
+                        &mut |root| {
+                            observations += 1;
+                            if observations == 3 {
+                                // Three observations while the lease is held.
+                                held.send(()).unwrap();
+                                release.recv().unwrap();
+                            }
+                            if withdraw {
+                                Err(withdrawn(root))
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    );
+                    (authority, observations)
+                })
+            };
+            if held_receiver.recv_timeout(Duration::from_secs(10)).is_err() {
+                let (authority, observations) = waiter.join().unwrap();
+                panic!(
+                    "withdraw={withdraw}: stopped waiting for held authority after \
+                     {observations} observations: {authority:?}"
+                );
+            }
+            assert!(!waiter.is_finished(), "withdraw={withdraw}");
+            assert!(!daemon_instance_released(&root).unwrap());
+            drop(lease);
+            release_sender.send(()).unwrap();
+
+            let (authority, observations) = waiter.join().unwrap();
+            assert_eq!(
+                authority.unwrap(),
+                DaemonAuthority::Released,
+                "withdraw={withdraw}"
+            );
+            assert_eq!(observations, 3, "withdraw={withdraw}");
+            // The released workspace admits a replacement owner.
+            drop(acquire_daemon_instance_lease(&root).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unauthentic_or_foreign_owner_metadata_fails_closed_while_authority_is_held() {
+        use packet28_daemon_core::task_store_lease::acquire_daemon_instance_lease;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let _lease = acquire_daemon_instance_lease(&root).unwrap();
+        type Discovery = Box<dyn Fn(&Path) -> RuntimeDiscoveryError>;
+        let errors: [(&str, Discovery); 3] = [
+            (
+                "has 0 links; expected exactly one",
+                Box::new(|root| RuntimeDiscoveryError::Io {
+                    operation: "failed to read authenticated daemon runtime metadata",
+                    path: runtime_path(root),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "daemon runtime metadata has 0 links; expected exactly one",
+                    ),
+                }),
+            ),
+            (
+                "changed identity during discovery",
+                Box::new(|root| RuntimeDiscoveryError::Io {
+                    operation: "failed to read authenticated daemon runtime metadata",
+                    path: runtime_path(root),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "authenticated runtime entry changed identity during discovery",
+                    ),
+                }),
+            ),
+            (
+                "failed to decode daemon runtime metadata",
+                Box::new(|root| RuntimeDiscoveryError::Json {
+                    path: runtime_path(root),
+                    source: serde_json::from_slice::<DaemonRuntimeInfo>(b"{").unwrap_err(),
+                }),
+            ),
+        ];
+        for (expected, error) in errors {
+            let mut observations = 0;
+            let result =
+                wait_for_daemon_authority_with(&root, Duration::from_secs(10), &mut |root| {
+                    observations += 1;
+                    Err(error(root))
+                });
+            let error = result.expect_err(expected);
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(observations, 1);
+        }
+
+        let foreign_runtime = DaemonRuntimeInfo {
+            workspace_root: foreign.path().display().to_string(),
+            ..DaemonRuntimeInfo::default()
+        };
+        let error = wait_for_daemon_authority_with(&root, Duration::from_secs(10), &mut |_| {
+            Ok(Some(foreign_runtime.clone()))
+        })
+        .expect_err("foreign runtime metadata must fail closed");
+        assert!(format!("{error:#}").contains(&foreign_runtime.workspace_root));
     }
 
     #[cfg(unix)]
