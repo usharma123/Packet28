@@ -112,6 +112,7 @@ exploration.
 | Map a repository area | `packet28 map repo --repo-root . --focus-symbol AuthService --json` |
 | Inspect local state | `packet28 daemon storage inspect --root . --json --pretty` |
 | Preview retention | `packet28 daemon storage cleanup --root . --max-age-seconds 604800` |
+| Archive an oversized record online | `packet28 daemon storage archive-record --root . --task-id <id>` |
 
 Run `packet28 --help` or `packet28 <command> --help` for the complete CLI.
 
