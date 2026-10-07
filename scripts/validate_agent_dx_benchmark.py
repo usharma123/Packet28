@@ -21,12 +21,17 @@ import sys
 from pathlib import Path
 
 import agent_dx_contract as contract
+import agent_dx_native as native
 import agent_dx_reduction as reduction
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_PATHS = ("crates", "Cargo.toml", "Cargo.lock")
-SOURCE_PREFIXES = ("crates/", "Cargo.toml", "Cargo.lock", "scripts/agent_dx", "scripts/benchmark_agent_dx.py",
-                   "scripts/validate_agent_dx_benchmark.py", "scripts/benchmark_common.py", "scripts/benchmark_fixtures/")
+NATIVE_WIRE = "scenarios/native_retrieval/mcp/retrieval.wire"
+NATIVE_STEPS = "scenarios/native_retrieval/mcp/retrieval.steps.json"
+NATIVE_FIXTURE = "scenarios/native_retrieval/fixture"
+FRESHNESS_WIRE = "scenarios/source_freshness/mcp/after-edit.wire"
+FRESHNESS_FORCED = "scenarios/source_freshness/forced-index.json"
+FRESHNESS_EDITED = f"scenarios/source_freshness/edited/{native.FRESHNESS_PATH}"
 
 
 def sha256_file(path: Path) -> str | None:
@@ -105,13 +110,37 @@ def check_binaries(summary: dict, report: Report, root: Path, bin_dir: Path | No
             report.notes.append(f"binaries bound by receipt; {detail}")
     else:
         report.notes.append("no external build receipt: binaries are taken as built from this checkout in the same job")
-    # The canonical gate regenerates a tracked JavaTest cache; only edits to
-    # runtime or benchmark sources make the measurement unattributable.
-    dirty = [path for path in (summary.get("source") or {}).get("dirty_paths", [])
-             if path.startswith(SOURCE_PREFIXES)]
-    if dirty:
-        report.fail("source binding", "measurements come from unmodified runtime and benchmark sources",
-                    f"modified: {dirty}")
+    check_source_status(summary, report)
+
+
+def check_source_status(summary: dict, report: Report) -> None:
+    """Re-parse the recorded `git status -z` receipts; trust no runner-derived path list.
+
+    The canonical gate regenerates a tracked JavaTest cache, so only runtime and
+    benchmark sources (contract.RELEVANT_SOURCE_PREFIXES) make a measurement
+    unattributable. A change between the start and end receipts means the
+    measured source moved during the run.
+    """
+    hashes = summary.get("evidence_sha256") or {}
+    parsed = {}
+    for label in ("source", "source_end"):
+        record = ((summary.get(label) or {}).get("status_porcelain_z")) or {}
+        rel = record.get("path")
+        if not rel or hashes.get(rel) != record.get("sha256") or sha256_file(report.artifact_dir / rel) != record.get("sha256"):
+            report.fail("source binding", "the measured source state is recorded", f"{label} git status receipt is missing or altered",
+                        [rel] if rel else None)
+            continue
+        parsed[label] = contract.parse_porcelain_z((report.artifact_dir / rel).read_bytes())
+        dirty = contract.relevant_dirty(parsed[label])
+        if dirty:
+            report.fail("source binding", "measurements come from unmodified runtime and benchmark sources",
+                        f"{label} modified or untracked: {dirty}", [rel])
+    start, end = summary.get("source") or {}, summary.get("source_end") or {}
+    if len(parsed) == 2 and ((start.get("commit"), start.get("tree")) != (end.get("commit"), end.get("tree"))
+                             or parsed["source"] != parsed["source_end"]):
+        report.fail("source binding", "the source did not change while the benchmark ran",
+                    f"start {start.get('commit')} {len(parsed['source'])} status entries, "
+                    f"end {end.get('commit')} {len(parsed['source_end'])} status entries")
 
 
 def check_scenarios(summary: dict, report: Report) -> None:
@@ -126,6 +155,12 @@ def check_scenarios(summary: dict, report: Report) -> None:
             report.fail(scenario_id, spec["intent"], "required scenario is missing")
             continue
         checks = {check.get("id"): check for check in scenario.get("checks", [])}
+        hashes = summary.get("evidence_sha256") or {}
+        for check in scenario.get("checks", []):
+            unbound = [item for item in check.get("evidence") or [] if check.get("passed") and item not in hashes]
+            if unbound:
+                report.fail(f"{scenario_id}/{check.get('id')}", "check evidence is persisted and hashed",
+                            f"evidence {unbound} is not in the hash ledger")
         for check_id, statement in spec["checks"].items():
             check = checks.get(check_id)
             if check is None:
@@ -139,6 +174,69 @@ def check_scenarios(summary: dict, report: Report) -> None:
     unknown = set(by_id) - set(contract.MEASURED)
     if unknown:
         report.fail("scenarios", "results match the versioned contract", f"unknown scenarios {sorted(unknown)}")
+
+
+def _evidence_bytes(summary: dict, report: Report, rel: str, scope: str, statement: str) -> bytes | None:
+    """Bytes of a hashed evidence file, or None after reporting why it is unusable."""
+    digest = (summary.get("evidence_sha256") or {}).get(rel)
+    path = report.artifact_dir / rel
+    if digest is None or sha256_file(path) != digest:
+        report.fail(scope, statement, f"{rel} is missing, unhashed or altered", [rel])
+        return None
+    return path.read_bytes()
+
+
+def _scenario(summary: dict, scenario_id: str) -> dict:
+    return next((item for item in summary.get("scenarios", []) if item.get("id") == scenario_id), {})
+
+
+def check_native(summary: dict, report: Report) -> None:
+    """Rerun the native retrieval contract on the captured wire and recompute its ledger."""
+    scope = "native_retrieval"
+    statement = contract.MEASURED[scope]["intent"]
+    files = native.fixture_files()
+    for rel, data in files.items():
+        if _evidence_bytes(summary, report, f"{NATIVE_FIXTURE}/{rel}", scope, "the fixture source is persisted") not in (None, data):
+            report.fail(scope, "the benchmark measured the declared fixture", f"{rel} differs from its declared bytes",
+                        [f"{NATIVE_FIXTURE}/{rel}"])
+    wire = _evidence_bytes(summary, report, NATIVE_WIRE, scope, statement)
+    steps_raw = _evidence_bytes(summary, report, NATIVE_STEPS, scope, statement)
+    if wire is None or steps_raw is None:
+        return
+    checks, _ = native.check_native_retrieval(wire, files)
+    for check_id, (passed, detail) in checks.items():
+        if not passed:
+            report.fail(f"{scope}/{check_id}", contract.check_statement(scope, check_id), f"rechecked from the wire: {detail}", [NATIVE_WIRE])
+    ledger, errors = native.native_ledger(wire, json.loads(steps_raw).get("steps", []))
+    for error in errors:
+        report.fail(f"{scope}/ledger_matches_wire", contract.check_statement(scope, "ledger_matches_wire"), error,
+                    [NATIVE_WIRE, NATIVE_STEPS])
+    reported = _scenario(summary, scope).get("metrics") or {}
+    for key, value in native.ledger_metrics(ledger).items():
+        if reported.get(key) != value:
+            report.fail(f"{scope}/ledger_matches_wire", "reported native metrics match the recorded exchanges",
+                        f"{key} reported {json.dumps(reported.get(key))}, recomputed {json.dumps(value)}", [NATIVE_STEPS])
+    report.notes.append(f"native retrieval rechecked from {NATIVE_WIRE}: {sum(p for p, _ in checks.values())}/{len(checks)} "
+                        f"contract checks, {ledger['required_retrieval']['round_trips']} required retrievals counted")
+
+
+def check_freshness(summary: dict, report: Report) -> None:
+    """Rerun the freshness contract on the captured search wire and forced-index replies."""
+    scope = "source_freshness"
+    statement = contract.MEASURED[scope]["intent"]
+    expected_edit = native.edited_freshness_source(native.fixture_files()[native.FRESHNESS_PATH])
+    edited = _evidence_bytes(summary, report, FRESHNESS_EDITED, scope, statement)
+    wire = _evidence_bytes(summary, report, FRESHNESS_WIRE, scope, statement)
+    forced = _evidence_bytes(summary, report, FRESHNESS_FORCED, scope, statement)
+    if edited is None or wire is None or forced is None:
+        return
+    if edited != expected_edit:
+        report.fail(scope, "the benchmark made the declared edit", "edited source differs from the declared edit", [FRESHNESS_EDITED])
+    for check_id, (passed, detail) in native.check_freshness(wire, json.loads(forced), expected_edit).items():
+        if not passed:
+            report.fail(f"{scope}/{check_id}", contract.check_statement(scope, check_id), f"rechecked from the wire: {detail}",
+                        [FRESHNESS_WIRE, FRESHNESS_FORCED])
+    report.notes.append(f"source freshness rechecked from {FRESHNESS_WIRE} and {FRESHNESS_FORCED}")
 
 
 def check_reduction(summary: dict, report: Report) -> None:
@@ -269,6 +367,8 @@ def validate(summary: dict, artifact_dir: Path, root: Path = ROOT, bin_dir: Path
     check_evidence(summary, report)
     check_binaries(summary, report, root, bin_dir)
     check_scenarios(summary, report)
+    check_native(summary, report)
+    check_freshness(summary, report)
     check_reduction(summary, report)
     check_delegated(summary, report, root)
     return report

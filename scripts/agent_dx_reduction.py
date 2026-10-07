@@ -37,8 +37,11 @@ PR_BODY_MAX_BYTES = 320
 PR_BODY_MAX_LINES = 8
 FILTERED_BODY_PREFIXES = ("![", "<!--", "<img", "[![")
 PR_IDENTITY_KEYS = {"title", "state", "number", "author", "url"}
-# A failing cargo test keeps its name and the first lines of its own output.
+# A failing cargo test keeps its name and a preview of its own output: the first
+# five nonblank lines of its failure block (panic location, assertion message,
+# compared values), excluding cargo's generic RUST_BACKTRACE hint.
 CARGO_FAILURE_PREVIEW_LINES = 5
+CARGO_BACKTRACE_HINT = "note: run with `RUST_BACKTRACE="
 
 SCRUBBED_ENV = (
     "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST",
@@ -237,8 +240,18 @@ def _cargo_failure_blocks(raw: str) -> dict[str, list[str]]:
             if trimmed == "failures:" or trimmed.startswith("---- "):
                 current = None
                 continue
-            blocks[current].append(trimmed)
+            blocks[current].append(line.rstrip())
     return blocks
+
+
+def _words(line: str) -> str:
+    return " ".join(line.split())
+
+
+def cargo_failure_preview(block: list[str]) -> list[str]:
+    """The documented failure preview: first nonblank lines of the block, without the backtrace hint."""
+    useful = [line for line in block if line.strip() and not line.strip().startswith(CARGO_BACKTRACE_HINT)]
+    return useful[:CARGO_FAILURE_PREVIEW_LINES]
 
 
 def _cargo_test_errors(raw: str, reduced_stdout: str, raw_exit: int) -> tuple[list[str], dict]:
@@ -265,16 +278,18 @@ def _cargo_test_errors(raw: str, reduced_stdout: str, raw_exit: int) -> tuple[li
     if failed and len(blocks) != failed:
         errors.append(f"raw output names {len(blocks)} failure blocks for {failed} failures")
     budget = len(expected.encode("utf-8")) + 1
+    visible = {_words(line) for line in lines}
     for name, block in blocks.items():
         if f"FAIL {name}" not in lines:
             errors.append(f"failing test {name} is not named")
-        panic = next((line for line in block if " panicked at " in line), None)
-        if panic is None:
+        preview = cargo_failure_preview(block)
+        if not any(" panicked at " in line for line in preview):
             errors.append(f"raw failure block for {name} has no panic location")
-        elif panic not in lines:
-            errors.append(f"panic location for {name} was not kept: {panic!r}")
-        preview = block[:CARGO_FAILURE_PREVIEW_LINES]
-        # Name line, its first output lines, and the blank separator between failures.
+        # Compare words, not spacing: the renderer may re-indent `left:`/`right:`.
+        for line in preview:
+            if _words(line) not in visible:
+                errors.append(f"failure evidence for {name} was not kept: {line!r}")
+        # Name line, its preview lines, and the blank separator between failures.
         budget += len(f"FAIL {name}".encode("utf-8")) + 2 + sum(len(line.encode("utf-8")) + 1 for line in preview)
     passing_noise = [line for line in lines if re.fullmatch(r"test \S+ \.\.\. ok", line.strip())]
     if passing_noise:
@@ -286,6 +301,7 @@ def _cargo_test_errors(raw: str, reduced_stdout: str, raw_exit: int) -> tuple[li
         "passed": passed,
         "failed": failed,
         "failing_tests": sorted(blocks),
+        "failure_preview": {name: cargo_failure_preview(block) for name, block in blocks.items()},
         "derived_output_budget_bytes": budget,
     }
 

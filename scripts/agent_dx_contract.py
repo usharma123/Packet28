@@ -57,12 +57,21 @@ MEASURED = {
     },
     "native_retrieval": {
         "intent": "An agent finds code through slim MCP results and retrieves the exact preserved "
-                  "evidence when it needs it.",
+                  "evidence when it needs it. The validator reruns these checks on the captured wire "
+                  "(scripts/agent_dx_native.py) against source-derived expected facts.",
         "checks": {
-            "search_returns_fetchable_artifact": "slim search names matching regions and a fetchable artifact",
-            "fetched_matches_equal_source": "every fetched match line equals the source file line",
-            "read_regions_exact": "read_regions returns the exact requested source lines",
-            "glob_paths_exist": "glob returns existing files that match the pattern",
+            "search_returns_fetchable_artifact": "slim search carries only documented navigational fields within "
+                                                 "the slim limits (6 paths, 8 regions, 4 symbols, 4 diagnostics), "
+                                                 "each backed by a source match, reports the source match count, "
+                                                 "leaves the needed definition outside the preview, and is smaller "
+                                                 "than the full result in bytes and tokens",
+            "fetched_matches_equal_source": "the required fetch returns exactly the source-derived match set "
+                                            "(no missing, extra or duplicated line) as untruncated path:line:text "
+                                            "owned by the search's task and artifact",
+            "read_regions_exact": "the required read returns the exact requested source lines",
+            "glob_paths_exist": "glob reports the source-derived path count slim and returns exactly those paths in full",
+            "ledger_matches_wire": "every tool call is counted once in its contract phase, required retrievals ran, "
+                                   "and per-phase bytes, tokens and elapsed time match the wire and step records",
         },
     },
     "same_task_sessions": {
@@ -103,6 +112,18 @@ MEASURED = {
             "same_daemon_process": "the daemon PID is unchanged across the error burst",
             "generations_within_limit": f"at most {LOG_GENERATIONS} generations, each at most the threshold",
             "diagnostics_retained": "the latest error diagnostic is retained",
+        },
+    },
+    "source_freshness": {
+        "intent": "After an unreported edit of an indexed tracked file, search shows the current source "
+                  "and the index never serves the stale generation.",
+        "checks": {
+            "edit_visible_to_search": "a normal search finds the new text at its current path and line, "
+                                      "through a fresh index or the live fallback",
+            "replaced_text_not_served": "a normal search no longer returns the replaced text",
+            "forced_index_never_stale": "a forced indexed search succeeds before the edit; after it, it refuses "
+                                        "or answers with the current source",
+            "fixture_restored": "the fixture file is restored to its committed bytes afterwards",
         },
     },
     "explicit_cli_reduction": {
@@ -201,11 +222,59 @@ DIAGNOSTIC_METRICS = (
     "acquisition_tokens",
     "required_retrieval_tokens",
     "verification_retrieval_tokens",
-    "all_full_retrieval_tokens",
+    "all_calls_tokens",
+    "required_elapsed_ms",
     "token_reduction_pct",
     "raw_est_tokens",
     "reduced_est_tokens",
 )
+
+
+# Sources whose modification makes a measurement unattributable: the runtime and
+# every benchmark input. Python bytecode caches are not source.
+RELEVANT_SOURCE_PREFIXES = (
+    "crates/", "Cargo.toml", "Cargo.lock", "scripts/agent_dx", "scripts/benchmark_agent_dx.py",
+    "scripts/validate_agent_dx_benchmark.py", "scripts/benchmark_common.py", "scripts/benchmark_fixtures/",
+)
+
+
+def parse_porcelain_z(data: bytes) -> list[dict]:
+    """Parse `git status --porcelain=v1 -z` without trimming status columns.
+
+    Each entry keeps its two status letters and exact path; a rename or copy
+    also keeps its original path, which follows as the next NUL field.
+    """
+    fields = data.split(b"\0")
+    entries = []
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if not field:
+            continue
+        status, path = field[:2].decode(), field[3:].decode("utf-8", "surrogateescape")
+        entry = {"status": status, "path": path}
+        if "R" in status or "C" in status:
+            entry["orig_path"] = fields[index].decode("utf-8", "surrogateescape") if index < len(fields) else ""
+            index += 1
+        entries.append(entry)
+    return entries
+
+
+def is_relevant_source(path: str) -> bool:
+    if "/__pycache__/" in f"/{path}" or path.endswith((".pyc", ".pyo")):
+        return False
+    return path.startswith(RELEVANT_SOURCE_PREFIXES)
+
+
+def relevant_dirty(entries: list[dict]) -> list[str]:
+    """Modified, staged, renamed, deleted or untracked runtime/benchmark sources."""
+    found = set()
+    for entry in entries:
+        for path in (entry.get("path"), entry.get("orig_path")):
+            if path and is_relevant_source(path):
+                found.add(path)
+    return sorted(found)
 
 
 def required_scenarios() -> list[str]:

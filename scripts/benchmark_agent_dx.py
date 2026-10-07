@@ -39,6 +39,7 @@ import traceback
 from pathlib import Path
 
 import agent_dx_contract as contract
+import agent_dx_native as native
 import agent_dx_reduction as reduction
 from benchmark_common import estimate_tokens
 
@@ -46,9 +47,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = "packet28.agent_dx_benchmark.v1"
 BINARIES = ("Packet28", "packet28d", "p28")
 CREDENTIAL_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
-TASK_SEARCH = "agent-dx-native"
+TASK_SEARCH = native.TASK_SEARCH
 TASK_SHARED = "agent-dx-shared"
-DEFINITION_PATH = "src/teller/discount.rs"
+DEFINITION_PATH = native.DEFINITION_PATH
 GIT_IDENTITY = ["-c", "user.name=Packet28 Fixture", "-c", "user.email=fixture@example.invalid",
                 "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
 
@@ -203,7 +204,16 @@ class CheckFailure(Exception):
 
 
 class McpSession:
-    """One `Packet28 mcp serve` process with complete wire capture."""
+    """One `Packet28 mcp serve` process with complete wire capture.
+
+    The session owns its process from the moment it starts: if initialize
+    fails or times out, the process is stopped and the partial wire and
+    stderr are persisted before the failure propagates.
+    """
+
+    INITIALIZE_TIMEOUT = 60.0
+    EXIT_TIMEOUT = 20.0
+    READER_JOIN_TIMEOUT = 10.0
 
     def __init__(self, ws: Workspace, scenario: str, name: str):
         self.ws = ws
@@ -213,18 +223,25 @@ class McpSession:
         self.wire: list[bytes] = []
         self.steps: list[dict] = []
         self.next_id = 1
+        self.closed = False
+        self.stderr_chunks: list[bytes] = []
         self.process = subprocess.Popen(
             [str(ws.packet28), "mcp", "serve", "--root", str(ws.repo)], cwd=ws.repo, env=ws.env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
-        self.stderr = b""
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
-        self.request("initialize", {
-            "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": {"name": "packet28-agent-dx-benchmark", "version": "1"},
-        })
+        self.readers = [threading.Thread(target=self._pump, daemon=True),
+                        threading.Thread(target=self._drain_stderr, daemon=True)]
+        for reader in self.readers:
+            reader.start()
+        try:
+            self.request("initialize", {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "packet28-agent-dx-benchmark", "version": "1"},
+            }, timeout=self.INITIALIZE_TIMEOUT)
+        except BaseException:
+            self.close()
+            raise
 
     def _pump(self) -> None:
         for line in self.process.stdout:  # type: ignore[union-attr]
@@ -232,7 +249,8 @@ class McpSession:
         self.lines.put(None)
 
     def _drain_stderr(self) -> None:
-        self.stderr = self.process.stderr.read()  # type: ignore[union-attr]
+        for chunk in iter(lambda: self.process.stderr.read1(65536), b""):  # type: ignore[union-attr]
+            self.stderr_chunks.append(chunk)
 
     def request(self, method: str, params: dict, timeout: float = 60) -> tuple[dict, bytes, float]:
         message_id = self.next_id
@@ -240,13 +258,16 @@ class McpSession:
         line = json.dumps({"jsonrpc": "2.0", "id": message_id, "method": method, "params": params}).encode() + b"\n"
         self.wire.append(b"> " + line)
         started = time.monotonic()
-        self.process.stdin.write(line)  # type: ignore[union-attr]
-        self.process.stdin.flush()  # type: ignore[union-attr]
+        try:
+            self.process.stdin.write(line)  # type: ignore[union-attr]
+            self.process.stdin.flush()  # type: ignore[union-attr]
+        except (BrokenPipeError, ValueError, OSError) as exc:
+            raise CheckFailure(f"MCP server stopped accepting {method}: {exc}", [f"{self.rel}.wire", f"{self.rel}.stderr"])
         deadline = started + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise CheckFailure(f"MCP {method} timed out after {timeout}s", [f"{self.rel}.wire"])
+                raise CheckFailure(f"MCP {method} timed out after {timeout}s", [f"{self.rel}.wire", f"{self.rel}.stderr"])
             try:
                 raw = self.lines.get(timeout=remaining)
             except queue.Empty:
@@ -262,12 +283,13 @@ class McpSession:
                 return message, raw, round((time.monotonic() - started) * 1000, 1)
 
     def call(self, tool: str, arguments: dict, phase: str, allow_error: bool = False) -> dict:
+        request_id = self.next_id
         message, raw, elapsed = self.request("tools/call", {"name": tool, "arguments": arguments})
         result = message.get("result") or {}
         error = message.get("error") or (result.get("isError") and result.get("content"))
         payload = result.get("structuredContent")
         step = {
-            "session": self.name, "tool": tool, "phase": phase, "elapsed_ms": elapsed,
+            "session": self.name, "request_id": request_id, "tool": tool, "phase": phase, "elapsed_ms": elapsed,
             "response_bytes": len(raw), "response_est_tokens": estimate_tokens(raw.decode("utf-8", "replace")),
             "structured_bytes": len(json.dumps(payload).encode()) if payload is not None else 0,
             "task_id": arguments.get("task_id"), "artifact_id": (payload or {}).get("artifact_id"),
@@ -279,17 +301,39 @@ class McpSession:
         return payload or {}
 
     def close(self) -> None:
-        if self.process.stdin:
-            self.process.stdin.close()
+        """Stop the owned process within bounded waits and persist everything captured."""
+        if self.closed:
+            return
+        self.closed = True
         try:
-            self.process.wait(timeout=20)
+            if self.process.stdin:
+                self.process.stdin.close()
+        except OSError:
+            pass
+        killed = False
+        try:
+            self.process.wait(timeout=self.EXIT_TIMEOUT)
         except subprocess.TimeoutExpired:
+            killed = True
             self.process.kill()
-            self.process.wait()
-        time.sleep(0.05)
+            try:
+                self.process.wait(timeout=self.EXIT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                pass
+        # Readers finish at EOF once the process has exited; never wait forever
+        # in case a grandchild still holds a pipe.
+        for reader in self.readers:
+            reader.join(timeout=self.READER_JOIN_TIMEOUT)
+        if not any(reader.is_alive() for reader in self.readers):
+            for pipe in (self.process.stdout, self.process.stderr):
+                if pipe:
+                    pipe.close()
         self.ws.evidence.write(f"{self.rel}.wire", b"".join(self.wire))
-        self.ws.evidence.write(f"{self.rel}.stderr", self.stderr or b"")
-        self.ws.evidence.write_json(f"{self.rel}.steps.json", {"exit_code": self.process.returncode, "steps": self.steps})
+        self.ws.evidence.write(f"{self.rel}.stderr", b"".join(self.stderr_chunks))
+        self.ws.evidence.write_json(f"{self.rel}.steps.json", {
+            "exit_code": self.process.returncode, "killed": killed,
+            "readers_finished": not any(reader.is_alive() for reader in self.readers), "steps": self.steps,
+        })
 
 
 class Scenario:
@@ -324,40 +368,9 @@ class Scenario:
 
 
 def write_fixture_repo(repo: Path) -> None:
-    """A small priced-ledger crate whose search results exceed the slim limits."""
-    (repo / "src" / "pricing").mkdir(parents=True)
-    (repo / "src" / "teller").mkdir(parents=True)
-    (repo / "docs").mkdir()
-    (repo / "Cargo.toml").write_text('[package]\nname = "ledger"\nversion = "0.1.0"\nedition = "2021"\n')
-    regions = [f"region_{index:02d}" for index in range(1, 11)]
-    (repo / "src" / "lib.rs").write_text("pub mod pricing;\npub mod teller;\n")
-    (repo / "src" / "pricing" / "mod.rs").write_text("".join(f"pub mod {name};\n" for name in regions))
-    for index, name in enumerate(regions, 1):
-        (repo / "src" / "pricing" / f"{name}.rs").write_text(
-            "use crate::teller::discount::apply_discount;\n\n"
-            f"pub fn seasonal_price_{index:02d}(cents: u64) -> u64 {{\n"
-            f"    apply_discount(cents, {index})\n}}\n\n"
-            f"pub fn member_price_{index:02d}(cents: u64) -> u64 {{\n"
-            f"    apply_discount(cents, {index + 10})\n}}\n"
-        )
-    (repo / "src" / "teller" / "mod.rs").write_text("pub mod discount;\n")
-    (repo / "src" / "teller" / "discount.rs").write_text(
-        "/// Integer-cent discounts shared by every pricing region.\n"
-        "pub fn apply_discount(cents: u64, percent: u64) -> u64 {\n"
-        "    // Rounds the discount down; ticket LEDGER-7 asks for nearest-cent rounding.\n"
-        "    cents - cents * percent / 100\n"
-        "}\n"
-        "\n"
-        "// Prüfsumme für Rabatte – ledger audit marker ✓\n"
-        "pub const DISCOUNT_AUDIT: &str = \"ledger-discount-v1\";\n"
-    )
-    (repo / "docs" / "pricing.md").write_text(
-        "# Pricing\n\nRegional prices call `apply_discount` from the teller module.\n"
-    )
-
-
-def file_line(repo: Path, path: str, line: int) -> str:
-    return (repo / path).read_text(encoding="utf-8").split("\n")[line - 1]
+    for rel, data in native.fixture_files().items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_bytes(data)
 
 
 # ---------------------------------------------------------------- scenarios
@@ -493,74 +506,48 @@ def scenario_hooks_capture_only(ws: Workspace, s: Scenario, state: dict) -> None
 
 def scenario_native_retrieval(ws: Workspace, s: Scenario, state: dict) -> None:
     sid = s.id
+    files = native.fixture_files()
+    # The expected facts come from the declared fixture bytes; the workspace must still hold them.
+    changed = [rel for rel, data in files.items() if (ws.repo / rel).read_bytes() != data]
+    for rel, data in files.items():
+        ws.evidence.write(f"scenarios/{sid}/fixture/{rel}", data)
+    ws.evidence.write_json(f"scenarios/{sid}/expected.json", {
+        "query": native.SEARCH_QUERY, "matches": native.expected_matches(files, native.SEARCH_QUERY),
+        "glob": native.expected_glob(files), "read": native.expected_read(files),
+        "fixture_sha256": {rel: sha256_bytes(data) for rel, data in files.items()},
+        "workspace_differs": changed,
+    })
+    if changed:
+        raise CheckFailure(f"workspace fixture differs from its declared bytes: {changed}", [])
+    read_start, _ = native.expected_read(files)
     session = McpSession(ws, sid, "retrieval")
     try:
-        search = session.call("packet28_search", {"task_id": TASK_SEARCH, "query": "apply_discount", "fixed_string": True}, "initial")
-        glob = session.call("packet28_glob", {"task_id": TASK_SEARCH, "pattern": "src/**/*.rs"}, "initial")
-        slim_ok = (search.get("response_mode") == "slim" and bool(search.get("artifact_id"))
-                   and len(search.get("paths", [])) <= 6 and len(search.get("regions", [])) <= 8
-                   and len(search.get("symbols", [])) <= 4 and "matches" not in search)
-        definition_in_preview = DEFINITION_PATH in search.get("paths", [])
-        s.check("search_returns_fetchable_artifact", slim_ok and search.get("match_count", 0) > 8 and not definition_in_preview,
-                f"match_count={search.get('match_count')} slim paths={len(search.get('paths', []))} "
-                f"regions={len(search.get('regions', []))} definition_in_preview={definition_in_preview}",
-                [f"{session.rel}.wire"])
+        search = session.call("packet28_search", {"task_id": TASK_SEARCH, "query": native.SEARCH_QUERY, "fixed_string": True}, "initial")
+        glob = session.call("packet28_glob", {"task_id": TASK_SEARCH, "pattern": native.GLOB_PATTERN}, "initial")
         # Required retrieval: the definition is beyond the slim preview.
-        full = session.call("packet28_fetch_tool_result", {"task_id": TASK_SEARCH, "artifact_id": search["artifact_id"]}, "required_retrieval")
-        matches = [line for line in str(full.get("content") or "").split("\n") if line]
-        mismatched = []
-        definition_line = None
-        for match in matches:
-            path, _, rest = match.partition(":")
-            number, _, line_text = rest.partition(":")
-            try:
-                if file_line(ws.repo, path, int(number)) != line_text:
-                    mismatched.append(match)
-            except (OSError, ValueError, IndexError):
-                mismatched.append(match)
-                continue
-            if path == DEFINITION_PATH and "pub fn apply_discount" in line_text:
-                definition_line = int(number)
-        owned = full.get("task_id") == TASK_SEARCH and full.get("artifact_id") == search["artifact_id"]
-        s.check("fetched_matches_equal_source",
-                bool(matches) and not mismatched and definition_line is not None and "groups" not in full and owned
-                and full.get("content_format") == "path:line:text" and not full.get("truncated")
-                and len(matches) == search.get("match_count"),
-                f"{len(matches)}/{search.get('match_count')} fetched matches, {len(mismatched)} differ from source, "
-                f"definition line={definition_line}, format={full.get('content_format')}, owner={full.get('task_id')}, "
-                f"truncated={full.get('truncated')}", [f"{session.rel}.wire"])
-        s.metrics["search_engine"] = (search.get("engine") or {}).get("engine")
-        start = (definition_line or 2) + 3
+        session.call("packet28_fetch_tool_result", {"task_id": TASK_SEARCH, "artifact_id": search.get("artifact_id")},
+                     "required_retrieval", allow_error=True)
         read = session.call("packet28_read_regions", {"task_id": TASK_SEARCH, "path": DEFINITION_PATH,
-                                                     "line_start": start, "line_end": start + 2}, "required_retrieval")
-        expected = "\n".join(f"{n}: {file_line(ws.repo, DEFINITION_PATH, n)}" for n in range(start, start + 3))
-        s.check("read_regions_exact", read.get("content") == expected and read.get("line_count") == 3,
-                f"requested {DEFINITION_PATH}:{start}-{start + 2} (blank and non-ASCII lines); "
-                f"exact={read.get('content') == expected}", [f"{session.rel}.wire"])
-        glob_full = session.call("packet28_fetch_tool_result", {"task_id": TASK_SEARCH, "artifact_id": glob["artifact_id"]}, "verification_retrieval")
-        paths = glob_full.get("paths") or glob_full.get("matches") or []
-        expected_paths = sorted(str(p.relative_to(ws.repo)) for p in (ws.repo / "src").rglob("*.rs"))
-        s.check("glob_paths_exist", sorted(paths) == expected_paths and len(json.dumps(glob)) < len(json.dumps(glob_full)),
-                f"{len(paths)} paths, expected {len(expected_paths)}; slim {len(json.dumps(glob))}B vs full {len(json.dumps(glob_full))}B",
-                [f"{session.rel}.wire"])
-        session.call("packet28_fetch_tool_result", {"task_id": TASK_SEARCH, "artifact_id": read["artifact_id"]}, "verification_retrieval")
+                                                     "line_start": read_start, "line_end": read_start + native.READ_LINES - 1},
+                            "required_retrieval", allow_error=True)
+        session.call("packet28_fetch_tool_result", {"task_id": TASK_SEARCH, "artifact_id": glob.get("artifact_id")},
+                     "verification_retrieval", allow_error=True)
+        session.call("packet28_fetch_tool_result", {"task_id": TASK_SEARCH, "artifact_id": read.get("artifact_id")},
+                     "verification_retrieval", allow_error=True)
     finally:
         session.close()
-    ledger = {}
-    for phase in ("initial", "required_retrieval", "verification_retrieval"):
-        steps = [step for step in session.steps if step["phase"] == phase]
-        ledger[phase] = {"round_trips": len(steps), "response_bytes": sum(x["response_bytes"] for x in steps),
-                         "est_tokens": sum(x["response_est_tokens"] for x in steps),
-                         "elapsed_ms": round(sum(x["elapsed_ms"] for x in steps), 1)}
-    s.metrics.update({
-        "mcp_round_trips": len(session.steps),
-        "acquisition_tokens": ledger["initial"]["est_tokens"],
-        "required_retrieval_tokens": ledger["initial"]["est_tokens"] + ledger["required_retrieval"]["est_tokens"],
-        "verification_retrieval_tokens": ledger["verification_retrieval"]["est_tokens"],
-        "all_full_retrieval_tokens": sum(x["response_est_tokens"] for x in session.steps),
-        "ledgers": ledger,
-        "token_estimate": "ceil(utf8_bytes/4) of complete JSON-RPC response lines",
-    })
+    wire = b"".join(session.wire)
+    checks, _ = native.check_native_retrieval(wire, files)
+    for check_id, (passed, detail) in checks.items():
+        s.check(check_id, passed, detail, [f"{session.rel}.wire"])
+    ledger, errors = native.native_ledger(wire, session.steps)
+    s.check("ledger_matches_wire", not errors, "; ".join(errors) or "six tool calls counted once in their contract phases",
+            [f"{session.rel}.wire", f"{session.rel}.steps.json"])
+    s.metrics["search_engine"] = (search.get("engine") or {}).get("engine")
+    s.metrics.update(native.ledger_metrics(ledger))
+    s.metrics["token_estimate"] = "ceil(utf8_bytes/4) of complete JSON-RPC response lines"
+    s.metrics["native_evidence"] = {"wire": f"{session.rel}.wire", "steps": f"{session.rel}.steps.json",
+                                    "fixture_dir": f"scenarios/{sid}/fixture"}
 
 
 def scenario_same_task_sessions(ws: Workspace, s: Scenario, state: dict) -> None:
@@ -806,6 +793,45 @@ def scenario_runtime_log_bounds(ws: Workspace, s: Scenario, state: dict) -> None
     s.metrics.update({"daemon_log_generation_bytes": sizes, "hook_log_generation_bytes": hook_sizes})
 
 
+def scenario_source_freshness(ws: Workspace, s: Scenario, state: dict) -> None:
+    """Edit an indexed tracked file without reporting it, then query it."""
+    sid = s.id
+    path = ws.repo / native.FRESHNESS_PATH
+    original = path.read_bytes()
+    if original != native.fixture_files()[native.FRESHNESS_PATH]:
+        raise CheckFailure(f"{native.FRESHNESS_PATH} differs from its committed fixture bytes", [])
+    runtime = ws.runtime()
+    if not runtime.get("socket_path"):
+        raise CheckFailure("daemon runtime has no Unix socket; the forced-index request needs the Unix transport", [])
+
+    def forced(query: str) -> dict:
+        return daemon_rpc(runtime, {"type": "packet28_search", "request": {
+            "request": {"query": query, "fixed_string": True}, "force_indexed": True}})
+
+    replies = {"before_edit": forced(native.FRESHNESS_OLD)}
+    edited = native.edited_freshness_source(original)
+    session = None
+    try:
+        path.write_bytes(edited)
+        ws.evidence.write(f"scenarios/{sid}/edited/{native.FRESHNESS_PATH}", edited)
+        replies["after_edit"] = forced(native.FRESHNESS_NEW)
+        session = McpSession(ws, sid, "after-edit")
+        for query in (native.FRESHNESS_NEW, native.FRESHNESS_OLD):
+            session.call("packet28_search", {"task_id": "agent-dx-freshness", "query": query, "fixed_string": True,
+                                             "response_mode": "full"}, "initial", allow_error=True)
+    finally:
+        if session is not None:
+            session.close()
+        path.write_bytes(original)
+        ws.evidence.write_json(f"scenarios/{sid}/forced-index.json", replies)
+    checks = native.check_freshness(b"".join(session.wire), replies, edited)
+    for check_id, (passed, detail) in checks.items():
+        s.check(check_id, passed, detail, [f"{session.rel}.wire", f"scenarios/{sid}/forced-index.json"])
+    s.check("fixture_restored", path.read_bytes() == original, f"{native.FRESHNESS_PATH} sha256 {sha256_bytes(path.read_bytes())}")
+    s.metrics["freshness_evidence"] = {"wire": f"{session.rel}.wire", "forced": f"scenarios/{sid}/forced-index.json",
+                                       "edited": f"scenarios/{sid}/edited/{native.FRESHNESS_PATH}"}
+
+
 def scenario_explicit_cli(ws: Workspace, s: Scenario, state: dict, results: list[dict]) -> None:
     manifest = reduction.load_manifest()
     replay_dir = ws.work / "replay"
@@ -864,8 +890,12 @@ def cleanup(ws: Workspace, s: Scenario) -> None:
 # ---------------------------------------------------------------- run metadata
 
 
-def git_text(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=False).stdout.strip()
+def git_bytes(root: Path, *args: str) -> bytes:
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, check=False, timeout=60).stdout
+
+
+def git_text(*args: str, root: Path = ROOT) -> str:
+    return git_bytes(root, *args).decode().strip()
 
 
 def tool_version(argv: list[str]) -> str | None:
@@ -875,18 +905,23 @@ def tool_version(argv: list[str]) -> str | None:
         return None
 
 
-def source_metadata() -> dict:
-    status = git_text("status", "--porcelain", "--untracked-files=no")
-    dirty_paths = sorted(line[3:] for line in status.splitlines() if line.strip())
+def source_metadata(root: Path = ROOT) -> tuple[dict, bytes]:
+    """Commit, tree and every modified, staged or untracked path, from `git status -z`.
+
+    The raw status bytes are returned so the validator can parse them itself.
+    """
+    status = git_bytes(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    entries = contract.parse_porcelain_z(status)
     return {
-        "commit": git_text("rev-parse", "HEAD"),
-        "tree": git_text("rev-parse", "HEAD^{tree}"),
-        "runtime_trees": {path: git_text("rev-parse", f"HEAD:{path}") for path in ("crates", "Cargo.toml", "Cargo.lock")},
-        "dirty": bool(status),
-        "dirty_paths": dirty_paths,
-        "lock_sha256": sha256_bytes((ROOT / "Cargo.lock").read_bytes()),
+        "commit": git_text("rev-parse", "HEAD", root=root),
+        "tree": git_text("rev-parse", "HEAD^{tree}", root=root),
+        "runtime_trees": {path: git_text("rev-parse", f"HEAD:{path}", root=root) for path in ("crates", "Cargo.toml", "Cargo.lock")},
+        "dirty": bool(entries),
+        "dirty_paths": sorted({entry["path"] for entry in entries} | {entry["orig_path"] for entry in entries if entry.get("orig_path")}),
+        "relevant_dirty_paths": contract.relevant_dirty(entries),
+        "lock_sha256": sha256_bytes((root / "Cargo.lock").read_bytes()),
         "github": {key: os.environ.get(key) for key in ("GITHUB_SHA", "GITHUB_REF", "GITHUB_RUN_ID", "GITHUB_WORKFLOW")},
-    }
+    }, status
 
 
 def main() -> int:
@@ -903,13 +938,18 @@ def main() -> int:
         os.environ.pop(key, None)
     bin_dir = Path(args.bin_dir).resolve()
     artifact_dir = Path(args.artifact_dir).resolve()
-    if artifact_dir.exists():
-        shutil.rmtree(artifact_dir)
-    artifact_dir.mkdir(parents=True)
+    # Never delete an existing directory: it may hold an earlier failure's evidence.
+    if artifact_dir.exists() and (not artifact_dir.is_dir() or any(artifact_dir.iterdir())):
+        print(f"[agent-dx] refusing to write into non-empty {artifact_dir}; choose a new or empty --artifact-dir",
+              file=sys.stderr)
+        return 2
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     evidence = Evidence(artifact_dir)
+    source, status = source_metadata()
+    source["status_porcelain_z"] = evidence.write("inputs/source-status-start.z", status)
     summary: dict = {
         "schema": SCHEMA, "contract_version": contract.SCHEMA_VERSION, "benchmark": contract.BENCHMARK,
-        "started_at": utc_now(), "artifact_dir": str(artifact_dir), "source": source_metadata(),
+        "started_at": utc_now(), "artifact_dir": str(artifact_dir), "source": source,
         "binaries": [], "environment": {
             "os": platform.system().lower(), "arch": platform.machine(), "python": platform.python_version(),
             "git": tool_version(["git", "--version"]), "rg": tool_version(["rg", "--version"]),
@@ -940,6 +980,7 @@ def main() -> int:
         ("handoff_cold_restart", scenario_handoff_cold_restart),
         ("corrupt_history_recovery", scenario_corrupt_history),
         ("runtime_log_bounds", scenario_runtime_log_bounds),
+        ("source_freshness", scenario_source_freshness),
     ]
     try:
         for scenario_id, function in order:
@@ -966,10 +1007,17 @@ def main() -> int:
         except Exception as exc:
             scenario.error = f"{type(exc).__name__}: {exc}"
         summary["scenarios"].append(scenario.result())
-        if not args.keep_workspace and not ws.owned_processes():
+        failed = any(x["status"] != "passed" for x in summary["scenarios"])
+        # Only the private temporary workspace is ever removed, and only after a clean pass.
+        if not args.keep_workspace and not failed and not ws.owned_processes():
             shutil.rmtree(work_dir, ignore_errors=True)
         summary["workspace"] = str(work_dir)
+        summary["workspace_kept"] = work_dir.exists()
         summary["finished_at"] = utc_now()
+        # A source change during the run would make the start receipt describe a different measurement.
+        end, status = source_metadata()
+        end["status_porcelain_z"] = evidence.write("inputs/source-status-end.z", status)
+        summary["source_end"] = end
         evidence.write("invocations.json", (json.dumps(evidence.invocations, indent=2) + "\n").encode())
         summary["evidence_sha256"] = dict(sorted(evidence.hashes.items()))
         summary["status"] = "passed" if all(x["status"] == "passed" for x in summary["scenarios"]) else "failed"

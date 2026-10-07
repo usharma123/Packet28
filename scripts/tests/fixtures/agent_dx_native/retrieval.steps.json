@@ -1,0 +1,85 @@
+{
+  "exit_code": 0,
+  "killed": false,
+  "readers_finished": true,
+  "steps": [
+    {
+      "artifact_id": "tool-invocation-84338596598382546f3c0b466ab4fb4d-1-result.json",
+      "elapsed_ms": 270.5,
+      "error": null,
+      "phase": "initial",
+      "request_id": 2,
+      "response_bytes": 951,
+      "response_est_tokens": 238,
+      "session": "retrieval",
+      "structured_bytes": 855,
+      "task_id": "agent-dx-native",
+      "tool": "packet28_search"
+    },
+    {
+      "artifact_id": "tool-invocation-84338596598382546f3c0b466ab4fb4d-2-result.json",
+      "elapsed_ms": 96.1,
+      "error": null,
+      "phase": "initial",
+      "request_id": 3,
+      "response_bytes": 320,
+      "response_est_tokens": 80,
+      "session": "retrieval",
+      "structured_bytes": 190,
+      "task_id": "agent-dx-native",
+      "tool": "packet28_glob"
+    },
+    {
+      "artifact_id": "tool-invocation-84338596598382546f3c0b466ab4fb4d-1-result.json",
+      "elapsed_ms": 6.0,
+      "error": null,
+      "phase": "required_retrieval",
+      "request_id": 4,
+      "response_bytes": 7022,
+      "response_est_tokens": 1756,
+      "session": "retrieval",
+      "structured_bytes": 6954,
+      "task_id": "agent-dx-native",
+      "tool": "packet28_fetch_tool_result"
+    },
+    {
+      "artifact_id": "tool-invocation-84338596598382546f3c0b466ab4fb4d-3-result.json",
+      "elapsed_ms": 74.8,
+      "error": null,
+      "phase": "required_retrieval",
+      "request_id": 5,
+      "response_bytes": 627,
+      "response_est_tokens": 157,
+      "session": "retrieval",
+      "structured_bytes": 462,
+      "task_id": "agent-dx-native",
+      "tool": "packet28_read_regions"
+    },
+    {
+      "artifact_id": "tool-invocation-84338596598382546f3c0b466ab4fb4d-2-result.json",
+      "elapsed_ms": 6.0,
+      "error": null,
+      "phase": "verification_retrieval",
+      "request_id": 6,
+      "response_bytes": 1259,
+      "response_est_tokens": 315,
+      "session": "retrieval",
+      "structured_bytes": 1108,
+      "task_id": "agent-dx-native",
+      "tool": "packet28_fetch_tool_result"
+    },
+    {
+      "artifact_id": "tool-invocation-84338596598382546f3c0b466ab4fb4d-3-result.json",
+      "elapsed_ms": 5.4,
+      "error": null,
+      "phase": "verification_retrieval",
+      "request_id": 7,
+      "response_bytes": 718,
+      "response_est_tokens": 180,
+      "session": "retrieval",
+      "structured_bytes": 578,
+      "task_id": "agent-dx-native",
+      "tool": "packet28_fetch_tool_result"
+    }
+  ]
+}

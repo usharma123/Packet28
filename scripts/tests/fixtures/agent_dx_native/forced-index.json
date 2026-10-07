@@ -1,0 +1,57 @@
+{
+  "after_edit": {
+    "message": "indexed search is not ready: workspace freshness could not be authenticated because the Git working tree changed after the indexed publication",
+    "type": "error"
+  },
+  "before_edit": {
+    "response": {
+      "compact_preview": "Search found 1 matches in 1 files.\n- src/teller/discount.rs (1)",
+      "diagnostics": [],
+      "engine": {
+        "base_commit": "0a9d15658aac0eb645896eba6842b139f74163fb",
+        "candidate_files": 1,
+        "candidates_examined": 1,
+        "engine": "indexed_regex",
+        "fallback_reason": null,
+        "index_generation": 2,
+        "index_lookups": 3,
+        "plan_kind": "literal",
+        "planner_fallback": null,
+        "postings_bytes_read": 21,
+        "stale_reason": null,
+        "verified_files": 1
+      },
+      "groups": [
+        {
+          "displayed_match_count": 1,
+          "match_count": 1,
+          "matches": [
+            {
+              "line": 8,
+              "path": "src/teller/discount.rs",
+              "text": "pub const DISCOUNT_AUDIT: &str = \"ledger-discount-v1\";"
+            }
+          ],
+          "path": "src/teller/discount.rs",
+          "truncated": false
+        }
+      ],
+      "match_count": 1,
+      "paths": [
+        "src/teller/discount.rs"
+      ],
+      "query": "ledger-discount-v1",
+      "regions": [
+        "src/teller/discount.rs:8-8"
+      ],
+      "requested_paths": [],
+      "resolved_paths": [],
+      "returned_match_count": 1,
+      "symbols": [
+        "ledger-discount-v1"
+      ],
+      "truncated": false
+    },
+    "type": "packet28_search"
+  }
+}

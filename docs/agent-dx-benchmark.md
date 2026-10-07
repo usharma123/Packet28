@@ -32,6 +32,19 @@ network or credentials. It strips GitHub and provider tokens, uses an isolated
 hook server it started. It always writes `summary.json` and exits 1 if a
 required check failed. A full run takes about 15 seconds on a debug build.
 
+`--artifact-dir` must be new or empty. The runner refuses a non-empty
+directory (exit 2) instead of deleting it, so an earlier failure's evidence
+survives. It removes only its own temporary workspace, and keeps that too when
+a scenario failed.
+
+Source state comes from `git status --porcelain=v1 -z --untracked-files=all`
+at the start and end of the run. Both raw receipts are kept. The validator
+parses them itself and fails if a runtime or benchmark source (see
+`RELEVANT_SOURCE_PREFIXES`) is modified, staged, renamed, deleted or
+untracked, or if the status changed during the run. Python bytecode caches
+and unrelated files, such as the regenerated JavaTest cache, are ignored. An
+edit made and reverted within the run is not detected.
+
 Pass `--binary-binding` with a build receipt when the binaries were built from
 another checkout. Pass `--product-test-tree` when the test log came from
 another Git tree. The validator accepts either only if that tree's `crates/`,
@@ -48,11 +61,12 @@ fails validation.
 | `setup_fresh_index` | Setup in a committed repository reports `index ready`. The index attests HEAD plus setup's own files, user source is unchanged, and indexed search finds user code and the generated guidance. |
 | `hooks_disabled_honesty` | With hooks disabled, doctor fails and says why without rewriting config, and the generated handler records nothing. Explicit setup re-enables capture, keeps a user handler, captures exactly once, and doctor passes. |
 | `hooks_capture_only` | Claude and Codex `PreToolUse` never return `updatedInput`, `permissionDecision` or `decision`, even when a legacy `rewrite_enabled=true` is stored. |
-| `native_retrieval` | Slim search stays within its field limits, and the definition the task needs lies beyond the preview. The fetched artifact belongs to the task, is `path:line:text`, is untruncated, and every line equals the source. An explicit read returns the exact lines, including a blank and a non-ASCII line. |
+| `native_retrieval` | Slim search carries only its documented navigational fields within the slim limits (6 paths, 8 regions, 4 symbols, 4 diagnostics), each backed by a source match, and is smaller than the full result in bytes and estimated tokens. The definition the task needs lies beyond the preview. The fetched artifact belongs to the task, is untruncated `path:line:text`, and holds exactly the 32 matches derived from the fixture source: none missing, extra or duplicated. An explicit read returns the exact lines, including a blank and a non-ASCII line. Glob is slim, then returns exactly the 14 source-derived paths. Every call is counted once in its contract phase. |
 | `same_task_sessions` | Sequential and concurrent fresh MCP processes on one task succeed with distinct artifacts. A later process retrieves every one unchanged. |
 | `handoff_cold_restart` | After an intention and a Stop hook, a handoff is ready. When `daemon stop` returns, the instance lock is free, readiness is withdrawn and the process has exited. One `daemon start` succeeds, and a new MCP process resumes the latest intention. |
 | `corrupt_history_recovery` | Damaged task history continues through a successor. The damaged bytes are quarantined exactly, inherited context stays readable, and the successor starts at sequence 1. |
 | `runtime_log_bounds` | The same daemon process keeps at most four log generations, each within the threshold, through a 128-error burst, and keeps the latest diagnostic. |
+| `source_freshness` | After an unreported edit of an indexed tracked line, a normal search finds the new text at its current line (through a fresh index or the live fallback) and no longer returns the replaced text. A forced indexed search (the daemon's `force_indexed` request) answers from the index before the edit. After it, the search refuses or answers with current source. The file is then restored. |
 | `explicit_cli_reduction` | Every frozen case keeps its derived contract (below). |
 | `cleanup` | No owned process or instance lock remains. |
 
@@ -83,9 +97,13 @@ Each contract is derived from the raw input and the documented renderer:
 - `gh_run_view`: the true job and annotation counts (unindented entries only),
   plus every failed job and failed step. Whether annotation text is kept is
   reported, not gated, because no renderer contract promises it.
-- `cargo_test`: pass/fail counts from `test result:` lines, every failing
-  test with its panic location, no passing-test lines, and a budget of each
-  failure's first five lines.
+- `cargo_test`: pass/fail counts from `test result:` lines, and every failing
+  test by name with its failure preview. The preview is the first five
+  nonblank lines of that test's own output (panic location, assertion message,
+  compared values), excluding cargo's `RUST_BACKTRACE` hint. The check compares
+  words, so spacing and indentation may change but content may not. There must
+  be no passing-test lines, and the output must fit within a budget derived
+  from those preview lines.
 - `diagnostic_facts`: declared facts must occur in the raw input and in the
   visible output.
 
@@ -107,11 +125,11 @@ For native retrieval it keeps separate ledgers:
 
 - acquisition: the slim search and glob responses;
 - required retrieval: acquisition plus the fetch and read the task needs;
-- verification and all-full retrieval: fetches made only to prove evidence
-  is recoverable.
+- verification: fetches made only to prove evidence is recoverable;
+- `all_calls_tokens`: every call together. This is not a raw baseline.
 
 Each ledger counts complete JSON-RPC response lines, round trips and elapsed
-time. These numbers are not provider token, cost or productivity claims. Any
+time. `required_elapsed_ms` adds the required fetch and read to acquisition. These numbers are not provider token, cost or productivity claims. Any
 future floor should come from repeated, reviewed runs of this fixed corpus.
 
 ## Evidence and failures
@@ -129,4 +147,26 @@ Evidence: .../reduction/vitest_one_failure.reduced.stdout
 ```
 
 CI publishes the validation report and uploads all artifacts even when a step
-fails.
+fails. An MCP process that fails or times out during `initialize` is stopped
+within bounded waits. Its partial wire, stderr and exit status are still
+written.
+
+## What the validator rechecks
+
+The validator does not trust the runner's verdicts where the evidence allows a
+recheck. `scripts/agent_dx_native.py` holds the native retrieval and freshness
+contracts. The validator reruns them on the hashed MCP wire, the forced-index
+replies and the fixture bytes it derives itself. It recomputes per-phase round
+trips, bytes and estimated tokens from the wire responses each step names, and
+sums elapsed time from the step ledger. Then it compares those totals with the
+summary. It also recomputes every explicit-CLI result from its streams. It
+re-parses the source status receipts, and requires every check's evidence to
+be in the hash ledger.
+
+Elapsed time cannot be reconstructed from bytes, so it is checked only for
+consistency. Process identity, lock release, log rotation on a live daemon,
+hook capture counts and recovery lineage are runner observations of live
+operating-system state. The validator checks that they were recorded and
+passed, and the delegated Rust tests cover the same contracts. It cannot
+replay those observations, and it does not authenticate who produced a
+supplied build receipt or test log. In CI both come from the same job.
