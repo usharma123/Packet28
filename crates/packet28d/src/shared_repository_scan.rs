@@ -689,20 +689,107 @@ mod tests {
         );
     }
 
-    fn set_fixture_mtimes(path: &Path) {
-        let modified = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        for entry in fs::read_dir(path).expect("read fixture directory") {
-            let entry = entry.expect("read fixture entry");
-            let file_type = entry.file_type().expect("read fixture entry type");
+    const FIXTURE_MTIME_SECONDS: u64 = 1_700_000_000;
+
+    fn set_fixture_mtimes(root: &Path) {
+        set_fixture_mtimes_with(root, root, &mut |_| {});
+    }
+
+    fn set_fixture_mtimes_with(root: &Path, path: &Path, before_open: &mut dyn FnMut(&Path)) {
+        let modified = UNIX_EPOCH + Duration::from_secs(FIXTURE_MTIME_SECONDS);
+        let entries = fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("read fixture directory {}: {error}", path.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("read fixture entry in {}: {error}", path.display())
+            });
+            let entry_path = entry.path();
+            // Git metadata is irrelevant to source parity, and Git may prune
+            // control files at any time, so only fixture content is touched.
+            if path == root && entry.file_name() == ".git" {
+                continue;
+            }
+            let file_type = entry.file_type().unwrap_or_else(|error| {
+                panic!("read fixture entry type {}: {error}", entry_path.display())
+            });
             if file_type.is_dir() {
-                set_fixture_mtimes(&entry.path());
+                set_fixture_mtimes_with(root, &entry_path, before_open);
             } else if file_type.is_file() {
-                fs::File::open(entry.path())
-                    .expect("open fixture file")
+                before_open(&entry_path);
+                fs::File::open(&entry_path)
+                    .unwrap_or_else(|error| {
+                        panic!("open fixture file {}: {error}", entry_path.display())
+                    })
                     .set_modified(modified)
-                    .expect("set fixture file mtime");
+                    .unwrap_or_else(|error| {
+                        panic!("set fixture file mtime {}: {error}", entry_path.display())
+                    });
             }
         }
+    }
+
+    fn fixture_mtime(path: &Path) -> std::time::SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn fixture_mtimes_skip_git_metadata_even_when_git_removes_control_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_fixture(root);
+        let git = root.join(".git");
+        let control = git.join("packet28-transient-control");
+        fs::write(&control, b"transient\n").unwrap();
+        let head_mtime = fixture_mtime(&git.join("HEAD"));
+        let modified = UNIX_EPOCH + Duration::from_secs(FIXTURE_MTIME_SECONDS);
+        let source = root.join("src/lib.rs");
+        fs::write(&source, b"pub fn shared_visible_symbol() -> usize { 9 }\n").unwrap();
+        assert_ne!(fixture_mtime(&source), modified);
+
+        let mut visited = Vec::new();
+        set_fixture_mtimes_with(root, root, &mut |path| {
+            // Model Git pruning a control file after the walk enumerated it
+            // and before it is opened.
+            if path == control {
+                fs::remove_file(path).unwrap();
+            }
+            visited.push(path.to_path_buf());
+        });
+
+        assert!(control.is_file(), "Git control file was touched");
+        assert!(
+            visited.iter().all(|path| !path.starts_with(&git)),
+            "fixture mtime walk visited Git metadata: {visited:?}"
+        );
+        assert!(visited.contains(&source));
+        assert_eq!(fixture_mtime(&source), modified);
+        assert_eq!(fixture_mtime(&git.join("HEAD")), head_mtime);
+    }
+
+    #[test]
+    fn fixture_mtimes_fail_with_the_path_of_a_vanished_source_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_fixture(root);
+        let vanished = root.join("docs/guide.md");
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set_fixture_mtimes_with(root, root, &mut |path| {
+                if path == vanished {
+                    fs::remove_file(path).unwrap();
+                }
+            });
+        }))
+        .expect_err("a vanished fixture source file must fail the walk");
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .expect("formatted panic message");
+
+        assert!(
+            message.starts_with(&format!("open fixture file {}:", vanished.display())),
+            "{message}"
+        );
     }
 
     fn fixture_git(root: &Path, arguments: &[&str]) {
