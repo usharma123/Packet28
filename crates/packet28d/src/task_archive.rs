@@ -618,9 +618,11 @@ mod tests {
         );
         state.lock().unwrap().task_maintenance.unfence(BIG, lease);
 
+        let archived = apply(&state, BIG);
         assert_eq!(
-            apply(&state, BIG).outcome,
-            TaskRecordArchiveOutcome::Archived
+            archived.outcome,
+            TaskRecordArchiveOutcome::Archived,
+            "{archived:?}"
         );
         let error = admit_task_request(&state, &[], &[BIG]).err().unwrap();
         assert!(format!("{error:#}").contains("archived"), "{error:#}");

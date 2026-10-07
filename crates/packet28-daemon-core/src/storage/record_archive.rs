@@ -546,8 +546,11 @@ pub fn publish_task_record_archive(
         |message: &'static str, source: std::io::Error| DaemonCoreError::io(message, &path, source);
     let workspace = CapabilityDir::open_workspace(root)
         .map_err(|source| io("failed to open workspace for task record archive", source))?;
+    // Registry/event persistence uses 0755 for this shared ancestor. Asking
+    // ensure_dir_open for 0700 here races its chmod/readback with those
+    // writers. Privacy belongs to the archive namespace and file below.
     let state = workspace
-        .ensure_dir_open(OsStr::new(".packet28"), PRIVATE_DIRECTORY_MODE)
+        .ensure_dir_open(OsStr::new(".packet28"), 0o755)
         .map_err(|source| {
             io(
                 "failed to open state directory for task record archive",
@@ -1185,6 +1188,56 @@ mod tests {
         let after = load_task_record_forward_fields(root.path()).unwrap();
         assert_eq!(after["task-big"], prepared.retained_forward_fields);
         assert_eq!(after["task-good"], forward["task-good"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_publication_preserves_the_shared_state_directory_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        crate::storage::ensure_daemon_dir(root.path()).unwrap();
+        let state = root.path().join(".packet28");
+        let mode = || std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(), 0o755);
+        let original = oversized("task-big", 200 * 1024);
+        let prepared =
+            prepare_task_record_archive(&original, &TaskRecordForwardFields::new(), "test", 1)
+                .unwrap();
+        let storage_id = TaskStorageId::try_from("task-big").unwrap();
+
+        publish_task_record_archive(root.path(), &storage_id, &prepared.bytes).unwrap();
+        assert_eq!(
+            mode(),
+            0o755,
+            "archive publication must not race registry persistence to chmod shared state"
+        );
+        crate::storage::load_task_registry(root.path()).unwrap();
+        assert!(!publish_task_record_archive(root.path(), &storage_id, &prepared.bytes).unwrap());
+        assert_eq!(
+            mode(),
+            0o755,
+            "idempotent publication also preserves shared mode"
+        );
+        let archive =
+            task_record_archive_path(root.path(), &storage_id, &prepared.pointer().digest);
+        assert_eq!(
+            std::fs::metadata(archive.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the archive directory remains private"
+        );
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            read_task_record_archive(root.path(), &prepared.tombstone).unwrap(),
+            prepared.bytes
+        );
     }
 
     #[cfg(unix)]
