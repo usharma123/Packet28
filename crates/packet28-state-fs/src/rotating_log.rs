@@ -785,7 +785,7 @@ mod tests {
         fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700)).unwrap();
 
         outcome.unwrap();
-        assert!(size.unwrap() <= 64, "notice plus record: {:?}", contents);
+        assert!(size.unwrap() <= 64, "notice plus record: {contents:?}");
         assert!(raw_size.unwrap() <= 64, "notice plus raw write");
         let contents = String::from_utf8(contents.unwrap()).unwrap();
         assert!(

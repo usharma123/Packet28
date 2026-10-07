@@ -61,6 +61,7 @@ PROTOCOL_PUBLIC_MODULES = (
     "frame",
     "hooks",
     "index",
+    "logging",
     "message",
     "paths",
     "process",
@@ -164,7 +165,8 @@ def write_packet28d_sources(
     broker.mkdir(parents=True)
     (source / "main.rs").write_text(main_source, encoding="utf-8")
     (source / "application.rs").write_text(
-        "pub fn serve() {}\n", encoding="utf-8"
+        "pub fn serve() {}\npub fn serve_with_managed_log() {}\n",
+        encoding="utf-8",
     )
     (source / "bootstrap.rs").write_text(
         "pub fn start() {}\n", encoding="utf-8"
@@ -174,6 +176,7 @@ def write_packet28d_sources(
         "mod bootstrap;\n"
         "mod broker;\n"
         "pub use application::serve;\n"
+        "pub use application::serve_with_managed_log;\n"
         "pub use bootstrap::start;\n"
         '#[cfg(feature = "shared-repository-scan")]\n'
         "pub mod shared_repository_scan;\n",

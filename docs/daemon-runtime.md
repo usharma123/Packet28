@@ -96,9 +96,11 @@ variant additionally owns the size-rotated workspace log described in
 
 `packet28d::start` (`packet28d start --root`) is excluded for the same reason:
 it takes the startup lease, waits for a stopping daemon to release the instance
-lease, and spawns `serve`. It is the bootstrap path for `p28`, which may not
-link `packet28-daemon-core`. The `p28` daemon process tests cover a held
-shutdown and the bounded authority timeout.
+lease, and spawns `serve --managed-log` from its own executable with null
+standard streams, so the started daemon owns the same bounded, size-rotated
+workspace log as a CLI-started daemon. It is the bootstrap path for `p28`,
+which may not link `packet28-daemon-core`. The `p28` daemon process tests cover
+a held shutdown, the bounded authority timeout and the managed-log bound.
 
 Bootstrap, in `packet28d start` and the Packet28 CLI, keeps two phases with
 separate fixed deadlines. An instance-lease owner that is neither serving nor

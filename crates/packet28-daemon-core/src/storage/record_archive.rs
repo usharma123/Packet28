@@ -82,15 +82,14 @@ pub struct PreparedTaskRecordArchive {
     /// encoding keeps them from the raw authority; every other forward field
     /// is listed in the pointer's `omitted_fields` and is not carried over.
     pub retained_forward_fields: TaskRecordForwardFields,
+    /// The pointer stored in [`Self::tombstone`] when it was prepared.
+    pointer: TaskRecordArchive,
 }
 
 impl PreparedTaskRecordArchive {
     /// Returns the archive pointer stored in [`Self::tombstone`].
     pub fn pointer(&self) -> &TaskRecordArchive {
-        self.tombstone
-            .archived
-            .as_ref()
-            .expect("prepared tombstone always carries its archive pointer")
+        &self.pointer
     }
 }
 
@@ -499,6 +498,7 @@ pub fn prepare_task_record_archive(
                 tombstone,
                 forward_fields: forward_fields.clone(),
                 retained_forward_fields,
+                pointer,
             });
         }
         let largest = fields

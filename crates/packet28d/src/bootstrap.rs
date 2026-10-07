@@ -24,7 +24,7 @@
 //! another bootstrap or an explicit stop, so the call as a whole has no single
 //! wall-clock bound. A timed-out caller leaves a starting daemon running.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -40,6 +40,7 @@ use packet28_daemon_client::transport::{
 use packet28_daemon_core::task_store_lease::{
     acquire_daemon_startup_lease, daemon_instance_lock_path, daemon_instance_released,
 };
+use packet28_daemon_protocol::logging::MANAGED_LOG_FLAG;
 use packet28_daemon_protocol::message::DaemonRuntimeInfo;
 use packet28_daemon_protocol::paths::{log_path, ready_path, socket_path, workspace_socket_path};
 use packet28_daemon_protocol::registry::DaemonStatusV1;
@@ -139,9 +140,7 @@ fn wait_for_authority(root: &Path) -> Result<Authority> {
 /// cleanup. Unauthentic or malformed metadata, or metadata naming another
 /// workspace, fails closed before its endpoint is used.
 fn observe_owner(root: &Path, deadline: Instant) -> Result<Owner> {
-    let Some(runtime) = read_runtime_info_if_present(root)
-        .context("failed to read packet28d runtime metadata while the daemon owns the workspace")?
-    else {
+    let Some(runtime) = read_owner_runtime(root)? else {
         // The owner has not published runtime metadata yet, or has removed it
         // during shutdown cleanup.
         return Ok(Owner::Unavailable);
@@ -165,6 +164,17 @@ fn observe_owner(root: &Path, deadline: Instant) -> Result<Owner> {
         // authority; keep waiting within the authority deadline.
         Ok(_) | Err(_) => Ok(Owner::Unavailable),
     }
+}
+
+/// Reads runtime metadata while another daemon may own the workspace.
+///
+/// A stopping owner removes its metadata, and a read that races the removal
+/// fails. The removal cannot fail a second read, so one retry tells it apart
+/// from unauthentic or malformed metadata, which still fails closed.
+fn read_owner_runtime(root: &Path) -> Result<Option<DaemonRuntimeInfo>> {
+    read_runtime_info_if_present(root)
+        .or_else(|_| read_runtime_info_if_present(root))
+        .context("failed to read packet28d runtime metadata while the daemon owns the workspace")
 }
 
 /// Waits for an existing starting daemon to answer status with its identity.
@@ -303,27 +313,62 @@ fn remove_stale_endpoint_files(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Spawns this executable as the background daemon for `root`.
+///
+/// The child owns its size-rotated workspace log through the managed-log flag,
+/// so diagnostics stay bounded while it runs and never depend on this process
+/// or inherited descriptors staying alive.
 fn spawn_daemon(root: &Path) -> Result<Child> {
     let binary = std::env::current_exe().context("failed to resolve packet28d executable")?;
-    let log_path = log_path(root);
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create daemon log dir '{}'", parent.display()))?;
-    }
-    let open_log = || {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .with_context(|| format!("failed to open daemon log '{}'", log_path.display()))
-    };
     Command::new(binary)
         .arg("serve")
         .arg("--root")
         .arg(root)
+        .arg(MANAGED_LOG_FLAG)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(open_log()?))
-        .stderr(Stdio::from(open_log()?))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .context("failed to spawn packet28d")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use packet28_daemon_protocol::paths::runtime_path;
+
+    use super::*;
+
+    #[test]
+    fn owner_runtime_read_tolerates_removal_by_a_stopping_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = runtime_path(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = serde_json::to_vec(&DaemonRuntimeInfo::default()).unwrap();
+
+        for round in 0..2_000 {
+            fs::write(&path, &bytes).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let remover = {
+                let (barrier, path) = (Arc::clone(&barrier), path.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    // Sweep the removal across the read's authentication steps.
+                    for _ in 0..(round % 500) * 40 {
+                        std::hint::spin_loop();
+                    }
+                    fs::remove_file(path).unwrap();
+                })
+            };
+            barrier.wait();
+            let read = read_owner_runtime(&root);
+            remover.join().unwrap();
+            assert!(read.is_ok(), "round {round}: {read:?}");
+        }
+        // Metadata that stays malformed still fails closed.
+        fs::write(&path, b"{").unwrap();
+        assert!(read_owner_runtime(&root).is_err());
+    }
 }

@@ -73,28 +73,10 @@ fn wait_for_settled_status(root: &Path, home: &Path) -> Value {
 
 /// Starts the daemon again to reload persisted index state.
 ///
-/// `daemon stop` can currently return before the old process releases its
-/// instance lock (tracked separately from this index contract), so a start that
-/// loses that race is retried within a bounded deadline.
+/// `daemon stop` returns only after the old process releases workspace
+/// authority, so an immediate start must succeed without a retry.
 fn start_stopped_daemon(root: &Path, home: &Path) {
-    let started = Instant::now();
-    loop {
-        let output = packet28_cmd()
-            .current_dir(root)
-            .env("HOME", home)
-            .env("PATH", "/usr/bin:/bin")
-            .args(["daemon", "start", "--root", root_arg(root)])
-            .output()
-            .unwrap();
-        if output.status.success() {
-            return;
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("did not become ready") && started.elapsed() < Duration::from_secs(30),
-            "daemon restart failed: {stderr}"
-        );
-    }
+    packet28(root, home, &["daemon", "start", "--root", root_arg(root)]).success();
 }
 
 fn regex_manifest(root: &Path) -> Value {

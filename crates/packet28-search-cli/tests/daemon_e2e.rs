@@ -294,6 +294,9 @@ fn assert_no_losing_replacement(workspace: &Path) {
 }
 
 fn lifecycle_workspace() -> (tempfile::TempDir, PathBuf) {
+    // Build the daemon before any test starts timing: the first use otherwise
+    // runs the nested build inside that test's readiness window.
+    daemon_bin();
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().canonicalize().unwrap();
     fs::create_dir_all(workspace.join(".git")).unwrap();
@@ -947,4 +950,159 @@ fn p28_replaces_copied_foreign_runtime_after_authority_release() {
     assert_ne!(runtime.pid, foreign.owner.id());
     assert_serving_identity(&workspace, runtime.pid);
     fixture.close();
+}
+
+/// Sends one request through the daemon's authenticated endpoint and returns
+/// its response.
+fn daemon_request(
+    workspace: &Path,
+    request: &packet28_daemon_protocol::message::DaemonRequest,
+) -> packet28_daemon_protocol::message::DaemonResponse {
+    use packet28_daemon_protocol::frame::{read_frame, write_frame};
+
+    let stream =
+        packet28_daemon_client::transport::connect(workspace, Duration::from_secs(5)).unwrap();
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let mut writer = std::io::BufWriter::new(stream);
+    write_frame(&mut writer, request).unwrap();
+    read_frame(&mut reader).unwrap()
+}
+
+fn log_generation(log: &Path, index: usize) -> PathBuf {
+    let mut name = log.file_name().unwrap().to_os_string();
+    name.push(format!(".{index}"));
+    log.with_file_name(name)
+}
+
+/// Waits until `needle` is logged and every generation is unchanged across
+/// two snapshots taken 300 ms apart, so no rotation is in flight.
+fn wait_for_settled_log(log: &Path, needle: &str) {
+    let snapshot = || {
+        (0..=4)
+            .map(|index| {
+                let path = match index {
+                    0 => log.to_path_buf(),
+                    index => log_generation(log, index),
+                };
+                fs::read(path).ok()
+            })
+            .collect::<Vec<_>>()
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut previous = snapshot();
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let current = snapshot();
+        let found = current
+            .iter()
+            .flatten()
+            .any(|bytes| String::from_utf8_lossy(bytes).contains(needle));
+        if found && current == previous {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} did not settle with {needle:?}",
+            log.display()
+        );
+        previous = current;
+    }
+}
+
+/// Stops a detached daemon if an assertion fails before the normal stop.
+struct StopDetachedOnDrop(PathBuf);
+
+impl Drop for StopDetachedOnDrop {
+    fn drop(&mut self) {
+        daemon_support::stop_daemon(&self.0);
+    }
+}
+
+#[test]
+fn p28_bootstrapped_daemon_rotates_its_own_log_while_running() {
+    use packet28_daemon_protocol::commands::PacketFetchRequest;
+    use packet28_daemon_protocol::message::{DaemonRequest, DaemonResponse};
+
+    // The size override is inherited through p28 and `packet28d start`.
+    const LOG_LIMIT: u64 = 4096;
+    let (_dir, workspace) = lifecycle_workspace();
+    let log = log_path(&workspace);
+
+    let first = output({
+        let mut command = cli_with_daemon_env();
+        command
+            .env("PACKET28_DAEMON_LOG_MAX_BYTES", LOG_LIMIT.to_string())
+            .current_dir(&workspace)
+            .args(DAEMON_SEARCH_ARGS);
+        command
+    });
+    let guard = StopDetachedOnDrop(workspace.clone());
+    assert!(
+        first.status.success(),
+        "p28 bootstrap failed: {}",
+        stderr_text(&first)
+    );
+    let pid = daemon_runtime_pid(&workspace).expect("bootstrapped runtime pid");
+    // The startup diagnostic reaches the daemon-owned log, not the null
+    // standard streams the bootstrap gave the daemon.
+    let startup = (0..=3)
+        .map(|index| match index {
+            0 => log.clone(),
+            index => log_generation(&log, index),
+        })
+        .any(|path| {
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .contains(&format!("starting packet28d pid={pid}"))
+        });
+    assert!(startup, "missing startup diagnostic for pid {pid}");
+
+    // Both launchers have exited; each failed request is a diagnostic written
+    // by the daemon itself.
+    for index in 0..128 {
+        let response = daemon_request(
+            &workspace,
+            &DaemonRequest::PacketFetch {
+                request: PacketFetchRequest {
+                    handle: format!("missing-p28-{index:03}"),
+                    root: workspace.to_string_lossy().into_owned(),
+                },
+            },
+        );
+        assert!(
+            matches!(response, DaemonResponse::Error { .. }),
+            "missing packet unexpectedly resolved: {response:?}"
+        );
+    }
+
+    assert_eq!(
+        daemon_status(&workspace).map(|status| status.pid),
+        Some(pid)
+    );
+    wait_for_settled_log(&log, "missing-p28-127");
+    for index in 0..=3 {
+        let path = match index {
+            0 => log.clone(),
+            index => log_generation(&log, index),
+        };
+        let size = fs::metadata(&path)
+            .unwrap_or_else(|error| panic!("missing generation {}: {error}", path.display()))
+            .len();
+        assert!(
+            size <= LOG_LIMIT,
+            "{} has {size} bytes; limit {LOG_LIMIT}",
+            path.display()
+        );
+    }
+    assert!(!log_generation(&log, 4).exists(), "only three backups");
+    let active = fs::read_to_string(&log).unwrap();
+    assert!(active.contains("missing-p28-127"), "{active}");
+    assert!(
+        !active.contains("missing-p28-000"),
+        "the oldest diagnostics must have rotated out of the active log"
+    );
+
+    stop_detached_daemon(&workspace);
+    assert!(daemon_support::instance_lease_released(&workspace));
+    drop(guard);
 }

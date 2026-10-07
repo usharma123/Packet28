@@ -22,6 +22,7 @@ const REVIEWED_MODULES: &[(&str, &str)] = &[
     ("frame", "runnable bounded-framing example"),
     ("hooks", "hook-ingest JSON compatibility tests"),
     ("index", "index state and process tests"),
+    ("logging", "runtime log rotation process tests"),
     ("message", "frozen request/response compatibility tests"),
     ("paths", "deterministic endpoint and confinement tests"),
     ("process", "session-detach child-process tests"),

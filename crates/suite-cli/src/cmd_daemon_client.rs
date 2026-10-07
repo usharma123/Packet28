@@ -591,6 +591,18 @@ enum DaemonOwner {
     Unavailable,
 }
 
+/// Reads runtime metadata while another daemon may own the workspace.
+///
+/// A stopping owner removes its metadata, and a read that races the removal
+/// fails. The removal cannot fail a second read, so one retry tells it apart
+/// from unauthentic or malformed metadata, which still fails closed.
+#[cfg(unix)]
+fn read_owner_runtime(root: &Path) -> Result<Option<DaemonRuntimeInfo>> {
+    read_runtime_info_if_present(root)
+        .or_else(|_| read_runtime_info_if_present(root))
+        .context("failed to read packet28d runtime metadata while the daemon owns the workspace")
+}
+
 /// Classifies the instance-lease owner from authenticated runtime metadata.
 ///
 /// Runtime metadata only selects what to wait for; it never authorizes
@@ -598,9 +610,7 @@ enum DaemonOwner {
 /// workspace, fails closed before its endpoint is used.
 #[cfg(unix)]
 fn observe_daemon_owner(root: &Path, deadline: Instant) -> Result<DaemonOwner> {
-    let Some(runtime) = read_runtime_info_if_present(root)
-        .context("failed to read packet28d runtime metadata while the daemon owns the workspace")?
-    else {
+    let Some(runtime) = read_owner_runtime(root)? else {
         return Ok(DaemonOwner::Unavailable);
     };
     verify_runtime_workspace(root, &runtime)?;

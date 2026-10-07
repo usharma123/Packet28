@@ -837,6 +837,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "packet28-daemon-client"
+version = "0.2.66"
+dependencies = [
+ "libc",
+ "packet28-daemon-protocol",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "packet28-daemon-core"
 version = "0.2.66"
 dependencies = [
@@ -939,10 +949,12 @@ dependencies = [
  "libc",
  "mapy-core",
  "notify",
+ "packet28-daemon-client",
  "packet28-daemon-core",
  "packet28-daemon-protocol",
  "packet28-reducer-core",
  "packet28-search-core",
+ "packet28-state-fs",
  "serde",
  "serde_json",
  "suite-foundation-core",
