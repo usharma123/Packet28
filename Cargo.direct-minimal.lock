@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "buildy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "regex",
@@ -379,7 +379,7 @@ checksum = "cf2bfb8b8661ac66cf4305b62ac89f6b9b557b72317a941aea6f358d7d28ea93"
 
 [[package]]
 name = "context-instruct-shim"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "hex",
  "libc",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "context-kernel-builtins"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "buildy-core",
  "context-kernel-mechanism",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "context-kernel-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "context-kernel-builtins",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "context-kernel-mechanism"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "context-memory-core",
  "context-scheduler-core",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "context-memory-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "fs2",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "context-scheduler-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "serde",
  "thiserror",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "contextq-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "covy-cli"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "covy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "diffy-core",
  "roaring",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "covy-ingest"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "covy-core",
@@ -773,7 +773,7 @@ checksum = "6184e33543162437515c2e2b48714794e37845ec9851711914eec9d308f6ebe8"
 
 [[package]]
 name = "diffy-cli"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "diffy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "colored",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "guardy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "glob",
  "regex",
@@ -1405,7 +1405,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mapy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "fs2",
@@ -1558,14 +1558,14 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "packet28-binary-codec"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "wincode",
 ]
 
 [[package]]
 name = "packet28-daemon-client"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "libc",
  "packet28-daemon-protocol",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-daemon-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "fs2",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-daemon-protocol"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "constant_time_eq 0.4.0",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-reducer-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-search-cli"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-search-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-state-fs"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "fs2",
  "rustix",
@@ -1670,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "packet28d"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2255,7 +2255,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stacky-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "regex",
@@ -2284,7 +2284,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suite-cli"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2330,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "suite-foundation-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "suite-ingest"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "covy-ingest",
  "suite-packet-core",
@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "suite-packet-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "hex",
@@ -2371,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "suite-policy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "glob",
  "regex",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "suite-proxy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "regex",
  "serde",
@@ -2444,7 +2444,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "testy-cli"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2458,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "testy-cli-common"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "clap",
  "covy-ingest",
@@ -2473,7 +2473,7 @@ dependencies = [
 
 [[package]]
 name = "testy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "glob",
  "quick-xml",

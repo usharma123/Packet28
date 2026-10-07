@@ -138,7 +138,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "covy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "diffy-core",
  "suite-foundation-core",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "covy-ingest"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "covy-core",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "diffy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "colored",
@@ -511,14 +511,14 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "packet28-binary-codec"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "wincode",
 ]
 
 [[package]]
 name = "packet28-daemon-protocol"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "constant_time_eq",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-reducer-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "blake3",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-search-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "blake3",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "packet28-state-fs"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "fs2",
  "rustix",
@@ -835,7 +835,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "suite-foundation-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "anyhow",
  "blake3",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "suite-packet-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "hex",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "testy-core"
-version = "0.2.66"
+version = "0.2.67"
 dependencies = [
  "glob",
  "quick-xml",
