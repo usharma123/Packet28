@@ -112,7 +112,6 @@ exploration.
 | Map a repository area | `packet28 map repo --repo-root . --focus-symbol AuthService --json` |
 | Inspect local state | `packet28 daemon storage inspect --root . --json --pretty` |
 | Preview retention | `packet28 daemon storage cleanup --root . --max-age-seconds 604800` |
-| Archive an oversized record online | `packet28 daemon storage archive-record --root . --task-id <id>` |
 
 Run `packet28 --help` or `packet28 <command> --help` for the complete CLI.
 
@@ -222,7 +221,7 @@ types, persistence, FFI, or release automation.
 ## Project stats
 
 <!-- BEGIN GENERATED PROJECT STATS -->
-- 288,093 lines across 698 Rust files
+- 299,173 lines across 708 Rust files
 - 34 crates in the workspace
 - 8 Cargo binary targets (including one internal generator)
 <!-- END GENERATED PROJECT STATS -->
