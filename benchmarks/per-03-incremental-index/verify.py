@@ -38,11 +38,11 @@ def main() -> None:
     mapy_incremental = median(result, "mapy_incremental_us")
     regex_full = median(result, "regex_full_overlay_us")
     regex_incremental = median(result, "regex_incremental_us")
-    assert mapy_whole == 5_075
-    assert mapy_incremental == 66_826
+    assert mapy_whole == 4_782
+    assert mapy_incremental == 71_158
     assert mapy_incremental > mapy_whole
-    assert regex_full == 389_491
-    assert regex_incremental == 128_038
+    assert regex_full == 387_995
+    assert regex_incremental == 129_657
     assert regex_incremental < regex_full
 
     published = result["published_bytes"]

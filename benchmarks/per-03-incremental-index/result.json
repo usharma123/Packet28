@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "captured_at": "2026-10-06",
+  "captured_at": "2026-10-07",
   "source": {
-    "snapshot_commit": "uncommitted-scope-closure-integration",
-    "snapshot_tree": "be3136d07d23c61d9c583d17374f7b16497698eb",
+    "snapshot_commit": "be6edbbcc5bc7b305b4c43e094bcfa3e4f8ac56e",
+    "snapshot_tree": "a010b5c41c4111cdbeedf92c2f299e281466b01f",
     "files": {
       "crates/mapy-core/examples/per03_incremental_index.rs": "ec9f288c8b7161d7344171940d5565bc736c88ae1f4fc4211e45c725c63cf4b6",
       "crates/mapy-core/src/generation.rs": "88729ec25083274106696785195bfc404f3cf42f81af6eac5c579637c13165af",
@@ -12,39 +12,42 @@
       "crates/packet28-state-fs/src/platform_fallback.rs": "ce77b6fd64b58b5167210bb29e56823ff00108604ba837fd76f76806c0ea28f0",
       "crates/packet28-search-core/src/generation.rs": "54ac0e5c2706a7b612fc68de477a01efde0172f3dd99c1ce2ab98997fe875903",
       "crates/packet28-search-core/src/layer.rs": "004e25ccb30bca8a04a9504237032f40fca92259738782d70418cd0f0c035719",
-      "crates/packet28-search-core/src/publication.rs": "3fb4292669185c03e3ebb46d50144d92c87465ddac5b7459575741a20b384065"
-    }
+      "crates/packet28-search-core/src/publication.rs": "3fb4292669185c03e3ebb46d50144d92c87465ddac5b7459575741a20b384065",
+      "crates/packet28-state-fs/src/rotating_log.rs": "6e7461ea7490e288a4de54e675c6c5ec80b5c3e1a203ece81a631b5bf0f3d34f"
+    },
+    "measurement_binding": "Measured staged tree; snapshot_commit preserves exactly the measured tree."
   },
   "environment": {
     "os": "Darwin 24.6.0",
     "arch": "arm64",
     "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
-    "cargo": "cargo 1.93.1 (083ac5135 2025-12-15)"
+    "cargo": "cargo 1.93.1 (083ac5135 2025-12-15)",
+    "concurrent_work": "Delivery policy checks on the same host; timings are not isolated latency estimates."
   },
   "invocations": [
     {
-      "mapy_whole_snapshot_us": 5222,
-      "mapy_incremental_us": 79892,
-      "mapy_compaction_us": 72841,
-      "regex_full_overlay_us": 382644,
-      "regex_incremental_us": 125083,
-      "regex_compaction_us": 409399
+      "mapy_whole_snapshot_us": 5142,
+      "mapy_incremental_us": 74586,
+      "mapy_compaction_us": 76483,
+      "regex_full_overlay_us": 403313,
+      "regex_incremental_us": 129657,
+      "regex_compaction_us": 406064
     },
     {
-      "mapy_whole_snapshot_us": 5039,
-      "mapy_incremental_us": 59650,
-      "mapy_compaction_us": 65917,
-      "regex_full_overlay_us": 389491,
-      "regex_incremental_us": 142646,
-      "regex_compaction_us": 431447
+      "mapy_whole_snapshot_us": 4782,
+      "mapy_incremental_us": 64649,
+      "mapy_compaction_us": 77059,
+      "regex_full_overlay_us": 384760,
+      "regex_incremental_us": 121913,
+      "regex_compaction_us": 392936
     },
     {
-      "mapy_whole_snapshot_us": 5075,
-      "mapy_incremental_us": 66826,
-      "mapy_compaction_us": 87581,
-      "regex_full_overlay_us": 396065,
-      "regex_incremental_us": 128038,
-      "regex_compaction_us": 410269
+      "mapy_whole_snapshot_us": 4782,
+      "mapy_incremental_us": 71158,
+      "mapy_compaction_us": 78674,
+      "regex_full_overlay_us": 387995,
+      "regex_incremental_us": 142007,
+      "regex_compaction_us": 374720
     }
   ],
   "published_bytes": {

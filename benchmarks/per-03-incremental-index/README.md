@@ -130,22 +130,25 @@ incremental invocation median improved from 16,965 to 4,764 µs (-71.92%, or
 
 ### Final-base durable-state decision
 
-The current source was last measured on 2026-10-06 at the uncommitted
-scope-closure integration tree `be3136d0`, after `packet28-state-fs` gained its
-additive rotating-log module and the search-core full rebuild began attesting
-stable dirty workspaces; the earlier `e3c6de30` snapshot had extended the byte
-snapshot from `mapy-v1/` to the complete `.packet28/index/` publication scope.
+The current benchmark source was measured on 2026-10-07 at staged tree
+`a010b5c41c4111cdbeedf92c2f299e281466b01f`, preserved exactly by commit
+`be6edbbcc5bc7b305b4c43e094bcfa3e4f8ac56e`. This rerun includes the final rotating-log
+module and stable dirty-workspace attestation. The earlier `e3c6de30` snapshot
+had extended the byte snapshot from `mapy-v1/` to the complete
+`.packet28/index/` publication scope.
 That correction includes the changed
 `.mapy-v1.generation-high-water.json` durability leaf. State publication
-synchronizes temporary files and parent directories. Three exact, uncontended
-release invocations reported:
+synchronizes temporary files and parent directories. Three exact release invocations reported:
 
 | Revision/path | Invocation medians (µs) | Median (µs) | Delta versus paired legacy |
 | --- | --- | ---: | ---: |
-| current whole snapshot | 5,222; 5,039; 5,075 | 5,075 | baseline |
-| current incremental generation | 79,892; 59,650; 66,826 | 66,826 | +1,216.77% |
+| current whole snapshot | 5,142; 4,782; 4,782 | 4,782 | baseline |
+| current incremental generation | 74,586; 64,649; 71,158 | 71,158 | +1,387.91% |
 
-The per-invocation deltas were +1,429.88%, +1,083.69%, and +1,216.55%.
+Delivery policy checks ran concurrently on the same machine; these timings
+include that host load and are not isolated latency estimates.
+
+The per-invocation deltas were +1,350.53%, +1,251.79%, and +1,387.91%.
 Therefore the elapsed-time decision gate fails on the durable state base.
 The whole-snapshot comparator uses a plain `fs::write`; the incremental
 transaction durably publishes the high-water mark, immutable segment,
@@ -200,13 +203,13 @@ the immutable base generation.
 
 | Path | Median compaction (µs) | Published bytes |
 | --- | ---: | ---: |
-| Mapy | 72,841 | 328,862 |
-| Regex | 410,269 | 223,531 |
+| Mapy | 77,059 | 328,862 |
+| Regex | 392,936 | 223,531 |
 
-Current Mapy compaction observations were 72,841, 65,917, and 87,581 µs
-(median 72,841 µs); the published-byte scope includes the generation high-water
-leaf. Current regex observations were 409,399, 431,447, and 410,269 µs
-(median 410,269 µs). The historical regex observations were 301,916, 348,383,
+Current Mapy compaction observations were 76,483, 77,059, and 78,674 µs
+(median 77,059 µs); the published-byte scope includes the generation high-water
+leaf. Current regex observations were 406,064, 392,936, and 374,720 µs
+(median 392,936 µs). The historical regex observations were 301,916, 348,383,
 and 307,572 µs. The regex compaction
 cost is approximately one former full-overlay update, but occurs once per eight
 segment publications; ordinary updates retain the measured incremental
