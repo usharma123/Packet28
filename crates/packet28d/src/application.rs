@@ -1313,8 +1313,11 @@ pub(crate) fn bind_preferred_daemon_listener(
 ) -> Result<DaemonListener> {
     match bind_unix_listener(primary) {
         Ok(listener) => Ok(listener),
-        Err(primary_error) if io_error_is_permission_denied(&primary_error) => {
-            bind_workspace_listener_or_tcp(root, primary, &primary_error.to_string())
+        Err(primary_error)
+            if io_error_is_permission_denied(&primary_error)
+                || primary_error.is::<UnixSocketPathTooLong>() =>
+        {
+            bind_workspace_listener_or_tcp(root, primary, &format!("{primary_error:#}"))
         }
         Err(error) => Err(error),
     }
@@ -1346,7 +1349,59 @@ fn bind_workspace_listener_or_tcp(
     }
 }
 
+/// A Unix socket path whose encoded bytes do not fit in `sockaddr_un`.
+///
+/// Binding such a path always fails before touching the filesystem, so the
+/// preferred endpoint may fall back to the workspace socket or authenticated
+/// loopback TCP.
+#[derive(Debug)]
+pub(crate) struct UnixSocketPathTooLong {
+    path: PathBuf,
+    len: usize,
+    max: usize,
+}
+
+impl std::fmt::Display for UnixSocketPathTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Unix socket path '{}' is {} bytes; this platform accepts at most {} bytes",
+            self.path.display(),
+            self.len,
+            self.max
+        )
+    }
+}
+
+impl std::error::Error for UnixSocketPathTooLong {}
+
+/// Capacity of `sockaddr_un.sun_path`, including the terminating NUL.
+pub(crate) const SUN_PATH_CAPACITY: usize =
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
+/// Rejects socket paths that `UnixListener::bind` would refuse for length.
+///
+/// The bound matches std's own check: the encoded path plus a NUL terminator
+/// must fit in `sun_path`.
+fn ensure_unix_socket_path_fits(endpoint: &Path) -> Result<(), UnixSocketPathTooLong> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let len = endpoint.as_os_str().as_bytes().len();
+    let max = SUN_PATH_CAPACITY - 1;
+    if len > max {
+        return Err(UnixSocketPathTooLong {
+            path: endpoint.to_path_buf(),
+            len,
+            max,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn bind_unix_listener(endpoint: &Path) -> Result<DaemonListener> {
+    // Check length first: an overlong path cannot be connected to or bound, so
+    // stale-entry probing would misreport it and could remove an unrelated file.
+    ensure_unix_socket_path_fits(endpoint)?;
     cleanup_socket_before_bind(endpoint)?;
     let listener = UnixListener::bind(endpoint)
         .with_context(|| format!("failed to bind '{}'", endpoint.display()))?;

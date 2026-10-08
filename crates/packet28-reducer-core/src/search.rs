@@ -15,6 +15,7 @@ const DEFAULT_DISPLAYED_MATCHES_PER_FILE: usize = 12;
 const DEFAULT_DISPLAYED_GROUPS_IN_PREVIEW: usize = 12;
 const DEFAULT_DISPLAYED_MATCH_LINES_IN_PREVIEW: usize = 12;
 const DEFAULT_MATCH_PREVIEW_TEXT_LIMIT: usize = 140;
+const MAX_FAILED_SEARCH_STDERR_BYTES: usize = 2048;
 
 pub fn normalize_capture_path(root: &Path, text: &str) -> String {
     let trimmed = text.trim();
@@ -262,14 +263,18 @@ fn collect_matches_with_rg(
         Err(error) => return Err(error).context("search command failed"),
     };
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    // Status 1 means no match; anything else is a failure whose stderr (such
+    // as a regex parse location) is the only actionable detail.
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        anyhow::bail!(
+            "search command exited with status {}{}",
+            output.status,
+            failed_search_stderr(&stderr)
+        );
+    }
     if !stderr.is_empty() {
         diagnostics.push(stderr);
     }
-    anyhow::ensure!(
-        matches!(output.status.code(), Some(0 | 1)),
-        "search command exited with status {}",
-        output.status
-    );
     let single_resolved_path = (resolved_paths.len() == 1
         && root.join(&resolved_paths[0]).is_file())
     .then(|| resolved_paths[0].clone());
@@ -291,6 +296,26 @@ fn collect_matches_with_rg(
         });
     }
     Ok(Some(matches))
+}
+
+/// Formats child stderr for a failed search, bounded to
+/// [`MAX_FAILED_SEARCH_STDERR_BYTES`] at a UTF-8 character boundary.
+fn failed_search_stderr(stderr: &str) -> String {
+    if stderr.is_empty() {
+        return String::new();
+    }
+    if stderr.len() <= MAX_FAILED_SEARCH_STDERR_BYTES {
+        return format!("; stderr:\n{stderr}");
+    }
+    let mut end = MAX_FAILED_SEARCH_STDERR_BYTES;
+    while !stderr.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "; stderr:\n{}\n[stderr truncated to {end} of {} bytes]",
+        &stderr[..end],
+        stderr.len()
+    )
 }
 
 fn collect_matches_without_rg(
@@ -369,6 +394,16 @@ fn collect_walk_files(root: &Path, target: &Path, files: &mut BTreeSet<String>) 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn search_with_test_rg(
+    root: &Path,
+    request: &SearchRequest,
+    rg_binary: &Path,
+) -> Result<SearchResult> {
+    let rg_binary = rg_binary.to_str().context("test rg path must be UTF-8")?;
+    search_with_rg_binary(root, request, rg_binary)
 }
 
 #[cfg(test)]
