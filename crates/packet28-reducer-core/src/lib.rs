@@ -29,7 +29,9 @@ pub use search::{
     parse_region_for_path, search,
 };
 #[cfg(test)]
-pub(crate) use search::{parse_grep_output_line, render_search_compact_preview, search_without_rg};
+pub(crate) use search::{
+    parse_grep_output_line, render_search_compact_preview, search_with_test_rg, search_without_rg,
+};
 pub use types::*;
 
 pub(crate) fn cache_fingerprint(family: &str, kind: &str, argv: &[String]) -> String {

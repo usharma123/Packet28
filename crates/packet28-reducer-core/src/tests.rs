@@ -1,10 +1,10 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     normalize_capture_path, parse_grep_output_line, render_search_compact_preview,
-    search_without_rg, SearchGroup, SearchMatch, SearchRequest,
+    search_with_test_rg, search_without_rg, SearchGroup, SearchMatch, SearchRequest,
 };
 
 #[test]
@@ -94,4 +94,103 @@ fn reducer_fallback_matches_anchored_line_start_regexes_without_rg() {
     assert_eq!(result.groups[0].matches[0].text, "    SearchRequest {");
 
     fs::remove_dir_all(&root).expect("cleanup test fixture");
+}
+
+/// A private fixture root with a stub `rg` that prints `stderr` and exits
+/// with `status`, so tests do not depend on the host's ripgrep or `PATH`.
+#[cfg(unix)]
+struct StubRg {
+    root: PathBuf,
+    binary: PathBuf,
+}
+
+#[cfg(unix)]
+impl StubRg {
+    fn new(name: &str, stderr: &[u8], status: i32) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "packet28-reducer-core-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("create stub rg directory");
+        fs::write(bin.join("stderr.txt"), stderr).expect("write stub stderr");
+        let binary = bin.join("rg");
+        fs::write(
+            &binary,
+            format!("#!/bin/sh\ncat \"$(dirname \"$0\")/stderr.txt\" >&2\nexit {status}\n"),
+        )
+        .expect("write stub rg");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("make stub rg executable");
+        Self { root, binary }
+    }
+
+    fn search(&self, query: &str) -> anyhow::Result<crate::SearchResult> {
+        let request = SearchRequest {
+            query: query.to_string(),
+            ..SearchRequest::default()
+        };
+        search_with_test_rg(&self.root, &request, &self.binary)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StubRg {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_search_error_includes_child_status_and_stderr() {
+    let stub = StubRg::new(
+        "search-parse-error",
+        b"rg: regex parse error:\n    (?:[)\n       ^\nerror: unclosed character class\n",
+        2,
+    );
+
+    let error = stub.search("[").unwrap_err().to_string();
+
+    assert_eq!(
+        error,
+        "search command exited with status exit status: 2; stderr:\n\
+         rg: regex parse error:\n    (?:[)\n       ^\nerror: unclosed character class"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_search_error_truncates_oversized_stderr_at_a_char_boundary() {
+    // 1 ASCII byte then 2-byte characters: byte 2048 falls inside a character.
+    let stderr = format!("x{}", "\u{e9}".repeat(2000));
+    let stub = StubRg::new("search-oversized-stderr", stderr.as_bytes(), 2);
+
+    let error = stub.search("[").unwrap_err().to_string();
+
+    let expected = format!(
+        "search command exited with status exit status: 2; stderr:\n{}\n\
+         [stderr truncated to 2047 of 4001 bytes]",
+        &stderr[..2047]
+    );
+    assert_eq!(error, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn no_match_search_status_still_returns_empty_result_with_diagnostics() {
+    let stub = StubRg::new("search-no-match", b"rg: ./missing: No such file\n", 1);
+
+    let result = stub.search("absent").expect("status 1 means no match");
+
+    assert_eq!(
+        (result.match_count, result.diagnostics),
+        (0, vec!["rg: ./missing: No such file".to_string()])
+    );
 }
