@@ -10,9 +10,13 @@
 //!    so any hook that still fires becomes a no-op and never starts a process,
 //! 2. asks the Claude HTTP hook server and `packet28d` for this workspace to exit,
 //! 3. strips Packet28 hook entries from every runtime hook config it knows,
-//! 4. removes the `packet28` MCP server entry unless `--keep-mcp` is passed.
+//! 4. removes the `packet28` MCP server entry unless `--keep-mcp` is passed,
+//! 5. lists instruction files that still contain Packet28 guidance.
 //!
-//! Workspace data under `.packet28/` is left in place.
+//! Setup appends that guidance without ownership markers, so uninstall cannot
+//! tell where it ends and user rules begin. It reports those files for manual
+//! cleanup instead of editing them. Workspace data under `.packet28/` is left
+//! in place.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,6 +28,7 @@ use packet28_daemon_protocol::hooks::{HookRuntimeConfig, RelaunchPreference};
 use packet28_daemon_protocol::paths::hook_runtime_config_path;
 use serde_json::Value;
 
+use crate::agent_surface;
 use crate::runtime_integrations::{adapters, RuntimeEnvironment};
 
 #[derive(Args, Debug, Clone)]
@@ -53,6 +58,7 @@ pub(crate) struct UninstallReport {
     pub(crate) hook_files_changed: Vec<PathBuf>,
     pub(crate) mcp_files_changed: Vec<PathBuf>,
     pub(crate) left_in_place: Vec<PathBuf>,
+    pub(crate) retained_instruction_files: Vec<PathBuf>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -143,6 +149,8 @@ pub(crate) fn uninstall_workspace(
             }
         }
     }
+    report.retained_instruction_files =
+        retained_instruction_files(environment, &mut report.warnings);
     report.hook_files_changed.sort();
     report.hook_files_changed.dedup();
     report.mcp_files_changed.sort();
@@ -150,6 +158,38 @@ pub(crate) fn uninstall_workspace(
     report.left_in_place.sort();
     report.left_in_place.dedup();
     Ok(report)
+}
+
+/// Instruction files setup may have written that still contain Packet28
+/// guidance: every runtime prompt target plus the generic `agent.md`.
+fn retained_instruction_files(
+    environment: &RuntimeEnvironment<'_>,
+    warnings: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    let mut candidates = adapters()
+        .iter()
+        .flat_map(|adapter| adapter.prompt_targets(environment))
+        .map(|target| target.path)
+        .chain(std::iter::once(environment.root().join("agent.md")))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter(|path| path.is_file())
+        .filter(|path| match fs::read(path) {
+            Ok(bytes) => {
+                agent_surface::contains_packet28_guidance(&String::from_utf8_lossy(&bytes))
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "could not check {} for Packet28 guidance: {err}",
+                    path.display()
+                ));
+                false
+            }
+        })
+        .collect()
 }
 
 fn disable_hook_runtime(root: &Path, dry_run: bool) -> Result<Option<PathBuf>> {
@@ -464,6 +504,13 @@ fn print_report(root: &Path, report: &UninstallReport, options: UninstallOptions
             path.display()
         );
     }
+    for path in &report.retained_instruction_files {
+        println!(
+            "  {} still has Packet28 agent guidance; uninstall does not edit instruction files, \
+             so delete the Packet28 section yourself and keep your own rules",
+            path.display()
+        );
+    }
     for warning in &report.warnings {
         println!("  {} {warning}", "warning:".yellow());
     }
@@ -664,6 +711,74 @@ mod tests {
             StripOutcome::Changed
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    fn no_commands(_: &str) -> bool {
+        false
+    }
+
+    fn no_run(_: &str, _: &[String]) -> Result<bool> {
+        Ok(false)
+    }
+
+    #[test]
+    fn dry_run_reports_each_instruction_file_with_guidance_once_and_keeps_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let agents_fragment =
+            agent_surface::render_prompt_fragment(agent_surface::AgentPromptFormat::Agents, None);
+        let claude_fragment =
+            agent_surface::render_prompt_fragment(agent_surface::AgentPromptFormat::Claude, None);
+        // AGENTS.md is the prompt target of several runtimes.
+        let files = [
+            (
+                "AGENTS.md",
+                format!("# Team rules\n\nRun tests.\n\n{agents_fragment}\n"),
+            ),
+            ("CLAUDE.md", format!("{claude_fragment}\n")),
+            ("agent.md", format!("{agents_fragment}\n")),
+            ("GEMINI.md", "# Only user rules\n".to_string()),
+        ];
+        for (name, content) in &files {
+            fs::write(root.path().join(name), content).unwrap();
+        }
+        let environment = RuntimeEnvironment::new(root.path(), home.path(), &no_commands, &no_run);
+
+        let report = uninstall_workspace(
+            &environment,
+            UninstallOptions {
+                keep_mcp: false,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.retained_instruction_files,
+            ["AGENTS.md", "CLAUDE.md", "agent.md"].map(|name| root.path().join(name))
+        );
+        for (name, content) in &files {
+            assert_eq!(
+                fs::read_to_string(root.path().join(name)).unwrap(),
+                *content,
+                "{name} changed"
+            );
+        }
+    }
+
+    #[test]
+    fn user_only_instruction_files_are_not_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["AGENTS.md", "CLAUDE.md", "agent.md"] {
+            fs::write(root.path().join(name), "# Packet28 is not used here\n").unwrap();
+        }
+        let environment = RuntimeEnvironment::new(root.path(), home.path(), &no_commands, &no_run);
+        let mut warnings = Vec::new();
+
+        let retained = retained_instruction_files(&environment, &mut warnings);
+
+        assert_eq!((retained, warnings), (Vec::<PathBuf>::new(), Vec::new()));
     }
 
     #[test]

@@ -140,7 +140,6 @@ impl RuntimeAdapter {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn prompt_targets(&self, environment: &RuntimeEnvironment<'_>) -> Vec<PromptTarget> {
         (self.prompt_targets)(environment)
     }
