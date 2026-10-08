@@ -84,6 +84,101 @@ fn denied_primary_unix_socket_falls_back_to_workspace_endpoint() {
     drop(listener);
 }
 
+/// A short root under `/tmp` keeps the workspace socket within every Unix
+/// platform's `sun_path` limit regardless of the caller's `TMPDIR`.
+fn short_socket_root() -> tempfile::TempDir {
+    tempfile::Builder::new().tempdir_in("/tmp").unwrap()
+}
+
+/// Returns a path below `parent` whose encoded length is exactly `len` bytes.
+fn path_with_encoded_len(parent: &Path, len: usize) -> PathBuf {
+    let prefix = parent.as_os_str().len() + 1;
+    assert!(len > prefix, "parent '{}' is too long", parent.display());
+    parent.join("s".repeat(len - prefix))
+}
+
+fn sun_path_max() -> usize {
+    SUN_PATH_CAPACITY - 1
+}
+
+#[test]
+fn unix_socket_path_limit_matches_platform_bind_limit() {
+    let root = short_socket_root();
+    let longest = path_with_encoded_len(root.path(), sun_path_max());
+    let overlong = path_with_encoded_len(root.path(), sun_path_max() + 1);
+
+    let listener = bind_unix_listener(&longest).unwrap();
+    drop(listener);
+    let std_error = std::os::unix::net::UnixListener::bind(&overlong).unwrap_err();
+    let error = bind_unix_listener(&overlong).err().unwrap();
+
+    assert_eq!(std_error.kind(), ErrorKind::InvalidInput);
+    assert!(
+        error.is::<UnixSocketPathTooLong>(),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn overlong_primary_unix_socket_falls_back_to_workspace_endpoint() {
+    let root = short_socket_root();
+    ensure_daemon_dir(root.path()).unwrap();
+    let primary = path_with_encoded_len(root.path(), sun_path_max() + 1);
+    // Unrelated bytes at the unusable primary path must survive the fallback.
+    std::fs::write(&primary, b"user data").unwrap();
+
+    let listener = bind_preferred_daemon_listener(root.path(), &primary).unwrap();
+
+    assert_eq!(
+        (listener.endpoint(), std::fs::read(&primary).unwrap()),
+        (
+            workspace_socket_path(root.path()).display().to_string(),
+            b"user data".to_vec()
+        )
+    );
+    drop(listener);
+}
+
+#[test]
+fn overlong_primary_and_workspace_sockets_fall_back_to_authenticated_tcp() {
+    let parent = tempfile::TempDir::new().unwrap();
+    let root = parent.path().join("w".repeat(sun_path_max()));
+    std::fs::create_dir(&root).unwrap();
+    ensure_daemon_dir(&root).unwrap();
+    // The root alone exceeds the limit, so both endpoints below it are overlong.
+    let primary = root.join("primary.sock");
+
+    let listener = bind_preferred_daemon_listener(&root, &primary).unwrap();
+
+    assert!(
+        listener.endpoint().starts_with("tcp://127.0.0.1:") && listener.transport_auth().is_some(),
+        "expected authenticated loopback TCP, got '{}'",
+        listener.endpoint()
+    );
+    drop(listener);
+}
+
+#[test]
+fn live_primary_unix_socket_fails_closed_without_fallback() {
+    let root = short_socket_root();
+    ensure_daemon_dir(root.path()).unwrap();
+    let primary = root.path().join("live.sock");
+    let live = std::os::unix::net::UnixListener::bind(&primary).unwrap();
+
+    let error = bind_preferred_daemon_listener(root.path(), &primary)
+        .err()
+        .unwrap();
+
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to replace a live socket")
+            && !workspace_socket_path(root.path()).exists(),
+        "unexpected outcome: {error:#}"
+    );
+    drop(live);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn processor_failure_is_fatal_bounded_and_detached_work_retains_its_lease() {
     let state = daemon_test_state();
