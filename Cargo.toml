@@ -68,7 +68,7 @@ shell-words = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # XML
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
